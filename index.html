@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Voxel RTS</title>
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; color: #ddd; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      #app { position: fixed; inset: 0; }
+      #hud { position: fixed; top: 8px; left: 8px; padding: 6px 10px; background: rgba(0,0,0,0.55); border-radius: 6px; font-size: 12px; line-height: 1.4; pointer-events: none; }
+      #hud b { color: #fff; }
+      #progress { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #000; color: #ddd; font-size: 14px; }
+      #progress.hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="hud">
+      <div><b>Voxel RTS</b> &mdash; phase 1+2 scaffold</div>
+      <div>WASD / edge scroll &middot; RMB drag yaw &middot; wheel zoom</div>
+      <div id="stats"></div>
+    </div>
+    <div id="progress">Generating world&hellip;</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
