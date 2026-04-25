@@ -19,9 +19,16 @@ export class Input {
   /** True if shift was held at click time. */
   lmbShift = false;
   private lmbQueuedShift = false;
+  /** Single-frame "key just pressed" pulses for hotkeys. */
+  private pressedQueue = new Set<string>();
+  pressed = new Set<string>();
 
   attach(el: HTMLElement | Window): void {
-    el.addEventListener('keydown', (e: Event) => { this.keys.add((e as KeyboardEvent).code); });
+    el.addEventListener('keydown', (e: Event) => {
+      const ke = e as KeyboardEvent;
+      if (!this.keys.has(ke.code)) this.pressedQueue.add(ke.code);
+      this.keys.add(ke.code);
+    });
     el.addEventListener('keyup', (e: Event) => { this.keys.delete((e as KeyboardEvent).code); });
     el.addEventListener('mousemove', (e: Event) => {
       const me = e as MouseEvent;
@@ -64,5 +71,7 @@ export class Input {
     this.lmbQueuedX = -1;
     this.lmbQueuedY = -1;
     this.lmbQueuedShift = false;
+    this.pressed = this.pressedQueue;
+    this.pressedQueue = new Set<string>();
   }
 }

@@ -17,6 +17,7 @@ export class PathClient {
   private readyWaiters: (() => void)[] = [];
   private nextReqId = 1;
   private pending = new Map<number, (r: PathResponse) => void>();
+  private rebuildWaiters = new Map<number, () => void>();
 
   constructor(world: VoxelWorld) {
     const useShared = typeof SharedArrayBuffer !== 'undefined' && (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
@@ -40,6 +41,15 @@ export class PathClient {
     return new Promise<PathResponse>((resolve) => {
       this.pending.set(reqId, resolve);
       this.worker.postMessage({ kind: 'path', reqId, req });
+    });
+  }
+
+  /** Ask the worker to rebuild the surface nav grid from the current voxel state. */
+  rebuildNav(): Promise<void> {
+    const reqId = this.nextReqId++;
+    return new Promise<void>((resolve) => {
+      this.rebuildWaiters.set(reqId, resolve);
+      this.worker.postMessage({ kind: 'rebuild', reqId });
     });
   }
 
@@ -77,6 +87,14 @@ export class PathClient {
       if (cb) {
         this.pending.delete(msg.reqId);
         cb({ cells: msg.cells, reached: msg.reached, expanded: msg.expanded });
+      }
+      return;
+    }
+    if (msg.kind === 'rebuild') {
+      const cb = this.rebuildWaiters.get(msg.reqId);
+      if (cb) {
+        this.rebuildWaiters.delete(msg.reqId);
+        cb();
       }
     }
   };

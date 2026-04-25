@@ -1,11 +1,11 @@
 /// <reference lib="webworker" />
-import { allocateNav, buildSurfaceNav, SurfaceNavBuffers } from '../path/SurfaceNav';
+import { buildSurfaceNav, SurfaceNavBuffers } from '../path/SurfaceNav';
 import { findPathSurface, AStarRequest, AStarWorkspace } from '../path/AStar';
 
 interface InitMessage {
   kind: 'init';
-  voxels: Uint8Array;       // shared
-  nav: SurfaceNavBuffers;   // shared (allocated on main thread)
+  voxels: Uint8Array;
+  nav: SurfaceNavBuffers;
 }
 
 interface PathRequestMessage {
@@ -14,9 +14,15 @@ interface PathRequestMessage {
   req: AStarRequest;
 }
 
-type Message = InitMessage | PathRequestMessage;
+interface RebuildMessage {
+  kind: 'rebuild';
+  reqId: number;
+}
+
+type Message = InitMessage | PathRequestMessage | RebuildMessage;
 
 let nav: SurfaceNavBuffers | null = null;
+let voxels: Uint8Array | null = null;
 const ws = new AStarWorkspace();
 
 self.onmessage = (ev: MessageEvent<Message>) => {
@@ -24,8 +30,14 @@ self.onmessage = (ev: MessageEvent<Message>) => {
   switch (msg.kind) {
     case 'init': {
       nav = msg.nav;
-      buildSurfaceNav(msg.voxels, nav);
+      voxels = msg.voxels;
+      buildSurfaceNav(voxels, nav);
       (self as unknown as Worker).postMessage({ kind: 'ready' });
+      break;
+    }
+    case 'rebuild': {
+      if (nav && voxels) buildSurfaceNav(voxels, nav);
+      (self as unknown as Worker).postMessage({ kind: 'rebuild', reqId: msg.reqId });
       break;
     }
     case 'path': {
