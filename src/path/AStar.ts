@@ -9,6 +9,10 @@ export interface AStarRequest {
   goalCx: number; goalCz: number;
   /** Cell-radius the unit needs in even terrain (e.g. 1 = single cell, 2 = 1.5m wide). */
   footprintRadius: number;
+  /** Maximum step (voxels) the unit can climb between adjacent cells. Cliffs above this are impassable. */
+  maxStepVoxels: number;
+  /** Per-voxel-step cost coefficient — lets soldiers pay more for slope than tanks. */
+  slopePenalty: number;
   /** If true, road cells are cheaper to traverse. */
   prefersRoads: boolean;
   /** Hard cap on expansions before bailing with partial path. */
@@ -61,7 +65,7 @@ export function findPathSurface(
   req: AStarRequest,
 ): AStarResult {
   const gen = ws.resetGeneration();
-  const { startCx, startCz, goalCx, goalCz, footprintRadius, prefersRoads } = req;
+  const { startCx, startCz, goalCx, goalCz, footprintRadius, prefersRoads, maxStepVoxels, slopePenalty } = req;
   const maxExpansions = req.maxExpansions ?? 20000;
 
   const startI = navIndex(startCx, startCz);
@@ -101,10 +105,10 @@ export function findPathSurface(
       if (ws.closed[ni] === gen) continue;
       if (nav.blocked[ni]) continue;
       if (nav.flatness[ni]! < footprintRadius) continue;
-      // Step-up/down limit: bail on big vertical jumps.
+      // Step-up/down limit: bail on jumps the unit can't physically climb.
       const nyTop = nav.topY[ni]!;
       const dY = Math.abs(nyTop - cy);
-      if (dY > FLAT_TOLERANCE_VOXELS) continue;
+      if (dY > maxStepVoxels) continue;
 
       // Diagonal corner cutting check: both adjacent cardinals must be passable.
       if (n >= 4) {
@@ -115,8 +119,8 @@ export function findPathSurface(
       }
 
       let stepCost = NB_COST[n]!;
-      // Slope penalty: small extra cost on uneven terrain.
-      stepCost += dY * 0.25;
+      // Slope penalty scales with the unit's tolerance — soldiers care more, tanks less.
+      stepCost += dY * slopePenalty;
       // Road preference.
       if (prefersRoads) {
         const rw = nav.road[ni]! / 255;

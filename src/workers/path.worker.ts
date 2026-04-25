@@ -1,6 +1,7 @@
 /// <reference lib="webworker" />
 import { buildSurfaceNav, SurfaceNavBuffers } from '../path/SurfaceNav';
 import { findPathSurface, AStarRequest, AStarWorkspace } from '../path/AStar';
+import { smoothPath } from '../path/Smooth';
 import { buildVolumeNav, VolumeNavBuffers } from '../path/VolumeNav';
 import { findPathVolume, AStar3DRequest, AStar3DWorkspace } from '../path/AStar3D';
 
@@ -60,9 +61,12 @@ self.onmessage = (ev: MessageEvent<Message>) => {
         break;
       }
       const r = findPathSurface(nav, ws2, msg.req);
+      const smoothed = r.cells.length > 2
+        ? smoothPath(nav, r.cells, msg.req.footprintRadius, msg.req.maxStepVoxels)
+        : r.cells;
       (self as unknown as Worker).postMessage({
         kind: 'path', reqId: msg.reqId,
-        cells: r.cells, reached: r.reached, expanded: r.expanded,
+        cells: smoothed, reached: r.reached, expanded: r.expanded,
       });
       break;
     }

@@ -148,7 +148,7 @@ export class Game {
       this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, (req) => this.handleCarve(req));
       this.buildings.tick(dt, this.world, this.units);
     }
-    this.unitRenderer.update(this.units, performance.now() / 1000);
+    this.unitRenderer.update(this.units);
     this.debris.update(dt);
     this.meshes.pump(8);
 
@@ -300,6 +300,8 @@ export class Game {
           startCx: start.cx, startCz: start.cz,
           goalCx: goalCell.cx, goalCz: goalCell.cz,
           footprintRadius: u.footprintRadius,
+          maxStepVoxels: u.maxStepVoxels,
+          slopePenalty: u.slopePenalty,
           prefersRoads: false,
         }).then((res) => {
           if (res.cells.length > 0) {
@@ -336,6 +338,8 @@ export class Game {
         startCx: start.cx, startCz: start.cz,
         goalCx: goal.cx, goalCz: goal.cz,
         footprintRadius: selected.footprintRadius,
+        maxStepVoxels: selected.maxStepVoxels,
+        slopePenalty: selected.slopePenalty,
         prefersRoads: false,
       });
       if (res.cells.length === 0) return;

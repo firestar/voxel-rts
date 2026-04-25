@@ -25,18 +25,18 @@ self.onmessage = (ev: MessageEvent<GenJob>) => {
 function generate(job: GenJob): void {
   const { voxels, dirty, seed, zStart, zEnd, progress } = job;
 
-  // Tunables.
-  const baseHeight = 48;     // voxels above bedrock (12 m at 0.25 m)
-  const heightAmp = 28;      // ±7 m
-  const heightFreq = 1 / 80; // gentle ridges
-  const dirtDepth = 6;
-  const grassDepth = 1;
+  // Tunables (voxels). All distances scaled for 0.125 m voxels.
+  const baseHeight = 96;       // 12 m above bedrock
+  const heightAmp = 56;        // ±7 m
+  const heightFreq = 1 / 160;  // gentle ridges (~10 m wavelength)
+  const dirtDepth = 12;        // 1.5 m
+  const grassDepth = 2;        // 0.25 m
 
-  // Cave parameters.
-  const caveStartY = 4;
-  const caveEndY = WORLD_Y - 4;
-  const worleyFreq = 1 / 14;
-  const fbmFreq = 1 / 22;
+  // Cave parameters (noise periods scaled to keep similar feature sizes).
+  const caveStartY = 8;
+  const caveEndY = WORLD_Y - 8;
+  const worleyFreq = 1 / 28;
+  const fbmFreq = 1 / 44;
 
   for (let z = zStart; z < zEnd; z++) {
     for (let x = 0; x < WORLD_X; x++) {
@@ -45,16 +45,15 @@ function generate(job: GenJob): void {
       const h = (baseHeight + w * heightAmp) | 0;
       const top = Math.max(2, Math.min(WORLD_Y - 1, h));
 
-      // Bedrock floor.
-      voxels[worldIndex(x, 0, z)] = M_BEDROCK;
-      voxels[worldIndex(x, 1, z)] = M_BEDROCK;
+      // Bedrock floor (a bit thicker now that voxels are smaller).
+      for (let by = 0; by < 4; by++) voxels[worldIndex(x, by, z)] = M_BEDROCK;
 
       // Stone column up to top - dirtDepth - grassDepth, dirt below grass, grass at top.
       const grassY = top;
       const dirtTopY = top - grassDepth;
       const stoneTopY = dirtTopY - dirtDepth;
 
-      for (let y = 2; y < top; y++) {
+      for (let y = 4; y < top; y++) {
         const idx = worldIndex(x, y, z);
         if (y <= stoneTopY) voxels[idx] = M_STONE;
         else if (y <= dirtTopY) voxels[idx] = M_DIRT;
@@ -68,7 +67,7 @@ function generate(job: GenJob): void {
       // Use the cheaper test first to short-circuit.
       for (let y = caveStartY; y < Math.min(caveEndY, top); y++) {
         // Bedrock layer is sacred.
-        if (y < 3) continue;
+        if (y < 5) continue;
         // Quick reject via fbm threshold.
         const f = fbm3(x * fbmFreq, y * fbmFreq, z * fbmFreq, seed + 7919, 2);
         if (f < 0.18) continue;

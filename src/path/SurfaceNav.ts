@@ -1,16 +1,17 @@
 import { WORLD_X, WORLD_Y, WORLD_Z, VOXEL_SIZE, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
 
-// 1 m surface cells = 4 voxels.
-export const NAV_CELL_VOXELS = 4;
-export const NAV_W = WORLD_X / NAV_CELL_VOXELS; // 128
-export const NAV_H = WORLD_Z / NAV_CELL_VOXELS; // 128
+// 1 m surface cells = 8 voxels (at 0.125 m).
+export const NAV_CELL_VOXELS = 8;
+export const NAV_W = WORLD_X / NAV_CELL_VOXELS; // 96
+export const NAV_H = WORLD_Z / NAV_CELL_VOXELS; // 96
 export const NAV_COUNT = NAV_W * NAV_H;
 export const NAV_CELL_METERS = NAV_CELL_VOXELS * VOXEL_SIZE; // 1.0
 
-// Slope tolerance: cells within this many voxels of vertical neighbor diff count as "even".
-export const FLAT_TOLERANCE_VOXELS = 2;
-export const MAX_FLATNESS_RADIUS = 16; // capped — no unit needs more than this in cells
+// Slope tolerance for "even-enough" cells used by the Chamfer flatness pass.
+// In voxels — at 0.125 m a value of 4 = 0.5 m vertical difference between adjacent cells.
+export const FLAT_TOLERANCE_VOXELS = 4;
+export const MAX_FLATNESS_RADIUS = 16;
 
 export interface SurfaceNavBuffers {
   topY: Int16Array;        // top solid voxel y (or -1 if none / blocked)

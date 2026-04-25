@@ -1,0 +1,70 @@
+import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H } from './SurfaceNav';
+
+/**
+ * String-pulling: walk a line between two cells using a 2D Bresenham-style supercover and
+ * return false the moment any sampled cell is impassable for a unit with the given footprint
+ * and step limit. Y-step limit is checked against the line's start cell.
+ */
+function navLineClear(
+  nav: SurfaceNavBuffers,
+  ax: number, az: number,
+  bx: number, bz: number,
+  footprintRadius: number,
+  maxStepVoxels: number,
+): boolean {
+  let x0 = ax, z0 = az;
+  const x1 = bx, z1 = bz;
+  const dx = Math.abs(x1 - x0);
+  const dz = Math.abs(z1 - z0);
+  const sx = x0 < x1 ? 1 : -1;
+  const sz = z0 < z1 ? 1 : -1;
+  let err = dx - dz;
+  const startTopY = nav.topY[navIndex(x0, z0)]!;
+  let prevY = startTopY;
+
+  // Step at most enough cells to cover the line.
+  const guard = dx + dz + 2;
+  for (let i = 0; i <= guard; i++) {
+    if (x0 < 0 || z0 < 0 || x0 >= NAV_W || z0 >= NAV_H) return false;
+    const idx = navIndex(x0, z0);
+    if (nav.blocked[idx]) return false;
+    if (nav.flatness[idx]! < footprintRadius) return false;
+    const y = nav.topY[idx]!;
+    if (Math.abs(y - prevY) > maxStepVoxels) return false;
+    prevY = y;
+    if (x0 === x1 && z0 === z1) return true;
+    const e2 = 2 * err;
+    if (e2 > -dz) { err -= dz; x0 += sx; }
+    if (e2 < dx) { err += dx; z0 += sz; }
+  }
+  return false;
+}
+
+/**
+ * Greedy smoothing: keep the current waypoint, skip ahead while the straight line from it
+ * to the next-next waypoint is still passable. Reduces the zig-zag of an octile A* path
+ * to a much shorter polyline that hugs the terrain.
+ */
+export function smoothPath(
+  nav: SurfaceNavBuffers,
+  cells: { cx: number; cz: number }[],
+  footprintRadius: number,
+  maxStepVoxels: number,
+): { cx: number; cz: number }[] {
+  if (cells.length <= 2) return cells;
+  const out: { cx: number; cz: number }[] = [cells[0]!];
+  let i = 0;
+  while (i < cells.length - 1) {
+    let j = cells.length - 1;
+    // Find the farthest cell from i that we can reach in a straight line.
+    while (j > i + 1) {
+      const a = cells[i]!;
+      const b = cells[j]!;
+      if (navLineClear(nav, a.cx, a.cz, b.cx, b.cz, footprintRadius, maxStepVoxels)) break;
+      j--;
+    }
+    out.push(cells[j]!);
+    i = j;
+  }
+  return out;
+}
