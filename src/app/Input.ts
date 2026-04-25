@@ -11,6 +11,14 @@ export class Input {
   private rmbAccDy = 0;
   wheel = 0;
   private wheelAcc = 0;
+  /** Set on the frame the LMB was pressed; cleared after beginFrame. */
+  lmbClickX = -1;
+  lmbClickY = -1;
+  private lmbQueuedX = -1;
+  private lmbQueuedY = -1;
+  /** True if shift was held at click time. */
+  lmbShift = false;
+  private lmbQueuedShift = false;
 
   attach(el: HTMLElement | Window): void {
     el.addEventListener('keydown', (e: Event) => { this.keys.add((e as KeyboardEvent).code); });
@@ -24,6 +32,11 @@ export class Input {
     el.addEventListener('mousedown', (e: Event) => {
       const me = e as MouseEvent;
       if (me.button === 2) { this.rmbDown = true; me.preventDefault(); }
+      if (me.button === 0) {
+        this.lmbQueuedX = me.clientX;
+        this.lmbQueuedY = me.clientY;
+        this.lmbQueuedShift = me.shiftKey;
+      }
     });
     el.addEventListener('mouseup', (e: Event) => {
       const me = e as MouseEvent;
@@ -45,5 +58,11 @@ export class Input {
     this.rmbAccDy = 0;
     this.wheel = this.wheelAcc;
     this.wheelAcc = 0;
+    this.lmbClickX = this.lmbQueuedX;
+    this.lmbClickY = this.lmbQueuedY;
+    this.lmbShift = this.lmbQueuedShift;
+    this.lmbQueuedX = -1;
+    this.lmbQueuedY = -1;
+    this.lmbQueuedShift = false;
   }
 }
