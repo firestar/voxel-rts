@@ -8,6 +8,10 @@ import { generateWorld } from '../voxel/WorldGen';
 import { raycastVoxel } from '../voxel/Raycast';
 import { VOXEL_SIZE } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
+import { PathClient } from '../path/PathClient';
+import { UnitManager } from '../sim/Units';
+import { UnitRenderer } from '../render/UnitRenderer';
+import { NAV_W, NAV_H, navIndex, navCenter } from '../path/SurfaceNav';
 
 export class Game {
   readonly renderer: Renderer;
@@ -16,6 +20,9 @@ export class Game {
   readonly world: VoxelWorld;
   readonly meshes: ChunkMeshRegistry;
   readonly debris: DebrisParticles;
+  readonly units = new UnitManager();
+  readonly unitRenderer = new UnitRenderer();
+  pathClient: PathClient | null = null;
 
   private last = performance.now();
   private fpsAcc = 0;
@@ -23,9 +30,8 @@ export class Game {
   private fpsTimer = 0;
   private fpsEl: HTMLElement | null;
 
-  // Default explosion tuning.
-  private readonly explosionRadiusMeters = 1.5; // 6 voxels
-  private readonly explosionRadiusBigMeters = 3.0; // shift-click — 12 voxels
+  private readonly explosionRadiusMeters = 1.5;
+  private readonly explosionRadiusBigMeters = 3.0;
   private readonly explosionPeak = 90;
 
   constructor(canvas: HTMLCanvasElement, statsEl: HTMLElement | null) {
@@ -39,6 +45,7 @@ export class Game {
     this.meshes = new ChunkMeshRegistry(this.renderer.scene, this.world);
     this.debris = new DebrisParticles(4096);
     this.renderer.scene.add(this.debris.mesh);
+    this.renderer.scene.add(this.unitRenderer.group);
     this.fpsEl = statsEl;
 
     this.onResize();
@@ -47,6 +54,35 @@ export class Game {
 
   async generate(seed: number, onProgress?: (done: number, total: number) => void): Promise<void> {
     await generateWorld(this.world, seed, p => onProgress?.(p.done, p.total));
+    // Spin up the path worker once the voxel buffer is filled.
+    this.pathClient = new PathClient(this.world);
+    await this.pathClient.awaitReady();
+    this.spawnInitialUnits();
+  }
+
+  private spawnInitialUnits(): void {
+    if (!this.pathClient) return;
+    // Find a flat cell near map center for the soldier spawn.
+    const nav = this.pathClient.nav;
+    const cx = NAV_W >> 1;
+    const cz = NAV_H >> 1;
+    let found = { cx, cz };
+    let bestFlat = -1;
+    for (let dz = -8; dz <= 8; dz++) {
+      for (let dx = -8; dx <= 8; dx++) {
+        const x = cx + dx, z = cz + dz;
+        if (x < 0 || z < 0 || x >= NAV_W || z >= NAV_H) continue;
+        const i = navIndex(x, z);
+        if (nav.blocked[i]) continue;
+        const f = nav.flatness[i]!;
+        if (f > bestFlat) { bestFlat = f; found = { cx: x, cz: z }; }
+      }
+    }
+    const c = navCenter(nav, found.cx, found.cz);
+    const soldier = this.units.spawn('soldier', c.x, c.y, c.z);
+    soldier.selected = true;
+    // Center camera on spawn.
+    this.camera.target.set(c.x, 0, c.z);
   }
 
   start(): void {
@@ -76,6 +112,11 @@ export class Game {
       this.handleClick(this.input.lmbClickX, this.input.lmbClickY, w, h, this.input.lmbShift);
     }
 
+    if (this.pathClient) {
+      this.units.tick(dt, this.pathClient.nav);
+    }
+    this.unitRenderer.update(this.units);
+
     this.debris.update(dt);
     this.meshes.pump(8);
 
@@ -86,7 +127,7 @@ export class Game {
     this.fpsTimer += dt;
     if (this.fpsTimer >= 0.5 && this.fpsEl) {
       const fps = this.fpsCount / this.fpsAcc;
-      this.fpsEl.textContent = `FPS ${fps.toFixed(0)} | meshed ${this.meshes.getMeshCount()} | inflight ${this.meshes.getInflight()}`;
+      this.fpsEl.textContent = `FPS ${fps.toFixed(0)} | meshed ${this.meshes.getMeshCount()} | inflight ${this.meshes.getInflight()} | units ${this.units.units.length}`;
       this.fpsAcc = 0; this.fpsCount = 0; this.fpsTimer = 0;
     }
   }
@@ -106,25 +147,49 @@ export class Game {
     const hit = raycastVoxel(this.world, origin, dir, 200);
     if (!hit) return;
 
-    const radiusMeters = shift ? this.explosionRadiusBigMeters : this.explosionRadiusMeters;
-    const radiusVoxels = radiusMeters / VOXEL_SIZE;
+    if (shift) {
+      this.detonateAt(hit);
+    } else {
+      this.commandMoveTo(hit.x, hit.z);
+    }
+  }
 
-    // Detonate slightly *into* the surface so we cleanly carve a crater.
+  private detonateAt(hit: { x: number; y: number; z: number; nx: number; ny: number; nz: number }): void {
+    const radiusVoxels = this.explosionRadiusBigMeters / VOXEL_SIZE;
     const cx = hit.x + 0.5 - hit.nx * 0.5;
     const cy = hit.y + 0.5 - hit.ny * 0.5;
     const cz = hit.z + 0.5 - hit.nz * 0.5;
-
     const result = this.world.damageSphere(cx, cy, cz, radiusVoxels, this.explosionPeak);
-
     if (result.destroyed.length > 0) {
-      // Sample tint from a destroyed voxel near the center.
       const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
-      const wx = (cx) * VOXEL_SIZE;
-      const wy = (cy) * VOXEL_SIZE;
-      const wz = (cz) * VOXEL_SIZE;
+      const wx = cx * VOXEL_SIZE, wy = cy * VOXEL_SIZE, wz = cz * VOXEL_SIZE;
       const burst = Math.min(160, 20 + result.destroyed.length * 2);
       this.debris.spawnBurst(wx, wy, wz, burst, sample.material);
     }
+  }
+
+  private async commandMoveTo(voxelX: number, voxelZ: number): Promise<void> {
+    if (!this.pathClient) return;
+    const selected = this.units.units.find(u => u.selected);
+    if (!selected) return;
+
+    const wx = (voxelX + 0.5) * VOXEL_SIZE;
+    const wz = (voxelZ + 0.5) * VOXEL_SIZE;
+    const goal = this.pathClient.cellAt(wx, wz);
+    if (!goal.ok) return;
+
+    const start = this.pathClient.cellAt(selected.x, selected.z);
+    if (!start.ok) return;
+
+    const res = await this.pathClient.requestPath({
+      startCx: start.cx, startCz: start.cz,
+      goalCx: goal.cx, goalCz: goal.cz,
+      footprintRadius: selected.footprintRadius,
+      prefersRoads: false,
+    });
+    if (res.cells.length === 0) return;
+    const wpts = this.pathClient.cellsToWaypoints(res.cells);
+    this.units.setPath(selected, wpts);
   }
 
   private onResize = (): void => {
