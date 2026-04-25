@@ -166,66 +166,112 @@ export function buildTankTurretGeometry(): THREE.BufferGeometry {
 export const TANK_TURRET_PIVOT_Y = 1.20;
 export const TANK_TURRET_PIVOT_Z = 0.05;
 
-// ---------- Tunneler ---------------------------------------------------------
-// Compact drill rig — narrower than the tank, dominated by a stepped drill bit.
-// Roughly 1.6 m long, 1.0 m wide, 1.2 m tall.
+// ---------- Tunneler (TBM) ---------------------------------------------------
+// Sized to ~3x the tank: roughly 9 m long, 7 m wide, 6 m tall. Dominated by a
+// massive cutter head; chassis behind it is a wide armored hull on heavy treads.
 
 export function buildTunnelerHullGeometry(): THREE.BufferGeometry {
-  const body = { r: 0.55, g: 0.40, b: 0.18 };       // industrial yellow
-  const bodyDark = { r: 0.40, g: 0.28, b: 0.10 };
-  const tread = { r: 0.10, g: 0.10, b: 0.12 };
+  const body = { r: 0.55, g: 0.42, b: 0.18 };       // industrial yellow
+  const bodyDark = { r: 0.40, g: 0.30, b: 0.10 };
+  const bodyHi = { r: 0.70, g: 0.55, b: 0.22 };
+  const tread = { r: 0.08, g: 0.08, b: 0.10 };
   const treadHi = { r: 0.20, g: 0.22, b: 0.24 };
+  const wheelHub = { r: 0.45, g: 0.45, b: 0.45 };
   const cabin = { r: 0.20, g: 0.45, b: 0.55 };      // teal cab glass
-  const exhaust = { r: 0.25, g: 0.25, b: 0.27 };
+  const exhaust = { r: 0.30, g: 0.30, b: 0.32 };
+  const reinf = { r: 0.55, g: 0.55, b: 0.60 };      // structural ribs
 
-  const blocks: VoxelBlock[] = [
-    // Treads
-    { x: -0.42, y: 0.22, z: 0.00, sx: 0.20, sy: 0.40, sz: 1.40, ...tread },
-    { x:  0.42, y: 0.22, z: 0.00, sx: 0.20, sy: 0.40, sz: 1.40, ...tread },
-  ];
-  for (let i = -3; i <= 3; i++) {
-    const z = i * 0.20;
-    blocks.push({ x: -0.54, y: 0.22, z, sx: 0.05, sy: 0.12, sz: 0.10, ...treadHi });
-    blocks.push({ x:  0.54, y: 0.22, z, sx: 0.05, sy: 0.12, sz: 0.10, ...treadHi });
+  const blocks: VoxelBlock[] = [];
+
+  // Massive treads (left + right), 6 m long, 1.0 m wide, 1.6 m tall.
+  for (const sx of [-2.4, 2.4]) {
+    blocks.push({ x: sx, y: 0.80, z: 0.00, sx: 1.00, sy: 1.60, sz: 6.00, ...tread });
   }
-  // Chassis
-  blocks.push({ x: 0.0, y: 0.46, z: 0.10, sx: 0.80, sy: 0.30, sz: 1.00, ...body });
-  // Cabin
-  blocks.push({ x: 0.0, y: 0.78, z: 0.30, sx: 0.50, sy: 0.30, sz: 0.40, ...cabin });
-  // Roof bar
-  blocks.push({ x: 0.0, y: 0.96, z: 0.30, sx: 0.60, sy: 0.06, sz: 0.50, ...bodyDark });
-  // Drill collar (where the bit attaches)
-  blocks.push({ x: 0.0, y: 0.46, z: -0.50, sx: 0.40, sy: 0.36, sz: 0.20, ...bodyDark });
-  // Exhaust stack
-  blocks.push({ x: -0.30, y: 0.94, z: -0.10, sx: 0.10, sy: 0.34, sz: 0.10, ...exhaust });
+  // Tread tooth bumps along outer faces.
+  for (let i = -8; i <= 8; i++) {
+    const z = i * 0.32;
+    blocks.push({ x: -2.95, y: 0.80, z, sx: 0.12, sy: 0.50, sz: 0.24, ...treadHi });
+    blocks.push({ x:  2.95, y: 0.80, z, sx: 0.12, sy: 0.50, sz: 0.24, ...treadHi });
+  }
+  // Drive sprockets at front + back, each side.
+  for (const sx of [-2.4, 2.4]) {
+    for (const sz of [2.6, -2.6]) {
+      blocks.push({ x: sx, y: 0.80, z: sz, sx: 1.10, sy: 1.00, sz: 1.00, ...wheelHub });
+    }
+  }
+  // Lower hull skirt
+  blocks.push({ x: 0.0, y: 1.20, z: 0.0, sx: 4.40, sy: 0.80, sz: 5.40, ...bodyDark });
+  // Main armored body (the "can")
+  blocks.push({ x: 0.0, y: 2.20, z: 0.0, sx: 4.80, sy: 1.80, sz: 5.00, ...body });
+  // Side reinforcement ribs along the can.
+  for (let i = -2; i <= 2; i++) {
+    const z = i * 1.0;
+    blocks.push({ x: -2.42, y: 2.20, z, sx: 0.08, sy: 1.80, sz: 0.20, ...reinf });
+    blocks.push({ x:  2.42, y: 2.20, z, sx: 0.08, sy: 1.80, sz: 0.20, ...reinf });
+  }
+  // Top deck — slightly inset.
+  blocks.push({ x: 0.0, y: 3.20, z: 0.0, sx: 4.20, sy: 0.40, sz: 4.40, ...bodyHi });
+  // Operator cab toward the back, raised up.
+  blocks.push({ x: 0.0, y: 3.80, z: 1.40, sx: 1.80, sy: 0.90, sz: 1.40, ...cabin });
+  // Cab roof
+  blocks.push({ x: 0.0, y: 4.30, z: 1.40, sx: 2.00, sy: 0.20, sz: 1.60, ...bodyDark });
+  // Two big exhaust stacks on the deck.
+  blocks.push({ x: -1.00, y: 3.80, z: 0.20, sx: 0.40, sy: 1.40, sz: 0.40, ...exhaust });
+  blocks.push({ x:  1.00, y: 3.80, z: 0.20, sx: 0.40, sy: 1.40, sz: 0.40, ...exhaust });
+  // Rear conveyor / spoil chute (sloped block out the back).
+  blocks.push({ x: 0.0, y: 1.40, z: 3.20, sx: 1.80, sy: 0.40, sz: 1.20, ...bodyDark });
+  // Front collar where the cutter head mounts.
+  blocks.push({ x: 0.0, y: 2.20, z: -2.60, sx: 4.20, sy: 1.80, sz: 0.40, ...reinf });
   return buildVoxelModel(blocks);
 }
 
-/** The drill bit, modeled as an arrow of stepped cones along -Z. Pivot at the collar. */
+/**
+ * The cutter head — a massive disc with stepped rings and many teeth around the perimeter.
+ * Pivot at the collar; spins about its forward axis (the unit's local Z).
+ */
 export function buildTunnelerDrillGeometry(): THREE.BufferGeometry {
-  const drill = { r: 0.55, g: 0.55, b: 0.60 };
-  const drillMid = { r: 0.70, g: 0.70, b: 0.75 };
-  const drillTip = { r: 0.92, g: 0.92, b: 0.96 };
-  // Coordinates relative to the drill pivot (front of the chassis).
-  const blocks: VoxelBlock[] = [
-    { x: 0.0, y: 0.0, z: -0.10, sx: 0.34, sy: 0.34, sz: 0.10, ...drill },
-    { x: 0.0, y: 0.0, z: -0.22, sx: 0.28, sy: 0.28, sz: 0.10, ...drill },
-    { x: 0.0, y: 0.0, z: -0.34, sx: 0.22, sy: 0.22, sz: 0.10, ...drillMid },
-    { x: 0.0, y: 0.0, z: -0.44, sx: 0.16, sy: 0.16, sz: 0.08, ...drillMid },
-    { x: 0.0, y: 0.0, z: -0.52, sx: 0.10, sy: 0.10, sz: 0.06, ...drillTip },
-  ];
-  // Three helical flute spikes — small angled cubes. Without skinning we just place a few
-  // bumps around the perimeter at a coarse pitch; rotation animates them visually.
-  for (let i = 0; i < 3; i++) {
-    const a = (i / 3) * Math.PI * 2;
-    const r = 0.16;
+  const headOuter = { r: 0.40, g: 0.40, b: 0.45 };
+  const headInner = { r: 0.55, g: 0.55, b: 0.60 };
+  const headCenter = { r: 0.70, g: 0.70, b: 0.75 };
+  const tooth = { r: 0.85, g: 0.85, b: 0.90 };
+  const teethTip = { r: 0.95, g: 0.95, b: 1.00 };
+
+  const blocks: VoxelBlock[] = [];
+  // Stepped rings of decreasing radius, advancing forward (-Z) so the head looks dome-like.
+  // Outer disc (3.6 m radius)
+  blocks.push({ x: 0.0, y: 0.0, z: -0.20, sx: 6.40, sy: 6.40, sz: 0.40, ...headOuter });
+  // Mid disc
+  blocks.push({ x: 0.0, y: 0.0, z: -0.55, sx: 5.20, sy: 5.20, sz: 0.40, ...headInner });
+  // Inner disc
+  blocks.push({ x: 0.0, y: 0.0, z: -0.85, sx: 3.60, sy: 3.60, sz: 0.30, ...headInner });
+  // Hub
+  blocks.push({ x: 0.0, y: 0.0, z: -1.05, sx: 1.80, sy: 1.80, sz: 0.30, ...headCenter });
+  // Center pyramid tip
+  blocks.push({ x: 0.0, y: 0.0, z: -1.25, sx: 0.80, sy: 0.80, sz: 0.20, ...teethTip });
+
+  // Cutter teeth — small studs around the outermost ring, every ~22.5°.
+  const teethCount = 16;
+  for (let i = 0; i < teethCount; i++) {
+    const a = (i / teethCount) * Math.PI * 2;
+    const r = 3.05;
     blocks.push({
-      x: Math.cos(a) * r, y: Math.sin(a) * r, z: -0.18,
-      sx: 0.05, sy: 0.05, sz: 0.16, r: 0.85, g: 0.85, b: 0.90,
+      x: Math.cos(a) * r, y: Math.sin(a) * r, z: -0.20,
+      sx: 0.40, sy: 0.40, sz: 0.50, ...tooth,
+    });
+  }
+  // Inner ring of teeth too.
+  const innerTeeth = 10;
+  for (let i = 0; i < innerTeeth; i++) {
+    const a = (i / innerTeeth) * Math.PI * 2 + 0.15;
+    const r = 2.30;
+    blocks.push({
+      x: Math.cos(a) * r, y: Math.sin(a) * r, z: -0.55,
+      sx: 0.30, sy: 0.30, sz: 0.40, ...tooth,
     });
   }
   return buildVoxelModel(blocks);
 }
 
-export const TUNNELER_DRILL_PIVOT_Y = 0.46;
-export const TUNNELER_DRILL_PIVOT_Z = -0.60;
+/** Drill pivot is at the front collar of the hull. */
+export const TUNNELER_DRILL_PIVOT_Y = 2.20;
+export const TUNNELER_DRILL_PIVOT_Z = -2.85;

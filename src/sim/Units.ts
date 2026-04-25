@@ -38,13 +38,15 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         hp: 220,
       };
     case 'tunneler':
-      // Compact drill rig; happy to chew through stone, narrower than the tank.
+      // Tunnel boring machine — about 3x the tank in linear dimensions.
+      // Wide footprint (5x5 cells = ~5 m clearance), powerful, slow, climbs almost anything,
+      // doesn't care about ground (it carries its own bench).
       return {
-        footprintRadius: 1, widthMeters: 1.0,
-        maxStepVoxels: 4, slopePenalty: 0.5,
-        canDig: true, requiresGround: true,
-        speed: 2.8, speedDigging: 1.4,
-        hp: 120,
+        footprintRadius: 3, widthMeters: 6.4,
+        maxStepVoxels: 8, slopePenalty: 0.15,
+        canDig: true, requiresGround: false,
+        speed: 2.2, speedDigging: 1.6,
+        hp: 600,
       };
   }
 }
@@ -197,7 +199,6 @@ export class UnitManager {
     const stillSolid = getBit(vnav.solid, ci) === 1;
 
     if (stillSolid) {
-      // Non-diggers can't enter a solid cell. Drop the path so the caller can replan.
       if (!u.canDig) {
         u.path = [];
         return;
@@ -219,8 +220,9 @@ export class UnitManager {
         u.x += dx * inv * step;
         u.y += dy * inv * step;
         u.z += dz * inv * step;
-        u.heading = Math.atan2(dx, dz);
+        applyPathOrientation(u, dx, dy, dz, dt);
       }
+      u.distanceWalked += step;
       return;
     }
 
@@ -237,13 +239,38 @@ export class UnitManager {
     u.x += dx * inv * step;
     u.y += dy * inv * step;
     u.z += dz * inv * step;
-    u.heading = Math.atan2(dx, dz);
     u.distanceWalked += step;
-    // Surface units (and tanks above ground) get slope-follow when they're not in a tunnel.
-    if (u.y > 0) sampleSurfaceFollow(u, this.lastSurfaceNav, dt);
+    // Underground / aerial: orient along the path. Above-surface units snap back to slope follow.
+    const surfaceY = surfaceWorldY(this.lastSurfaceNav, u.x, u.z);
+    if (u.y > surfaceY - 0.4) {
+      sampleSurfaceFollow(u, this.lastSurfaceNav, dt);
+    } else {
+      applyPathOrientation(u, dx, dy, dz, dt);
+    }
   }
   /** Last surface nav passed to tick — kept so the tunneler clear-cell branch can slope-follow. */
   private lastSurfaceNav!: SurfaceNavBuffers;
+}
+
+/**
+ * Set heading + pitch from the unit's instantaneous motion vector. Roll is eased to 0 since
+ * 3D path waypoints don't define a sensible roll. Used while underground or in flight.
+ */
+function applyPathOrientation(u: Unit, dx: number, dy: number, dz: number, dt: number): void {
+  const horiz = Math.hypot(dx, dz);
+  if (horiz > 1e-4) u.heading = Math.atan2(dx, dz);
+  const targetPitch = Math.atan2(-dy, Math.max(horiz, 1e-4));
+  const k = Math.min(1, dt * 8);
+  u.pitch += (targetPitch - u.pitch) * k;
+  u.roll  += (0           - u.roll ) * k;
+}
+
+/** Surface world-space Y at (wx, wz) from the surface nav grid (meters). */
+function surfaceWorldY(nav: SurfaceNavBuffers, wx: number, wz: number): number {
+  const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(wx / NAV_CELL_METERS)));
+  const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(wz / NAV_CELL_METERS)));
+  const top = nav.topY[navIndex(cx, cz)]!;
+  return top < 0 ? 0 : (top + 1) * VOXEL_SIZE;
 }
 
 /**

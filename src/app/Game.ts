@@ -15,6 +15,7 @@ import { NAV_W, NAV_H, navIndex, navCenter } from '../path/SurfaceNav';
 import { worldToVolumeCell } from '../path/VolumeNav';
 import { BuildingManager, BARRACKS, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
+import { TargetMarker } from '../render/TargetMarker';
 
 type Mode = 'play' | 'build';
 
@@ -29,7 +30,12 @@ export class Game {
   readonly unitRenderer = new UnitRenderer();
   readonly buildings = new BuildingManager();
   readonly ghost = new BuildingGhost();
+  readonly target = new TargetMarker();
   pathClient: PathClient | null = null;
+  /** Pixels of vertical drag = 1 m of altitude offset for tunneler targets. */
+  private readonly altitudeDragSensitivity = 8;
+  /** Squared px threshold above which a click is treated as a "drag". */
+  private readonly dragThresholdPx2 = 6 * 6;
 
   private last = performance.now();
   private fpsAcc = 0;
@@ -57,6 +63,7 @@ export class Game {
     this.renderer.scene.add(this.debris.mesh);
     this.renderer.scene.add(this.unitRenderer.group);
     this.renderer.scene.add(this.ghost.group);
+    this.renderer.scene.add(this.target.group);
     this.ghost.setSpec(BARRACKS);
 
     this.buildings.spawner = (kind, x, y, z): Unit | null => this.spawnUnit(kind, x, y, z);
@@ -140,8 +147,10 @@ export class Game {
       this.updateGhost(w, h);
     }
 
-    if (this.input.lmbClickX >= 0) {
-      this.handleClick(this.input.lmbClickX, this.input.lmbClickY, w, h, this.input.lmbShift);
+    // LMB hold → preview marker (tunneler altitude drag); release → fire actual command.
+    this.updateLmbPreview(w, h);
+    if (this.input.release) {
+      this.handleRelease(this.input.release, w, h);
     }
 
     if (this.pathClient) {
@@ -200,21 +209,71 @@ export class Game {
     this.ghost.place(ox, oz, fp.floorY >= 0 ? fp.floorY : hit.y, fp.ok);
   }
 
-  private handleClick(px: number, py: number, w: number, h: number, shift: boolean): void {
+  /**
+   * Compute the world-space target for the currently-selected unit given the cursor at
+   * (px, py) and an optional vertical drag in pixels (positive = drag down = go deeper).
+   * Returns null when the ray misses geometry.
+   */
+  private resolveTarget(px: number, py: number, w: number, h: number, verticalDragPx: number): {
+    surface: THREE.Vector3;
+    target: THREE.Vector3;
+    voxelXYZ: { x: number; y: number; z: number; nx: number; ny: number; nz: number };
+  } | null {
     const { origin, dir } = this.rayFromScreen(px, py, w, h);
-    const hit = raycastVoxel(this.world, origin, dir, 200);
-    if (!hit) return;
+    const hit = raycastVoxel(this.world, origin, dir, 400);
+    if (!hit) return null;
+    const wx = (hit.x + 0.5) * VOXEL_SIZE;
+    const wy = (hit.y + 0.5) * VOXEL_SIZE;
+    const wz = (hit.z + 0.5) * VOXEL_SIZE;
+    const dragMeters = verticalDragPx / this.altitudeDragSensitivity; // down = +meters depth
+    const target = new THREE.Vector3(wx, Math.max(0.5, wy - dragMeters), wz);
+    return {
+      surface: new THREE.Vector3(wx, wy, wz),
+      target,
+      voxelXYZ: { x: hit.x, y: hit.y, z: hit.z, nx: hit.nx, ny: hit.ny, nz: hit.nz },
+    };
+  }
 
-    if (this.mode === 'build') {
-      this.tryPlaceBuilding(hit);
+  private updateLmbPreview(w: number, h: number): void {
+    const hold = this.input.hold;
+    if (!hold || this.mode === 'build' || hold.shift) {
+      this.target.hide();
       return;
     }
+    const selected = this.units.units.find(u => u.selected);
+    // Preview only matters for tunnelers (vertical drag) — keep marker visible when held over terrain.
+    if (!selected) { this.target.hide(); return; }
+    const verticalDrag = hold.currentY - hold.startY;
+    const r = this.resolveTarget(hold.startX, hold.startY, w, h, selected.kind === 'tunneler' ? verticalDrag : 0);
+    if (!r) { this.target.hide(); return; }
+    this.target.show(r.surface, r.target);
+  }
 
-    if (shift) {
-      this.detonateAt(hit);
-    } else {
-      this.commandMoveTo(hit.x, hit.y, hit.z);
+  private handleRelease(release: { startX: number; startY: number; endX: number; endY: number; shift: boolean }, w: number, h: number): void {
+    this.target.hide();
+    if (this.mode === 'build') {
+      const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
+      if (r) this.tryPlaceBuilding(r.voxelXYZ);
+      return;
     }
+    if (release.shift) {
+      const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
+      if (r) this.detonateAt(r.voxelXYZ);
+      return;
+    }
+    const selected = this.units.units.find(u => u.selected);
+    const verticalDrag = release.endY - release.startY;
+    const useDrag = selected?.kind === 'tunneler';
+    const r = this.resolveTarget(release.startX, release.startY, w, h, useDrag ? verticalDrag : 0);
+    if (!r) return;
+    void this.commandMoveToWorld(r.target.x, r.target.y, r.target.z);
+  }
+
+  private async commandMoveToWorld(wx: number, wy: number, wz: number): Promise<void> {
+    if (!this.pathClient) return;
+    const selected = this.units.units.find(u => u.selected);
+    if (!selected) return;
+    await this.routePath(selected, wx, wy, wz);
   }
 
   private tryPlaceBuilding(hit: { x: number; z: number }): void {
@@ -284,16 +343,6 @@ export class Game {
       const goal = u.path[u.path.length - 1]!;
       void this.routePath(u, goal.x, goal.y, goal.z);
     }
-  }
-
-  private async commandMoveTo(voxelX: number, voxelY: number, voxelZ: number): Promise<void> {
-    if (!this.pathClient) return;
-    const selected = this.units.units.find(u => u.selected);
-    if (!selected) return;
-    const wx = (voxelX + 0.5) * VOXEL_SIZE;
-    const wy = (voxelY + 0.5) * VOXEL_SIZE;
-    const wz = (voxelZ + 0.5) * VOXEL_SIZE;
-    await this.routePath(selected, wx, wy, wz);
   }
 
   /**
