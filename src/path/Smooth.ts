@@ -1,9 +1,18 @@
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H } from './SurfaceNav';
 
 /**
+ * Effective flatness threshold used when probing intermediate cells. Always one less than
+ * the unit's full footprint requirement — A* already proved a footprint-strict path exists,
+ * so the smoother is allowed to nibble through "almost flat" cells to straighten it out.
+ */
+function smoothingThreshold(footprintRadius: number): number {
+  return Math.max(0, footprintRadius - 1);
+}
+
+/**
  * String-pulling: walk a line between two cells using a 2D Bresenham-style supercover and
  * return false the moment any sampled cell is impassable for a unit with the given footprint
- * and step limit. Y-step limit is checked against the line's start cell.
+ * and step limit. Uses the relaxed flatness threshold so larger units get longer segments.
  */
 function navLineClear(
   nav: SurfaceNavBuffers,
@@ -21,16 +30,20 @@ function navLineClear(
   let err = dx - dz;
   const startTopY = nav.topY[navIndex(x0, z0)]!;
   let prevY = startTopY;
+  const flatThresh = smoothingThreshold(footprintRadius);
 
-  // Step at most enough cells to cover the line.
+  // Larger units may roll over a slightly bigger ledge between adjacent cells than they'd
+  // accept for a fresh A* expansion — we know the surrounding terrain is path-feasible.
+  const stepLimit = maxStepVoxels + (footprintRadius >= 2 ? 2 : 0);
+
   const guard = dx + dz + 2;
   for (let i = 0; i <= guard; i++) {
     if (x0 < 0 || z0 < 0 || x0 >= NAV_W || z0 >= NAV_H) return false;
     const idx = navIndex(x0, z0);
     if (nav.blocked[idx]) return false;
-    if (nav.flatness[idx]! < footprintRadius) return false;
+    if (nav.flatness[idx]! < flatThresh) return false;
     const y = nav.topY[idx]!;
-    if (Math.abs(y - prevY) > maxStepVoxels) return false;
+    if (Math.abs(y - prevY) > stepLimit) return false;
     prevY = y;
     if (x0 === x1 && z0 === z1) return true;
     const e2 = 2 * err;
@@ -42,8 +55,7 @@ function navLineClear(
 
 /**
  * Greedy smoothing: keep the current waypoint, skip ahead while the straight line from it
- * to the next-next waypoint is still passable. Reduces the zig-zag of an octile A* path
- * to a much shorter polyline that hugs the terrain.
+ * to the next-next waypoint is still passable.
  */
 export function smoothPath(
   nav: SurfaceNavBuffers,
@@ -56,7 +68,6 @@ export function smoothPath(
   let i = 0;
   while (i < cells.length - 1) {
     let j = cells.length - 1;
-    // Find the farthest cell from i that we can reach in a straight line.
     while (j > i + 1) {
       const a = cells[i]!;
       const b = cells[j]!;

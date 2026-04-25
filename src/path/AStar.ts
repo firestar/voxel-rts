@@ -74,9 +74,16 @@ export function findPathSurface(
   if (nav.blocked[startI] || nav.blocked[goalI]) {
     return { cells: [], reached: false, expanded: 0 };
   }
+  // Strict footprint requirement at the goal; the start is exempt since the unit may
+  // already be standing on a borderline cell.
   if (nav.flatness[goalI]! < footprintRadius) {
     return { cells: [], reached: false, expanded: 0 };
   }
+
+  // Permissive flatness threshold for intermediate cells. The strict footprint check is
+  // only enforced at the goal — soldiers and tanks are happy to take diagonals through
+  // slightly uneven cells along the way as long as the step-up limit is respected.
+  const passFlat = Math.max(0, footprintRadius - 1);
 
   ws.gScore[startI] = 0;
   ws.gen[startI] = gen;
@@ -104,18 +111,26 @@ export function findPathSurface(
       const ni = navIndex(nx, nz);
       if (ws.closed[ni] === gen) continue;
       if (nav.blocked[ni]) continue;
-      if (nav.flatness[ni]! < footprintRadius) continue;
+      // Goal must satisfy the full footprint; intermediate cells can be one notch rougher.
+      const minFlat = ni === goalI ? footprintRadius : passFlat;
+      if (nav.flatness[ni]! < minFlat) continue;
       // Step-up/down limit: bail on jumps the unit can't physically climb.
       const nyTop = nav.topY[ni]!;
       const dY = Math.abs(nyTop - cy);
       if (dY > maxStepVoxels) continue;
 
-      // Diagonal corner cutting check: both adjacent cardinals must be passable.
+      // Diagonal corner cutting: at least one adjacent cardinal must be passable, and
+      // the dY stays within the unit's climb limit. Soldiers and tanks can therefore
+      // cut across slightly uneven shoulders that strict cardinals-only would forbid.
       if (n >= 4) {
         const a = navIndex(cx + NB_DX[n]!, cz);
         const b = navIndex(cx, cz + NB_DZ[n]!);
-        if (nav.blocked[a] || nav.blocked[b]) continue;
-        if (nav.flatness[a]! < footprintRadius || nav.flatness[b]! < footprintRadius) continue;
+        if (nav.blocked[a] && nav.blocked[b]) continue;
+        const aOk = !nav.blocked[a] && nav.flatness[a]! >= passFlat
+          && Math.abs(nav.topY[a]! - cy) <= maxStepVoxels;
+        const bOk = !nav.blocked[b] && nav.flatness[b]! >= passFlat
+          && Math.abs(nav.topY[b]! - cy) <= maxStepVoxels;
+        if (!aOk && !bOk) continue;
       }
 
       let stepCost = NB_COST[n]!;

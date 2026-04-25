@@ -81,6 +81,8 @@ export interface Unit {
   carveCooldown: number;
   /** Distance traveled in meters — drives walk-cycle phase. */
   distanceWalked: number;
+  /** distanceWalked value the last time we deposited a track / footprint mark. */
+  lastTrackDistance: number;
 }
 
 export interface CarveRequest {
@@ -116,20 +118,43 @@ export class UnitManager {
       selected: false,
       carveCooldown: 0,
       distanceWalked: 0,
+      lastTrackDistance: 0,
     };
     this.units.push(u);
     return u;
   }
 
   setPath(unit: Unit, waypoints: { x: number; y: number; z: number }[]): void {
+    if (waypoints.length === 0) {
+      unit.path = [];
+      unit.carveCooldown = 0;
+      return;
+    }
     let i = 0;
-    if (waypoints.length > 0) {
+    if (unit.path.length > 0) {
+      // We were already moving — drop incoming waypoints that lie behind the unit's
+      // current heading or are too close to its position. This is what stops the
+      // back-and-forth glitch when a rebuild lands a fresh path mid-stride.
+      // forward = (-sin(heading), -cos(heading)) (model forward is local -Z).
+      const fx = -Math.sin(unit.heading);
+      const fz = -Math.cos(unit.heading);
+      while (i < waypoints.length - 1) {
+        const w = waypoints[i]!;
+        const dx = w.x - unit.x;
+        const dz = w.z - unit.z;
+        const distSq = dx * dx + dz * dz;
+        const ahead = dx * fx + dz * fz;
+        if (distSq > 0.6 * 0.6 && ahead > -0.15) break;
+        i++;
+      }
+    } else {
       const w = waypoints[0]!;
       const dx = w.x - unit.x;
       const dy = w.y - unit.y;
       const dz = w.z - unit.z;
       if (dx * dx + dy * dy + dz * dz < 0.5 * 0.5) i = 1;
     }
+    if (i >= waypoints.length) i = waypoints.length - 1;
     unit.path = waypoints.slice(i);
     unit.carveCooldown = 0;
   }

@@ -11,8 +11,9 @@ import { DebrisParticles } from '../render/DebrisParticles';
 import { PathClient } from '../path/PathClient';
 import { UnitManager, Unit, UnitKind, CarveRequest } from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
-import { NAV_W, NAV_H, navIndex, navCenter } from '../path/SurfaceNav';
+import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { worldToVolumeCell } from '../path/VolumeNav';
+import { M_GRASS, M_DIRT } from '../voxel/Materials';
 import { BuildingManager, BARRACKS, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { TargetMarker } from '../render/TargetMarker';
@@ -46,6 +47,7 @@ export class Game {
   private mode: Mode = 'play';
   private rebuildPending = false;
   private rebuildQueued = false;
+  private rebuildShouldReplan = false;
 
   private readonly explosionRadiusBigMeters = 3.0;
   private readonly explosionPeak = 90;
@@ -156,6 +158,7 @@ export class Game {
     if (this.pathClient) {
       this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, (req) => this.handleCarve(req));
       this.buildings.tick(dt, this.world, this.units);
+      this.paintTankTracks();
     }
     this.unitRenderer.update(this.units);
     this.debris.update(dt);
@@ -315,23 +318,30 @@ export class Game {
     if (result.destroyed.length > 0) {
       const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
       this.debris.spawnBurst(req.x, req.y, req.z, 30, sample.material);
-      this.requestNavRebuild();
+      // Carving only opens new space — it never blocks an existing path. Refresh nav so
+      // future routes see the tunnel, but skip the replan that would yank live paths.
+      this.requestNavRebuild(false);
     }
   }
 
-  private requestNavRebuild(): void {
+  private requestNavRebuild(replan = true): void {
     if (!this.pathClient) return;
     if (this.rebuildPending) {
       this.rebuildQueued = true;
+      // If any caller asks to replan, the eventual rebuild should replan.
+      if (replan) this.rebuildShouldReplan = true;
       return;
     }
     this.rebuildPending = true;
+    this.rebuildShouldReplan = replan;
     void this.pathClient.rebuildNav().then(() => {
       this.rebuildPending = false;
-      this.replanMovingUnits();
+      const shouldReplan = this.rebuildShouldReplan;
+      this.rebuildShouldReplan = false;
+      if (shouldReplan) this.replanMovingUnits();
       if (this.rebuildQueued) {
         this.rebuildQueued = false;
-        this.requestNavRebuild();
+        this.requestNavRebuild(shouldReplan);
       }
     });
   }
@@ -386,6 +396,58 @@ export class Game {
     });
     if (res.cells.length === 0) return;
     this.units.setPath(unit, this.pathClient.cellsToWaypoints(res.cells));
+  }
+
+  /**
+   * For every tank that's traveled at least TANK_TRACK_INTERVAL meters since its last mark,
+   * paint a small patch of grass voxels to dirt under each tread. This is cosmetic — voxel
+   * heights don't change, so we don't need a nav rebuild; the chunk gets remeshed via the
+   * usual dirty-chunk pump.
+   */
+  private paintTankTracks(): void {
+    if (!this.pathClient) return;
+    const TANK_TRACK_INTERVAL = 0.4;     // m
+    const TANK_TREAD_OFFSET = 1.20;      // half-spacing between treads, in m (matches model)
+    const TANK_TREAD_HALF_VOXELS = 2;    // tread paints a 4x4 voxel swath
+    const nav = this.pathClient.nav;
+    const voxels = this.world.buffers.voxels;
+    for (const u of this.units.units) {
+      if (u.kind !== 'tank') continue;
+      if (u.distanceWalked - u.lastTrackDistance < TANK_TRACK_INTERVAL) continue;
+      u.lastTrackDistance = u.distanceWalked;
+      // Right vector for heading h where forward = (-sin h, -cos h):  right = (cos h, -sin h).
+      const ch = Math.cos(u.heading);
+      const sh = Math.sin(u.heading);
+      const rx = ch, rz = -sh;
+      for (const off of [-TANK_TREAD_OFFSET, TANK_TREAD_OFFSET]) {
+        const wx = u.x + rx * off;
+        const wz = u.z + rz * off;
+        const cx = Math.floor(wx / NAV_CELL_METERS);
+        const cz = Math.floor(wz / NAV_CELL_METERS);
+        if (cx < 0 || cz < 0 || cx >= NAV_W || cz >= NAV_H) continue;
+        const top = nav.topY[navIndex(cx, cz)]!;
+        if (top < 0) continue;
+        const baseX = Math.floor(wx / VOXEL_SIZE);
+        const baseZ = Math.floor(wz / VOXEL_SIZE);
+        for (let dz = -TANK_TREAD_HALF_VOXELS; dz < TANK_TREAD_HALF_VOXELS; dz++) {
+          for (let dx = -TANK_TREAD_HALF_VOXELS; dx < TANK_TREAD_HALF_VOXELS; dx++) {
+            const x = baseX + dx;
+            const z = baseZ + dz;
+            // Per-column topY: scan a few voxels around the cell-level top so sloped ground
+            // gets painted on the right voxel rather than always at the cell's average top.
+            for (let yProbe = top + 2; yProbe >= top - 2 && yProbe >= 0; yProbe--) {
+              const m = this.world.get(x, yProbe, z);
+              if (m === 0) continue;
+              if (m === M_GRASS) {
+                this.world.set(x, yProbe, z, M_DIRT);
+              }
+              break;
+            }
+          }
+        }
+      }
+    }
+    void voxels;
   }
 
   /** World-space Y (meters) of the topY voxel under the given world-space (x, z). */
