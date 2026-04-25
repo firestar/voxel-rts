@@ -148,7 +148,7 @@ export class Game {
       this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, (req) => this.handleCarve(req));
       this.buildings.tick(dt, this.world, this.units);
     }
-    this.unitRenderer.update(this.units);
+    this.unitRenderer.update(this.units, performance.now() / 1000);
     this.debris.update(dt);
     this.meshes.pump(8);
 
