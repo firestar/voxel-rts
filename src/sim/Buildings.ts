@@ -18,8 +18,8 @@ export interface BuildingSpec {
   wall: MaterialId;
   /** Time between unit spawns in seconds. */
   productionInterval: number;
-  /** Unit kind produced. */
-  produces: UnitKind;
+  /** Cycled through on each spawn; lets one Barracks alternate Soldier/Tunneler. */
+  produces: UnitKind[];
 }
 
 export const BARRACKS: BuildingSpec = {
@@ -28,8 +28,8 @@ export const BARRACKS: BuildingSpec = {
   cellsD: 4,
   headroomVoxels: 12, // 3m
   wall: M_WOOD,
-  productionInterval: 8.0,
-  produces: 'soldier',
+  productionInterval: 6.0,
+  produces: ['soldier', 'tunneler'],
 };
 
 export interface FootprintHit {
@@ -45,15 +45,13 @@ export interface FootprintHit {
 export interface Building {
   id: number;
   spec: BuildingSpec;
-  /** Footprint origin in nav cells. */
   ox: number; oz: number;
-  /** Floor voxel y. Voxels [floorY+1 .. floorY+headroom] above are construction airspace. */
   floorY: number;
-  /** Production timer in seconds; spawns when it crosses 0. */
   productionTimer: number;
-  /** Cumulative damage to wall voxels — used as a rough alive marker. */
   wallVoxelsAtBuild: number;
   destroyed: boolean;
+  /** Index into spec.produces for the next spawn. */
+  nextProduceIdx: number;
 }
 
 /**
@@ -220,6 +218,7 @@ export class BuildingManager {
       productionTimer: spec.productionInterval,
       wallVoxelsAtBuild: wallCount,
       destroyed: false,
+      nextProduceIdx: 0,
     };
     this.buildings.push(b);
     return b;
@@ -237,13 +236,14 @@ export class BuildingManager {
         b.productionTimer += b.spec.productionInterval;
         if (this.spawner) {
           const door = doorWorldPos(b);
-          // Verify the door cell is still standing-ish: wall count > 25%.
           const alive = countLivingWalls(world, b);
           if (alive < b.wallVoxelsAtBuild * 0.25) {
             b.destroyed = true;
             continue;
           }
-          this.spawner(b.spec.produces, door.x, door.y, door.z);
+          const kind = b.spec.produces[b.nextProduceIdx % b.spec.produces.length]!;
+          b.nextProduceIdx++;
+          this.spawner(kind, door.x, door.y, door.z);
         }
       }
     }

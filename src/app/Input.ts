@@ -28,6 +28,8 @@ export class Input {
       const ke = e as KeyboardEvent;
       if (!this.keys.has(ke.code)) this.pressedQueue.add(ke.code);
       this.keys.add(ke.code);
+      // Browser tab navigation steals focus — block while in-game.
+      if (ke.code === 'Tab') ke.preventDefault();
     });
     el.addEventListener('keyup', (e: Event) => { this.keys.delete((e as KeyboardEvent).code); });
     el.addEventListener('mousemove', (e: Event) => {

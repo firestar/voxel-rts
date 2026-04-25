@@ -9,10 +9,11 @@ import { raycastVoxel } from '../voxel/Raycast';
 import { VOXEL_SIZE } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
 import { PathClient } from '../path/PathClient';
-import { UnitManager, Unit, UnitKind } from '../sim/Units';
+import { UnitManager, Unit, UnitKind, CarveRequest } from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
-import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_VOXELS, NAV_CELL_METERS } from '../path/SurfaceNav';
-import { BuildingManager, BARRACKS, checkFootprint, doorWorldPos } from '../sim/Buildings';
+import { NAV_W, NAV_H, navIndex, navCenter } from '../path/SurfaceNav';
+import { worldToVolumeCell } from '../path/VolumeNav';
+import { BuildingManager, BARRACKS, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 
 type Mode = 'play' | 'build';
@@ -38,6 +39,7 @@ export class Game {
   private modeEl: HTMLElement | null = null;
   private mode: Mode = 'play';
   private rebuildPending = false;
+  private rebuildQueued = false;
 
   private readonly explosionRadiusBigMeters = 3.0;
   private readonly explosionPeak = 90;
@@ -92,6 +94,8 @@ export class Game {
     const c = navCenter(nav, found.cx, found.cz);
     const soldier = this.spawnUnit('soldier', c.x, c.y, c.z);
     if (soldier) soldier.selected = true;
+    // Spawn a tunneler nearby so the user has both kinds available right away.
+    this.spawnUnit('tunneler', c.x + 1.5, c.y, c.z);
     this.camera.target.set(c.x, 0, c.z);
   }
 
@@ -130,6 +134,7 @@ export class Game {
       this.mode = 'play';
       this.ghost.hide();
     }
+    if (this.input.pressed.has('Tab')) this.cycleSelection();
 
     if (this.mode === 'build') {
       this.updateGhost(w, h);
@@ -140,7 +145,7 @@ export class Game {
     }
 
     if (this.pathClient) {
-      this.units.tick(dt, this.pathClient.nav);
+      this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, (req) => this.handleCarve(req));
       this.buildings.tick(dt, this.world, this.units);
     }
     this.unitRenderer.update(this.units);
@@ -158,8 +163,19 @@ export class Game {
       this.fpsAcc = 0; this.fpsCount = 0; this.fpsTimer = 0;
     }
     if (this.modeEl) {
-      this.modeEl.textContent = this.mode === 'build' ? 'MODE: BUILD (LMB place, Esc cancel)' : 'MODE: PLAY';
+      const sel = this.units.units.find(u => u.selected);
+      const selDesc = sel ? `${sel.kind} #${sel.id}` : 'none';
+      this.modeEl.textContent = `${this.mode === 'build' ? 'MODE: BUILD (LMB place, Esc cancel)' : 'MODE: PLAY'} | selected: ${selDesc}`;
     }
+  }
+
+  private cycleSelection(): void {
+    const arr = this.units.units;
+    if (arr.length === 0) return;
+    const idx = arr.findIndex(u => u.selected);
+    arr.forEach(u => u.selected = false);
+    const next = (idx + 1) % arr.length;
+    arr[next]!.selected = true;
   }
 
   private rayFromScreen(px: number, py: number, w: number, h: number): { origin: THREE.Vector3; dir: THREE.Vector3 } {
@@ -178,7 +194,6 @@ export class Game {
     const wx = hit.x * VOXEL_SIZE;
     const wz = hit.z * VOXEL_SIZE;
     const cell = this.pathClient.cellAt(wx, wz);
-    // Snap so the cursor sits at the building's center cell.
     const ox = Math.max(0, Math.min(NAV_W - BARRACKS.cellsW, cell.cx - (BARRACKS.cellsW >> 1)));
     const oz = Math.max(0, Math.min(NAV_H - BARRACKS.cellsD, cell.cz - (BARRACKS.cellsD >> 1)));
     const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, BARRACKS, ox, oz);
@@ -198,7 +213,7 @@ export class Game {
     if (shift) {
       this.detonateAt(hit);
     } else {
-      this.commandMoveTo(hit.x, hit.z);
+      this.commandMoveTo(hit.x, hit.y, hit.z);
     }
   }
 
@@ -211,9 +226,7 @@ export class Game {
     const oz = Math.max(0, Math.min(NAV_H - BARRACKS.cellsD, cell.cz - (BARRACKS.cellsD >> 1)));
     const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, BARRACKS, ox, oz);
     if (!fp.ok) return;
-    const b = this.buildings.place(this.world, BARRACKS, ox, oz, fp.floorY);
-    void b;
-    // Voxel writes mark chunks dirty automatically; nav grid needs rebuild.
+    this.buildings.place(this.world, BARRACKS, ox, oz, fp.floorY);
     this.requestNavRebuild();
   }
 
@@ -232,13 +245,35 @@ export class Game {
     }
   }
 
+  /** Tunneler asks to clear a cell — issue a destructive sphere edit and queue a rebuild. */
+  private handleCarve(req: CarveRequest): void {
+    const radiusVoxels = req.radiusMeters / VOXEL_SIZE;
+    const cx = req.x / VOXEL_SIZE;
+    const cy = req.y / VOXEL_SIZE;
+    const cz = req.z / VOXEL_SIZE;
+    // Use a peak well above any soft-material HP so the cell fully clears.
+    const result = this.world.damageSphere(cx, cy, cz, radiusVoxels, 250);
+    if (result.destroyed.length > 0) {
+      const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
+      this.debris.spawnBurst(req.x, req.y, req.z, 30, sample.material);
+      this.requestNavRebuild();
+    }
+  }
+
   private requestNavRebuild(): void {
     if (!this.pathClient) return;
-    if (this.rebuildPending) return;
+    if (this.rebuildPending) {
+      this.rebuildQueued = true;
+      return;
+    }
     this.rebuildPending = true;
     void this.pathClient.rebuildNav().then(() => {
       this.rebuildPending = false;
       this.replanMovingUnits();
+      if (this.rebuildQueued) {
+        this.rebuildQueued = false;
+        this.requestNavRebuild();
+      }
     });
   }
 
@@ -247,40 +282,65 @@ export class Game {
     for (const u of this.units.units) {
       if (u.path.length === 0) continue;
       const goal = u.path[u.path.length - 1]!;
-      const start = this.pathClient.cellAt(u.x, u.z);
-      const goalCell = this.pathClient.cellAt(goal.x, goal.z);
-      void this.pathClient.requestPath({
-        startCx: start.cx, startCz: start.cz,
-        goalCx: goalCell.cx, goalCz: goalCell.cz,
-        footprintRadius: u.footprintRadius,
-        prefersRoads: false,
-      }).then((res) => {
-        if (res.cells.length > 0) {
-          this.units.setPath(u, this.pathClient!.cellsToWaypoints(res.cells));
-        } else {
-          // Path no longer reachable — drop.
-          u.path = [];
-        }
-      });
+      if (u.kind === 'tunneler') {
+        const startCell = worldToVolumeCell(u.x, u.y, u.z);
+        const goalCell = worldToVolumeCell(goal.x, goal.y, goal.z);
+        void this.pathClient.requestVolumePath({
+          startCx: startCell.cx, startCy: startCell.cy, startCz: startCell.cz,
+          goalCx: goalCell.cx, goalCy: goalCell.cy, goalCz: goalCell.cz,
+        }).then((res) => {
+          if (res.cells.length > 0) {
+            this.units.setPath(u, this.pathClient!.volumeCellsToWaypoints(res.cells));
+          }
+        });
+      } else {
+        const start = this.pathClient.cellAt(u.x, u.z);
+        const goalCell = this.pathClient.cellAt(goal.x, goal.z);
+        void this.pathClient.requestPath({
+          startCx: start.cx, startCz: start.cz,
+          goalCx: goalCell.cx, goalCz: goalCell.cz,
+          footprintRadius: u.footprintRadius,
+          prefersRoads: false,
+        }).then((res) => {
+          if (res.cells.length > 0) {
+            this.units.setPath(u, this.pathClient!.cellsToWaypoints(res.cells));
+          } else {
+            u.path = [];
+          }
+        });
+      }
     }
   }
 
-  private async commandMoveTo(voxelX: number, voxelZ: number): Promise<void> {
+  private async commandMoveTo(voxelX: number, voxelY: number, voxelZ: number): Promise<void> {
     if (!this.pathClient) return;
     const selected = this.units.units.find(u => u.selected);
     if (!selected) return;
     const wx = (voxelX + 0.5) * VOXEL_SIZE;
+    const wy = (voxelY + 0.5) * VOXEL_SIZE;
     const wz = (voxelZ + 0.5) * VOXEL_SIZE;
-    const goal = this.pathClient.cellAt(wx, wz);
-    const start = this.pathClient.cellAt(selected.x, selected.z);
-    const res = await this.pathClient.requestPath({
-      startCx: start.cx, startCz: start.cz,
-      goalCx: goal.cx, goalCz: goal.cz,
-      footprintRadius: selected.footprintRadius,
-      prefersRoads: false,
-    });
-    if (res.cells.length === 0) return;
-    this.units.setPath(selected, this.pathClient.cellsToWaypoints(res.cells));
+
+    if (selected.kind === 'tunneler') {
+      const startCell = worldToVolumeCell(selected.x, selected.y, selected.z);
+      const goalCell = worldToVolumeCell(wx, wy, wz);
+      const res = await this.pathClient.requestVolumePath({
+        startCx: startCell.cx, startCy: startCell.cy, startCz: startCell.cz,
+        goalCx: goalCell.cx, goalCy: goalCell.cy, goalCz: goalCell.cz,
+      });
+      if (res.cells.length === 0) return;
+      this.units.setPath(selected, this.pathClient.volumeCellsToWaypoints(res.cells));
+    } else {
+      const goal = this.pathClient.cellAt(wx, wz);
+      const start = this.pathClient.cellAt(selected.x, selected.z);
+      const res = await this.pathClient.requestPath({
+        startCx: start.cx, startCz: start.cz,
+        goalCx: goal.cx, goalCz: goal.cz,
+        footprintRadius: selected.footprintRadius,
+        prefersRoads: false,
+      });
+      if (res.cells.length === 0) return;
+      this.units.setPath(selected, this.pathClient.cellsToWaypoints(res.cells));
+    }
   }
 
   private onResize = (): void => {
@@ -289,7 +349,3 @@ export class Game {
     this.camera.resize(w, h);
   };
 }
-
-void NAV_CELL_VOXELS;
-void NAV_CELL_METERS;
-void doorWorldPos;
