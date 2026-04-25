@@ -3,6 +3,9 @@ import { VOXEL_SIZE } from '../voxel/types';
 import {
   worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers, VNAV_CELL_METERS,
 } from '../path/VolumeNav';
+import {
+  TUNNELER_CUTTER_RADIUS, TUNNELER_CUTTER_FORWARD, TUNNELER_CUTTER_HEIGHT,
+} from '../render/UnitModels';
 
 export type UnitKind = 'soldier' | 'tank' | 'tunneler';
 
@@ -38,15 +41,14 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         hp: 220,
       };
     case 'tunneler':
-      // Tunnel boring machine — about 3x the tank in linear dimensions.
-      // Wide footprint (5x5 cells = ~5 m clearance), powerful, slow, climbs almost anything,
-      // doesn't care about ground (it carries its own bench).
+      // Tunnel boring machine — about 1.5x the tank in linear dimensions.
+      // Cutter head clears more than the body, so the path footprint can stay 2 cells.
       return {
-        footprintRadius: 3, widthMeters: 6.4,
-        maxStepVoxels: 8, slopePenalty: 0.15,
+        footprintRadius: 2, widthMeters: 3.6,
+        maxStepVoxels: 6, slopePenalty: 0.2,
         canDig: true, requiresGround: false,
-        speed: 2.2, speedDigging: 1.6,
-        hp: 600,
+        speed: 2.5, speedDigging: 1.8,
+        hp: 320,
       };
   }
 }
@@ -174,7 +176,9 @@ export class UnitManager {
       const inv = 1 / d;
       u.x += dx * inv * step;
       u.z += dz * inv * step;
-      u.heading = Math.atan2(dx, dz);
+      // Models are built with their forward at local -Z, so heading needs to point -Z
+      // toward the motion vector — that's atan2(-dx, -dz), not atan2(dx, dz).
+      u.heading = Math.atan2(-dx, -dz);
       moved = step;
     }
     // Snap to ground and update slope orientation from the surface gradient.
@@ -203,17 +207,7 @@ export class UnitManager {
         u.path = [];
         return;
       }
-      u.carveCooldown += dt;
-      if (u.carveCooldown >= TUNNELER_CARVE_PERIOD) {
-        u.carveCooldown = 0;
-        carveOut({
-          x: (cell.cx + 0.5) * VNAV_CELL_METERS,
-          y: (cell.cy + 0.5) * VNAV_CELL_METERS,
-          z: (cell.cz + 0.5) * VNAV_CELL_METERS,
-          radiusMeters: u.widthMeters * 0.55,
-          unit: u,
-        });
-      }
+      // Crawl forward at digging speed, and let the cutter head do its thing below.
       const step = u.speedDigging * dt;
       if (d > 0.001) {
         const inv = 1 / d;
@@ -223,23 +217,25 @@ export class UnitManager {
         applyPathOrientation(u, dx, dy, dz, dt);
       }
       u.distanceWalked += step;
+      this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, carveOut);
       return;
     }
 
     // Cell is clear — normal motion toward waypoint.
     const step = u.speed * dt;
+    let consumed = step;
     if (d <= step) {
+      consumed = d;
       u.x = tgt.x; u.y = tgt.y; u.z = tgt.z;
       u.path.shift();
       u.carveCooldown = 0;
-      u.distanceWalked += d;
-      return;
+    } else {
+      const inv = 1 / d;
+      u.x += dx * inv * step;
+      u.y += dy * inv * step;
+      u.z += dz * inv * step;
     }
-    const inv = 1 / d;
-    u.x += dx * inv * step;
-    u.y += dy * inv * step;
-    u.z += dz * inv * step;
-    u.distanceWalked += step;
+    u.distanceWalked += consumed;
     // Underground / aerial: orient along the path. Above-surface units snap back to slope follow.
     const surfaceY = surfaceWorldY(this.lastSurfaceNav, u.x, u.z);
     if (u.y > surfaceY - 0.4) {
@@ -247,6 +243,34 @@ export class UnitManager {
     } else {
       applyPathOrientation(u, dx, dy, dz, dt);
     }
+    // The cutter still grinds anything the disc clips even while moving through clear cells.
+    this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, carveOut);
+  }
+
+  /**
+   * If the unit is a tunneler and is moving, fire a sphere damage at the cutter head
+   * position throttled by TUNNELER_CARVE_PERIOD. The spot is the front of the unit along
+   * its motion vector. The carve is a no-op (no rebuild) when no solid voxels are in range.
+   */
+  private maybeCarveAtCutter(
+    u: Unit, dt: number,
+    dx: number, dy: number, dz: number, d: number,
+    carveOut: (req: CarveRequest) => void,
+  ): void {
+    if (!u.canDig) return;
+    if (d < 1e-3) return;
+    u.carveCooldown += dt;
+    if (u.carveCooldown < TUNNELER_CARVE_PERIOD) return;
+    u.carveCooldown = 0;
+    const inv = 1 / d;
+    const fx = dx * inv, fy = dy * inv, fz = dz * inv;
+    carveOut({
+      x: u.x + fx * TUNNELER_CUTTER_FORWARD,
+      y: u.y + TUNNELER_CUTTER_HEIGHT + fy * TUNNELER_CUTTER_FORWARD,
+      z: u.z + fz * TUNNELER_CUTTER_FORWARD,
+      radiusMeters: TUNNELER_CUTTER_RADIUS,
+      unit: u,
+    });
   }
   /** Last surface nav passed to tick — kept so the tunneler clear-cell branch can slope-follow. */
   private lastSurfaceNav!: SurfaceNavBuffers;
@@ -258,7 +282,7 @@ export class UnitManager {
  */
 function applyPathOrientation(u: Unit, dx: number, dy: number, dz: number, dt: number): void {
   const horiz = Math.hypot(dx, dz);
-  if (horiz > 1e-4) u.heading = Math.atan2(dx, dz);
+  if (horiz > 1e-4) u.heading = Math.atan2(-dx, -dz);
   const targetPitch = Math.atan2(-dy, Math.max(horiz, 1e-4));
   const k = Math.min(1, dt * 8);
   u.pitch += (targetPitch - u.pitch) * k;
