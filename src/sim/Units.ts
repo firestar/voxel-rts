@@ -4,7 +4,50 @@ import {
   worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers, VNAV_CELL_METERS,
 } from '../path/VolumeNav';
 
-export type UnitKind = 'soldier' | 'tunneler';
+export type UnitKind = 'soldier' | 'tank' | 'tunneler';
+
+interface UnitConfig {
+  footprintRadius: number;
+  widthMeters: number;
+  maxStepVoxels: number;
+  slopePenalty: number;
+  canDig: boolean;
+  requiresGround: boolean;
+  speed: number;
+  speedDigging: number;
+  hp: number;
+}
+
+export function unitConfig(kind: UnitKind): UnitConfig {
+  switch (kind) {
+    case 'soldier':
+      return {
+        footprintRadius: 1, widthMeters: 0.75,
+        maxStepVoxels: 2, slopePenalty: 1.0,
+        canDig: false, requiresGround: true,
+        speed: 4.5, speedDigging: 0,
+        hp: 80,
+      };
+    case 'tank':
+      // Big, capable on rough ground, can use existing tunnels but never digs.
+      return {
+        footprintRadius: 2, widthMeters: 2.4,
+        maxStepVoxels: 6, slopePenalty: 0.25,
+        canDig: false, requiresGround: true,
+        speed: 3.5, speedDigging: 0,
+        hp: 220,
+      };
+    case 'tunneler':
+      // Compact drill rig; happy to chew through stone, narrower than the tank.
+      return {
+        footprintRadius: 1, widthMeters: 1.0,
+        maxStepVoxels: 4, slopePenalty: 0.5,
+        canDig: true, requiresGround: true,
+        speed: 2.8, speedDigging: 1.4,
+        hp: 120,
+      };
+  }
+}
 
 export interface Unit {
   id: number;
@@ -17,6 +60,10 @@ export interface Unit {
   maxStepVoxels: number;
   /** Per-step slope cost coefficient — soldiers care more, tanks less. */
   slopePenalty: number;
+  /** Whether this unit may carve through solid material. Only the Tunneler does. */
+  canDig: boolean;
+  /** Whether this unit needs solid ground beneath it (no flying). */
+  requiresGround: boolean;
   x: number; y: number; z: number;
   heading: number;
   /** Pitch and roll, applied each frame from the surface gradient. */
@@ -45,23 +92,23 @@ export class UnitManager {
   private nextId = 1;
 
   spawn(kind: UnitKind, x: number, y: number, z: number): Unit {
-    const isSoldier = kind === 'soldier';
+    const cfg = unitConfig(kind);
     const u: Unit = {
       id: this.nextId++,
       kind,
-      // Soldier squeezes through 1-cell corridors but is sensitive to bumps.
-      // Tank needs a 2-cell-wide corridor but can climb three voxels (~0.4 m) at a time.
-      footprintRadius: isSoldier ? 1 : 2,
-      widthMeters: isSoldier ? 0.75 : 1.6,
-      maxStepVoxels: isSoldier ? 2 : 5,    // 0.25 m vs 0.625 m
-      slopePenalty: isSoldier ? 1.0 : 0.3, // soldier pays much more on slope
+      footprintRadius: cfg.footprintRadius,
+      widthMeters: cfg.widthMeters,
+      maxStepVoxels: cfg.maxStepVoxels,
+      slopePenalty: cfg.slopePenalty,
+      canDig: cfg.canDig,
+      requiresGround: cfg.requiresGround,
       x, y, z,
       heading: 0,
       pitch: 0, roll: 0,
-      speed: isSoldier ? 4.5 : 3.0,
-      speedDigging: 1.2,
+      speed: cfg.speed,
+      speedDigging: cfg.speedDigging,
       path: [],
-      hp: 100,
+      hp: cfg.hp,
       selected: false,
       carveCooldown: 0,
       distanceWalked: 0,
@@ -96,19 +143,21 @@ export class UnitManager {
     this.lastSurfaceNav = nav;
     for (const u of this.units) {
       if (u.path.length === 0) {
-        // Idle units still ease their orientation toward the local slope so they don't sit askew.
         if (u.y > 0) sampleSurfaceFollow(u, nav, dt);
         continue;
       }
-      if (u.kind === 'tunneler') {
-        this.tickTunneler(u, dt, vnav, carveOut);
-      } else {
-        this.tickSoldier(u, dt, nav);
-      }
+      // Path waypoints carry their own Y. Use 3D motion when the next waypoint is
+      // meaningfully above/below the unit (typical underground / tunnel paths) or
+      // when the unit can dig.
+      const tgt = u.path[0]!;
+      const dy = tgt.y - u.y;
+      const using3D = u.canDig || Math.abs(dy) > 0.3;
+      if (using3D) this.tickVolume(u, dt, vnav, carveOut);
+      else this.tickSurface(u, dt, nav);
     }
   }
 
-  private tickSoldier(u: Unit, dt: number, nav: SurfaceNavBuffers): void {
+  private tickSurface(u: Unit, dt: number, nav: SurfaceNavBuffers): void {
     const tgt = u.path[0]!;
     const dx = tgt.x - u.x;
     const dz = tgt.z - u.z;
@@ -131,7 +180,7 @@ export class UnitManager {
     u.distanceWalked += moved;
   }
 
-  private tickTunneler(
+  private tickVolume(
     u: Unit,
     dt: number,
     vnav: VolumeNavBuffers,
@@ -143,12 +192,16 @@ export class UnitManager {
     const dz = tgt.z - u.z;
     const d = Math.hypot(dx, dy, dz);
 
-    // Determine whether the next waypoint cell is still solid.
     const cell = worldToVolumeCell(tgt.x, tgt.y, tgt.z);
     const ci = vnavIndex(cell.cx, cell.cy, cell.cz);
     const stillSolid = getBit(vnav.solid, ci) === 1;
 
     if (stillSolid) {
+      // Non-diggers can't enter a solid cell. Drop the path so the caller can replan.
+      if (!u.canDig) {
+        u.path = [];
+        return;
+      }
       u.carveCooldown += dt;
       if (u.carveCooldown >= TUNNELER_CARVE_PERIOD) {
         u.carveCooldown = 0;
@@ -160,7 +213,6 @@ export class UnitManager {
           unit: u,
         });
       }
-      // Crawl forward at digging speed.
       const step = u.speedDigging * dt;
       if (d > 0.001) {
         const inv = 1 / d;
@@ -187,7 +239,7 @@ export class UnitManager {
     u.z += dz * inv * step;
     u.heading = Math.atan2(dx, dz);
     u.distanceWalked += step;
-    // Tanks above ground also get slope-follow.
+    // Surface units (and tanks above ground) get slope-follow when they're not in a tunnel.
     if (u.y > 0) sampleSurfaceFollow(u, this.lastSurfaceNav, dt);
   }
   /** Last surface nav passed to tick — kept so the tunneler clear-cell branch can slope-follow. */

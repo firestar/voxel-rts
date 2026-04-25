@@ -94,8 +94,8 @@ export class Game {
     const c = navCenter(nav, found.cx, found.cz);
     const soldier = this.spawnUnit('soldier', c.x, c.y, c.z);
     if (soldier) soldier.selected = true;
-    // Spawn a tunneler nearby so the user has both kinds available right away.
-    this.spawnUnit('tunneler', c.x + 1.5, c.y, c.z);
+    this.spawnUnit('tank', c.x + 3.0, c.y, c.z);
+    this.spawnUnit('tunneler', c.x - 2.0, c.y, c.z);
     this.camera.target.set(c.x, 0, c.z);
   }
 
@@ -282,35 +282,7 @@ export class Game {
     for (const u of this.units.units) {
       if (u.path.length === 0) continue;
       const goal = u.path[u.path.length - 1]!;
-      if (u.kind === 'tunneler') {
-        const startCell = worldToVolumeCell(u.x, u.y, u.z);
-        const goalCell = worldToVolumeCell(goal.x, goal.y, goal.z);
-        void this.pathClient.requestVolumePath({
-          startCx: startCell.cx, startCy: startCell.cy, startCz: startCell.cz,
-          goalCx: goalCell.cx, goalCy: goalCell.cy, goalCz: goalCell.cz,
-        }).then((res) => {
-          if (res.cells.length > 0) {
-            this.units.setPath(u, this.pathClient!.volumeCellsToWaypoints(res.cells));
-          }
-        });
-      } else {
-        const start = this.pathClient.cellAt(u.x, u.z);
-        const goalCell = this.pathClient.cellAt(goal.x, goal.z);
-        void this.pathClient.requestPath({
-          startCx: start.cx, startCz: start.cz,
-          goalCx: goalCell.cx, goalCz: goalCell.cz,
-          footprintRadius: u.footprintRadius,
-          maxStepVoxels: u.maxStepVoxels,
-          slopePenalty: u.slopePenalty,
-          prefersRoads: false,
-        }).then((res) => {
-          if (res.cells.length > 0) {
-            this.units.setPath(u, this.pathClient!.cellsToWaypoints(res.cells));
-          } else {
-            u.path = [];
-          }
-        });
-      }
+      void this.routePath(u, goal.x, goal.y, goal.z);
     }
   }
 
@@ -321,30 +293,59 @@ export class Game {
     const wx = (voxelX + 0.5) * VOXEL_SIZE;
     const wy = (voxelY + 0.5) * VOXEL_SIZE;
     const wz = (voxelZ + 0.5) * VOXEL_SIZE;
+    await this.routePath(selected, wx, wy, wz);
+  }
 
-    if (selected.kind === 'tunneler') {
-      const startCell = worldToVolumeCell(selected.x, selected.y, selected.z);
+  /**
+   * Pick surface vs volume pathing for a unit:
+   *  - Tunneler always uses volume (it digs).
+   *  - Anyone whose start OR destination is meaningfully below the local surface uses volume.
+   *  - Otherwise surface pathing (cheaper, gives a smoother surface walk).
+   */
+  private async routePath(unit: Unit, wx: number, wy: number, wz: number): Promise<void> {
+    if (!this.pathClient) return;
+    const goalSurfaceY = this.surfaceWorldY(wx, wz);
+    const startSurfaceY = this.surfaceWorldY(unit.x, unit.z);
+    const goalUnderground = wy < goalSurfaceY - 0.5;
+    const startUnderground = unit.y < startSurfaceY - 0.5;
+    const useVolume = unit.canDig || goalUnderground || startUnderground;
+
+    if (useVolume) {
+      const startCell = worldToVolumeCell(unit.x, unit.y, unit.z);
       const goalCell = worldToVolumeCell(wx, wy, wz);
       const res = await this.pathClient.requestVolumePath({
         startCx: startCell.cx, startCy: startCell.cy, startCz: startCell.cz,
         goalCx: goalCell.cx, goalCy: goalCell.cy, goalCz: goalCell.cz,
+        canDig: unit.canDig,
+        requiresGround: unit.requiresGround,
+        footprintRadius: unit.footprintRadius,
       });
       if (res.cells.length === 0) return;
-      this.units.setPath(selected, this.pathClient.volumeCellsToWaypoints(res.cells));
-    } else {
-      const goal = this.pathClient.cellAt(wx, wz);
-      const start = this.pathClient.cellAt(selected.x, selected.z);
-      const res = await this.pathClient.requestPath({
-        startCx: start.cx, startCz: start.cz,
-        goalCx: goal.cx, goalCz: goal.cz,
-        footprintRadius: selected.footprintRadius,
-        maxStepVoxels: selected.maxStepVoxels,
-        slopePenalty: selected.slopePenalty,
-        prefersRoads: false,
-      });
-      if (res.cells.length === 0) return;
-      this.units.setPath(selected, this.pathClient.cellsToWaypoints(res.cells));
+      this.units.setPath(unit, this.pathClient.volumeCellsToWaypoints(res.cells));
+      return;
     }
+
+    const goal = this.pathClient.cellAt(wx, wz);
+    const start = this.pathClient.cellAt(unit.x, unit.z);
+    const res = await this.pathClient.requestPath({
+      startCx: start.cx, startCz: start.cz,
+      goalCx: goal.cx, goalCz: goal.cz,
+      footprintRadius: unit.footprintRadius,
+      maxStepVoxels: unit.maxStepVoxels,
+      slopePenalty: unit.slopePenalty,
+      prefersRoads: false,
+    });
+    if (res.cells.length === 0) return;
+    this.units.setPath(unit, this.pathClient.cellsToWaypoints(res.cells));
+  }
+
+  /** World-space Y (meters) of the topY voxel under the given world-space (x, z). */
+  private surfaceWorldY(wx: number, wz: number): number {
+    if (!this.pathClient) return 0;
+    const cell = this.pathClient.cellAt(wx, wz);
+    const i = navIndex(cell.cx, cell.cz);
+    const top = this.pathClient.nav.topY[i]!;
+    return top < 0 ? 0 : (top + 1) * VOXEL_SIZE;
   }
 
   private onResize = (): void => {

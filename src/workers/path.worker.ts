@@ -3,7 +3,7 @@ import { buildSurfaceNav, SurfaceNavBuffers } from '../path/SurfaceNav';
 import { findPathSurface, AStarRequest, AStarWorkspace } from '../path/AStar';
 import { smoothPath } from '../path/Smooth';
 import { buildVolumeNav, VolumeNavBuffers } from '../path/VolumeNav';
-import { findPathVolume, AStar3DRequest, AStar3DWorkspace } from '../path/AStar3D';
+import { findPathVolume, smoothPathVolume, AStar3DRequest, AStar3DWorkspace } from '../path/AStar3D';
 
 interface InitMessage {
   kind: 'init';
@@ -76,9 +76,12 @@ self.onmessage = (ev: MessageEvent<Message>) => {
         break;
       }
       const r = findPathVolume(vnav, ws3, msg.req);
+      const smoothed = r.cells.length > 2
+        ? smoothPathVolume(vnav, r.cells, msg.req.canDig, msg.req.requiresGround, msg.req.footprintRadius)
+        : r.cells;
       (self as unknown as Worker).postMessage({
         kind: 'volumePath', reqId: msg.reqId,
-        cells: r.cells, reached: r.reached, expanded: r.expanded,
+        cells: smoothed, reached: r.reached, expanded: r.expanded,
       });
       break;
     }

@@ -7,7 +7,13 @@ import {
 export interface AStar3DRequest {
   startCx: number; startCy: number; startCz: number;
   goalCx: number;  goalCy: number;  goalCz: number;
-  /** Cells per max-expansion budget. */
+  /** Whether the unit may carve through solid material. False for tank/soldier. */
+  canDig: boolean;
+  /** Empty cells must have a solid cell directly below to be enterable. */
+  requiresGround: boolean;
+  /** Cell-radius footprint — adjacent cells in XZ within this radius must also be enterable. */
+  footprintRadius: number;
+  /** Hard cap on expansions before bailing with partial path. */
   maxExpansions?: number;
 }
 
@@ -17,7 +23,6 @@ export interface AStar3DResult {
   expanded: number;
 }
 
-// 26-neighbor offsets and base step costs (cardinal=1, face-diag=√2, corner-diag=√3).
 const NB26: { dx: number; dy: number; dz: number; cost: number }[] = (() => {
   const out: { dx: number; dy: number; dz: number; cost: number }[] = [];
   for (let dz = -1; dz <= 1; dz++) {
@@ -35,7 +40,6 @@ const NB26: { dx: number; dy: number; dz: number; cost: number }[] = (() => {
 
 function chebyshev3(ax: number, ay: number, az: number, bx: number, by: number, bz: number): number {
   const dx = Math.abs(ax - bx), dy = Math.abs(ay - by), dz = Math.abs(az - bz);
-  // Chebyshev with √2/√3 corrections is more admissible:
   const max = Math.max(dx, dy, dz);
   const min = Math.min(dx, dy, dz);
   const mid = dx + dy + dz - max - min;
@@ -61,20 +65,63 @@ export class AStar3DWorkspace {
   }
 }
 
+/** A cell is enterable for the requesting unit. */
+function cellPassable(
+  vnav: VolumeNavBuffers,
+  cx: number, cy: number, cz: number,
+  canDig: boolean,
+  requiresGround: boolean,
+  isStartOrGoal: boolean,
+): boolean {
+  if (cx < 0 || cy < 0 || cz < 0 || cx >= VNAV_X || cy >= VNAV_Y || cz >= VNAV_Z) return false;
+  const i = vnavIndex(cx, cy, cz);
+  if (getBit(vnav.bedrock, i)) return false;
+  const solid = getBit(vnav.solid, i) === 1;
+  if (solid && !canDig) return false;
+  if (!solid && requiresGround && !isStartOrGoal) {
+    // Need a support below: solid cell at cy-1, or floor of world.
+    if (cy === 0) return false;
+    if (getBit(vnav.solid, vnavIndex(cx, cy - 1, cz)) !== 1) return false;
+  }
+  return true;
+}
+
+/** Footprint check: every cell of the footprint at this center must be passable. */
+function footprintPassable(
+  vnav: VolumeNavBuffers,
+  cx: number, cy: number, cz: number,
+  canDig: boolean,
+  requiresGround: boolean,
+  footprintRadius: number,
+  isStartOrGoal: boolean,
+): boolean {
+  if (footprintRadius <= 1) {
+    return cellPassable(vnav, cx, cy, cz, canDig, requiresGround, isStartOrGoal);
+  }
+  const r = footprintRadius - 1;
+  for (let dz = -r; dz <= r; dz++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (!cellPassable(vnav, cx + dx, cy, cz + dz, canDig, requiresGround, isStartOrGoal)) return false;
+    }
+  }
+  return true;
+}
+
 export function findPathVolume(
   vnav: VolumeNavBuffers,
   ws: AStar3DWorkspace,
   req: AStar3DRequest,
 ): AStar3DResult {
   const gen = ws.resetGeneration();
-  const { startCx, startCy, startCz, goalCx, goalCy, goalCz } = req;
-  const maxExpansions = req.maxExpansions ?? 5000;
+  const { startCx, startCy, startCz, goalCx, goalCy, goalCz, canDig, requiresGround, footprintRadius } = req;
+  const maxExpansions = req.maxExpansions ?? 8000;
 
   const startI = vnavIndex(startCx, startCy, startCz);
   const goalI = vnavIndex(goalCx, goalCy, goalCz);
 
-  // Goal must not be bedrock.
-  if (getBit(vnav.bedrock, goalI)) {
+  // Goal must be enterable (allow start/goal to skip the requiresGround check so units can
+  // be on stairs / doorway thresholds).
+  if (!footprintPassable(vnav, goalCx, goalCy, goalCz, canDig, requiresGround, footprintRadius, true)) {
     return { cells: [], reached: false, expanded: 0 };
   }
 
@@ -106,12 +153,11 @@ export function findPathVolume(
       if (nx < 0 || ny < 0 || nz < 0 || nx >= VNAV_X || ny >= VNAV_Y || nz >= VNAV_Z) continue;
       const ni = vnavIndex(nx, ny, nz);
       if (ws.closed[ni] === gen) continue;
-      if (getBit(vnav.bedrock, ni)) continue;
+      if (!footprintPassable(vnav, nx, ny, nz, canDig, requiresGround, footprintRadius, ni === goalI)) continue;
 
       let stepCost = off.cost;
       const isSolid = getBit(vnav.solid, ni);
       if (isSolid) {
-        // Add the cell's stored dig cost on top of the geometric step.
         stepCost += vnav.digCost[ni]!;
       }
 
@@ -130,7 +176,6 @@ export function findPathVolume(
   let endI = goalI;
   if (!reached) {
     let bestH = Infinity, best = -1;
-    // Scan closed set — bounded by maxExpansions worth of cells.
     for (let i = 0; i < VNAV_COUNT; i++) {
       if (ws.closed[i] !== gen) continue;
       const cx = i % VNAV_X;
@@ -158,4 +203,55 @@ export function findPathVolume(
   }
   out.reverse();
   return { cells: out, reached, expanded };
+}
+
+/**
+ * 3D supercover line check: all cells touched by the line A→B (in volume cells) must be
+ * passable for the requesting unit. Used by smoothPathVolume to collapse waypoints.
+ */
+function lineClearVolume(
+  vnav: VolumeNavBuffers,
+  ax: number, ay: number, az: number,
+  bx: number, by: number, bz: number,
+  canDig: boolean,
+  requiresGround: boolean,
+  footprintRadius: number,
+): boolean {
+  // Step in unit-cell steps, checking the closest cell at each.
+  const dx = bx - ax, dy = by - ay, dz = bz - az;
+  const steps = Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz));
+  if (steps === 0) return true;
+  for (let s = 0; s <= steps; s++) {
+    const t = s / steps;
+    const cx = Math.round(ax + dx * t);
+    const cy = Math.round(ay + dy * t);
+    const cz = Math.round(az + dz * t);
+    if (!footprintPassable(vnav, cx, cy, cz, canDig, requiresGround, footprintRadius, false)) return false;
+  }
+  return true;
+}
+
+/** Greedy line-of-sight reduction over a volume-cell path. */
+export function smoothPathVolume(
+  vnav: VolumeNavBuffers,
+  cells: { cx: number; cy: number; cz: number }[],
+  canDig: boolean,
+  requiresGround: boolean,
+  footprintRadius: number,
+): { cx: number; cy: number; cz: number }[] {
+  if (cells.length <= 2) return cells;
+  const out: { cx: number; cy: number; cz: number }[] = [cells[0]!];
+  let i = 0;
+  while (i < cells.length - 1) {
+    let j = cells.length - 1;
+    while (j > i + 1) {
+      const a = cells[i]!;
+      const b = cells[j]!;
+      if (lineClearVolume(vnav, a.cx, a.cy, a.cz, b.cx, b.cy, b.cz, canDig, requiresGround, footprintRadius)) break;
+      j--;
+    }
+    out.push(cells[j]!);
+    i = j;
+  }
+  return out;
 }
