@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { placeRoads } from '../src/voxel/Roads';
 import { VoxelWorld, worldIndex } from '../src/voxel/VoxelWorld';
 import { WORLD_X, WORLD_Z } from '../src/voxel/types';
-import { M_GRASS, M_PATH, M_DIRT } from '../src/voxel/Materials';
-import { allocateNav, buildSurfaceNav, navIndex } from '../src/path/SurfaceNav';
+import { M_GRASS, M_PATH, M_DIRT, M_DIRT_ROAD } from '../src/voxel/Materials';
+import { allocateNav, buildSurfaceNav, navIndex, NAV_W, NAV_H, NAV_CELL_VOXELS } from '../src/path/SurfaceNav';
 import { findPathSurface, AStarWorkspace } from '../src/path/AStar';
 
 function buildGrassPlane(): VoxelWorld {
@@ -17,6 +17,34 @@ function buildGrassPlane(): VoxelWorld {
     }
   }
   return world;
+}
+
+/** Grass over a gentle ramp — surface Y rises 1 voxel per 8 voxels of X (~7°). */
+function buildGrassRamp(): VoxelWorld {
+  const world = VoxelWorld.create(false);
+  const v = world.buffers.voxels;
+  const baseY = 24;
+  for (let z = 0; z < WORLD_Z; z++) {
+    for (let x = 0; x < WORLD_X; x++) {
+      const surfaceY = baseY + Math.floor(x / 8);
+      for (let y = 0; y < surfaceY; y++) v[worldIndex(x, y, z)] = M_DIRT;
+      v[worldIndex(x, surfaceY, z)] = M_GRASS;
+    }
+  }
+  return world;
+}
+
+/** Walkable top y at the centre voxel column of a nav cell — reads from voxels directly. */
+function topYAt(v: Uint8Array, cx: number, cz: number): number {
+  const wx = cx * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+  const wz = cz * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+  for (let y = 191; y >= 1; y--) {
+    const m = v[worldIndex(wx, y, wz)]!;
+    if (m === 0) continue;       // air
+    if (m === 4 || m === 5) continue; // wood / leaf
+    return y;
+  }
+  return -1;
 }
 
 function countMaterial(v: Uint8Array, mat: number): number {
@@ -187,5 +215,167 @@ describe('roads + surface nav', () => {
     // same base. The road version multiplies by (1 - 0.6 * 200/255).
     const expectedRoadFactor = 1 - 0.6 * (200 / 255);
     expect(expectedRoadFactor).toBeLessThan(0.6);
+  });
+});
+
+describe('road geometry', () => {
+  it('roads are wide enough for a tank — at least one cell has a 4 m clear M_PATH neighbourhood', () => {
+    const w = buildGrassPlane();
+    placeRoads(w.buffers.voxels, 1234);
+    const nav = allocateNav(false);
+    buildSurfaceNav(w.buffers.voxels, nav);
+
+    // Half the road width is 19 voxels (≈ 2.4 m). On a perfectly straight
+    // segment a centred 16-radius (≈ 2 m) disc around the cell centre should
+    // be all M_PATH at the surface.
+    const v = w.buffers.voxels;
+    let bestRadius = 0;
+    for (let cz = 4; cz < NAV_H - 4; cz++) {
+      for (let cx = 4; cx < NAV_W - 4; cx++) {
+        if (nav.road[navIndex(cx, cz)] !== 200) continue; // pick a paved cell
+        const ty = topYAt(v, cx, cz);
+        if (ty < 0) continue;
+        const wxC = cx * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+        const wzC = cz * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+        // Find the largest radius r such that every voxel within r of the
+        // centre, at y=ty, is M_PATH.
+        let r = 0;
+        for (; r < 20; r++) {
+          let ok = true;
+          for (let dz = -r; dz <= r && ok; dz++) {
+            for (let dx = -r; dx <= r && ok; dx++) {
+              if (dx * dx + dz * dz > r * r) continue;
+              const x = wxC + dx;
+              const z = wzC + dz;
+              if (x < 0 || z < 0 || x >= WORLD_X || z >= WORLD_Z) { ok = false; break; }
+              if (v[worldIndex(x, ty, z)] !== M_PATH) { ok = false; break; }
+            }
+          }
+          if (!ok) break;
+        }
+        if (r > bestRadius) bestRadius = r;
+      }
+    }
+    // 16 voxels = 2 m radius → 4 m disc fits inside the road. Tank width 2.4 m
+    // → road must be ≥ ~5 m to fit a 4 m disc, so allow a little tolerance.
+    expect(bestRadius).toBeGreaterThanOrEqual(15);
+  });
+
+  it('road grade between adjacent road cells is ≤ 40°', () => {
+    const w = buildGrassRamp();
+    placeRoads(w.buffers.voxels, 7777);
+    const v = w.buffers.voxels;
+
+    // tan(40°) cap → cardinal max rise 6 voxels, diagonal max rise 9.
+    const CARD = 6, DIAG = 9;
+    let pairsChecked = 0;
+    for (let cz = 0; cz < NAV_H; cz++) {
+      for (let cx = 0; cx < NAV_W; cx++) {
+        const ty = topYAt(v, cx, cz);
+        if (ty < 0) continue;
+        const wxC = cx * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+        const wzC = cz * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+        if (v[worldIndex(wxC, ty, wzC)] !== M_PATH
+          && v[worldIndex(wxC, ty, wzC)] !== M_DIRT_ROAD) continue;
+        for (let dz = -1; dz <= 1; dz++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dz === 0) continue;
+            const nx = cx + dx, nz = cz + dz;
+            if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) continue;
+            const nty = topYAt(v, nx, nz);
+            if (nty < 0) continue;
+            const nwx = nx * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+            const nwz = nz * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+            const nm = v[worldIndex(nwx, nty, nwz)];
+            if (nm !== M_PATH && nm !== M_DIRT_ROAD) continue;
+            const rise = Math.abs(nty - ty);
+            const cap = (dx === 0 || dz === 0) ? CARD : DIAG;
+            expect(rise).toBeLessThanOrEqual(cap);
+            pairsChecked++;
+          }
+        }
+      }
+    }
+    expect(pairsChecked).toBeGreaterThan(0);
+  });
+
+  it('road surface is flat across its width on a slope (no side-tilt)', () => {
+    const w = buildGrassRamp();
+    placeRoads(w.buffers.voxels, 4242);
+    const v = w.buffers.voxels;
+    const nav = allocateNav(false);
+    buildSurfaceNav(v, nav);
+
+    // For each paved cell, find the longest constant-topY run through the
+    // cell centre across the four axis-aligned directions. The road is flat
+    // perpendicular to travel direction but graded along it; one of the four
+    // sweeps will land near-perpendicular and produce a long flat run.
+    const dirs: { dx: number; dz: number }[] = [
+      { dx: 1, dz: 0 }, { dx: 0, dz: 1 }, { dx: 1, dz: 1 }, { dx: 1, dz: -1 },
+    ];
+    const topRoadY = (x: number, z: number): number => {
+      if (x < 0 || z < 0 || x >= WORLD_X || z >= WORLD_Z) return -2;
+      for (let y = 191; y >= 1; y--) {
+        const m = v[worldIndex(x, y, z)]!;
+        if (m === M_PATH || m === M_DIRT_ROAD) return y;
+        if (m !== 0) return -1;
+      }
+      return -1;
+    };
+    let cellsWithFlatRun = 0;
+    for (let cz = 4; cz < NAV_H - 4; cz++) {
+      for (let cx = 4; cx < NAV_W - 4; cx++) {
+        if (nav.road[navIndex(cx, cz)] !== 200) continue;
+        const wxC = cx * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+        const wzC = cz * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+        const cy = topRoadY(wxC, wzC);
+        if (cy < 0) continue;
+        let bestRun = 0;
+        for (const d of dirs) {
+          let run = 1;
+          for (let s = 1; s < 25; s++) {
+            const tyP = topRoadY(wxC + d.dx * s, wzC + d.dz * s);
+            if (tyP !== cy) break;
+            run++;
+          }
+          for (let s = 1; s < 25; s++) {
+            const tyN = topRoadY(wxC - d.dx * s, wzC - d.dz * s);
+            if (tyN !== cy) break;
+            run++;
+          }
+          if (run > bestRun) bestRun = run;
+        }
+        // 2*ROAD_HALF_VOXELS+1 = 39 perpendicular voxels at minimum on a
+        // perfectly axis-aligned road. Diagonal perpendicular slice through
+        // a 39-voxel-wide strip is 39*√2 ≈ 55 voxels. Allow slack for endpoint
+        // taper and minor angle mismatch.
+        if (bestRun >= 35) cellsWithFlatRun++;
+      }
+    }
+    expect(cellsWithFlatRun).toBeGreaterThan(0);
+  });
+
+  it('produces dirt-road branches as well as paved trunks', () => {
+    const w = buildGrassPlane();
+    const v = w.buffers.voxels;
+    const stats = placeRoads(v, 2025);
+    let dirt = 0;
+    for (let i = 0; i < v.length; i++) if (v[i] === M_DIRT_ROAD) dirt++;
+    expect(stats.branchSegments).toBeGreaterThan(0);
+    expect(dirt).toBeGreaterThan(0);
+  });
+
+  it('dirt-road branches give a non-zero, less-than-paved road weight in surface nav', () => {
+    const w = buildGrassPlane();
+    placeRoads(w.buffers.voxels, 31);
+    const nav = allocateNav(false);
+    buildSurfaceNav(w.buffers.voxels, nav);
+    let pavedCells = 0, dirtCells = 0;
+    for (let i = 0; i < nav.road.length; i++) {
+      if (nav.road[i] === 200) pavedCells++;
+      else if (nav.road[i]! > 0 && nav.road[i]! < 200) dirtCells++;
+    }
+    expect(pavedCells).toBeGreaterThan(0);
+    expect(dirtCells).toBeGreaterThan(0);
   });
 });

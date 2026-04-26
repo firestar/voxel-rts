@@ -1,6 +1,6 @@
 import { WORLD_X, WORLD_Y, WORLD_Z, AIR } from './types';
 import { worldIndex } from './VoxelWorld';
-import { M_GRASS, M_PATH, M_MUD, M_WOOD, M_LEAF, M_BEDROCK } from './Materials';
+import { M_GRASS, M_PATH, M_DIRT_ROAD, M_MUD, M_WOOD, M_LEAF, M_BEDROCK } from './Materials';
 import { NAV_W, NAV_H, NAV_CELL_VOXELS } from '../path/SurfaceNav';
 import { Xoshiro128 } from '../util/Rng';
 import { FourAryHeap } from '../util/Heap';
@@ -11,9 +11,13 @@ import { FourAryHeap } from '../util/Heap';
  *   1. Build a coarse 1 m grid (matches the surface nav grid) with each cell's
  *      top walkable Y. Mud cells are blocked — roads don't run through bogs.
  *   2. Pick a handful of POIs on grass with mild local slope and good spacing.
- *   3. Connect them with a chain of slope-weighted A* paths (POIᵢ → POIᵢ₊₁).
- *   4. Rasterise each path as a ~1 m wide swath of `M_PATH` voxels stamped
- *      onto the surface (top voxel + one below).
+ *   3. Trunk pass: connect POIs with a chain of grade-capped, slope-weighted
+ *      A* paths and stamp them as paved (M_PATH).
+ *   4. Branch pass: from each POI shoot 1–2 short dirt-road branches to nearby
+ *      cells and stamp them as M_DIRT_ROAD.
+ *   5. Each path is rasterised as a flat strip ~2× tank-width across (≈ 4.75 m)
+ *      with cut-and-fill so the road surface is level across the strip and
+ *      respects a 40° max grade along its length.
  *
  * Runs on the main thread once worldgen workers finish, before tree
  * placement. Trees skip non-grass surfaces, so the canopy + trunk pass
@@ -30,18 +34,34 @@ const POI_MARGIN_CELLS = 6;           // keep POIs out of map edges
 const POI_MAX_LOCAL_SLOPE_VOXELS = 4; // POIs sit on roughly flat ground
 
 // A* tunables.
-const ROAD_SLOPE_PENALTY = 0.6;       // cost units per voxel of |ΔY|
+const ROAD_SLOPE_PENALTY = 0.6;       // soft cost per voxel of |ΔY|
 const ROAD_MAX_EXPANSIONS = 50_000;   // belt-and-braces
 
+// Hard grade cap: tan(40°) ≈ 0.839. With 1 m cells (8 voxels at 0.125 m):
+//   cardinal max rise = 6 voxels (0.75 m) → 36.9°  (under 40°)
+//   diagonal max rise = 9 voxels (1.125 m over √2 m run) → 38.5°
+// Steeper edges are rejected outright by the search.
+const ROAD_MAX_RISE_CARDINAL = 6;
+const ROAD_MAX_RISE_DIAGONAL = 9;
+
 // Stamp width / depth.
-const ROAD_HALF_VOXELS = 4;           // 4 voxels ≈ 0.5 m → ~1 m wide road
-const ROAD_DEPTH_VOXELS = 2;          // top voxel + 1 below
-const ROAD_BRIDGE_SUBSTEPS = 4;       // discs between adjacent path cells (covers diagonals)
+// Tank width is 2.4 m; roads are 2× that (≈ 4.75 m → half = 19 voxels).
+const ROAD_HALF_VOXELS = 19;
+// Top + 2 below — when carving into a ridge we still want a solid sub-base.
+const ROAD_DEPTH_VOXELS = 3;
+
+// Branch (dirt road) tunables.
+const BRANCH_PER_POI = 2;
+const BRANCH_LEN_CELLS_MIN = 6;
+const BRANCH_LEN_CELLS_MAX = 14;
+const BRANCH_TARGET_ATTEMPTS = 30;
 
 export interface RoadGenStats {
   poiCount: number;
   pathSegments: number;
   pathCells: number;
+  branchSegments: number;
+  branchCells: number;
 }
 
 interface POI { cx: number; cz: number; }
@@ -59,8 +79,11 @@ interface RoadGrid {
 export function placeRoads(voxels: Uint8Array, seed: number): RoadGenStats {
   const grid = buildRoadGrid(voxels);
   const pois = pickPOIs(grid, voxels, seed);
-  if (pois.length < 2) return { poiCount: pois.length, pathSegments: 0, pathCells: 0 };
+  if (pois.length < 2) {
+    return { poiCount: pois.length, pathSegments: 0, pathCells: 0, branchSegments: 0, branchCells: 0 };
+  }
 
+  // Trunk: paved between consecutive POIs.
   let segments = 0;
   let cells = 0;
   for (let k = 0; k + 1 < pois.length; k++) {
@@ -68,11 +91,34 @@ export function placeRoads(voxels: Uint8Array, seed: number): RoadGenStats {
     const b = pois[k + 1]!;
     const cellsPath = aStarRoad(grid, a.cx, a.cz, b.cx, b.cz);
     if (cellsPath.length < 2) continue;
-    stampRoad(voxels, cellsPath);
+    stampRoadFlat(voxels, grid, cellsPath, M_PATH);
     segments++;
     cells += cellsPath.length;
   }
-  return { poiCount: pois.length, pathSegments: segments, pathCells: cells };
+
+  // Branches: short dirt roads peeled off each POI.
+  const branchRng = new Xoshiro128((seed ^ 0xBADBEEF) >>> 0);
+  let branchSegs = 0;
+  let branchCells = 0;
+  for (const poi of pois) {
+    for (let b = 0; b < BRANCH_PER_POI; b++) {
+      const target = pickBranchTarget(grid, voxels, poi, branchRng);
+      if (!target) continue;
+      const cellsPath = aStarRoad(grid, poi.cx, poi.cz, target.cx, target.cz);
+      if (cellsPath.length < 2) continue;
+      stampRoadFlat(voxels, grid, cellsPath, M_DIRT_ROAD);
+      branchSegs++;
+      branchCells += cellsPath.length;
+    }
+  }
+
+  return {
+    poiCount: pois.length,
+    pathSegments: segments,
+    pathCells: cells,
+    branchSegments: branchSegs,
+    branchCells: branchCells,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -147,8 +193,28 @@ function pickPOIs(grid: RoadGrid, voxels: Uint8Array, seed: number): POI[] {
   return out;
 }
 
+// Pick a branch endpoint a moderate distance from the POI, on grass, not blocked.
+function pickBranchTarget(grid: RoadGrid, voxels: Uint8Array, poi: POI, rng: Xoshiro128): POI | null {
+  for (let i = 0; i < BRANCH_TARGET_ATTEMPTS; i++) {
+    const dist = BRANCH_LEN_CELLS_MIN + ((rng.nextU32() % (BRANCH_LEN_CELLS_MAX - BRANCH_LEN_CELLS_MIN + 1)) | 0);
+    const ang = rng.next() * Math.PI * 2;
+    const cx = poi.cx + Math.round(Math.cos(ang) * dist);
+    const cz = poi.cz + Math.round(Math.sin(ang) * dist);
+    if (cx < POI_MARGIN_CELLS || cz < POI_MARGIN_CELLS) continue;
+    if (cx >= NAV_W - POI_MARGIN_CELLS || cz >= NAV_H - POI_MARGIN_CELLS) continue;
+    const idx = cz * NAV_W + cx;
+    if (grid.blocked[idx]) continue;
+    const ty = grid.topY[idx]!;
+    const wx = cx * C + (C >> 1);
+    const wz = cz * C + (C >> 1);
+    if (voxels[worldIndex(wx, ty, wz)] !== M_GRASS) continue;
+    return { cx, cz };
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
-// 3. Slope-weighted A* on the coarse grid.
+// 3. Slope-weighted, grade-capped A* on the coarse grid.
 
 function octileH(ax: number, az: number, bx: number, bz: number): number {
   const dx = Math.abs(ax - bx);
@@ -197,6 +263,9 @@ function aStarRoad(grid: RoadGrid, sx: number, sz: number, gx: number, gz: numbe
           if (grid.blocked[aI] || grid.blocked[bI]) continue;
         }
         const dy = Math.abs(grid.topY[ni]! - ty);
+        // Hard 40° grade cap per edge — see ROAD_MAX_RISE_* constants.
+        const maxRise = (dx === 0 || dz === 0) ? ROAD_MAX_RISE_CARDINAL : ROAD_MAX_RISE_DIAGONAL;
+        if (dy > maxRise) continue;
         const base = (dx === 0 || dz === 0) ? 1 : Math.SQRT2;
         const cost = base + ROAD_SLOPE_PENALTY * dy;
         const ng = g[i]! + cost;
@@ -224,58 +293,120 @@ function aStarRoad(grid: RoadGrid, sx: number, sz: number, gx: number, gz: numbe
 }
 
 // ---------------------------------------------------------------------------
-// 4. Rasterise the path into M_PATH voxels.
+// 4. Flat-section rasterisation.
 
-function stampRoad(voxels: Uint8Array, cells: POI[]): void {
-  for (let k = 0; k < cells.length; k++) {
+/**
+ * Stamp a flat road along `cells` into `voxels`. The road surface is at a
+ * smoothed centerline Y (clamped to respect the per-edge grade cap), and
+ * each cell gets a footprint that is one cell long along travel × the road
+ * width across travel. Any voxels above the surface in the footprint are
+ * carved to AIR (cut), any below are filled with `material` (fill).
+ */
+function stampRoadFlat(voxels: Uint8Array, grid: RoadGrid, cells: POI[], material: number): void {
+  const n = cells.length;
+  if (n < 2) return;
+
+  // 1. Build a smoothed centerline Y profile.
+  const targetY = new Int32Array(n);
+  for (let k = 0; k < n; k++) {
     const c = cells[k]!;
-    const wx = c.cx * C + (C >> 1);
-    const wz = c.cz * C + (C >> 1);
-    stampDisc(voxels, wx, wz);
-    if (k > 0) {
-      // Substep stamps between adjacent cells so diagonals don't leave gaps.
-      const p = cells[k - 1]!;
-      const pwx = p.cx * C + (C >> 1);
-      const pwz = p.cz * C + (C >> 1);
-      for (let s = 1; s < ROAD_BRIDGE_SUBSTEPS; s++) {
-        const t = s / ROAD_BRIDGE_SUBSTEPS;
-        const x = Math.round(pwx + (wx - pwx) * t);
-        const z = Math.round(pwz + (wz - pwz) * t);
-        stampDisc(voxels, x, z);
-      }
+    targetY[k] = grid.topY[c.cz * NAV_W + c.cx]!;
+  }
+  // 3 sweeps of (3-tap smooth + grade clamp).
+  for (let pass = 0; pass < 3; pass++) {
+    // Smooth (centred 3-tap, endpoints kept).
+    const tmp = new Int32Array(n);
+    tmp[0] = targetY[0]!;
+    tmp[n - 1] = targetY[n - 1]!;
+    for (let k = 1; k < n - 1; k++) {
+      tmp[k] = Math.round((targetY[k - 1]! + 2 * targetY[k]! + targetY[k + 1]!) / 4);
+    }
+    for (let k = 0; k < n; k++) targetY[k] = tmp[k]!;
+    // Forward + backward grade clamp so |Δ| ≤ maxRise per step.
+    for (let k = 1; k < n; k++) {
+      const a = cells[k - 1]!, b = cells[k]!;
+      const dx = b.cx - a.cx, dz = b.cz - a.cz;
+      const maxRise = (dx === 0 || dz === 0) ? ROAD_MAX_RISE_CARDINAL : ROAD_MAX_RISE_DIAGONAL;
+      const diff = targetY[k]! - targetY[k - 1]!;
+      if (diff > maxRise) targetY[k] = targetY[k - 1]! + maxRise;
+      else if (diff < -maxRise) targetY[k] = targetY[k - 1]! - maxRise;
+    }
+    for (let k = n - 2; k >= 0; k--) {
+      const a = cells[k]!, b = cells[k + 1]!;
+      const dx = b.cx - a.cx, dz = b.cz - a.cz;
+      const maxRise = (dx === 0 || dz === 0) ? ROAD_MAX_RISE_CARDINAL : ROAD_MAX_RISE_DIAGONAL;
+      const diff = targetY[k]! - targetY[k + 1]!;
+      if (diff > maxRise) targetY[k] = targetY[k + 1]! + maxRise;
+      else if (diff < -maxRise) targetY[k] = targetY[k + 1]! - maxRise;
+    }
+  }
+
+  // 2. Per-cell footprint stamp.
+  for (let k = 0; k < n; k++) {
+    const cell = cells[k]!;
+    const prev = k > 0 ? cells[k - 1]! : cell;
+    const next = k < n - 1 ? cells[k + 1]! : cell;
+    // Travel direction in cells (unit length 1 m).
+    let tdx = next.cx - prev.cx;
+    let tdz = next.cz - prev.cz;
+    const tlen = Math.hypot(tdx, tdz) || 1;
+    tdx /= tlen; tdz /= tlen;
+    // Perpendicular.
+    const px = -tdz, pz = tdx;
+    stampFlatSection(voxels, cell, targetY[k]!, tdx, tdz, px, pz, material);
+  }
+}
+
+function stampFlatSection(
+  voxels: Uint8Array,
+  cell: POI,
+  ty: number,
+  tdx: number, tdz: number,
+  px: number, pz: number,
+  material: number,
+): void {
+  const cxw = cell.cx * C + (C >> 1);
+  const czw = cell.cz * C + (C >> 1);
+  // Sub-sample length and width at voxel resolution. Length covers one cell
+  // (8 voxels). Width is 2*ROAD_HALF_VOXELS+1.
+  const halfLen = C / 2; // 4 voxels each side of cell centre = 1 m total
+  // Track seen voxel columns this cell to avoid double-writes (cheap dedup
+  // via a set keyed on (x,z)).
+  for (let li = -halfLen; li < halfLen; li++) {
+    for (let ni = -ROAD_HALF_VOXELS; ni <= ROAD_HALF_VOXELS; ni++) {
+      const wx = Math.round(cxw + tdx * (li + 0.5) + px * ni);
+      const wz = Math.round(czw + tdz * (li + 0.5) + pz * ni);
+      if (wx < 0 || wz < 0 || wx >= WORLD_X || wz >= WORLD_Z) continue;
+      paveColumn(voxels, wx, wz, ty, material);
     }
   }
 }
 
-function stampDisc(voxels: Uint8Array, wx: number, wz: number): void {
-  const r = ROAD_HALF_VOXELS;
-  const r2 = r * r;
-  for (let dz = -r; dz <= r; dz++) {
-    for (let dx = -r; dx <= r; dx++) {
-      if (dx * dx + dz * dz > r2) continue;
-      const x = wx + dx;
-      const z = wz + dz;
-      if (x < 0 || z < 0 || x >= WORLD_X || z >= WORLD_Z) continue;
-      // Find the column's top walkable voxel (skip canopies, but those don't
-      // exist yet — trees haven't been placed).
-      let top = -1;
-      for (let y = WORLD_Y - 1; y >= 1; y--) {
-        const m = voxels[worldIndex(x, y, z)]!;
-        if (m === AIR) continue;
-        if (m === M_WOOD || m === M_LEAF) continue;
-        top = y;
-        break;
-      }
-      if (top < 0) continue;
-      for (let dy = 0; dy < ROAD_DEPTH_VOXELS; dy++) {
-        const y = top - dy;
-        if (y < 1) break;
-        const idx = worldIndex(x, y, z);
-        const cur = voxels[idx]!;
-        // Don't pave over bedrock or air.
-        if (cur === AIR || cur === M_BEDROCK) continue;
-        voxels[idx] = M_PATH;
-      }
-    }
+/**
+ * Cut anything above ty in the column to AIR (preserving bedrock), set the
+ * surface voxel at ty to `material`, and ensure ROAD_DEPTH_VOXELS-1 voxels
+ * below are solid (fill air with `material`, leave existing solids alone).
+ */
+function paveColumn(voxels: Uint8Array, wx: number, wz: number, ty: number, material: number): void {
+  if (ty < 1 || ty >= WORLD_Y) return;
+  // Cut: clear anything above ty (skip bedrock).
+  for (let y = ty + 1; y < WORLD_Y; y++) {
+    const idx = worldIndex(wx, y, wz);
+    const cur = voxels[idx]!;
+    if (cur === AIR) continue;
+    if (cur === M_BEDROCK) continue;
+    voxels[idx] = AIR;
+  }
+  // Surface (don't pave bedrock).
+  const surfIdx = worldIndex(wx, ty, wz);
+  if (voxels[surfIdx]! !== M_BEDROCK) voxels[surfIdx] = material;
+  // Sub-base: fill any air below the surface, up to ROAD_DEPTH_VOXELS-1 deep.
+  for (let dy = 1; dy < ROAD_DEPTH_VOXELS; dy++) {
+    const y = ty - dy;
+    if (y < 1) break;
+    const idx = worldIndex(wx, y, wz);
+    const cur = voxels[idx]!;
+    if (cur === M_BEDROCK) break;
+    if (cur === AIR) voxels[idx] = material;
   }
 }

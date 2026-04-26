@@ -57,7 +57,7 @@ Per-cell fields (`SurfaceNavBuffers`, all backed by SAB or AB):
 - `material: Uint8Array` — material id of `topY`
 - `slope: Uint8Array` — max |dY| over 3×3 neighborhood, in voxels
 - `flatness: Uint8Array` — Chamfer (3,4) distance to nearest uneven cell, in cells
-- `road: Uint8Array` — 0..255 road weight (200 if top voxel is `M_PATH`, else 0)
+- `road: Uint8Array` — 0..255 road weight (200 for `M_PATH`, 120 for `M_DIRT_ROAD`, else 0)
 - `blocked: Uint8Array` — 0/1
 - `headroom: Uint8Array` — contiguous air voxels above topY at cell centre, capped 255
 
