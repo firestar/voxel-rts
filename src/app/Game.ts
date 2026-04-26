@@ -108,6 +108,7 @@ export class Game {
     if (soldier) soldier.selected = true;
     this.spawnUnit('tank', c.x + 3.0, c.y, c.z);
     this.spawnUnit('tunneler', c.x - 2.0, c.y, c.z);
+    this.spawnUnit('worm', c.x + 0.5, c.y, c.z + 4.0);
     this.camera.target.set(c.x, 0, c.z);
   }
 
@@ -283,7 +284,7 @@ export class Game {
     // Preview only matters for tunnelers (vertical drag) — keep marker visible when held over terrain.
     if (!selected) { this.target.hide(); return; }
     const verticalDrag = hold.currentY - hold.startY;
-    const useDrag = selected.kind === 'tunneler';
+    const useDrag = selected.canDig;
     // Tunneler depth is relative to its current Y (so the user can drop the cursor
     // anywhere and a 0-drag click means "stay at this height"). Other units take
     // the click's voxel y as the base.
@@ -309,7 +310,7 @@ export class Game {
     }
     const selected = this.units.units.find(u => u.selected);
     const verticalDrag = release.endY - release.startY;
-    const useDrag = selected?.kind === 'tunneler';
+    const useDrag = selected?.canDig === true;
     // Same as updateLmbPreview — tunneler base height = its own y, so a no-drag
     // click means "head toward the click XZ at my current height". And the dive
     // angle is clamped to the unit's maxPitchRad so dragging past the cap still

@@ -29,7 +29,7 @@ export const BARRACKS: BuildingSpec = {
   headroomVoxels: 24, // 3 m at 0.125 m voxels
   wall: M_WOOD,
   productionInterval: 6.0,
-  produces: ['soldier', 'tank', 'tunneler'],
+  produces: ['soldier', 'tank', 'tunneler', 'worm'],
 };
 
 export interface FootprintHit {

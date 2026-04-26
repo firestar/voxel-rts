@@ -5,6 +5,8 @@ import {
   buildTankHullGeometry, buildTankTurretGeometry, TANK_TURRET_PIVOT_Y, TANK_TURRET_PIVOT_Z,
   buildTunnelerHullGeometry, buildTunnelerDrillGeometry,
   TUNNELER_DRILL_PIVOT_Y, TUNNELER_DRILL_PIVOT_Z,
+  buildWormHeadGeometry, buildWormSegmentGeometry, buildWormDrillGeometry,
+  WORM_DRILL_PIVOT_Y, WORM_DRILL_PIVOT_Z, WORM_SEGMENT_COUNT,
 } from './UnitModels';
 
 /**
@@ -24,6 +26,9 @@ export class UnitRenderer {
   private tankTurret: THREE.InstancedMesh;
   private tunnelerHull: THREE.InstancedMesh;
   private tunnelerDrill: THREE.InstancedMesh;
+  private wormHead: THREE.InstancedMesh;
+  private wormDrill: THREE.InstancedMesh;
+  private wormSegment: THREE.InstancedMesh;
 
   private capacity: number;
   private bodyM = new THREE.Matrix4();
@@ -38,6 +43,7 @@ export class UnitRenderer {
   private selectionRingSoldier: THREE.LineSegments;
   private selectionRingTank: THREE.LineSegments;
   private selectionRingTunneler: THREE.LineSegments;
+  private selectionRingWorm: THREE.LineSegments;
 
   constructor(capacity = 256) {
     this.capacity = capacity;
@@ -50,35 +56,46 @@ export class UnitRenderer {
     this.tankTurret = makeIM(buildTankTurretGeometry(), mat, capacity);
     this.tunnelerHull = makeIM(buildTunnelerHullGeometry(), mat, capacity);
     this.tunnelerDrill = makeIM(buildTunnelerDrillGeometry(), mat, capacity);
+    this.wormHead = makeIM(buildWormHeadGeometry(), mat, capacity);
+    this.wormDrill = makeIM(buildWormDrillGeometry(), mat, capacity);
+    // The body-segment mesh holds capacity * SEGMENT_COUNT instances — one per
+    // (worm, segment) pair — so a roomful of worms doesn't run out of slots.
+    this.wormSegment = makeIM(buildWormSegmentGeometry(), mat, capacity * WORM_SEGMENT_COUNT);
 
     this.group.add(
       this.soldierBody, this.soldierLegL, this.soldierLegR,
       this.tankHull, this.tankTurret,
       this.tunnelerHull, this.tunnelerDrill,
+      this.wormHead, this.wormDrill, this.wormSegment,
     );
 
     this.selectionRingSoldier = makeSelectionRing(0.6, 0x00ff88);
     this.selectionRingTank = makeSelectionRing(1.6, 0xffaa33);
     this.selectionRingTunneler = makeSelectionRing(0.7, 0xffe066);
+    this.selectionRingWorm = makeSelectionRing(0.9, 0xc266ff);
     this.selectionRingSoldier.visible = false;
     this.selectionRingTank.visible = false;
     this.selectionRingTunneler.visible = false;
-    this.group.add(this.selectionRingSoldier, this.selectionRingTank, this.selectionRingTunneler);
+    this.selectionRingWorm.visible = false;
+    this.group.add(
+      this.selectionRingSoldier, this.selectionRingTank,
+      this.selectionRingTunneler, this.selectionRingWorm,
+    );
   }
 
   update(units: UnitManager): void {
-    let nSold = 0, nTank = 0, nTun = 0;
+    let nSold = 0, nTank = 0, nTun = 0, nWorm = 0, nWormSeg = 0;
     let selected: Unit | null = null;
     const now = performance.now() / 1000;
 
     for (const u of units.units) {
       const isMoving = u.path.length > 0;
-      // Tunneler chassis stays mostly level — it's the cutter that articulates to
+      // Tunneler/worm chassis stays mostly level — it's the cutter that articulates to
       // follow the dig angle. We render the body with a small fraction of u.pitch
       // so it still leans into the slope a bit, then push the rest of the pitch
       // onto the drill via an extra X-rotation at its pivot. Soldier and tank
       // bodies still use the full pitch as before.
-      const bodyPitchScale = u.kind === 'tunneler' ? 0.2 : 1.0;
+      const bodyPitchScale = (u.kind === 'tunneler' || u.kind === 'worm') ? 0.2 : 1.0;
       const bodyPitch = u.pitch * bodyPitchScale;
       const cutterExtraPitch = u.pitch - bodyPitch;
       this.tmpEuler.set(bodyPitch, u.heading, u.roll, 'YXZ');
@@ -89,8 +106,8 @@ export class UnitRenderer {
       // / treads into the voxel underneath. Collision/path always use u.y as
       // the static feet position; the renderer must never draw the model lower
       // than that. Amplitude doubled to keep the same visual lift.
-      const bobFreq = u.kind === 'soldier' ? 6.0 : u.kind === 'tank' ? 3.0 : 4.0;
-      const bobAmp  = u.kind === 'soldier' ? 0.08 : u.kind === 'tank' ? 0.04 : 0.05;
+      const bobFreq = u.kind === 'soldier' ? 6.0 : u.kind === 'tank' ? 3.0 : u.kind === 'tunneler' ? 4.0 : 5.0;
+      const bobAmp  = u.kind === 'soldier' ? 0.08 : u.kind === 'tank' ? 0.04 : u.kind === 'tunneler' ? 0.05 : 0.03;
       const sineRaw = Math.sin(u.distanceWalked * bobFreq + u.id);
       const bodyBob = isMoving ? Math.max(0, sineRaw) * bobAmp : 0;
       // Per-kind feet offset. Each model has its lowest geometry at a different
@@ -120,8 +137,7 @@ export class UnitRenderer {
         this.partM.premultiply(this.bodyM);
         this.tankTurret.setMatrixAt(nTank, this.partM);
         nTank++;
-      } else {
-        // tunneler
+      } else if (u.kind === 'tunneler') {
         if (nTun >= this.capacity) continue;
         this.tunnelerHull.setMatrixAt(nTun, this.bodyM);
         // Drill spins around its local Z axis (forward) when moving or carving.
@@ -146,6 +162,38 @@ export class UnitRenderer {
         this.partM.multiplyMatrices(this.bodyM, drillLocal);
         this.tunnelerDrill.setMatrixAt(nTun, this.partM);
         nTun++;
+      } else {
+        // worm
+        if (nWorm >= this.capacity) continue;
+        this.wormHead.setMatrixAt(nWorm, this.bodyM);
+        // Same drill-spin idea as the tunneler — cutter rotates around its forward
+        // axis when moving/carving, with the residual path-pitch applied at the
+        // mounting pivot so the head points along the dig.
+        const wSpin = isMoving ? now * 22 : u.carveCooldown > 0 ? now * 14 : 0;
+        const wSpinE = new THREE.Euler(0, 0, wSpin, 'XYZ');
+        const wSpinQ = new THREE.Quaternion().setFromEuler(wSpinE);
+        const wSpinM = new THREE.Matrix4().makeRotationFromQuaternion(wSpinQ);
+        const wCutterPitchM = new THREE.Matrix4().makeRotationX(-cutterExtraPitch);
+        const wDrillLocal = new THREE.Matrix4()
+          .makeTranslation(0, WORM_DRILL_PIVOT_Y, WORM_DRILL_PIVOT_Z)
+          .multiply(wCutterPitchM)
+          .multiply(wSpinM);
+        this.partM.multiplyMatrices(this.bodyM, wDrillLocal);
+        this.wormDrill.setMatrixAt(nWorm, this.partM);
+        nWorm++;
+
+        // Body segments — each one has its own world position, heading, and pitch
+        // that the sim already settled this frame (chain constraint + gravity).
+        for (const seg of u.segments) {
+          if (nWormSeg >= this.wormSegment.count + this.capacity * WORM_SEGMENT_COUNT) break;
+          this.tmpEuler.set(seg.pitch * 0.7, seg.heading, 0, 'YXZ');
+          this.quat.setFromEuler(this.tmpEuler);
+          this.tmpV.set(seg.x, seg.y, seg.z);
+          const segM = new THREE.Matrix4();
+          segM.compose(this.tmpV, this.quat, new THREE.Vector3(1, 1, 1));
+          this.wormSegment.setMatrixAt(nWormSeg, segM);
+          nWormSeg++;
+        }
       }
 
       if (u.selected && !selected) selected = u;
@@ -158,18 +206,28 @@ export class UnitRenderer {
     this.tankTurret.count = nTank;
     this.tunnelerHull.count = nTun;
     this.tunnelerDrill.count = nTun;
-    for (const m of [this.soldierBody, this.soldierLegL, this.soldierLegR, this.tankHull, this.tankTurret, this.tunnelerHull, this.tunnelerDrill]) {
+    this.wormHead.count = nWorm;
+    this.wormDrill.count = nWorm;
+    this.wormSegment.count = nWormSeg;
+    for (const m of [
+      this.soldierBody, this.soldierLegL, this.soldierLegR,
+      this.tankHull, this.tankTurret,
+      this.tunnelerHull, this.tunnelerDrill,
+      this.wormHead, this.wormDrill, this.wormSegment,
+    ]) {
       m.instanceMatrix.needsUpdate = true;
     }
 
     this.selectionRingSoldier.visible = false;
     this.selectionRingTank.visible = false;
     this.selectionRingTunneler.visible = false;
+    this.selectionRingWorm.visible = false;
     if (selected) {
       const ring =
         selected.kind === 'soldier' ? this.selectionRingSoldier
         : selected.kind === 'tank' ? this.selectionRingTank
-        : this.selectionRingTunneler;
+        : selected.kind === 'tunneler' ? this.selectionRingTunneler
+        : this.selectionRingWorm;
       ring.position.set(selected.x, selected.y + 0.05, selected.z);
       ring.visible = true;
     }

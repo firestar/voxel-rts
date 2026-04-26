@@ -8,9 +8,11 @@ import {
 } from '../path/VolumeNav';
 import {
   TUNNELER_CUTTER_RADIUS, TUNNELER_CUTTER_FORWARD, TUNNELER_CUTTER_HEIGHT,
+  WORM_CUTTER_RADIUS, WORM_CUTTER_FORWARD, WORM_CUTTER_HEIGHT,
+  WORM_SEGMENT_COUNT, WORM_SEGMENT_SPACING,
 } from '../render/UnitModels';
 
-export type UnitKind = 'soldier' | 'tank' | 'tunneler';
+export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm';
 
 /** Downward acceleration in m/s². Slightly snappier than real-world 9.81 — units feel
  *  "weighty" without dragging out the fall arc. Per-unit terminal velocity then sets
@@ -55,6 +57,16 @@ interface UnitConfig {
   /** Magnitude of the terminal vertical velocity in m/s. Stored positive; falling
    *  velocity is clamped at -terminalFallSpeed. */
   terminalFallSpeed: number;
+  /** Outer radius of the unit's cutter face, meters. 0 for non-diggers. */
+  cutterRadius: number;
+  /** Forward offset of the cutter face from the unit's origin, meters. 0 for non-diggers. */
+  cutterForward: number;
+  /** Cutter centre height above the unit's feet, meters. 0 for non-diggers. */
+  cutterHeight: number;
+  /** Number of trailing body segments (only used for chain-bodied diggers like the worm). */
+  segmentCount: number;
+  /** Target spacing between adjacent body segments along the chain, meters. */
+  segmentSpacing: number;
 }
 
 export function unitConfig(kind: UnitKind): UnitConfig {
@@ -77,6 +89,8 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         hp: 80,
         massKg: 80,                              // a person in full kit
         terminalFallSpeed: 28,                   // skydiver-ish cap
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
       };
     case 'tank':
       // Tanks are restricted to fairly flat terrain.
@@ -99,6 +113,8 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         hp: 220,
         massKg: 50_000,                          // ~50 t — main battle tank
         terminalFallSpeed: 45,                   // heavier shell, drags less per kg
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
       };
     case 'tunneler':
       // 5x5 cells (5 m x 5 m); 9 voxels (≈1.1 m) residual tolerance — generous because
@@ -120,6 +136,35 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         hp: 320,
         massKg: 150_000,                         // ~150 t — full TBM with cutter head
         terminalFallSpeed: 55,                   // dense + low drag per kg → falls hardest
+        cutterRadius: TUNNELER_CUTTER_RADIUS,
+        cutterForward: TUNNELER_CUTTER_FORWARD,
+        cutterHeight: TUNNELER_CUTTER_HEIGHT,
+        segmentCount: 0, segmentSpacing: 0,
+      };
+    case 'worm':
+      // Smaller, articulated tunneler. Head (the controlled body) carries a narrower
+      // cutter than the TBM — ~1.7 m diameter shaft vs the tunneler's 3.4 m. Body
+      // segments trail behind on a chain, each one settling under its own gravity to
+      // the local ground (or tunnel floor underground). The chain is a visual /
+      // collision-free trail; only the head participates in pathing and carving, so
+      // routing reuses the existing tunneler volume-A* code path unchanged.
+      return {
+        footprintRadius: 1, widthMeters: 1.8,
+        maxStepVoxels: 16, slopePenalty: 0.12,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 12,
+        turnRateRadPerSec: 1.4,
+        maxPitchRad: 55 * Math.PI / 180,         // worm is more flexible than the rigid TBM
+        heightVoxels: 12,
+        canDig: true, requiresGround: true,
+        speed: 2.4, speedDigging: 1.6,           // faster + nimbler than the heavy TBM
+        hp: 220,
+        massKg: 60_000,                          // ~60 t over the whole chain
+        terminalFallSpeed: 48,
+        cutterRadius: WORM_CUTTER_RADIUS,
+        cutterForward: WORM_CUTTER_FORWARD,
+        cutterHeight: WORM_CUTTER_HEIGHT,
+        segmentCount: WORM_SEGMENT_COUNT,
+        segmentSpacing: WORM_SEGMENT_SPACING,
       };
   }
 }
@@ -161,6 +206,26 @@ export interface Unit {
   massKg: number;
   /** Magnitude of terminal fall velocity in m/s — see UnitConfig.terminalFallSpeed. */
   terminalFallSpeed: number;
+  /** Cutter geometry. Zero for non-diggers. */
+  cutterRadius: number;
+  cutterForward: number;
+  cutterHeight: number;
+  /**
+   * Trailing body segments for chain-bodied diggers (worm). Empty for everyone else.
+   * Element 0 is the segment closest to the head; each subsequent segment is pulled
+   * by the previous one (rope-like distance constraint). Vertical motion is gravity
+   * + ground snap per segment, so a body draped across a tunnel rim sags into the
+   * tunnel correctly instead of floating at the head's Y.
+   */
+  segments: WormSegment[];
+}
+
+export interface WormSegment {
+  x: number; y: number; z: number;
+  vy: number;
+  /** Heading + pitch derived from the link to the segment in front, for rendering. */
+  heading: number;
+  pitch: number;
 }
 
 export interface CarveRequest {
@@ -192,6 +257,19 @@ export class UnitManager {
 
   spawn(kind: UnitKind, x: number, y: number, z: number): Unit {
     const cfg = unitConfig(kind);
+    const segments: WormSegment[] = [];
+    for (let i = 0; i < cfg.segmentCount; i++) {
+      // Initial layout: segments stretched out behind the head along +Z (heading = 0
+      // points toward -Z so the chain trails to +Z). They settle visually on the
+      // first tick once gravity + the distance constraint run.
+      segments.push({
+        x, y,
+        z: z + (i + 1) * cfg.segmentSpacing,
+        vy: 0,
+        heading: 0,
+        pitch: 0,
+      });
+    }
     const u: Unit = {
       id: this.nextId++,
       kind,
@@ -221,6 +299,10 @@ export class UnitManager {
       vy: 0,
       massKg: cfg.massKg,
       terminalFallSpeed: cfg.terminalFallSpeed,
+      cutterRadius: cfg.cutterRadius,
+      cutterForward: cfg.cutterForward,
+      cutterHeight: cfg.cutterHeight,
+      segments,
     };
     this.units.push(u);
     return u;
@@ -294,6 +376,13 @@ export class UnitManager {
       const using3D = u.canDig || underground || tgtUnderground;
       if (using3D) this.tickVolume(u, dt, nav, vnav, carveOut);
       else this.tickSurface(u, dt, nav);
+    }
+    // Body-segment chain: runs after every unit has had its head step this frame, so
+    // segments always trail the post-tick head position. Only worms (segmentCount > 0)
+    // do anything here.
+    for (const u of this.units) {
+      if (u.segments.length === 0) continue;
+      tickWormChain(u, this.lastVoxels, nav, dt);
     }
   }
 
@@ -387,7 +476,7 @@ export class UnitManager {
       const step = u.speedDigging * speedMult * dt;
       const clearAhead = inv === 0
         ? true
-        : voxelSlabClear(this.lastVoxels, u.x, u.y, u.z, fx, fy, fz, step);
+        : voxelSlabClear(this.lastVoxels, u, u.x, u.y, u.z, fx, fy, fz, step);
       if (clearAhead && d > 0.001 && step > 0) {
         u.x += fx * step;
         u.y += fy * step;
@@ -478,10 +567,10 @@ export class UnitManager {
     // Total cylinder depth = 2 * halfLength = 4 voxels along the forward axis.
     // Perpendicular extent = cutter radius + 3 voxels of clearance on every side.
     const halfLength = VOXEL * 2;                          // 4 voxels of total depth
-    const radius = TUNNELER_CUTTER_RADIUS + VOXEL * 3;
-    const centerForward = TUNNELER_CUTTER_FORWARD + halfLength;
+    const radius = u.cutterRadius + VOXEL * 3;
+    const centerForward = u.cutterForward + halfLength;
     const cutterX = u.x + fx * centerForward;
-    const cutterY = u.y + TUNNELER_CUTTER_HEIGHT + fy * centerForward;
+    const cutterY = u.y + u.cutterHeight + fy * centerForward;
     const cutterZ = u.z + fz * centerForward;
 
     // Engagement gate, only applied when the caller hasn't explicitly opted into carving.
@@ -578,9 +667,9 @@ function sampleCutterMaterial(
   u: Unit,
   fx: number, fy: number, fz: number,
 ): number {
-  const aheadM = TUNNELER_CUTTER_FORWARD + 0.125; // 1 voxel past the blade face
+  const aheadM = u.cutterForward + 0.125; // 1 voxel past the blade face
   const wx = u.x + fx * aheadM;
-  const wy = u.y + TUNNELER_CUTTER_HEIGHT + fy * aheadM;
+  const wy = u.y + u.cutterHeight + fy * aheadM;
   const wz = u.z + fz * aheadM;
   const vx = Math.floor(wx / VOXEL_SIZE);
   const vy = Math.floor(wy / VOXEL_SIZE);
@@ -629,6 +718,7 @@ function findFloorBelow(
  */
 function voxelSlabClear(
   voxels: Uint8Array,
+  u: Unit,
   ux: number, uy: number, uz: number,
   fx: number, fy: number, fz: number,
   step: number,
@@ -644,13 +734,13 @@ function voxelSlabClear(
   const uy2 = fz * rx - fx * rz;
   const uz2 = fx * ry - fy * rx;
 
-  const aheadDist = TUNNELER_CUTTER_FORWARD + step * 0.5;
+  const aheadDist = u.cutterForward + step * 0.5;
   const cx = ux + fx * aheadDist;
-  const cy = uy + TUNNELER_CUTTER_HEIGHT + fy * aheadDist;
+  const cy = uy + u.cutterHeight + fy * aheadDist;
   const cz = uz + fz * aheadDist;
   // Sample a 4x4 grid covering the cutter cross-section (radius + 1 voxel margin).
   const SAMPLES = 4;
-  const r = TUNNELER_CUTTER_RADIUS + VOXEL_SIZE;
+  const r = u.cutterRadius + VOXEL_SIZE;
   for (let i = 0; i < SAMPLES; i++) {
     const a = (i / (SAMPLES - 1)) * 2 - 1; // -1..+1
     for (let j = 0; j < SAMPLES; j++) {
@@ -801,4 +891,74 @@ function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, voxels: Uint8Array
   const k = Math.min(1, dt * 8);
   u.pitch += (targetPitch - u.pitch) * k;
   u.roll  += (targetRoll  - u.roll)  * k;
+}
+
+/**
+ * Worm body chain. Each segment chases the link in front of it (segment[0] chases the
+ * head; segment[i>0] chases segment[i-1]) and is gravity-pulled to the local ground
+ * floor. The chain doesn't carve, doesn't take part in pathing, and doesn't block
+ * anything — so a segment can drape over a tunnel rim or sag down into a freshly
+ * carved shaft entirely independently of the head.
+ *
+ * Distance constraint: pull-only. Segments are allowed to bunch up when the head
+ * stops, but never to stretch past the configured spacing. That gives the chain a
+ * subway-train feel: tight when driving, slack when idle.
+ */
+function tickWormChain(u: Unit, voxels: Uint8Array, nav: SurfaceNavBuffers, dt: number): void {
+  const spacing = WORM_SEGMENT_SPACING;
+  let prevX = u.x, prevY = u.y, prevZ = u.z;
+  for (const seg of u.segments) {
+    const dx = seg.x - prevX;
+    const dz = seg.z - prevZ;
+    const horiz = Math.hypot(dx, dz);
+    if (horiz > spacing && horiz > 1e-4) {
+      const t = spacing / horiz;
+      seg.x = prevX + dx * t;
+      seg.z = prevZ + dz * t;
+    } else if (horiz < 1e-4) {
+      // Degenerate: link directly on top of leader. Push slightly behind on the
+      // leader's heading so the chain can re-form rather than collapsing in place.
+      seg.x = prevX + Math.sin(u.heading) * spacing;
+      seg.z = prevZ + Math.cos(u.heading) * spacing;
+    }
+
+    const surfaceTop = surfaceWorldY(nav, seg.x, seg.z);
+    const segUnderground = seg.y < surfaceTop - 0.5;
+    let targetY: number | null = null;
+    if (!segUnderground) {
+      const top = findFootprintTopVoxel(voxels, nav, seg.x, seg.z, 0.4);
+      if (top !== null) targetY = (top + 1) * VOXEL_SIZE;
+    } else {
+      const probe = Math.max(3.0, -seg.vy * dt + 1.0);
+      targetY = findFloorBelow(voxels, seg.x, seg.y + 0.3, seg.z, probe);
+    }
+
+    if (targetY !== null && seg.y <= targetY + 1e-4) {
+      seg.y = targetY;
+      seg.vy = 0;
+    } else {
+      seg.vy = Math.max(-u.terminalFallSpeed, seg.vy - GRAVITY * dt);
+      seg.y += seg.vy * dt;
+      if (targetY !== null && seg.y < targetY) {
+        seg.y = targetY;
+        seg.vy = 0;
+      }
+    }
+
+    const linkDx = prevX - seg.x;
+    const linkDz = prevZ - seg.z;
+    const linkDy = prevY - seg.y;
+    const linkH = Math.hypot(linkDx, linkDz);
+    if (linkH > 1e-4) {
+      const targetHeading = Math.atan2(-linkDx, -linkDz);
+      const angDiff = wrapAngle(targetHeading - seg.heading);
+      const turnStep = u.turnRateRadPerSec * 1.5 * dt;
+      seg.heading += clamp(angDiff, -turnStep, turnStep);
+    }
+    const targetPitch = clamp(Math.atan2(linkDy, Math.max(linkH, 1e-4)), -u.maxPitchRad, u.maxPitchRad);
+    const k = Math.min(1, dt * 8);
+    seg.pitch += (targetPitch - seg.pitch) * k;
+
+    prevX = seg.x; prevY = seg.y; prevZ = seg.z;
+  }
 }
