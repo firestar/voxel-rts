@@ -160,16 +160,25 @@ function edgeCost(
 }
 
 /**
- * Bidirectional A* on the surface grid. Forward search expands from the start with
- * heuristic h(n) = octile(n, goal); backward search expands from the goal with
- * h(n) = octile(n, start). The two frontiers meet in the middle, so the explored
- * area looks like two converging cones rather than one big circle from the start.
+ * Bidirectional, weighted-A* "cone" search. Forward and backward fronts each grow
+ * outward from start and goal with a weighted heuristic (w * h(n, other-end)). The
+ * weight tightens the explored fan into a cone shape pointed at the other side, and
+ * we accept the *first* meeting as the route — no further searching.
  *
- * Termination is conservative: when the smaller of the two heaps' top priority
- * already exceeds the best meeting cost we've seen, neither side can find a
- * cheaper path and we stop. Reconstruction concatenates the forward chain
- * (start → meet) with the reversed backward chain (meet → goal).
+ *   forward fan ─┐    ┌─ backward fan
+ *               🔵====🔵
+ *
+ * This is faster than admissible A* because the search doesn't keep expanding to
+ * prove optimality; the trade-off is paths that may be slightly suboptimal in
+ * convoluted terrain (a wider detour may exist). For RTS movement that's a great
+ * trade — units find a workable route quickly and the visual is intuitive.
+ *
+ * Reconstruction concatenates the forward chain (start → meet) with the reversed
+ * backward chain (meet → goal). The meet cell appears once.
  */
+// Heuristic multiplier — values >1 narrow the search into cone shape. 1.0 is
+// admissible A* (broad fan); 2.5 is a tight cone that may miss long detours.
+const HEURISTIC_WEIGHT = 1.5;
 export function findPathSurface(
   nav: SurfaceNavBuffers,
   ws: AStarWorkspace,
@@ -200,33 +209,27 @@ export function findPathSurface(
   ws.fG[startI] = 0;
   ws.fGen[startI] = gen;
   ws.fCameFrom[startI] = -1;
-  ws.fOpen.push(startI, octileH(startCx, startCz, goalCx, goalCz));
+  ws.fOpen.push(startI, HEURISTIC_WEIGHT * octileH(startCx, startCz, goalCx, goalCz));
   // Backward init.
   ws.bG[goalI] = 0;
   ws.bGen[goalI] = gen;
   ws.bCameFrom[goalI] = -1;
-  ws.bOpen.push(goalI, octileH(goalCx, goalCz, startCx, startCz));
+  ws.bOpen.push(goalI, HEURISTIC_WEIGHT * octileH(goalCx, goalCz, startCx, startCz));
 
-  let bestCost = Infinity;
   let meetNode = -1;
   let expanded = 0;
 
   while (ws.fOpen.length > 0 && ws.bOpen.length > 0) {
-    const topF = ws.fOpen.topPriority();
-    const topB = ws.bOpen.topPriority();
-    // Termination: if both frontiers are looking at f-values that already exceed our
-    // best found path, neither side can do better.
-    if (topF >= bestCost && topB >= bestCost) break;
     if (expanded >= maxExpansions) break;
+    if (meetNode >= 0) break; // first connection wins
 
-    // Expand the smaller-priority side. Roughly balances exploration on both ends.
-    const expandForward = topF <= topB;
+    // Expand the smaller-priority side so the two cones grow at comparable rates.
+    const expandForward = ws.fOpen.topPriority() <= ws.bOpen.topPriority();
     const open = expandForward ? ws.fOpen : ws.bOpen;
     const myG = expandForward ? ws.fG : ws.bG;
     const myCameFrom = expandForward ? ws.fCameFrom : ws.bCameFrom;
     const myClosed = expandForward ? ws.fClosed : ws.bClosed;
     const myGen = expandForward ? ws.fGen : ws.bGen;
-    const otherG = expandForward ? ws.bG : ws.fG;
     const otherGen = expandForward ? ws.bGen : ws.fGen;
     const heuristicTargetCx = expandForward ? goalCx : startCx;
     const heuristicTargetCz = expandForward ? goalCz : startCz;
@@ -236,15 +239,8 @@ export function findPathSurface(
     myClosed[i] = gen;
     expanded++;
 
-    // Meet check on pop. If the other side has reached this cell, the sum of g-scores
-    // gives a candidate complete-path cost.
-    if (otherGen[i] === gen) {
-      const total = myG[i]! + otherG[i]!;
-      if (total < bestCost) {
-        bestCost = total;
-        meetNode = i;
-      }
-    }
+    // First meeting on pop: the other side has already settled this exact cell.
+    if (otherGen[i] === gen) { meetNode = i; break; }
 
     const cx = i % NAV_W;
     const cz = (i / NAV_W) | 0;
@@ -277,18 +273,12 @@ export function findPathSurface(
         myGen[ni] = gen;
         myG[ni] = g;
         myCameFrom[ni] = i;
-        const f = g + octileH(nx, nz, heuristicTargetCx, heuristicTargetCz);
-        if (f < bestCost) open.push(ni, f);
+        const f = g + HEURISTIC_WEIGHT * octileH(nx, nz, heuristicTargetCx, heuristicTargetCz);
+        open.push(ni, f);
 
-        // Early meet — if the other side has already settled this neighbor, update
-        // bestCost without waiting for the pop. This helps termination converge.
-        if (otherGen[ni] === gen) {
-          const total = g + otherG[ni]!;
-          if (total < bestCost) {
-            bestCost = total;
-            meetNode = ni;
-          }
-        }
+        // First meeting on relaxation: the other side has already settled this cell.
+        // Take it immediately — this is the user-visible "first connection wins" rule.
+        if (otherGen[ni] === gen) { meetNode = ni; break; }
       }
     }
   }

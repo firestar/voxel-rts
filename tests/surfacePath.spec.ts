@@ -150,4 +150,27 @@ describe('surface A* + smoother on flat ground', () => {
     expect(r.cells.length).toBe(1);
     expect(r.cells[0]).toEqual({ cx: 30, cz: 30 });
   });
+
+  it('cone search expands far fewer cells than a flood-fill would across a long route', () => {
+    // Diagonal of the world is roughly sqrt(2) * 90 ≈ 127 cells. A breadth-first
+    // search would visit the entire grid (96 * 96 = 9216 cells) before reaching
+    // the far corner. Bidirectional cone-A* with weight 1.5 should land the path
+    // in a small fraction of that.
+    const world = buildFlatWorld();
+    const nav = allocateNav(false);
+    buildSurfaceNav(world.buffers.voxels, nav);
+    const ws = new AStarWorkspace();
+    const r = findPathSurface(nav, ws, {
+      startCx: 5, startCz: 5,
+      goalCx: 90, goalCz: 90,
+      footprintRadius: 1, maxStepVoxels: 16, slopePenalty: 0.15,
+      bodyHalfCells: 0, bodyRoughnessVoxels: 999, prefersRoads: false,
+    });
+    expect(r.reached).toBe(true);
+    // Two cones converging: roughly two thin fans on a flat map.
+    expect(r.expanded).toBeLessThan(2000);
+    // Path goes from start to goal (cells near each end match).
+    expect(r.cells[0]).toEqual({ cx: 5, cz: 5 });
+    expect(r.cells[r.cells.length - 1]).toEqual({ cx: 90, cz: 90 });
+  });
 });
