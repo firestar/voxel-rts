@@ -16,6 +16,7 @@ import { worldToVolumeCell } from '../path/VolumeNav';
 import { M_GRASS, M_DIRT } from '../voxel/Materials';
 import { BuildingManager, BARRACKS, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
+import { PathPreview } from '../render/PathPreview';
 import { TargetMarker } from '../render/TargetMarker';
 
 type Mode = 'play' | 'build';
@@ -31,6 +32,7 @@ export class Game {
   readonly unitRenderer = new UnitRenderer();
   readonly buildings = new BuildingManager();
   readonly ghost = new BuildingGhost();
+  readonly pathPreview = new PathPreview();
   readonly target = new TargetMarker();
   pathClient: PathClient | null = null;
   /** Pixels of vertical drag = 1 m of altitude offset for tunneler targets. */
@@ -65,6 +67,7 @@ export class Game {
     this.renderer.scene.add(this.debris.mesh);
     this.renderer.scene.add(this.unitRenderer.group);
     this.renderer.scene.add(this.ghost.group);
+    this.renderer.scene.add(this.pathPreview.object);
     this.renderer.scene.add(this.target.group);
     this.ghost.setSpec(BARRACKS);
 
@@ -161,6 +164,14 @@ export class Game {
       this.paintTankTracks();
     }
     this.unitRenderer.update(this.units);
+
+    // Dashed path preview for the selected unit (if any).
+    const sel = this.units.units.find(u => u.selected);
+    if (sel && sel.path.length > 0) {
+      this.pathPreview.update({ x: sel.x, y: sel.y, z: sel.z }, sel.path);
+    } else {
+      this.pathPreview.update(null, []);
+    }
     this.debris.update(dt);
     this.meshes.pump(8);
 
@@ -379,7 +390,8 @@ export class Game {
         requiresGround: unit.requiresGround,
         footprintRadius: unit.footprintRadius,
       });
-      if (res.cells.length === 0) return;
+      // Refuse partial paths — the unit only moves if A* could reach the destination.
+      if (res.cells.length === 0 || !res.reached) return;
       this.units.setPath(unit, this.pathClient.volumeCellsToWaypoints(res.cells));
       return;
     }
@@ -394,7 +406,7 @@ export class Game {
       slopePenalty: unit.slopePenalty,
       prefersRoads: false,
     });
-    if (res.cells.length === 0) return;
+    if (res.cells.length === 0 || !res.reached) return;
     this.units.setPath(unit, this.pathClient.cellsToWaypoints(res.cells));
   }
 
