@@ -280,3 +280,100 @@ export const TUNNELER_CUTTER_RADIUS = 1.7;
 export const TUNNELER_CUTTER_FORWARD = 1.65;
 /** Height of cutter center above feet in unit-local coords. */
 export const TUNNELER_CUTTER_HEIGHT = 1.10;
+
+// ---------- Worm tunneler ----------------------------------------------------
+// A subway-style chain: a wedge-shaped head with a small cutter at the nose, then
+// several body segments that trail behind on a rope-like distance constraint and
+// each gravity-settle onto the local ground (or tunnel floor). Faces -Z. Origin =
+// feet, centred in XZ, just like the other vehicles.
+
+const WORM_HEAD_PLATE = { r: 0.42, g: 0.36, b: 0.20 };
+const WORM_HEAD_PLATE_DARK = { r: 0.28, g: 0.22, b: 0.10 };
+const WORM_HEAD_RIB = { r: 0.55, g: 0.50, b: 0.42 };
+const WORM_BODY_PLATE = { r: 0.46, g: 0.40, b: 0.22 };
+const WORM_BODY_PLATE_DARK = { r: 0.30, g: 0.24, b: 0.12 };
+const WORM_BODY_RIB = { r: 0.60, g: 0.55, b: 0.46 };
+const WORM_BELLY = { r: 0.20, g: 0.18, b: 0.14 };
+
+/** Worm head: a tapered wedge hull, the cutter mounts on its nose. */
+export function buildWormHeadGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Main head body — broad at the back, narrowed and lifted toward the front.
+  blocks.push({ x: 0, y: 0.55, z: 0.20, sx: 1.50, sy: 0.95, sz: 1.20, ...WORM_HEAD_PLATE });
+  blocks.push({ x: 0, y: 0.55, z: -0.50, sx: 1.30, sy: 0.85, sz: 0.60, ...WORM_HEAD_PLATE });
+  // Front-facing armoured collar where the cutter mounts.
+  blocks.push({ x: 0, y: 0.55, z: -0.85, sx: 1.10, sy: 0.75, sz: 0.18, ...WORM_HEAD_RIB });
+  // Belly plate (looks heavy and grounded).
+  blocks.push({ x: 0, y: 0.10, z: 0.00, sx: 1.30, sy: 0.20, sz: 1.60, ...WORM_BELLY });
+  // Side ribs.
+  for (let i = -1; i <= 1; i++) {
+    const z = i * 0.40;
+    blocks.push({ x: -0.78, y: 0.55, z, sx: 0.04, sy: 0.85, sz: 0.10, ...WORM_HEAD_RIB });
+    blocks.push({ x:  0.78, y: 0.55, z, sx: 0.04, sy: 0.85, sz: 0.10, ...WORM_HEAD_RIB });
+  }
+  // Top dorsal ridge — three small bumps along the spine.
+  for (const sz of [-0.30, 0.10, 0.50]) {
+    blocks.push({ x: 0, y: 1.10, z: sz, sx: 0.40, sy: 0.14, sz: 0.20, ...WORM_HEAD_PLATE_DARK });
+  }
+  return buildVoxelModel(blocks);
+}
+
+/** A single worm body segment — origin at feet, centred so a chain of them lines up flush. */
+export function buildWormSegmentGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Belly + main armoured cylinder approximation (a couple of stacked plates).
+  blocks.push({ x: 0, y: 0.10, z: 0, sx: 1.30, sy: 0.20, sz: 1.30, ...WORM_BELLY });
+  blocks.push({ x: 0, y: 0.50, z: 0, sx: 1.40, sy: 0.80, sz: 1.30, ...WORM_BODY_PLATE });
+  blocks.push({ x: 0, y: 0.95, z: 0, sx: 1.20, sy: 0.20, sz: 1.10, ...WORM_BODY_PLATE_DARK });
+  // Ring rib at front and back of the segment so the chain has visible joints.
+  for (const sz of [-0.55, 0.55]) {
+    blocks.push({ x: 0, y: 0.55, z: sz, sx: 1.50, sy: 0.90, sz: 0.10, ...WORM_BODY_RIB });
+  }
+  // Side bolts, three per side.
+  for (let i = -1; i <= 1; i++) {
+    const z = i * 0.32;
+    blocks.push({ x: -0.74, y: 0.55, z, sx: 0.04, sy: 0.20, sz: 0.10, ...WORM_BODY_RIB });
+    blocks.push({ x:  0.74, y: 0.55, z, sx: 0.04, sy: 0.20, sz: 0.10, ...WORM_BODY_RIB });
+  }
+  // Spine bump.
+  blocks.push({ x: 0, y: 1.10, z: 0, sx: 0.40, sy: 0.10, sz: 0.50, ...WORM_BODY_PLATE_DARK });
+  return buildVoxelModel(blocks);
+}
+
+/** Worm cutter head — same idea as the tunneler drill but smaller and simpler. */
+export function buildWormDrillGeometry(): THREE.BufferGeometry {
+  const headOuter = { r: 0.42, g: 0.42, b: 0.46 };
+  const headInner = { r: 0.55, g: 0.55, b: 0.58 };
+  const headCenter = { r: 0.72, g: 0.72, b: 0.74 };
+  const tooth = { r: 0.85, g: 0.85, b: 0.90 };
+  const teethTip = { r: 0.95, g: 0.95, b: 1.00 };
+
+  const blocks: VoxelBlock[] = [];
+  blocks.push({ x: 0, y: 0, z: -0.05, sx: 1.70, sy: 1.70, sz: 0.16, ...headOuter });
+  blocks.push({ x: 0, y: 0, z: -0.18, sx: 1.30, sy: 1.30, sz: 0.14, ...headInner });
+  blocks.push({ x: 0, y: 0, z: -0.28, sx: 0.80, sy: 0.80, sz: 0.10, ...headInner });
+  blocks.push({ x: 0, y: 0, z: -0.36, sx: 0.40, sy: 0.40, sz: 0.10, ...headCenter });
+  blocks.push({ x: 0, y: 0, z: -0.44, sx: 0.20, sy: 0.20, sz: 0.08, ...teethTip });
+  // Outer ring of teeth.
+  const teethCount = 10;
+  for (let i = 0; i < teethCount; i++) {
+    const a = (i / teethCount) * Math.PI * 2;
+    const r = 0.78;
+    blocks.push({
+      x: Math.cos(a) * r, y: Math.sin(a) * r, z: -0.05,
+      sx: 0.16, sy: 0.16, sz: 0.20, ...tooth,
+    });
+  }
+  return buildVoxelModel(blocks);
+}
+
+/** Drill pivot mounts on the worm head's front collar. */
+export const WORM_DRILL_PIVOT_Y = 0.55;
+export const WORM_DRILL_PIVOT_Z = -0.95;
+/** Cutter dimensions — see Units.ts cutter helpers (carve, slab clear, sample). */
+export const WORM_CUTTER_RADIUS = 0.85;
+export const WORM_CUTTER_FORWARD = 1.05;
+export const WORM_CUTTER_HEIGHT = 0.55;
+/** Number of trailing body segments and their target spacing in metres. */
+export const WORM_SEGMENT_COUNT = 6;
+export const WORM_SEGMENT_SPACING = 1.30;
