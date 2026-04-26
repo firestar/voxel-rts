@@ -174,53 +174,37 @@ export class UnitManager {
       const dy = tgt.y - u.y;
       const using3D = u.canDig || underground || Math.abs(dy) > 0.3;
       if (using3D) this.tickVolume(u, dt, nav, vnav, carveOut);
-      else this.tickSurface(u, dt, nav, vnav);
+      else this.tickSurface(u, dt, nav);
     }
   }
 
-  private tickSurface(u: Unit, dt: number, nav: SurfaceNavBuffers, vnav: VolumeNavBuffers): void {
+  /**
+   * Surface motion. The path search already enforces blocked + climb-step gating, and the
+   * smoother only emits line segments whose adjacent topY deltas are within the unit's
+   * climb limit (plus a small slack for fp >= 2). So we trust the path here — there's no
+   * runtime "is this cell solid in the volume grid" check, because a surface unit's Y
+   * always sits in a volume cell that contains the top voxel itself, which would always
+   * read as solid. That false-positive is what was freezing soldiers and tanks.
+   */
+  private tickSurface(u: Unit, dt: number, nav: SurfaceNavBuffers): void {
     const tgt = u.path[0]!;
     const dx = tgt.x - u.x;
     const dz = tgt.z - u.z;
     const d = Math.hypot(dx, dz);
     const step = u.speed * dt;
     let moved = 0;
-    let nextX: number, nextZ: number, snapping: boolean;
     if (d <= step) {
-      nextX = tgt.x; nextZ = tgt.z;
-      snapping = true;
-    } else {
-      const inv = 1 / d;
-      nextX = u.x + dx * inv * step;
-      nextZ = u.z + dz * inv * step;
-      snapping = false;
-    }
-    // Cliff gate — refuse if the next cell's topY differs from the current cell's by
-    // more than maxStepVoxels (climb limit).
-    if (!stepClimbOk(u, nav, nextX, nextZ)) {
-      u.blockedFrames++;
-      if (u.blockedFrames >= COLLISION_BLOCK_LIMIT) u.path = [];
-      sampleSurfaceFollow(u, nav, dt);
-      return;
-    }
-    // Voxel-collision gate — for non-diggers, the next position must not be inside a solid
-    // volume cell. (Surface units shouldn't be entering a cave wall sideways.)
-    if (!u.canDig && !volumePassable(u, vnav, nextX, surfaceWorldY(nav, nextX, nextZ), nextZ)) {
-      u.blockedFrames++;
-      if (u.blockedFrames >= COLLISION_BLOCK_LIMIT) u.path = [];
-      sampleSurfaceFollow(u, nav, dt);
-      return;
-    }
-    u.blockedFrames = 0;
-    if (snapping) {
       moved = d;
-      u.x = nextX; u.z = nextZ;
+      u.x = tgt.x; u.z = tgt.z;
       u.path.shift();
     } else {
-      u.x = nextX; u.z = nextZ;
+      const inv = 1 / d;
+      u.x += dx * inv * step;
+      u.z += dz * inv * step;
       u.heading = Math.atan2(-dx, -dz);
       moved = step;
     }
+    u.blockedFrames = 0;
     sampleSurfaceFollow(u, nav, dt);
     u.distanceWalked += moved;
   }
@@ -328,21 +312,6 @@ export class UnitManager {
  */
 function isUnderground(u: Unit, nav: SurfaceNavBuffers): boolean {
   return u.y < surfaceWorldY(nav, u.x, u.z) - 0.5;
-}
-
-/**
- * Returns true if the next surface cell is within the unit's climb limit. Cliffs above
- * maxStepVoxels are impassable — this is what prevents soldiers from teleporting up walls.
- */
-function stepClimbOk(u: Unit, nav: SurfaceNavBuffers, nextWX: number, nextWZ: number): boolean {
-  const cx0 = Math.max(0, Math.min(NAV_W - 1, Math.floor(u.x / NAV_CELL_METERS)));
-  const cz0 = Math.max(0, Math.min(NAV_H - 1, Math.floor(u.z / NAV_CELL_METERS)));
-  const cx1 = Math.max(0, Math.min(NAV_W - 1, Math.floor(nextWX / NAV_CELL_METERS)));
-  const cz1 = Math.max(0, Math.min(NAV_H - 1, Math.floor(nextWZ / NAV_CELL_METERS)));
-  const t0 = nav.topY[navIndex(cx0, cz0)]!;
-  const t1 = nav.topY[navIndex(cx1, cz1)]!;
-  if (t0 < 0 || t1 < 0) return false;
-  return Math.abs(t1 - t0) <= u.maxStepVoxels;
 }
 
 /**
