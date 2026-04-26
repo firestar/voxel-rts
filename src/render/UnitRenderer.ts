@@ -73,7 +73,15 @@ export class UnitRenderer {
 
     for (const u of units.units) {
       const isMoving = u.path.length > 0;
-      this.tmpEuler.set(u.pitch, u.heading, u.roll, 'YXZ');
+      // Tunneler chassis stays mostly level — it's the cutter that articulates to
+      // follow the dig angle. We render the body with a small fraction of u.pitch
+      // so it still leans into the slope a bit, then push the rest of the pitch
+      // onto the drill via an extra X-rotation at its pivot. Soldier and tank
+      // bodies still use the full pitch as before.
+      const bodyPitchScale = u.kind === 'tunneler' ? 0.2 : 1.0;
+      const bodyPitch = u.pitch * bodyPitchScale;
+      const cutterExtraPitch = u.pitch - bodyPitch;
+      this.tmpEuler.set(bodyPitch, u.heading, u.roll, 'YXZ');
       this.quat.setFromEuler(this.tmpEuler);
       // One-sided bob: max(0, sin) lifts the body up and lets it settle back to
       // u.y, never dipping below. The previous symmetric ±sin had the model
@@ -121,8 +129,14 @@ export class UnitRenderer {
         const spinE = new THREE.Euler(0, 0, spin, 'XYZ');
         const spinQ = new THREE.Quaternion().setFromEuler(spinE);
         const spinM = new THREE.Matrix4().makeRotationFromQuaternion(spinQ);
+        // Drill local transform = translate-to-pivot · pitch-around-X · spin-around-Z.
+        // The X-rotation makes the cutter point the rest of the way along the path
+        // pitch (the body only got a fraction). Pivots around the drill's mounting
+        // point on the chassis.
+        const cutterPitchM = new THREE.Matrix4().makeRotationX(cutterExtraPitch);
         const drillLocal = new THREE.Matrix4()
           .makeTranslation(0, TUNNELER_DRILL_PIVOT_Y, TUNNELER_DRILL_PIVOT_Z)
+          .multiply(cutterPitchM)
           .multiply(spinM);
         this.partM.multiplyMatrices(this.bodyM, drillLocal);
         this.tunnelerDrill.setMatrixAt(nTun, this.partM);

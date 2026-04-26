@@ -54,7 +54,12 @@ export function placeTrees(voxels: Uint8Array, seed: number): { count: number } 
       const sizeHash = hash32(wx, wz, 1, seed + 12345);
       const shape: TreeShape = {
         trunkRadius: 1 + ((sizeHash >>> 24) & 1),                    // 1..2
-        trunkHeight: 8 + ((sizeHash >>> 16) & 0x07),                  // 8..15
+        // Trunks tall enough that the canopy bottom sits above the tallest unit's
+        // head-clearance requirement (tank heightVoxels = 18). Path search rejects
+        // any cell whose air-above-topY is below the unit's height; if the canopy
+        // dips into walkable headroom, soldiers + tanks couldn't path past trees
+        // and the world becomes a bunch of impassable forests.
+        trunkHeight: 18 + ((sizeHash >>> 16) & 0x07),                 // 18..25
         canopyRadius: 6 + ((sizeHash >>> 8) & 0x07),                  // 6..13
       };
       stampTree(voxels, wx, surfaceY, wz, shape, seed + count);

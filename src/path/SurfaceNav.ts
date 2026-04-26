@@ -1,5 +1,6 @@
 import { WORLD_X, WORLD_Y, WORLD_Z, VOXEL_SIZE, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
+import { M_WOOD, M_LEAF } from '../voxel/Materials';
 
 // 1 m surface cells = 8 voxels (at 0.125 m).
 export const NAV_CELL_VOXELS = 8;
@@ -58,14 +59,17 @@ export function buildSurfaceNav(voxels: Uint8Array, nav: SurfaceNavBuffers): voi
       const wx = cx * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
       let top = -1;
       let mat = 0;
-      // Walk top-down to find the highest solid voxel with air immediately above.
+      // Walk top-down to find the highest WALKABLE ground voxel — wood and leaf
+      // (trees) are skipped, so the ground voxel under a canopy still wins.
+      // Without this skip, a tree's TOP read as topY (it has air above), the
+      // grass underneath was buried, and the cell appeared to have full sky
+      // headroom above the canopy — exactly the wrong answer.
       for (let y = WORLD_Y - 1; y >= 1; y--) {
         const m = voxels[worldIndex(wx, y, wz)]!;
-        if (m !== AIR) {
-          // Check air above (or top of world).
-          const above = y + 1 >= WORLD_Y ? AIR : voxels[worldIndex(wx, y + 1, wz)]!;
-          if (above === AIR) { top = y; mat = m; break; }
-        }
+        if (m === AIR) continue;
+        if (m === M_WOOD || m === M_LEAF) continue;
+        top = y; mat = m;
+        break;
       }
       const i = navIndex(cx, cz);
       nav.topY[i] = top;
@@ -77,34 +81,22 @@ export function buildSurfaceNav(voxels: Uint8Array, nav: SurfaceNavBuffers): voi
       // minimum so a tree trunk sitting at a cell corner still flags the whole
       // cell as low-headroom. Without this, anything off the cell-centre column
       // (e.g. a 1-voxel-wide tree trunk stamped at a cell edge) was invisible.
-      // Headroom: walk up from the WALKABLE surface (cell's topY + 1) at every
-       // probe column and count contiguous air. The minimum across probes is the
-       // cell's headroom — this correctly catches a tree trunk sitting at any
-       // corner because that trunk's first voxel sits right above the grass
-       // surface and shows up as 0 air at that probe.
-      let minHead = 255;
+      // Headroom: count contiguous air voxels above the walkable topY at the cell's
+       // CENTRE column. We deliberately don't multi-probe — the previous "min over
+       // 5 probes" version locked down the entire region around a forest because
+       // canopies that overhang into a corner of an otherwise-clear cell would
+       // reduce that cell's headroom to nearly zero. With centre-only sampling,
+       // cells whose centre is genuinely under a canopy (or contain a trunk) get
+       // marked as low headroom, but cells next to a tree stay walkable.
+      let head = 0;
       if (top >= 0) {
-        const probes: [number, number][] = [
-          [wx, wz],                                                // centre
-          [cx * NAV_CELL_VOXELS,           cz * NAV_CELL_VOXELS],         // -X-Z corner
-          [cx * NAV_CELL_VOXELS + NAV_CELL_VOXELS - 1, cz * NAV_CELL_VOXELS],         // +X-Z
-          [cx * NAV_CELL_VOXELS,           cz * NAV_CELL_VOXELS + NAV_CELL_VOXELS - 1], // -X+Z
-          [cx * NAV_CELL_VOXELS + NAV_CELL_VOXELS - 1, cz * NAV_CELL_VOXELS + NAV_CELL_VOXELS - 1], // +X+Z
-        ];
-        for (const [px, pz] of probes) {
-          let h = 0;
-          for (let y = top + 1; y < WORLD_Y; y++) {
-            if (voxels[worldIndex(px, y, pz)] !== AIR) break;
-            h++;
-            if (h >= 255) { h = 255; break; }
-          }
-          if (h < minHead) minHead = h;
-          if (minHead === 0) break; // can't get any worse
+        for (let y = top + 1; y < WORLD_Y; y++) {
+          if (voxels[worldIndex(wx, y, wz)] !== AIR) break;
+          head++;
+          if (head >= 255) { head = 255; break; }
         }
-      } else {
-        minHead = 0;
       }
-      nav.headroom[i] = minHead;
+      nav.headroom[i] = head;
     }
   }
 

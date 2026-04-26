@@ -81,14 +81,59 @@ describe('placeTrees', () => {
 });
 
 describe('trees + surface pathing', () => {
+  it('placeTrees leaves enough headroom in adjacent cells for the tallest unit (18 voxels)', () => {
+    // Build a flat grass world, place the procedural forest, then sample headroom
+    // for cells that are NOT the trunk cell of any tree but are next to one. The
+    // canopy should sit above the tallest unit's clearance — without that the
+    // forest blocks all surface paths.
+    const world = buildGrassPlane();
+    const v = world.buffers.voxels;
+    placeTrees(v, 7777);
+    const nav = allocateNav(false);
+    buildSurfaceNav(v, nav);
+
+    // Find every nav cell that has wood at any of its 5 sample probes — those are
+    // "trunk cells". Their immediate 4-neighbours should still have headroom for
+    // the tallest unit (tank, 18 voxels).
+    const TANK_HEIGHT = 18;
+    let trunkCells = 0;
+    let neighborsWithEnoughHead = 0;
+    let neighborsTooLow = 0;
+    for (let cz = 1; cz < 95; cz++) {
+      for (let cx = 1; cx < 95; cx++) {
+        const trunkBaseY = 33;
+        const isTrunk =
+          v[worldIndex(cx * 8 + 0, trunkBaseY, cz * 8 + 0)] === M_WOOD ||
+          v[worldIndex(cx * 8 + 7, trunkBaseY, cz * 8 + 7)] === M_WOOD ||
+          v[worldIndex(cx * 8 + 4, trunkBaseY, cz * 8 + 4)] === M_WOOD;
+        if (!isTrunk) continue;
+        trunkCells++;
+        // Check the 4 cardinal neighbours
+        for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+          const ncx = cx + dx, ncz = cz + dz;
+          const nh = nav.headroom[navIndex(ncx, ncz)]!;
+          if (nh >= TANK_HEIGHT) neighborsWithEnoughHead++;
+          else neighborsTooLow++;
+        }
+      }
+    }
+    expect(trunkCells).toBeGreaterThan(0);
+    // The vast majority of neighbours should pass; some will fail because of
+    // overlapping canopies on dense forest patches and that's acceptable.
+    const passRate = neighborsWithEnoughHead / (neighborsWithEnoughHead + neighborsTooLow);
+    expect(passRate).toBeGreaterThan(0.5);
+  });
+
   it('a unit with high-enough headroom requirement detours around tree cells', () => {
     // Build the same flat grass world the tree tests use, place a single tall tree,
     // then ask for a path through its trunk cell. With headroomVoxels >= the tree
     // height, the surface path search should reject the tree's nav cell.
     const world = buildGrassPlane();
     const v = world.buffers.voxels;
-    // Place a single tree centred on (96, 32, 96) — that's nav cell (12, 12) at NAV_CELL_VOXELS=8.
-    const baseX = 96, baseZ = 96;
+    // Place a single tree at the centre of cell (12, 12). With NAV_CELL_VOXELS=8 the
+    // cell spans voxels x=[96..103] z=[96..103] and its centre column is (100, 100) —
+    // headroom is sampled there, so the trunk needs to sit at that column to register.
+    const baseX = 100, baseZ = 100;
     // Manually stamp a tall trunk so the tree cell has a known low headroom.
     const trunkBase = 32;
     for (let dy = 1; dy <= 16; dy++) {
