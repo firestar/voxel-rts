@@ -45,9 +45,11 @@ export function unitConfig(kind: UnitKind): UnitConfig {
   switch (kind) {
     case 'soldier':
       // Single-cell footprint, so the body-roughness check is a no-op for soldiers.
+      // maxStepVoxels = 20 voxels (2.5 m climb between adjacent cells ≈ 68° slope) —
+      // soldiers scramble up almost anything that isn't a literal vertical wall.
       return {
         footprintRadius: 1, widthMeters: 0.75,
-        maxStepVoxels: 16, slopePenalty: 0.15,
+        maxStepVoxels: 20, slopePenalty: 0.10,
         bodyHalfCells: 0, bodyRoughnessVoxels: 999,
         turnRateRadPerSec: 6.0,                  // ~340°/s, snappy infantry turn
         maxPitchRad: Math.PI / 2,                // soldiers are flexible — no real pitch cap
@@ -56,13 +58,14 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         hp: 80,
       };
     case 'tank':
-      // 3x3 cells (3 m x 3 m) under the body; max 0.5 m residual from the best-fit plane.
-      // Uniform slopes pass (planar = zero residual); ridges/steps that lift a corner
-      // above the rest fail. Tank can climb steep hills as long as they're smooth.
+      // 3x3 cells (3 m x 3 m) under the body. Roughness raised to 6 voxels (0.75 m
+       // residual from the plane fit) so the tank can park on natural undulating
+       // terrain without rejecting anything that isn't a billiard table.
+      // maxStepVoxels = 18 voxels (2.25 m climb between adjacent cells ≈ 66° slope).
       return {
         footprintRadius: 2, widthMeters: 2.4,
-        maxStepVoxels: 14, slopePenalty: 0.12,
-        bodyHalfCells: 1, bodyRoughnessVoxels: 4,
+        maxStepVoxels: 18, slopePenalty: 0.10,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 6,
         turnRateRadPerSec: 1.4,                  // ~80°/s — tank pivots are slow
         maxPitchRad: Math.PI / 3,                // 60° — steep slopes OK, no flipping
         canDig: false, requiresGround: true,
@@ -70,17 +73,17 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         hp: 220,
       };
     case 'tunneler':
-      // 5x5 cells (5 m x 5 m); 0.75 m residual tolerance.
+      // 5x5 cells (5 m x 5 m); 9 voxels (≈1.1 m) residual tolerance — generous because
+      // the cutter levels its own bench as it goes.
       // Ground-locked like the tank: it can carve through anything but it can't levitate
       // through open air. Tunnels it digs leave a solid floor underneath, so this still
       // lets the unit walk along its own freshly-bored shafts.
-      // Slow heavy machine. Surface speed roughly half a tank; digging speed is the
-      // baseline 1.2 m/s in dirt, scaled per-material by digSpeedMultiplier (so stone
-      // crawls at ~0.36 m/s, leaf rips along at ~1.7 m/s).
+      // maxStepVoxels = 14 voxels (1.75 m climb ≈ 60° slope) — wider machine than the
+      // tank, but with the cutter pulling it up steep grades.
       return {
         footprintRadius: 2, widthMeters: 3.6,
-        maxStepVoxels: 10, slopePenalty: 0.18,
-        bodyHalfCells: 2, bodyRoughnessVoxels: 6,
+        maxStepVoxels: 14, slopePenalty: 0.15,
+        bodyHalfCells: 2, bodyRoughnessVoxels: 9,
         turnRateRadPerSec: 0.7,                  // ~40°/s — heavy machine pivots slowly
         maxPitchRad: Math.PI / 4,                // 45° — never goes vertical, no straight-down digs
         canDig: true, requiresGround: true,
