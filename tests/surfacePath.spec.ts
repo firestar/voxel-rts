@@ -151,6 +151,53 @@ describe('surface A* + smoother on flat ground', () => {
     expect(r.cells[0]).toEqual({ cx: 30, cz: 30 });
   });
 
+  it('does not cross a 1-cell void column (gap blocks both A* and smoother)', () => {
+    // Build a flat world, then carve every voxel from a single 1-cell-wide column
+    // (cx=40, cz around the path) so the cell becomes blocked. The path from
+    // (5,40) to (90,40) has a gap right in the middle. A unit cannot cross it.
+    const world = buildFlatWorld();
+    const v = world.buffers.voxels;
+    const gapCx = 40;
+    const NAV_CELL_VOXELS = 8;
+    // Carve all voxels in the column under cell (40, 40)
+    const wxStart = gapCx * NAV_CELL_VOXELS;
+    const wzStart = 40 * NAV_CELL_VOXELS;
+    for (let dx = 0; dx < NAV_CELL_VOXELS; dx++) {
+      for (let dz = 0; dz < NAV_CELL_VOXELS; dz++) {
+        for (let y = 0; y < 100; y++) {
+          v[worldIndex(wxStart + dx, y, wzStart + dz)] = 0;
+        }
+      }
+    }
+
+    const nav = allocateNav(false);
+    buildSurfaceNav(v, nav);
+    // Sanity: the carved cell really is blocked.
+    expect(nav.blocked[40 * 96 + 40]).toBe(1); // cz=40, cx=40
+
+    const ws = new AStarWorkspace();
+    const r = findPathSurface(nav, ws, {
+      startCx: 5, startCz: 40,
+      goalCx: 90, goalCz: 40,
+      footprintRadius: 1, maxStepVoxels: 16, slopePenalty: 0.15,
+      bodyHalfCells: 0, bodyRoughnessVoxels: 999, prefersRoads: false,
+    });
+    // Path may either reach (going around) or fail; either way no cell along the
+    // returned path may be the blocked column.
+    for (const c of r.cells) {
+      expect(c.cx === 40 && c.cz === 40).toBe(false);
+    }
+    // And no two consecutive cells should be (39,40) → (41,40) — that would be a
+    // straight horizontal through the gap (Bresenham diagonal couldn't either).
+    for (let i = 1; i < r.cells.length; i++) {
+      const a = r.cells[i - 1]!;
+      const b = r.cells[i]!;
+      const skipsGapCardinally = a.cz === 40 && b.cz === 40 &&
+        Math.min(a.cx, b.cx) <= 39 && Math.max(a.cx, b.cx) >= 41;
+      expect(skipsGapCardinally).toBe(false);
+    }
+  });
+
   it('cone search expands far fewer cells than a flood-fill would across a long route', () => {
     // Diagonal of the world is roughly sqrt(2) * 90 ≈ 127 cells. A breadth-first
     // search would visit the entire grid (96 * 96 = 9216 cells) before reaching

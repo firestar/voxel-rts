@@ -260,15 +260,19 @@ export function findPathSurface(
       const dY = Math.abs(nyTop - cy);
       if (dY > maxStepVoxels) continue;
       if (bodyHalfCells > 0 && !bodyRoughnessOk(nav, nx, nz, bodyHalfCells, bodyRoughnessVoxels)) continue;
-      if (n >= 4 && !agile) {
-        // Vehicles need at least one cardinal that's both passable and within the
-        // climb step — they can't squeeze through a wall corner.
+      if (n >= 4) {
         const a = navIndex(cx + NB_DX[n]!, cz);
         const b = navIndex(cx, cz + NB_DZ[n]!);
+        // No diagonal across a 1-cell void: even agile units can't leap a gap
+        // where both cardinals are blocked.
         if (nav.blocked[a] && nav.blocked[b]) continue;
-        const aOk = !nav.blocked[a] && Math.abs(nav.topY[a]! - cy) <= maxStepVoxels;
-        const bOk = !nav.blocked[b] && Math.abs(nav.topY[b]! - cy) <= maxStepVoxels;
-        if (!aOk && !bOk) continue;
+        if (!agile) {
+          // Vehicles also need at least one cardinal both passable AND within the
+          // climb step — they can't squeeze through a wall corner.
+          const aOk = !nav.blocked[a] && Math.abs(nav.topY[a]! - cy) <= maxStepVoxels;
+          const bOk = !nav.blocked[b] && Math.abs(nav.topY[b]! - cy) <= maxStepVoxels;
+          if (!aOk && !bOk) continue;
+        }
       }
 
       const stepCost = edgeCost(nav, i, ni, NB_COST[n]!, slopePenalty, prefersRoads, routeSeed);

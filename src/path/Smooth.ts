@@ -2,9 +2,14 @@ import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H } from './SurfaceNav';
 import { bodyRoughnessOk } from './AStar';
 
 /**
- * String-pulling: walk a line between two cells using a 2D Bresenham-style supercover and
- * return false the moment any sampled cell is impassable for a unit with the given step
- * limit. Surface pathing relies on climb-step alone; flatness is no longer gated here.
+ * Walk every nav cell touched by the line from (ax, az) to (bx, bz) and return false
+ * the moment a cell is impassable for the unit. Visiting EVERY cell — not just the
+ * Bresenham-stepped ones — is what stops the smoother from drawing a long diagonal
+ * across a 1-cell air gap (a void column whose blocked bit Bresenham would otherwise
+ * skip past).
+ *
+ * Implementation: round-to-nearest sample along the parameterised line at 4× cell
+ * oversampling. Any cell touched by the line is hit at least once.
  */
 function navLineClear(
   nav: SurfaceNavBuffers,
@@ -15,35 +20,34 @@ function navLineClear(
   bodyHalfCells: number,
   bodyRoughnessVoxels: number,
 ): boolean {
-  let x0 = ax, z0 = az;
-  const x1 = bx, z1 = bz;
-  const dx = Math.abs(x1 - x0);
-  const dz = Math.abs(z1 - z0);
-  const sx = x0 < x1 ? 1 : -1;
-  const sz = z0 < z1 ? 1 : -1;
-  let err = dx - dz;
-  const startTopY = nav.topY[navIndex(x0, z0)]!;
-  let prevY = startTopY;
-
+  const dx = bx - ax;
+  const dz = bz - az;
+  const span = Math.max(Math.abs(dx), Math.abs(dz));
+  if (span === 0) {
+    if (ax < 0 || az < 0 || ax >= NAV_W || az >= NAV_H) return false;
+    return !nav.blocked[navIndex(ax, az)];
+  }
   // Larger units get a slightly more generous step limit since A* already verified a
   // climb-feasible cardinal path through the surrounding terrain.
   const stepLimit = maxStepVoxels + (footprintRadius >= 2 ? 2 : 0);
-
-  const guard = dx + dz + 2;
-  for (let i = 0; i <= guard; i++) {
-    if (x0 < 0 || z0 < 0 || x0 >= NAV_W || z0 >= NAV_H) return false;
-    const idx = navIndex(x0, z0);
+  const steps = span * 4; // 4× oversample — catches every cell the line clips
+  let prevX = -1, prevZ = -1;
+  let prevY = 0;
+  let havePrev = false;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const x = Math.round(ax + dx * t);
+    const z = Math.round(az + dz * t);
+    if (x === prevX && z === prevZ) continue;
+    if (x < 0 || z < 0 || x >= NAV_W || z >= NAV_H) return false;
+    const idx = navIndex(x, z);
     if (nav.blocked[idx]) return false;
     const y = nav.topY[idx]!;
-    if (Math.abs(y - prevY) > stepLimit) return false;
-    prevY = y;
-    if (bodyHalfCells > 0 && !bodyRoughnessOk(nav, x0, z0, bodyHalfCells, bodyRoughnessVoxels)) return false;
-    if (x0 === x1 && z0 === z1) return true;
-    const e2 = 2 * err;
-    if (e2 > -dz) { err -= dz; x0 += sx; }
-    if (e2 < dx) { err += dx; z0 += sz; }
+    if (havePrev && Math.abs(y - prevY) > stepLimit) return false;
+    if (bodyHalfCells > 0 && !bodyRoughnessOk(nav, x, z, bodyHalfCells, bodyRoughnessVoxels)) return false;
+    prevX = x; prevZ = z; prevY = y; havePrev = true;
   }
-  return false;
+  return true;
 }
 
 /**
