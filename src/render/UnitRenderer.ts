@@ -7,6 +7,8 @@ import {
   TUNNELER_DRILL_PIVOT_Y, TUNNELER_DRILL_PIVOT_Z,
   buildWormHeadGeometry, buildWormSegmentGeometry, buildWormDrillGeometry,
   WORM_DRILL_PIVOT_Y, WORM_DRILL_PIVOT_Z, WORM_SEGMENT_COUNT,
+  buildWorkerBodyGeometry, buildWorkerLegGeometry, buildWorkerCrateGeometry,
+  WORKER_HIP_Y, WORKER_LEG_X,
 } from './UnitModels';
 
 /**
@@ -29,6 +31,11 @@ export class UnitRenderer {
   private wormHead: THREE.InstancedMesh;
   private wormDrill: THREE.InstancedMesh;
   private wormSegment: THREE.InstancedMesh;
+  private workerBody: THREE.InstancedMesh;
+  private workerLegL: THREE.InstancedMesh;
+  private workerLegR: THREE.InstancedMesh;
+  private workerCrateWood: THREE.InstancedMesh;
+  private workerCrateMetal: THREE.InstancedMesh;
 
   private capacity: number;
   private bodyM = new THREE.Matrix4();
@@ -44,6 +51,7 @@ export class UnitRenderer {
   private selectionRingTank: THREE.LineSegments;
   private selectionRingTunneler: THREE.LineSegments;
   private selectionRingWorm: THREE.LineSegments;
+  private selectionRingWorker: THREE.LineSegments;
 
   constructor(capacity = 256) {
     this.capacity = capacity;
@@ -61,30 +69,41 @@ export class UnitRenderer {
     // The body-segment mesh holds capacity * SEGMENT_COUNT instances — one per
     // (worm, segment) pair — so a roomful of worms doesn't run out of slots.
     this.wormSegment = makeIM(buildWormSegmentGeometry(), mat, capacity * WORM_SEGMENT_COUNT);
+    this.workerBody = makeIM(buildWorkerBodyGeometry(), mat, capacity);
+    this.workerLegL = makeIM(buildWorkerLegGeometry(), mat, capacity);
+    this.workerLegR = makeIM(buildWorkerLegGeometry(), mat, capacity);
+    this.workerCrateWood  = makeIM(buildWorkerCrateGeometry(false), mat, capacity);
+    this.workerCrateMetal = makeIM(buildWorkerCrateGeometry(true),  mat, capacity);
 
     this.group.add(
       this.soldierBody, this.soldierLegL, this.soldierLegR,
       this.tankHull, this.tankTurret,
       this.tunnelerHull, this.tunnelerDrill,
       this.wormHead, this.wormDrill, this.wormSegment,
+      this.workerBody, this.workerLegL, this.workerLegR,
+      this.workerCrateWood, this.workerCrateMetal,
     );
 
     this.selectionRingSoldier = makeSelectionRing(0.6, 0x00ff88);
     this.selectionRingTank = makeSelectionRing(1.6, 0xffaa33);
     this.selectionRingTunneler = makeSelectionRing(0.7, 0xffe066);
     this.selectionRingWorm = makeSelectionRing(0.9, 0xc266ff);
+    this.selectionRingWorker = makeSelectionRing(0.55, 0x33ccff);
     this.selectionRingSoldier.visible = false;
     this.selectionRingTank.visible = false;
     this.selectionRingTunneler.visible = false;
     this.selectionRingWorm.visible = false;
+    this.selectionRingWorker.visible = false;
     this.group.add(
       this.selectionRingSoldier, this.selectionRingTank,
       this.selectionRingTunneler, this.selectionRingWorm,
+      this.selectionRingWorker,
     );
   }
 
   update(units: UnitManager): void {
     let nSold = 0, nTank = 0, nTun = 0, nWorm = 0, nWormSeg = 0;
+    let nWork = 0, nCrateW = 0, nCrateM = 0;
     let selected: Unit | null = null;
     const now = performance.now() / 1000;
 
@@ -106,8 +125,16 @@ export class UnitRenderer {
       // / treads into the voxel underneath. Collision/path always use u.y as
       // the static feet position; the renderer must never draw the model lower
       // than that. Amplitude doubled to keep the same visual lift.
-      const bobFreq = u.kind === 'soldier' ? 6.0 : u.kind === 'tank' ? 3.0 : u.kind === 'tunneler' ? 4.0 : 5.0;
-      const bobAmp  = u.kind === 'soldier' ? 0.08 : u.kind === 'tank' ? 0.04 : u.kind === 'tunneler' ? 0.05 : 0.03;
+      const bobFreq = u.kind === 'soldier' ? 6.0
+                    : u.kind === 'tank' ? 3.0
+                    : u.kind === 'tunneler' ? 4.0
+                    : u.kind === 'worker' ? 6.0
+                    : 5.0;
+      const bobAmp  = u.kind === 'soldier' ? 0.08
+                    : u.kind === 'tank' ? 0.04
+                    : u.kind === 'tunneler' ? 0.05
+                    : u.kind === 'worker' ? 0.07
+                    : 0.03;
       const sineRaw = Math.sin(u.distanceWalked * bobFreq + u.id);
       const bodyBob = isMoving ? Math.max(0, sineRaw) * bobAmp : 0;
       // Per-kind feet offset. Each model has its lowest geometry at a different
@@ -118,7 +145,10 @@ export class UnitRenderer {
       //   Tank:    tread bottom at body-local y = 0.05 → -0.05 drops the treads
       //            to u.y (was 5 cm of ground clearance which read as floating).
       //   Tunneler: tread bottom at body-local y = 0.0 already → no offset.
-      const feetOffset = u.kind === 'soldier' ? 0.05 : u.kind === 'tank' ? -0.05 : 0.0;
+      const feetOffset = u.kind === 'soldier' ? 0.05
+                       : u.kind === 'tank' ? -0.05
+                       : u.kind === 'worker' ? 0.05
+                       : 0.0;
       this.tmpV.set(u.x, u.y + feetOffset + bodyBob, u.z);
       this.bodyM.compose(this.tmpV, this.quat, new THREE.Vector3(1, 1, 1));
 
@@ -129,6 +159,31 @@ export class UnitRenderer {
         this.applyLegMatrix(nSold, this.soldierLegL, swing,  +SOLDIER_LEG_X);
         this.applyLegMatrix(nSold, this.soldierLegR, -swing, -SOLDIER_LEG_X);
         nSold++;
+      } else if (u.kind === 'worker') {
+        if (nWork >= this.capacity) continue;
+        this.workerBody.setMatrixAt(nWork, this.bodyM);
+        // Same gait as soldier — counter-swinging legs around the same hip
+        // pivot. Workers reuse the soldier hip constants since the geometry
+        // is identical except for colour and the toolbelt.
+        const swing = isMoving ? Math.sin(u.distanceWalked * 4.5 + u.id) * 0.55 : 0;
+        this.applyWorkerLegMatrix(nWork, this.workerLegL, swing,  +WORKER_LEG_X);
+        this.applyWorkerLegMatrix(nWork, this.workerLegR, -swing, -WORKER_LEG_X);
+        // Carry crate — appears on the back when the worker is hauling. We
+        // pick the variant by which payload is heavier; ties go to wood.
+        const carryW = u.carrying.wood;
+        const carryM = u.carrying.metals;
+        if (carryW + carryM > 0) {
+          const crateLocal = new THREE.Matrix4().makeTranslation(0, 0.95, 0.18);
+          this.partM.multiplyMatrices(this.bodyM, crateLocal);
+          if (carryM > carryW) {
+            this.workerCrateMetal.setMatrixAt(nCrateM, this.partM);
+            nCrateM++;
+          } else {
+            this.workerCrateWood.setMatrixAt(nCrateW, this.partM);
+            nCrateW++;
+          }
+        }
+        nWork++;
       } else if (u.kind === 'tank') {
         if (nTank >= this.capacity) continue;
         this.tankHull.setMatrixAt(nTank, this.bodyM);
@@ -209,11 +264,18 @@ export class UnitRenderer {
     this.wormHead.count = nWorm;
     this.wormDrill.count = nWorm;
     this.wormSegment.count = nWormSeg;
+    this.workerBody.count = nWork;
+    this.workerLegL.count = nWork;
+    this.workerLegR.count = nWork;
+    this.workerCrateWood.count = nCrateW;
+    this.workerCrateMetal.count = nCrateM;
     for (const m of [
       this.soldierBody, this.soldierLegL, this.soldierLegR,
       this.tankHull, this.tankTurret,
       this.tunnelerHull, this.tunnelerDrill,
       this.wormHead, this.wormDrill, this.wormSegment,
+      this.workerBody, this.workerLegL, this.workerLegR,
+      this.workerCrateWood, this.workerCrateMetal,
     ]) {
       m.instanceMatrix.needsUpdate = true;
     }
@@ -222,11 +284,13 @@ export class UnitRenderer {
     this.selectionRingTank.visible = false;
     this.selectionRingTunneler.visible = false;
     this.selectionRingWorm.visible = false;
+    this.selectionRingWorker.visible = false;
     if (selected) {
       const ring =
         selected.kind === 'soldier' ? this.selectionRingSoldier
         : selected.kind === 'tank' ? this.selectionRingTank
         : selected.kind === 'tunneler' ? this.selectionRingTunneler
+        : selected.kind === 'worker' ? this.selectionRingWorker
         : this.selectionRingWorm;
       ring.position.set(selected.x, selected.y + 0.05, selected.z);
       ring.visible = true;
@@ -235,6 +299,14 @@ export class UnitRenderer {
 
   private applyLegMatrix(slot: number, mesh: THREE.InstancedMesh, swing: number, hipX: number): void {
     this.hipOffset.makeTranslation(hipX, SOLDIER_HIP_Y, 0);
+    this.legRot.makeRotationX(swing);
+    this.legPivot.multiplyMatrices(this.hipOffset, this.legRot);
+    this.partM.multiplyMatrices(this.bodyM, this.legPivot);
+    mesh.setMatrixAt(slot, this.partM);
+  }
+
+  private applyWorkerLegMatrix(slot: number, mesh: THREE.InstancedMesh, swing: number, hipX: number): void {
+    this.hipOffset.makeTranslation(hipX, WORKER_HIP_Y, 0);
     this.legRot.makeRotationX(swing);
     this.legPivot.multiplyMatrices(this.hipOffset, this.legRot);
     this.partM.multiplyMatrices(this.bodyM, this.legPivot);

@@ -2,6 +2,7 @@ import { WORLD_X, WORLD_Z } from './types';
 import { VoxelWorld } from './VoxelWorld';
 import { placeTrees } from './Trees';
 import { placeRoads, clearAboveRoads } from './Roads';
+import { placeMetals } from './Metals';
 
 import WorldgenWorker from '../workers/worldgen.worker?worker';
 
@@ -64,6 +65,9 @@ export async function generateWorld(
   // tree-free without any extra check. Both run on the main thread post-merge
   // to avoid races on writes that cross worker slab boundaries.
   const roadStats = placeRoads(world.buffers.voxels, seed);
+  // Metals before trees: trees skip non-grass surfaces, so a metal blob that
+  // happens to break the surface naturally keeps that column tree-free.
+  placeMetals(world.buffers.voxels, seed);
   placeTrees(world.buffers.voxels, seed);
   // Trim any tree canopy that drifted across a road column so the road
   // surface stays open to the sky.

@@ -159,3 +159,51 @@ cost shape) rather than asserting an idealised detour.
 If a behavior isn't covered by an existing test and we want to confirm it,
 add a test in `tests/**/*.spec.ts`. Pathfinding, voxel edits, the cutter
 carve, unit ticks — all run headless against the in-memory world.
+
+## Economy: harvesters drop piles, transporters deliver to storage
+
+The user asked for "automated harvest workers" plus "transport workers that
+put resources into storage buildings from harvesters when enough resources
+are gathered." We modelled this as two roles on a single `'worker'` UnitKind
+(no separate kind so both reuse the same geometry / config / pathing):
+
+- `harvester` auto-finds the nearest exposed `M_WOOD` or `M_METAL` voxel
+  via a coarse-stride brute-force scan in `findNearestExposed`, walks
+  there, and chips at it with `damageSphere`. When carry total ≥
+  `WORKER_CARRY_CAP` (5), the harvester drops a `Pile` at its feet and
+  resumes scanning.
+- `transporter` claims piles via `PileManager.nearest`, walks to the pile,
+  picks up, then walks to the nearest live `STORAGE` building and adds the
+  load to `Resources`.
+
+`PileManager.claimedBy` prevents two transporters from racing to the same
+pile. The pile entity is purely sim-side (no voxels written) so harvesting
+doesn't permanently alter the world geometry.
+
+## Metals are large underground patches, exposed by tunneling
+
+Per user direction, `M_METAL` is placed by `placeMetals` (`src/voxel/Metals.ts`)
+as ellipsoidal blobs of radius 4..11 voxels XZ × 3..6 voxels Y, replacing
+stone or dirt. 25% of patches spawn shallow (4..14 voxels under the
+surface), 60% medium (16..36), 15% deep (36..60). Workers can only mine
+voxels with at least one air-side neighbour, so deep patches are
+inaccessible until a tunneler cuts a shaft to expose them — this turns the
+existing tunneler into an economy-critical unit.
+
+## Saplings: marker stamp + 30 s growth, then full tree
+
+`SaplingManager.plant` stamps a 2-voxel wood + 1 leaf marker on a grass
+column so the player sees something happen. Each tick adds `dt` to
+`ageSec`; once it crosses `SAPLING_MATURE_SEC = 30` the marker is cleared
+and the original `stampTree` (now exported from `Trees.ts`) writes a full
+tree, with chunk-dirty flags raised over a column wide enough to cover the
+canopy. Maturation requests a nav rebuild because the new canopy raises
+headroom.
+
+## Build-mode key cycles through specs
+
+`B` cycles `play → buildBarracks → buildFarm → buildStorage → play`. `P`
+toggles plant mode. The single `Mode` enum keeps the input dispatch in
+`handleRelease` flat — `isBuildMode` and `activeBuildSpec` centralise the
+"which spec are we placing?" decision so the ghost preview, footprint
+check, and `buildings.place` call all read from the same source.

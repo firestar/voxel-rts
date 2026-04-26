@@ -13,7 +13,7 @@ const TREE_GRID_SPACING_VOXELS = 24;     // ~3 m minimum spacing
 const TREE_DENSITY_FREQ = 1 / 96;        // tree-cluster wavelength (~12 m)
 const TREE_DENSITY_THRESHOLD = 0.10;     // raise to thin forests, lower to thicken
 
-interface TreeShape {
+export interface TreeShape {
   /** Trunk diameter in voxels (rough). */
   trunkRadius: number;
   /** Trunk height in voxels above the ground. */
@@ -83,8 +83,10 @@ function findGrassTop(voxels: Uint8Array, wx: number, wz: number): number {
  * Stamp a single tree into the voxel grid. The trunk is a vertical cylinder of WOOD;
  * the canopy is an ellipsoidal blob of LEAF voxels with hashed jitter so each tree
  * isn't a perfect sphere.
+ *
+ * Exported so saplings can reuse the same stamping shape when they mature.
  */
-function stampTree(
+export function stampTree(
   voxels: Uint8Array,
   baseX: number, baseY: number, baseZ: number,
   shape: TreeShape,

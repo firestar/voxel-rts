@@ -93,6 +93,74 @@ export function buildSoldierLegGeometry(): THREE.BufferGeometry {
 export const SOLDIER_HIP_Y = 0.55;
 export const SOLDIER_LEG_X = 0.10;
 
+// ---------- Worker -----------------------------------------------------------
+// Civilian harvester / transporter. Same scale as the soldier (~1.6 m tall)
+// but in distinctive blue work clothes + yellow hard hat. Same hip pivot so
+// the leg geometry can be reused with a recolour.
+
+const WORKER_JEANS = { r: 0.20, g: 0.30, b: 0.55 };
+const WORKER_SHIRT = { r: 0.78, g: 0.55, b: 0.18 }; // hi-vis tan
+const WORKER_HAT   = { r: 0.95, g: 0.78, b: 0.10 }; // safety yellow
+const WORKER_BOOT  = { r: 0.16, g: 0.12, b: 0.10 };
+
+export function buildWorkerBodyGeometry(): THREE.BufferGeometry {
+  const skin = { r: 0.85, g: 0.70, b: 0.55 };
+  const tool = { r: 0.28, g: 0.20, b: 0.12 };       // wooden pickaxe handle
+  const head = { r: 0.55, g: 0.55, b: 0.58 };       // pickaxe head
+  const beltStrap = { r: 0.35, g: 0.22, b: 0.14 };
+
+  const blocks: VoxelBlock[] = [
+    // Torso (hi-vis vest over a darker shirt)
+    { x: 0.00, y: 0.78, z: 0.00, sx: 0.46, sy: 0.50, sz: 0.28, ...WORKER_SHIRT },
+    // Tool belt
+    { x: 0.00, y: 0.55, z: 0.00, sx: 0.50, sy: 0.06, sz: 0.32, ...beltStrap },
+    // Neck + head
+    { x: 0.00, y: 1.07, z: 0.00, sx: 0.16, sy: 0.10, sz: 0.16, ...skin },
+    { x: 0.00, y: 1.22, z: 0.00, sx: 0.32, sy: 0.30, sz: 0.32, ...skin },
+    // Hard hat — domed top + narrow brim
+    { x: 0.00, y: 1.40, z: 0.00, sx: 0.36, sy: 0.14, sz: 0.36, ...WORKER_HAT },
+    { x: 0.00, y: 1.32, z: 0.04, sx: 0.40, sy: 0.04, sz: 0.40, ...WORKER_HAT },
+    // Arms — left at side, right gripping a pickaxe forward
+    { x: -0.30, y: 0.78, z: 0.00, sx: 0.14, sy: 0.46, sz: 0.18, ...WORKER_SHIRT },
+    { x:  0.30, y: 0.85, z: -0.06, sx: 0.14, sy: 0.18, sz: 0.30, ...WORKER_SHIRT },
+    { x:  0.30, y: 0.66, z: -0.16, sx: 0.14, sy: 0.18, sz: 0.18, ...WORKER_SHIRT },
+    // Pickaxe — handle running forward, head crossways near the tip
+    { x:  0.30, y: 0.84, z: -0.34, sx: 0.05, sy: 0.05, sz: 0.40, ...tool },
+    { x:  0.30, y: 0.84, z: -0.50, sx: 0.30, sy: 0.10, sz: 0.06, ...head },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+/** One worker leg, modeled identically to the soldier leg but in jeans / boot colours. */
+export function buildWorkerLegGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [
+    { x: 0.0, y: -0.25, z: 0.0, sx: 0.18, sy: 0.50, sz: 0.20, ...WORKER_JEANS },
+    { x: 0.0, y: -0.55, z: 0.04, sx: 0.20, sy: 0.10, sz: 0.26, ...WORKER_BOOT },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+/**
+ * Carry pack — a small crate that floats above the worker's back when
+ * carrying anything. Two variants (wood / metal) are colour-coded so the
+ * player can tell at a glance what each worker is holding.
+ */
+export function buildWorkerCrateGeometry(metal: boolean): THREE.BufferGeometry {
+  const wood = { r: 0.40, g: 0.28, b: 0.16 };
+  const metalCol = { r: 0.50, g: 0.55, b: 0.65 };
+  const c = metal ? metalCol : wood;
+  const trim = metal ? { r: 0.30, g: 0.32, b: 0.36 } : { r: 0.22, g: 0.16, b: 0.10 };
+  const blocks: VoxelBlock[] = [
+    { x: 0, y: 0, z: 0, sx: 0.34, sy: 0.30, sz: 0.26, ...c },
+    { x: 0, y: 0.16, z: 0, sx: 0.36, sy: 0.04, sz: 0.28, ...trim },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+/** Worker uses the same hip pivot offsets as the soldier. */
+export const WORKER_HIP_Y = 0.55;
+export const WORKER_LEG_X = 0.10;
+
 // ---------- Tank --------------------------------------------------------------
 // Scaled ~2x from earlier so it reads as a proper vehicle next to a 1.6 m soldier.
 // Rough dimensions: 3.2 m long, 2.4 m wide (incl. treads), 2.0 m tall to top of antenna.

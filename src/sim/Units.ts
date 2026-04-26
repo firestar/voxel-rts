@@ -12,7 +12,33 @@ import {
   WORM_SEGMENT_COUNT, WORM_SEGMENT_SPACING,
 } from '../render/UnitModels';
 
-export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm';
+export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'worker';
+
+/**
+ * Worker role. Harvesters auto-find resources (trees, exposed metal ore) and
+ * mine them, dropping piles when full. Transporters watch piles and ferry
+ * them to storage buildings. Both share the same UnitKind, geometry, and
+ * config — only the `tickWorkers` automation differentiates them.
+ */
+export type WorkerRole = 'harvester' | 'transporter';
+
+/**
+ * Worker task — what the per-frame `tickWorkers` automation should do for
+ * this worker right now. The state machine lives in `Workers.ts`; this is
+ * just the shape it stores on each Unit.
+ */
+export type WorkerTask =
+  | { kind: 'idle' }
+  /** Harvester chopping a wood voxel at the given world meters. */
+  | { kind: 'chop'; wx: number; wy: number; wz: number }
+  /** Harvester mining a metal-ore voxel at the given world meters. */
+  | { kind: 'mine'; wx: number; wy: number; wz: number }
+  /** Player-issued plant action; once at target xz, calls SaplingManager.plant. */
+  | { kind: 'plant'; wx: number; wz: number }
+  /** Transporter is en-route to claimedPileId. */
+  | { kind: 'fetchPile'; pileId: number }
+  /** Carrying resources back to a storage building (transporter or harvester). */
+  | { kind: 'deliver' };
 
 /** Downward acceleration in m/s². Slightly snappier than real-world 9.81 — units feel
  *  "weighty" without dragging out the fall arc. Per-unit terminal velocity then sets
@@ -141,6 +167,28 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         cutterHeight: TUNNELER_CUTTER_HEIGHT,
         segmentCount: 0, segmentSpacing: 0,
       };
+    case 'worker':
+      // Civilian worker. Single-cell footprint, soldier-class agility on
+      // hills (so they can scramble between an ore deposit and a depot
+      // without getting stuck on shallow benches), but slower than a soldier
+      // since they're carrying tools / payload. canDig stays false — workers
+      // mine voxels via direct damageSphere calls in tickWorkers, not by
+      // pathing through solid.
+      return {
+        footprintRadius: 1, widthMeters: 0.65,
+        maxStepVoxels: 24, slopePenalty: 0.10,
+        bodyHalfCells: 0, bodyRoughnessVoxels: 999,
+        turnRateRadPerSec: 5.0,
+        maxPitchRad: Math.PI / 2,
+        heightVoxels: 14,
+        canDig: false, requiresGround: true,
+        speed: 3.2, speedDigging: 0,
+        hp: 60,
+        massKg: 75,
+        terminalFallSpeed: 28,
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
+      };
     case 'worm':
       // Smaller, articulated tunneler. Head (the controlled body) carries a narrower
       // cutter than the TBM — ~1.7 m diameter shaft vs the tunneler's 3.4 m. Body
@@ -211,6 +259,23 @@ export interface Unit {
   cutterForward: number;
   cutterHeight: number;
   /**
+   * Worker role — only meaningful when `kind === 'worker'`. Defaults to
+   * 'harvester' for non-worker spawns; tickWorkers ignores non-workers
+   * entirely so the value is harmless.
+   */
+  workerRole: WorkerRole;
+  /**
+   * Worker's current automation task. 'idle' means tickWorkers will pick a
+   * new task next frame (find nearest tree / ore for harvesters; nearest
+   * pile for transporters). Non-workers always carry { kind: 'idle' }.
+   */
+  task: WorkerTask;
+  /**
+   * What the worker is currently carrying. Capacity is enforced by the
+   * automation tick (CARRY_CAP). Non-workers leave this at zero.
+   */
+  carrying: { wood: number; metals: number };
+  /**
    * Trailing body segments for chain-bodied diggers (worm). Empty for everyone else.
    * Element 0 is the segment closest to the head; each subsequent segment trails
    * further back. Each segment is placed at an exact arc-length offset along the
@@ -272,7 +337,7 @@ export class UnitManager {
   units: Unit[] = [];
   private nextId = 1;
 
-  spawn(kind: UnitKind, x: number, y: number, z: number): Unit {
+  spawn(kind: UnitKind, x: number, y: number, z: number, opts?: { workerRole?: WorkerRole }): Unit {
     const cfg = unitConfig(kind);
     const segments: WormSegment[] = [];
     for (let i = 0; i < cfg.segmentCount; i++) {
@@ -331,6 +396,9 @@ export class UnitManager {
       cutterRadius: cfg.cutterRadius,
       cutterForward: cfg.cutterForward,
       cutterHeight: cfg.cutterHeight,
+      workerRole: opts?.workerRole ?? 'harvester',
+      task: { kind: 'idle' },
+      carrying: { wood: 0, metals: 0 },
       segments,
       pathHistory,
     };

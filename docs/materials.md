@@ -19,6 +19,8 @@ Source: `src/voxel/Materials.ts`.
 | 7 | `M_BEDROCK` | bedrock | 0 | (40, 40, 50) | Indestructible (`hp = 0` sentinel) |
 | 8 | `M_MUD` | mud | 10 | (70, 52, 28) | Soft; tank tread marks chew through fast |
 | 9 | `M_DIRT_ROAD` | dirt_road | 28 | (126, 92, 56) | Dirt branches off paved roads — milder A* discount |
+| 10 | `M_METAL` | metal | 80 | (140, 152, 178) | Underground ore patches; harvesters mine exposed voxels |
+| 11 | `M_FARM` | farm | 15 | (212, 182, 90) | Cropland tiles stamped by farms; cosmetic |
 
 `hp = 0` means **indestructible** for non-air ids (bedrock). Air uses 0 hp
 as a sentinel because it isn't damageable anyway.
@@ -38,6 +40,8 @@ as a sentinel because it isn't damageable anyway.
 | path | 0.85 | Compacted dirt |
 | wood | 0.55 | Medium |
 | stone | 0.30 | Hard |
+| metal | 0.35 | Hard ore — slightly easier than raw stone |
+| farm | 1.0 | Cropland; behaves like soft soil if a cutter passes through |
 | bedrock | 0 | Uncuttable |
 | (default) | 0.5 | Unknown |
 
@@ -52,6 +56,8 @@ as a sentinel because it isn't damageable anyway.
 | path | 1.15 | Fastest — beaten road |
 | leaf | 0.9 | Soft canopy underfoot |
 | stone | 0.95 | Slightly less grippy |
+| metal | 0.9 | Ore boulders — uneven footing |
+| farm | 1.0 | Tilled soil; walks like grass |
 | (default) | 1.0 | |
 
 ## Tread damage — `trackDamageFor(m)`
@@ -78,3 +84,9 @@ tank actually sinks into mud as it rolls.
 - `M_LEAF` and `M_WOOD` are deliberately skipped in `findFootprintTopVoxel`
   and in `buildSurfaceNav`'s topY scan so units stand on the ground beneath
   trees, not on canopies. Don't accidentally re-enable them.
+- `M_METAL` is placed by `placeMetals` (`src/voxel/Metals.ts`) as large
+  ellipsoidal patches inside stone/dirt — most patches are deep enough that
+  exposing them requires a tunneler, but ~25% spawn shallow so a fresh map
+  always has surface ore for early-game harvesters.
+- `M_FARM` is purely visual — stamped by `stampFarm` inside the building
+  footprint and never written elsewhere. Don't gate logic on it.

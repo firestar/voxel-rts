@@ -14,12 +14,22 @@ import { UnitRenderer } from '../render/UnitRenderer';
 import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { worldToVolumeCell, vnavIndex, getBit } from '../path/VolumeNav';
 import { trackDamageFor } from '../voxel/Materials';
-import { BuildingManager, BARRACKS, checkFootprint } from '../sim/Buildings';
+import { BuildingManager, BARRACKS, FARM, STORAGE, BuildingSpec, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { PathPreview } from '../render/PathPreview';
 import { TargetMarker } from '../render/TargetMarker';
+import { Resources } from '../sim/Resources';
+import { PileManager } from '../sim/Piles';
+import { SaplingManager } from '../sim/Saplings';
+import { tickWorkers } from '../sim/Workers';
+import { M_WOOD, M_METAL } from '../voxel/Materials';
 
-type Mode = 'play' | 'build';
+/**
+ * Player UI mode. `build*` modes preview a building footprint; `plant` mode
+ * tells the next LMB-on-grass to dispatch a sapling-plant task to the
+ * selected worker. `play` is everything else.
+ */
+type Mode = 'play' | 'buildBarracks' | 'buildFarm' | 'buildStorage' | 'plant';
 
 export class Game {
   readonly renderer: Renderer;
@@ -34,6 +44,9 @@ export class Game {
   readonly ghost = new BuildingGhost();
   readonly pathPreview = new PathPreview();
   readonly target = new TargetMarker();
+  readonly resources = new Resources();
+  readonly piles = new PileManager();
+  readonly saplings = new SaplingManager();
   pathClient: PathClient | null = null;
   /** Pixels of vertical drag = 1 m of altitude offset for tunneler targets. */
   private readonly altitudeDragSensitivity = 8;
@@ -72,6 +85,9 @@ export class Game {
     this.ghost.setSpec(BARRACKS);
 
     this.buildings.spawner = (kind, x, y, z): Unit | null => this.spawnUnit(kind, x, y, z);
+    // Farms feed the resource counter via the manager's foodSink hook so the
+    // sim doesn't have to know about Resources directly.
+    this.buildings.foodSink = (amount): void => { this.resources.food += amount; };
 
     this.fpsEl = statsEl;
     this.modeEl = document.getElementById('mode');
@@ -109,11 +125,39 @@ export class Game {
     this.spawnUnit('tank', c.x + 3.0, c.y, c.z);
     this.spawnUnit('tunneler', c.x - 2.0, c.y, c.z);
     this.spawnUnit('worm', c.x + 0.5, c.y, c.z + 4.0);
+    // Two harvester workers + one transporter so the player sees the
+    // economy loop running from the first frame. They auto-pick targets
+    // via tickWorkers — the player can still override with click commands.
+    this.spawnWorker('harvester', c.x - 4.0, c.y, c.z + 1.0);
+    this.spawnWorker('harvester', c.x - 4.5, c.y, c.z - 1.0);
+    this.spawnWorker('transporter', c.x - 3.0, c.y, c.z + 2.5);
+
+    // Place a starter Storage depot near spawn so transporters always have a
+    // delivery target. We try a handful of candidate footprints around the
+    // central flat cell; first valid wins. If none is valid (very rare on a
+    // generated world) we just skip — the player can build one manually.
+    const startCx = found.cx;
+    const startCz = found.cz;
+    const offsets: [number, number][] = [[5, 0], [-5, 0], [0, 5], [0, -5], [4, 4], [-4, -4]];
+    for (const [dx, dz] of offsets) {
+      const ox = Math.max(0, Math.min(NAV_W - STORAGE.cellsW, startCx + dx - (STORAGE.cellsW >> 1)));
+      const oz = Math.max(0, Math.min(NAV_H - STORAGE.cellsD, startCz + dz - (STORAGE.cellsD >> 1)));
+      const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, STORAGE, ox, oz);
+      if (fp.ok) {
+        this.buildings.place(this.world, STORAGE, ox, oz, fp.floorY);
+        this.requestNavRebuild(false);
+        break;
+      }
+    }
     this.camera.target.set(c.x, 0, c.z);
   }
 
   private spawnUnit(kind: UnitKind, x: number, y: number, z: number): Unit | null {
     return this.units.spawn(kind, x, y, z);
+  }
+
+  private spawnWorker(role: 'harvester' | 'transporter', x: number, y: number, z: number): Unit | null {
+    return this.units.spawn('worker', x, y, z, { workerRole: role });
   }
 
   start(): void {
@@ -139,17 +183,25 @@ export class Game {
       width: w, height: h,
     }, dt);
 
+    // Build-mode cycle: Play → Barracks → Farm → Storage → Play. Each press
+    // of 'B' advances one step. 'P' toggles plant mode (only meaningful with
+    // a worker selected; the click handler enforces that).
     if (this.input.pressed.has('KeyB')) {
-      this.mode = this.mode === 'build' ? 'play' : 'build';
-      if (this.mode !== 'build') this.ghost.hide();
+      this.mode = nextBuildMode(this.mode);
+      this.applyGhostSpec();
+      if (!isBuildMode(this.mode)) this.ghost.hide();
     }
-    if (this.input.pressed.has('Escape') && this.mode === 'build') {
+    if (this.input.pressed.has('KeyP')) {
+      this.mode = this.mode === 'plant' ? 'play' : 'plant';
+      this.ghost.hide();
+    }
+    if (this.input.pressed.has('Escape') && this.mode !== 'play') {
       this.mode = 'play';
       this.ghost.hide();
     }
     if (this.input.pressed.has('Tab')) this.cycleSelection();
 
-    if (this.mode === 'build') {
+    if (isBuildMode(this.mode)) {
       this.updateGhost(w, h);
     }
 
@@ -163,6 +215,21 @@ export class Game {
       this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, this.world.buffers.voxels, (req) => this.handleCarve(req));
       this.buildings.tick(dt, this.world, this.units);
       this.paintTankTracks();
+      // Worker automation: drive harvesters / transporters. Routing is
+      // delegated back to routePath via the routeWorker callback so the
+      // existing path client is reused unchanged.
+      tickWorkers(dt, {
+        units: this.units,
+        world: this.world,
+        buildings: this.buildings,
+        piles: this.piles,
+        saplings: this.saplings,
+        resources: this.resources,
+        routeWorker: (u, wx, wy, wz): void => { void this.routePath(u, wx, wy, wz); },
+        onVoxelEdit: (): void => { this.requestNavRebuild(false); },
+      });
+      const grow = this.saplings.tick(dt, this.world);
+      if (grow.matured > 0) this.requestNavRebuild(false);
     }
     this.unitRenderer.update(this.units);
 
@@ -183,13 +250,16 @@ export class Game {
     this.fpsTimer += dt;
     if (this.fpsTimer >= 0.5 && this.fpsEl) {
       const fps = this.fpsCount / this.fpsAcc;
-      this.fpsEl.textContent = `FPS ${fps.toFixed(0)} | meshed ${this.meshes.getMeshCount()} | inflight ${this.meshes.getInflight()} | units ${this.units.units.length} | buildings ${this.buildings.buildings.length}`;
+      const r = this.resources;
+      this.fpsEl.textContent = `FPS ${fps.toFixed(0)} | meshed ${this.meshes.getMeshCount()} | inflight ${this.meshes.getInflight()} | units ${this.units.units.length} | buildings ${this.buildings.buildings.length} | wood ${r.wood} metals ${r.metals} food ${r.food} | piles ${this.piles.piles.length}`;
       this.fpsAcc = 0; this.fpsCount = 0; this.fpsTimer = 0;
     }
     if (this.modeEl) {
       const sel = this.units.units.find(u => u.selected);
-      const selDesc = sel ? `${sel.kind} #${sel.id}` : 'none';
-      this.modeEl.textContent = `${this.mode === 'build' ? 'MODE: BUILD (LMB place, Esc cancel)' : 'MODE: PLAY'} | selected: ${selDesc}`;
+      const selDesc = sel
+        ? (sel.kind === 'worker' ? `worker(${sel.workerRole}) #${sel.id}` : `${sel.kind} #${sel.id}`)
+        : 'none';
+      this.modeEl.textContent = `${describeMode(this.mode)} | selected: ${selDesc}`;
     }
   }
 
@@ -211,6 +281,8 @@ export class Game {
 
   private updateGhost(w: number, h: number): void {
     if (!this.pathClient) return;
+    const spec = this.activeBuildSpec();
+    if (!spec) { this.ghost.hide(); return; }
     if (this.input.mouseX < 0) { this.ghost.hide(); return; }
     const { origin, dir } = this.rayFromScreen(this.input.mouseX, this.input.mouseY, w, h);
     const hit = raycastVoxel(this.world, origin, dir, 200);
@@ -218,10 +290,26 @@ export class Game {
     const wx = hit.x * VOXEL_SIZE;
     const wz = hit.z * VOXEL_SIZE;
     const cell = this.pathClient.cellAt(wx, wz);
-    const ox = Math.max(0, Math.min(NAV_W - BARRACKS.cellsW, cell.cx - (BARRACKS.cellsW >> 1)));
-    const oz = Math.max(0, Math.min(NAV_H - BARRACKS.cellsD, cell.cz - (BARRACKS.cellsD >> 1)));
-    const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, BARRACKS, ox, oz);
+    const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
+    const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
+    const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, spec, ox, oz);
     this.ghost.place(ox, oz, fp.floorY >= 0 ? fp.floorY : hit.y, fp.ok);
+  }
+
+  /** The BuildingSpec that matches the current build-mode (or null in non-build modes). */
+  private activeBuildSpec(): BuildingSpec | null {
+    switch (this.mode) {
+      case 'buildBarracks': return BARRACKS;
+      case 'buildFarm':     return FARM;
+      case 'buildStorage':  return STORAGE;
+      default:              return null;
+    }
+  }
+
+  /** Make the ghost preview reflect the current build spec (resizes the box). */
+  private applyGhostSpec(): void {
+    const spec = this.activeBuildSpec();
+    if (spec) this.ghost.setSpec(spec);
   }
 
   /**
@@ -276,7 +364,7 @@ export class Game {
 
   private updateLmbPreview(w: number, h: number): void {
     const hold = this.input.hold;
-    if (!hold || this.mode === 'build' || hold.shift) {
+    if (!hold || isBuildMode(this.mode) || this.mode === 'plant' || hold.shift) {
       this.target.hide();
       return;
     }
@@ -298,7 +386,7 @@ export class Game {
 
   private handleRelease(release: { startX: number; startY: number; endX: number; endY: number; shift: boolean }, w: number, h: number): void {
     this.target.hide();
-    if (this.mode === 'build') {
+    if (isBuildMode(this.mode)) {
       const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
       if (r) this.tryPlaceBuilding(r.voxelXYZ);
       return;
@@ -309,6 +397,17 @@ export class Game {
       return;
     }
     const selected = this.units.units.find(u => u.selected);
+    if (this.mode === 'plant') {
+      // Plant mode: only meaningful with a harvester worker selected. Click
+      // anywhere on terrain — we drop the plant task at the click voxel xz
+      // and let tickWorkers route the worker to it.
+      const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
+      if (!r || !selected || selected.kind !== 'worker' || selected.workerRole !== 'harvester') return;
+      const wx = r.target.x, wz = r.target.z;
+      selected.task = { kind: 'plant', wx, wz };
+      void this.routePath(selected, wx, selected.y, wz);
+      return;
+    }
     const verticalDrag = release.endY - release.startY;
     const useDrag = selected?.canDig === true;
     // Same as updateLmbPreview — tunneler base height = its own y, so a no-drag
@@ -320,6 +419,35 @@ export class Game {
     const pitchOrigin = useDrag && selected ? { x: selected.x, z: selected.z } : undefined;
     const r = this.resolveTarget(release.startX, release.startY, w, h, useDrag ? verticalDrag : 0, baseY, pitchCap, pitchOrigin);
     if (!r) return;
+
+    // Worker LMB targets a specific voxel. If it's wood / metal we set the
+    // matching task; otherwise fall through to a generic move.
+    if (selected && selected.kind === 'worker' && selected.workerRole === 'harvester') {
+      const m = this.world.get(r.voxelXYZ.x, r.voxelXYZ.y, r.voxelXYZ.z);
+      if (m === M_WOOD) {
+        selected.task = {
+          kind: 'chop',
+          wx: (r.voxelXYZ.x + 0.5) * VOXEL_SIZE,
+          wy: (r.voxelXYZ.y + 0.5) * VOXEL_SIZE,
+          wz: (r.voxelXYZ.z + 0.5) * VOXEL_SIZE,
+        };
+        void this.routePath(selected, selected.task.wx, selected.task.wy, selected.task.wz);
+        return;
+      }
+      if (m === M_METAL) {
+        selected.task = {
+          kind: 'mine',
+          wx: (r.voxelXYZ.x + 0.5) * VOXEL_SIZE,
+          wy: (r.voxelXYZ.y + 0.5) * VOXEL_SIZE,
+          wz: (r.voxelXYZ.z + 0.5) * VOXEL_SIZE,
+        };
+        void this.routePath(selected, selected.task.wx, selected.task.wy, selected.task.wz);
+        return;
+      }
+      // Empty click → cancel any task and walk to the surface point.
+      selected.task = { kind: 'idle' };
+    }
+
     void this.commandMoveToWorld(r.target.x, r.target.y, r.target.z);
   }
 
@@ -332,14 +460,16 @@ export class Game {
 
   private tryPlaceBuilding(hit: { x: number; z: number }): void {
     if (!this.pathClient) return;
+    const spec = this.activeBuildSpec();
+    if (!spec) return;
     const wx = hit.x * VOXEL_SIZE;
     const wz = hit.z * VOXEL_SIZE;
     const cell = this.pathClient.cellAt(wx, wz);
-    const ox = Math.max(0, Math.min(NAV_W - BARRACKS.cellsW, cell.cx - (BARRACKS.cellsW >> 1)));
-    const oz = Math.max(0, Math.min(NAV_H - BARRACKS.cellsD, cell.cz - (BARRACKS.cellsD >> 1)));
-    const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, BARRACKS, ox, oz);
+    const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
+    const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
+    const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, spec, ox, oz);
     if (!fp.ok) return;
-    this.buildings.place(this.world, BARRACKS, ox, oz, fp.floorY);
+    this.buildings.place(this.world, spec, ox, oz, fp.floorY);
     this.requestNavRebuild();
   }
 
@@ -599,4 +729,29 @@ export class Game {
     this.renderer.resize(w, h);
     this.camera.resize(w, h);
   };
+}
+
+/** Cycle Play → Barracks → Farm → Storage → Play on each press of B. */
+function nextBuildMode(m: Mode): Mode {
+  switch (m) {
+    case 'play':           return 'buildBarracks';
+    case 'buildBarracks':  return 'buildFarm';
+    case 'buildFarm':      return 'buildStorage';
+    case 'buildStorage':   return 'play';
+    case 'plant':          return 'buildBarracks';
+  }
+}
+
+function isBuildMode(m: Mode): boolean {
+  return m === 'buildBarracks' || m === 'buildFarm' || m === 'buildStorage';
+}
+
+function describeMode(m: Mode): string {
+  switch (m) {
+    case 'play':           return 'MODE: PLAY';
+    case 'buildBarracks':  return 'MODE: BUILD BARRACKS (LMB place, B cycle, Esc cancel)';
+    case 'buildFarm':      return 'MODE: BUILD FARM (LMB place, B cycle, Esc cancel)';
+    case 'buildStorage':   return 'MODE: BUILD STORAGE (LMB place, B cycle, Esc cancel)';
+    case 'plant':          return 'MODE: PLANT SAPLING (LMB on grass, P cancel)';
+  }
 }

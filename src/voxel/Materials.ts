@@ -23,6 +23,13 @@ export const MATERIALS: Material[] = [
   // Dirt road — graded, compacted dirt. Warmer/redder than raw dirt so the
   // network is visually distinct from exposed soil.
   { id: 9, name: 'dirt_road', hp: 28, r: 126, g: 92, b: 56 },
+  // Metal ore — appears in large underground patches inside stone. Workers can
+  // mine exposed voxels (any metal voxel adjacent to air). Visually a cool
+  // gray-blue so it stands out from stone when a tunnel cuts into a vein.
+  { id: 10, name: 'metal',    hp: 80,  r: 140, g: 152, b: 178 },
+  // Farm crops — purely cosmetic golden-wheat tiles laid down by stampFarm.
+  // No special speed/dig behaviour; default-cased in the helpers below.
+  { id: 11, name: 'farm',     hp: 15,  r: 212, g: 182, b: 90  },
 ];
 
 export const M_AIR = 0;
@@ -35,6 +42,8 @@ export const M_PATH = 6;
 export const M_BEDROCK = 7;
 export const M_MUD = 8;
 export const M_DIRT_ROAD = 9;
+export const M_METAL = 10;
+export const M_FARM = 11;
 
 // Flat RGBA palette (length = MATERIALS.length * 4) for fast worker lookup.
 export function materialColors(): Uint8Array {
@@ -70,6 +79,8 @@ export function digSpeedMultiplier(m: MaterialId): number {
     case M_PATH:    return 0.85; // compacted dirt
     case M_WOOD:    return 0.55; // medium
     case M_STONE:   return 0.30; // hard — really slows the dig
+    case M_METAL:   return 0.35; // hard ore — slightly easier than raw stone
+    case M_FARM:    return 1.0;  // soft cropland; behaves like dirt under a cutter
     case M_BEDROCK: return 0;    // can't be cut
     default:        return 0.5;  // unknown = play safe
   }
@@ -89,6 +100,8 @@ export function groundSpeedMultiplier(m: MaterialId): number {
     case M_PATH:  return 1.15;  // fastest — a beaten road
     case M_LEAF:  return 0.9;   // soft canopy underfoot
     case M_STONE: return 0.95;  // bare rock is slightly less grippy
+    case M_METAL: return 0.9;   // ore boulders — uneven footing
+    case M_FARM:  return 1.0;   // tilled soil walks like grass
     default:      return 1.0;
   }
 }
