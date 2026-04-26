@@ -60,16 +60,20 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         hp: 80,
       };
     case 'tank':
-      // 3x3 cells (3 m x 3 m) under the body. Roughness raised to 6 voxels (0.75 m
-       // residual from the plane fit) so the tank can park on natural undulating
-       // terrain without rejecting anything that isn't a billiard table.
-      // maxStepVoxels = 18 voxels (2.25 m climb between adjacent cells ≈ 66° slope).
+      // Tanks are restricted to fairly flat terrain.
+      //   maxStepVoxels = 4 voxels (0.5 m climb between adjacent 1 m cells, ~27° slope).
+      //   bodyRoughnessVoxels = 5 (0.625 m residual from the plane fit) — uniform slopes
+      //     up to that 27° still pass, but ridges and rocky bumps are rejected.
+      //   slopePenalty = 0.25 — A* actively prefers flatter routes even when steeper
+      //     ones are technically allowed.
+      // Cliffs / steep hills now hard-block tank routes; the unit will detour around
+      // them instead of trying to scale them.
       return {
         footprintRadius: 2, widthMeters: 2.4,
-        maxStepVoxels: 18, slopePenalty: 0.10,
-        bodyHalfCells: 1, bodyRoughnessVoxels: 6,
+        maxStepVoxels: 4, slopePenalty: 0.25,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 5,
         turnRateRadPerSec: 1.4,                  // ~80°/s — tank pivots are slow
-        maxPitchRad: Math.PI / 3,                // 60° — steep slopes OK, no flipping
+        maxPitchRad: Math.PI / 6,                // 30° — pitched body cap matches the climb cap
         canDig: false, requiresGround: true,
         speed: 3.5, speedDigging: 0,
         hp: 220,

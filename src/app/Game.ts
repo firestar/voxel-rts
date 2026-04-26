@@ -12,7 +12,7 @@ import { PathClient } from '../path/PathClient';
 import { UnitManager, Unit, UnitKind, CarveRequest } from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
 import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS } from '../path/SurfaceNav';
-import { worldToVolumeCell } from '../path/VolumeNav';
+import { worldToVolumeCell, vnavIndex, getBit } from '../path/VolumeNav';
 import { trackDamageFor } from '../voxel/Materials';
 import { BuildingManager, BARRACKS, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
@@ -388,6 +388,16 @@ export class Game {
     const useVolume = unit.canDig || goalUnderground || startUnderground;
 
     if (useVolume) {
+      // Tunneler shortcut — it can grind through anything that isn't bedrock, so
+      // we don't need a graph search to find a route. Just heading straight at
+      // the destination is correct in the common case; the only reasons to fall
+      // back to volume A* are:
+      //   - the line would require a steeper climb/dive than the unit can pitch,
+      //   - or it crosses a bedrock cell the unit physically can't cut.
+      if (unit.canDig && this.tunnelerCanGoStraight(unit, wx, wy, wz)) {
+        this.units.setPath(unit, [{ x: wx, y: wy, z: wz }]);
+        return;
+      }
       const startCell = worldToVolumeCell(unit.x, unit.y, unit.z);
       const goalCell = worldToVolumeCell(wx, wy, wz);
       const res = await this.pathClient.requestVolumePath({
@@ -491,6 +501,43 @@ export class Game {
     // Only request a nav rebuild when track damage actually removed voxels (changed
     // topY); a no-op pass over compacted grass/dirt just bumps damage counters.
     if (anythingDestroyed) this.requestNavRebuild(false);
+  }
+
+  /**
+   * Validate a straight-line route for a tunneler from its current position to the
+   * world-space goal. Returns true when:
+   *   - the climb/dive pitch is within the unit's maxPitchRad, AND
+   *   - no volume cell along the line is marked bedrock.
+   *
+   * Anything else is fair game — the cutter chews through dirt, stone, and walks
+   * through air with the same path. This is what lets the tunneler ignore the volume
+   * A* on the common case where the user just wants it to head toward a target.
+   */
+  private tunnelerCanGoStraight(unit: { x: number; y: number; z: number; maxPitchRad: number }, wx: number, wy: number, wz: number): boolean {
+    if (!this.pathClient) return false;
+    const dx = wx - unit.x, dy = wy - unit.y, dz = wz - unit.z;
+    const horiz = Math.hypot(dx, dz);
+    const pitch = horiz < 1e-4 ? Math.PI / 2 : Math.atan2(Math.abs(dy), horiz);
+    if (pitch > unit.maxPitchRad) return false;
+
+    const dist = Math.hypot(dx, dy, dz);
+    if (dist < 1e-3) return true;
+    // One sample per metre — volume cells are 1 m so this hits every cell on the line.
+    const steps = Math.max(1, Math.ceil(dist));
+    const vnav = this.pathClient.vnav;
+    let lastIdx = -1;
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const sx = unit.x + dx * t;
+      const sy = unit.y + dy * t;
+      const sz = unit.z + dz * t;
+      const cell = worldToVolumeCell(sx, sy, sz);
+      const idx = vnavIndex(cell.cx, cell.cy, cell.cz);
+      if (idx === lastIdx) continue;
+      lastIdx = idx;
+      if (getBit(vnav.bedrock, idx)) return false;
+    }
+    return true;
   }
 
   /** World-space Y (meters) of the topY voxel under the given world-space (x, z). */

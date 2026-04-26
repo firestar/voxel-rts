@@ -107,4 +107,66 @@ describe('volume A*', () => {
   });
 });
 
+/**
+ * Regression test for the tunneler's straight-line shortcut. Game.tunnelerCanGoStraight
+ * is the gate; we replicate its logic locally to verify the rule on a clean world.
+ */
+function tunnelerStraightOk(
+  vnav: ReturnType<typeof allocateVolumeNav>,
+  start: { x: number; y: number; z: number },
+  goal: { x: number; y: number; z: number },
+  maxPitchRad: number,
+): boolean {
+  const dx = goal.x - start.x, dy = goal.y - start.y, dz = goal.z - start.z;
+  const horiz = Math.hypot(dx, dz);
+  const pitch = horiz < 1e-4 ? Math.PI / 2 : Math.atan2(Math.abs(dy), horiz);
+  if (pitch > maxPitchRad) return false;
+  const dist = Math.hypot(dx, dy, dz);
+  if (dist < 1e-3) return true;
+  const steps = Math.max(1, Math.ceil(dist));
+  let lastIdx = -1;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const sx = start.x + dx * t;
+    const sy = start.y + dy * t;
+    const sz = start.z + dz * t;
+    const cx = Math.floor(sx);
+    const cy = Math.floor(sy);
+    const cz = Math.floor(sz);
+    const idx = (cy * 96 + cz) * 96 + cx; // VNAV_X/Z = 96 — must match VolumeNav.ts
+    if (idx === lastIdx) continue;
+    lastIdx = idx;
+    const bit = (vnav.bedrock[idx >> 3]! >> (idx & 7)) & 1;
+    if (bit) return false;
+  }
+  return true;
+}
+
+describe('tunneler straight-line shortcut', () => {
+  it('horizontal direct path through stone is valid', () => {
+    const world = buildSolidWorld();
+    const vnav = allocateVolumeNav(false);
+    buildVolumeNav(world.buffers.voxels, vnav);
+    expect(tunnelerStraightOk(vnav, { x: 30, y: 8, z: 30 }, { x: 50, y: 8, z: 30 }, Math.PI / 4)).toBe(true);
+  });
+
+  it('rejects a steeper-than-max-pitch line', () => {
+    const world = buildSolidWorld();
+    const vnav = allocateVolumeNav(false);
+    buildVolumeNav(world.buffers.voxels, vnav);
+    // start and goal share xz, only y differs — vertical line, infinite pitch
+    expect(tunnelerStraightOk(vnav, { x: 30, y: 8, z: 30 }, { x: 30, y: 18, z: 30 }, Math.PI / 4)).toBe(false);
+  });
+
+  it('rejects a line crossing a bedrock cell', () => {
+    const world = buildSolidWorld();
+    const vnav = allocateVolumeNav(false);
+    buildVolumeNav(world.buffers.voxels, vnav);
+    // bedrock layer is at cy=0 (voxels y=0,1). A line from cy=2 to cy=2 stays clear
+    // even crossing solid stone (canDig handles that). A line that dips through cy=0
+    // should be rejected because of the bedrock bit.
+    expect(tunnelerStraightOk(vnav, { x: 10, y: 2.5, z: 10 }, { x: 30, y: 0.5, z: 30 }, Math.PI / 2)).toBe(false);
+  });
+});
+
 void VNAV_Y;
