@@ -228,7 +228,7 @@ export class Game {
    * (px, py) and an optional vertical drag in pixels (positive = drag down = go deeper).
    * Returns null when the ray misses geometry.
    */
-  private resolveTarget(px: number, py: number, w: number, h: number, verticalDragPx: number): {
+  private resolveTarget(px: number, py: number, w: number, h: number, verticalDragPx: number, baseY?: number): {
     surface: THREE.Vector3;
     target: THREE.Vector3;
     voxelXYZ: { x: number; y: number; z: number; nx: number; ny: number; nz: number };
@@ -240,7 +240,11 @@ export class Game {
     const wy = (hit.y + 0.5) * VOXEL_SIZE;
     const wz = (hit.z + 0.5) * VOXEL_SIZE;
     const dragMeters = verticalDragPx / this.altitudeDragSensitivity; // down = +meters depth
-    const target = new THREE.Vector3(wx, Math.max(0.5, wy - dragMeters), wz);
+    // Default base height is the click's voxel y. Callers pass `baseY` to override —
+    // tunnelers use their CURRENT y so vertical drag adjusts depth relative to where
+    // they already are, not relative to whatever the cursor happens to be over.
+    const base = baseY !== undefined ? baseY : wy;
+    const target = new THREE.Vector3(wx, Math.max(0.5, base - dragMeters), wz);
     return {
       surface: new THREE.Vector3(wx, wy, wz),
       target,
@@ -258,7 +262,12 @@ export class Game {
     // Preview only matters for tunnelers (vertical drag) — keep marker visible when held over terrain.
     if (!selected) { this.target.hide(); return; }
     const verticalDrag = hold.currentY - hold.startY;
-    const r = this.resolveTarget(hold.startX, hold.startY, w, h, selected.kind === 'tunneler' ? verticalDrag : 0);
+    const useDrag = selected.kind === 'tunneler';
+    // Tunneler depth is relative to its current Y (so the user can drop the cursor
+    // anywhere and a 0-drag click means "stay at this height"). Other units take
+    // the click's voxel y as the base.
+    const baseY = useDrag ? selected.y : undefined;
+    const r = this.resolveTarget(hold.startX, hold.startY, w, h, useDrag ? verticalDrag : 0, baseY);
     if (!r) { this.target.hide(); return; }
     this.target.show(r.surface, r.target);
   }
@@ -278,7 +287,10 @@ export class Game {
     const selected = this.units.units.find(u => u.selected);
     const verticalDrag = release.endY - release.startY;
     const useDrag = selected?.kind === 'tunneler';
-    const r = this.resolveTarget(release.startX, release.startY, w, h, useDrag ? verticalDrag : 0);
+    // Same as updateLmbPreview — tunneler base height = its own y, so a no-drag
+    // click means "head toward the click XZ at my current height".
+    const baseY = useDrag && selected ? selected.y : undefined;
+    const r = this.resolveTarget(release.startX, release.startY, w, h, useDrag ? verticalDrag : 0, baseY);
     if (!r) return;
     void this.commandMoveToWorld(r.target.x, r.target.y, r.target.z);
   }
