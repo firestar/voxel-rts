@@ -1,11 +1,11 @@
 import { VoxelWorld } from '../voxel/VoxelWorld';
 import { worldIndex } from '../voxel/VoxelWorld';
 import { WORLD_X, WORLD_Y, WORLD_Z, AIR, MaterialId, VOXEL_SIZE } from '../voxel/types';
-import { M_WOOD } from '../voxel/Materials';
+import { M_WOOD, M_FARM, M_DIRT_ROAD } from '../voxel/Materials';
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_VOXELS, NAV_CELL_METERS, FLAT_TOLERANCE_VOXELS } from '../path/SurfaceNav';
 import { UnitManager, UnitKind, Unit } from './Units';
 
-export type BuildingKind = 'barracks';
+export type BuildingKind = 'barracks' | 'farm' | 'storage';
 
 export interface BuildingSpec {
   kind: BuildingKind;
@@ -29,7 +29,42 @@ export const BARRACKS: BuildingSpec = {
   headroomVoxels: 24, // 3 m at 0.125 m voxels
   wall: M_WOOD,
   productionInterval: 6.0,
-  produces: ['soldier', 'tank', 'tunneler', 'worm', 'dozer', 'hauler'],
+  // Cycle through every kind the barracks can produce so a single building
+  // visibly outputs a balanced mix. Order is roughly "infantry → vehicles
+  // → diggers → economy" so the early ticks favour combat units.
+  produces: ['soldier', 'tank', 'tunneler', 'worm', 'dozer', 'hauler', 'worker'],
+};
+
+/**
+ * Farm — passive food generator. Smaller footprint than a barracks, no roof
+ * or door (it's an open field). Once built, it ticks `+5 food` every
+ * `productionInterval` seconds via the `foodSink` callback on
+ * `BuildingManager`. `produces` is empty — no units come out of farms.
+ */
+export const FARM: BuildingSpec = {
+  kind: 'farm',
+  cellsW: 3,
+  cellsD: 3,
+  headroomVoxels: 4,            // ~0.5 m fence + open sky
+  wall: M_DIRT_ROAD,            // low fence stamped from packed dirt
+  productionInterval: 5.0,      // food tick interval (seconds)
+  produces: [],
+};
+
+/**
+ * Storage depot — where transporter workers drop resources for the player's
+ * counters. Same wooden walls as a barracks but smaller and roofless. No
+ * production. The visit detection lives in `tickWorkers` (Workers.ts), not
+ * here — `BuildingManager.tick` for storage is a no-op.
+ */
+export const STORAGE: BuildingSpec = {
+  kind: 'storage',
+  cellsW: 3,
+  cellsD: 3,
+  headroomVoxels: 12,
+  wall: M_WOOD,
+  productionInterval: 0,        // no timer-driven behaviour
+  produces: [],
 };
 
 export interface FootprintHit {
@@ -167,6 +202,48 @@ export function stampBarracks(
 }
 
 /**
+ * Stamp a Farm: an open square of M_FARM crop tiles, surrounded by a
+ * single-voxel-tall fence of `spec.wall`. No roof, no door — just a field.
+ * Returns the count of fence voxels written so the manager can detect
+ * destruction with the same threshold logic barracks uses.
+ */
+export function stampFarm(
+  world: VoxelWorld,
+  spec: BuildingSpec,
+  ox: number, oz: number,
+  floorY: number,
+): number {
+  const wxStart = ox * NAV_CELL_VOXELS;
+  const wzStart = oz * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const yField = floorY + 1;
+  const yFenceTop = yField; // single-voxel fence sits AT yField on the perimeter
+
+  let fenceCount = 0;
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      const onPerimeter =
+        x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+      if (onPerimeter) {
+        // Fence column: a single voxel of wall at yField, air just above.
+        if (yFenceTop >= 0 && yFenceTop < WORLD_Y) {
+          world.set(x, yFenceTop, z, spec.wall);
+          fenceCount++;
+        }
+      } else {
+        // Interior cropland: golden wheat at yField.
+        if (yField >= 0 && yField < WORLD_Y) {
+          world.set(x, yField, z, M_FARM);
+        }
+      }
+    }
+  }
+  return fenceCount;
+}
+
+/**
  * Sample wall voxels and return roughly how many remain. Used for "destroyed" check.
  * Cheap: only checks perimeter columns.
  */
@@ -207,9 +284,17 @@ export class BuildingManager {
   private nextId = 1;
   /** Called when a building wants to spawn a unit. Returns true if accepted. */
   spawner: ((kind: UnitKind, x: number, y: number, z: number) => Unit | null) | null = null;
+  /**
+   * Food sink. A farm calls this every `productionInterval` seconds while
+   * alive. The Game wires it to its Resources counter. If null, farms tick
+   * silently (used by tests that don't bother with a Resources instance).
+   */
+  foodSink: ((amount: number, b: Building) => void) | null = null;
 
   place(world: VoxelWorld, spec: BuildingSpec, ox: number, oz: number, floorY: number): Building {
-    const wallCount = stampBarracks(world, spec, ox, oz, floorY);
+    const wallCount = spec.kind === 'farm'
+      ? stampFarm(world, spec, ox, oz, floorY)
+      : stampBarracks(world, spec, ox, oz, floorY);
     const b: Building = {
       id: this.nextId++,
       spec,
@@ -228,24 +313,50 @@ export class BuildingManager {
     void units;
     for (const b of this.buildings) {
       if (b.destroyed) continue;
-      // Cheap liveness check every few seconds — count remaining wall voxels.
-      // (Skipped for performance — done lazily on damage.)
-
+      // Storage buildings have no production timer — skip the timer logic.
+      if (b.spec.kind === 'storage' || b.spec.productionInterval <= 0) continue;
       b.productionTimer -= dt;
-      if (b.productionTimer <= 0) {
-        b.productionTimer += b.spec.productionInterval;
-        if (this.spawner) {
-          const door = doorWorldPos(b);
-          const alive = countLivingWalls(world, b);
-          if (alive < b.wallVoxelsAtBuild * 0.25) {
-            b.destroyed = true;
-            continue;
-          }
-          const kind = b.spec.produces[b.nextProduceIdx % b.spec.produces.length]!;
-          b.nextProduceIdx++;
-          this.spawner(kind, door.x, door.y, door.z);
-        }
+      if (b.productionTimer > 0) continue;
+      b.productionTimer += b.spec.productionInterval;
+
+      // Liveness check: structures whose perimeter has been chewed below 25%
+      // count as destroyed and stop ticking.
+      const alive = countLivingWalls(world, b);
+      if (alive < b.wallVoxelsAtBuild * 0.25) {
+        b.destroyed = true;
+        continue;
+      }
+
+      if (b.spec.kind === 'farm') {
+        // Each tick generates a fixed food bundle. We don't model crop growth
+        // per-voxel — the farm is treated as a passive +5 food / interval
+        // generator. Tweak the per-tick amount here when balance demands it.
+        if (this.foodSink) this.foodSink(5, b);
+        continue;
+      }
+
+      // Barracks: cycle through `produces`, spawning a unit at the door.
+      if (b.spec.produces.length > 0 && this.spawner) {
+        const door = doorWorldPos(b);
+        const kind = b.spec.produces[b.nextProduceIdx % b.spec.produces.length]!;
+        b.nextProduceIdx++;
+        this.spawner(kind, door.x, door.y, door.z);
       }
     }
+  }
+
+  /** Lookup the nearest live storage building (in XZ). Returns null if there are none. */
+  nearestStorage(x: number, z: number): Building | null {
+    let best: Building | null = null;
+    let bestD2 = Infinity;
+    for (const b of this.buildings) {
+      if (b.destroyed) continue;
+      if (b.spec.kind !== 'storage') continue;
+      const dpos = doorWorldPos(b);
+      const dx = dpos.x - x, dz = dpos.z - z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < bestD2) { bestD2 = d2; best = b; }
+    }
+    return best;
   }
 }

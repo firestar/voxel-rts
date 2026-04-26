@@ -4,9 +4,16 @@ Quick definitions for terms that come up in code or PRs.
 
 ## Units & geometry
 
-- **Unit** — a controllable entity (soldier, tank, tunneler).
-- **Kind** — one of `'soldier' | 'tank' | 'tunneler'`. Used as the
-  `Unit.kind` discriminator and to pick a config in `unitConfig()`.
+- **Unit** — a controllable entity (soldier, tank, tunneler, worm, worker).
+- **Kind** — one of `'soldier' | 'tank' | 'tunneler' | 'worm' | 'worker'`. Used
+  as the `Unit.kind` discriminator and to pick a config in `unitConfig()`.
+- **Worker role** — `'harvester' | 'transporter'`, stored on the Unit as
+  `workerRole`. Same geometry / config / pathing for both; the
+  `tickWorkers` automation differentiates behaviour.
+- **Pile** — sim-only entity dropped by a harvester at cap. Holds a
+  wood/metal payload until a transporter picks it up.
+- **Sapling** — sim-only entity placed by a worker's plant task. Ages each
+  tick; matures into a full tree at `SAPLING_MATURE_SEC` (30 s).
 - **Part** — a piece of a unit's geometry rendered as its own
   `InstancedMesh` so it can animate independently (legs, turret, drill).
 - **Pivot** — body-local point a part rotates around. Pivot Y/Z constants

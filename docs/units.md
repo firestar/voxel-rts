@@ -1,7 +1,8 @@
 # Units
 
-Three unit kinds. Each is a distinct entity type with its own config, model,
-and movement rules. The string name in code is `UnitKind = 'soldier' | 'tank' | 'tunneler'`.
+Five unit kinds. Each is a distinct entity type with its own config, model,
+and movement rules. The string name in code is
+`UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'worker'`.
 
 Source of truth:
 - Sim configs and `Unit` shape — `src/sim/Units.ts`
@@ -224,7 +225,81 @@ Falls accelerate naturally; landing snaps to `targetY` and zeros `vy`.
 
 ---
 
-## Building (Barracks — planned)
+## Worker
 
-Defined in `src/sim/Buildings.ts`. Out of scope for this doc until Phase 6
-lands a concrete model.
+Civilian unit. Two roles share one `UnitKind`: harvester and transporter,
+discriminated by the runtime `workerRole` field on the `Unit`. No combat,
+no carve. Drives the resource economy via `tickWorkers` in `src/sim/Workers.ts`.
+
+### Geometry parts
+
+| Part | Builder | InstancedMesh field | Notes |
+|---|---|---|---|
+| Body | `buildWorkerBodyGeometry()` | `workerBody` | Torso (hi-vis vest), tool belt, head, hard hat, two arms, pickaxe |
+| Left leg | `buildWorkerLegGeometry()` | `workerLegL` | Same shape as soldier, in jeans + boot colours |
+| Right leg | `buildWorkerLegGeometry()` | `workerLegR` | Mirrored hip X |
+| Carry crate | `buildWorkerCrateGeometry(metal)` | `workerCrateWood` / `workerCrateMetal` | Floats above the back when carrying anything; colour-coded by payload majority |
+
+### Pivots / model constants
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `WORKER_HIP_Y` | `0.55` m | Same hip pivot as the soldier — leg swing matches |
+| `WORKER_LEG_X` | `0.10` m | ±half-width between hips |
+
+### Animation
+
+- Legs counter-swing: `Math.sin(distanceWalked * 4.5 + id) * 0.55` rad about hip X.
+- Body bob: one-sided sine, freq 6, amplitude 0.07 (slightly less than the soldier).
+- Carry crate is rendered at body-local `(0, 0.95, 0.18)` whenever
+  `carrying.wood + carrying.metals > 0`. Wood vs metal variant chosen by
+  whichever payload is larger.
+
+### Sim config
+
+| Field | Value | Why |
+|---|---|---|
+| `footprintRadius` | 1 | Single nav cell — squeezes through 1 m gaps |
+| `widthMeters` | 0.65 | |
+| `maxStepVoxels` | 24 (3 m) | Less agile than a soldier, but climbs ledges easily |
+| `slopePenalty` | 0.10 | Mild |
+| `bodyHalfCells` | 0 | No roughness check |
+| `bodyRoughnessVoxels` | 999 | Disabled |
+| `turnRateRadPerSec` | 5.0 | ~290°/s |
+| `maxPitchRad` | π/2 | No real cap |
+| `heightVoxels` | 14 | ~1.75 m head clearance |
+| `canDig` | false | Workers mine via direct `damageSphere` calls in `tickWorkers`, not by pathing through solid |
+| `requiresGround` | true | |
+| `speed` | 3.2 m/s | Slower than a soldier — they're hauling tools |
+| `hp` | 60 | |
+
+### Selection ring
+
+Cyan (`0x33ccff`), radius 0.55 m.
+
+### Roles
+
+- `harvester` — auto-picks the nearest exposed wood / metal voxel within
+  `SCAN_RADIUS_M` (60 m) and walks there to chop / mine. Once
+  `carrying.wood + carrying.metals >= WORKER_CARRY_CAP` (5), drops a Pile
+  at the current location and returns to idle. Player can override with
+  LMB on a specific voxel (`chop` / `mine` task) or via plant mode.
+- `transporter` — empty-handed: scans for the nearest unclaimed Pile, claims
+  it, walks there, picks up. Carrying anything: walks to the nearest
+  Storage building and drops the load into `Resources`.
+
+The two roles share geometry and config; only `tickWorkers` cares.
+
+---
+
+## Buildings
+
+| Spec | cells | Wall | Production |
+|---|---|---|---|
+| `BARRACKS` | 4×4 | wood | Cycles through `'soldier' \| 'tank' \| 'tunneler' \| 'worm' \| 'worker'` every 6 s |
+| `FARM` | 3×3 | dirt_road fence | `+5 food` to `Resources` every 5 s while alive (no roof) |
+| `STORAGE` | 3×3 | wood | None — drop-off target for transporter workers |
+
+`BuildingManager` exposes `nearestStorage(x, z)` for the worker tick to
+locate a depot. `foodSink` is a callback set by `Game` that funnels farm
+ticks into `Resources.food`.
