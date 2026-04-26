@@ -2,6 +2,7 @@ import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_METERS } from '../p
 import { VOXEL_SIZE } from '../voxel/types';
 import {
   worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers, VNAV_CELL_METERS,
+  VNAV_X, VNAV_Y, VNAV_Z,
 } from '../path/VolumeNav';
 import {
   TUNNELER_CUTTER_RADIUS, TUNNELER_CUTTER_FORWARD, TUNNELER_CUTTER_HEIGHT,
@@ -24,20 +25,16 @@ interface UnitConfig {
 export function unitConfig(kind: UnitKind): UnitConfig {
   switch (kind) {
     case 'soldier':
-      // Agile (footprintRadius <= 1) so the surface pather skips the flatness gate
-      // entirely — soldiers only care about climb step + blocked cells. Climb step
-      // bumped from 2 (0.25 m) to 6 (0.75 m) so they can traverse rolling hills.
+      // Agile (footprintRadius <= 1) so the surface pather skips the flatness gate.
+      // maxStepVoxels acts as the hard cliff gate — anything taller is impassable.
       return {
         footprintRadius: 1, widthMeters: 0.75,
-        maxStepVoxels: 6, slopePenalty: 0.4,
+        maxStepVoxels: 8, slopePenalty: 0.2,
         canDig: false, requiresGround: true,
         speed: 4.5, speedDigging: 0,
         hp: 80,
       };
     case 'tank':
-      // Big, capable on rough ground, can use existing tunnels but never digs.
-      // Surface pather no longer gates on flatness; climb step is the sole gate.
-      // Bumped climb to 8 (1 m) so tanks don't stall on natural rolling hills.
       return {
         footprintRadius: 2, widthMeters: 2.4,
         maxStepVoxels: 8, slopePenalty: 0.15,
@@ -46,8 +43,6 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         hp: 220,
       };
     case 'tunneler':
-      // Tunnel boring machine — about 1.5x the tank in linear dimensions.
-      // Cutter head clears more than the body, so the path footprint can stay 2 cells.
       return {
         footprintRadius: 2, widthMeters: 3.6,
         maxStepVoxels: 6, slopePenalty: 0.2,
@@ -61,33 +56,25 @@ export function unitConfig(kind: UnitKind): UnitConfig {
 export interface Unit {
   id: number;
   kind: UnitKind;
-  /** Footprint half-width in nav cells (1m). */
   footprintRadius: number;
-  /** Body diameter in meters — drives the carving radius for tunnelers. */
   widthMeters: number;
-  /** Maximum step (voxels) the unit can climb. Cliffs above this are impassable. */
   maxStepVoxels: number;
-  /** Per-step slope cost coefficient — soldiers care more, tanks less. */
   slopePenalty: number;
-  /** Whether this unit may carve through solid material. Only the Tunneler does. */
   canDig: boolean;
-  /** Whether this unit needs solid ground beneath it (no flying). */
   requiresGround: boolean;
   x: number; y: number; z: number;
   heading: number;
-  /** Pitch and roll, applied each frame from the surface gradient. */
   pitch: number; roll: number;
-  speed: number;          // m/s in clear air
-  speedDigging: number;   // m/s while in solid (tunnelers)
+  speed: number;
+  speedDigging: number;
   path: { x: number; y: number; z: number }[];
   hp: number;
   selected: boolean;
-  /** Time accumulated while a tunneler is in solid; carve when >= the throttle. */
   carveCooldown: number;
-  /** Distance traveled in meters — drives walk-cycle phase. */
   distanceWalked: number;
-  /** distanceWalked value the last time we deposited a track / footprint mark. */
   lastTrackDistance: number;
+  /** Frames the unit has been blocked by collision. After enough, the path is cleared. */
+  blockedFrames: number;
 }
 
 export interface CarveRequest {
@@ -97,6 +84,7 @@ export interface CarveRequest {
 }
 
 const TUNNELER_CARVE_PERIOD = 0.4; // seconds between carves per tunneler
+const COLLISION_BLOCK_LIMIT = 6;   // frames stalled before we drop the path
 
 export class UnitManager {
   units: Unit[] = [];
@@ -124,6 +112,7 @@ export class UnitManager {
       carveCooldown: 0,
       distanceWalked: 0,
       lastTrackDistance: 0,
+      blockedFrames: 0,
     };
     this.units.push(u);
     return u;
@@ -133,14 +122,11 @@ export class UnitManager {
     if (waypoints.length === 0) {
       unit.path = [];
       unit.carveCooldown = 0;
+      unit.blockedFrames = 0;
       return;
     }
     let i = 0;
     if (unit.path.length > 0) {
-      // We were already moving — drop incoming waypoints that lie behind the unit's
-      // current heading or are too close to its position. This is what stops the
-      // back-and-forth glitch when a rebuild lands a fresh path mid-stride.
-      // forward = (-sin(heading), -cos(heading)) (model forward is local -Z).
       const fx = -Math.sin(unit.heading);
       const fz = -Math.cos(unit.heading);
       while (i < waypoints.length - 1) {
@@ -162,12 +148,9 @@ export class UnitManager {
     if (i >= waypoints.length) i = waypoints.length - 1;
     unit.path = waypoints.slice(i);
     unit.carveCooldown = 0;
+    unit.blockedFrames = 0;
   }
 
-  /**
-   * Step all unit motion. `carveOut` is invoked when a tunneler needs to clear the next
-   * volume cell to advance — the caller should perform a sphere damage at the given world center.
-   */
   tick(
     dt: number,
     nav: SurfaceNavBuffers,
@@ -176,42 +159,68 @@ export class UnitManager {
   ): void {
     this.lastSurfaceNav = nav;
     for (const u of this.units) {
+      const underground = isUnderground(u, nav);
       if (u.path.length === 0) {
-        if (u.y > 0) sampleSurfaceFollow(u, nav, dt);
+        // Idle: surface-follow only when actually on the surface; underground tunnelers
+        // (and any unit caught in a cave) just relax pitch/roll instead of snapping Y up.
+        if (!underground) {
+          sampleSurfaceFollow(u, nav, dt);
+        } else {
+          relaxOrientation(u, dt);
+        }
         continue;
       }
-      // Path waypoints carry their own Y. Use 3D motion when the next waypoint is
-      // meaningfully above/below the unit (typical underground / tunnel paths) or
-      // when the unit can dig.
       const tgt = u.path[0]!;
       const dy = tgt.y - u.y;
-      const using3D = u.canDig || Math.abs(dy) > 0.3;
-      if (using3D) this.tickVolume(u, dt, vnav, carveOut);
-      else this.tickSurface(u, dt, nav);
+      const using3D = u.canDig || underground || Math.abs(dy) > 0.3;
+      if (using3D) this.tickVolume(u, dt, nav, vnav, carveOut);
+      else this.tickSurface(u, dt, nav, vnav);
     }
   }
 
-  private tickSurface(u: Unit, dt: number, nav: SurfaceNavBuffers): void {
+  private tickSurface(u: Unit, dt: number, nav: SurfaceNavBuffers, vnav: VolumeNavBuffers): void {
     const tgt = u.path[0]!;
     const dx = tgt.x - u.x;
     const dz = tgt.z - u.z;
     const d = Math.hypot(dx, dz);
     const step = u.speed * dt;
     let moved = 0;
+    let nextX: number, nextZ: number, snapping: boolean;
     if (d <= step) {
-      moved = d;
-      u.x = tgt.x; u.z = tgt.z;
-      u.path.shift();
+      nextX = tgt.x; nextZ = tgt.z;
+      snapping = true;
     } else {
       const inv = 1 / d;
-      u.x += dx * inv * step;
-      u.z += dz * inv * step;
-      // Models are built with their forward at local -Z, so heading needs to point -Z
-      // toward the motion vector — that's atan2(-dx, -dz), not atan2(dx, dz).
+      nextX = u.x + dx * inv * step;
+      nextZ = u.z + dz * inv * step;
+      snapping = false;
+    }
+    // Cliff gate — refuse if the next cell's topY differs from the current cell's by
+    // more than maxStepVoxels (climb limit).
+    if (!stepClimbOk(u, nav, nextX, nextZ)) {
+      u.blockedFrames++;
+      if (u.blockedFrames >= COLLISION_BLOCK_LIMIT) u.path = [];
+      sampleSurfaceFollow(u, nav, dt);
+      return;
+    }
+    // Voxel-collision gate — for non-diggers, the next position must not be inside a solid
+    // volume cell. (Surface units shouldn't be entering a cave wall sideways.)
+    if (!u.canDig && !volumePassable(u, vnav, nextX, surfaceWorldY(nav, nextX, nextZ), nextZ)) {
+      u.blockedFrames++;
+      if (u.blockedFrames >= COLLISION_BLOCK_LIMIT) u.path = [];
+      sampleSurfaceFollow(u, nav, dt);
+      return;
+    }
+    u.blockedFrames = 0;
+    if (snapping) {
+      moved = d;
+      u.x = nextX; u.z = nextZ;
+      u.path.shift();
+    } else {
+      u.x = nextX; u.z = nextZ;
       u.heading = Math.atan2(-dx, -dz);
       moved = step;
     }
-    // Snap to ground and update slope orientation from the surface gradient.
     sampleSurfaceFollow(u, nav, dt);
     u.distanceWalked += moved;
   }
@@ -219,6 +228,7 @@ export class UnitManager {
   private tickVolume(
     u: Unit,
     dt: number,
+    nav: SurfaceNavBuffers,
     vnav: VolumeNavBuffers,
     carveOut: (req: CarveRequest) => void,
   ): void {
@@ -234,10 +244,12 @@ export class UnitManager {
 
     if (stillSolid) {
       if (!u.canDig) {
+        // Path now requires going through solid, but we can't dig. Stop and request replan.
         u.path = [];
+        u.blockedFrames = 0;
+        applyPathOrientation(u, dx, dy, dz, dt);
         return;
       }
-      // Crawl forward at digging speed, and let the cutter head do its thing below.
       const step = u.speedDigging * dt;
       if (d > 0.001) {
         const inv = 1 / d;
@@ -251,37 +263,42 @@ export class UnitManager {
       return;
     }
 
-    // Cell is clear — normal motion toward waypoint.
+    // Cell is clear — propose normal motion toward waypoint, then collision-check it.
     const step = u.speed * dt;
-    let consumed = step;
+    let nextX: number, nextY: number, nextZ: number, snapping = false;
     if (d <= step) {
-      consumed = d;
-      u.x = tgt.x; u.y = tgt.y; u.z = tgt.z;
-      u.path.shift();
-      u.carveCooldown = 0;
+      nextX = tgt.x; nextY = tgt.y; nextZ = tgt.z;
+      snapping = true;
     } else {
       const inv = 1 / d;
-      u.x += dx * inv * step;
-      u.y += dy * inv * step;
-      u.z += dz * inv * step;
+      nextX = u.x + dx * inv * step;
+      nextY = u.y + dy * inv * step;
+      nextZ = u.z + dz * inv * step;
+    }
+    if (!volumePassable(u, vnav, nextX, nextY, nextZ)) {
+      // Would clip through solid (or bedrock). Don't move this frame.
+      u.blockedFrames++;
+      if (u.blockedFrames >= COLLISION_BLOCK_LIMIT) u.path = [];
+      applyPathOrientation(u, dx, dy, dz, dt);
+      return;
+    }
+    u.blockedFrames = 0;
+    const consumed = snapping ? d : step;
+    u.x = nextX; u.y = nextY; u.z = nextZ;
+    if (snapping) {
+      u.path.shift();
+      u.carveCooldown = 0;
     }
     u.distanceWalked += consumed;
-    // Underground / aerial: orient along the path. Above-surface units snap back to slope follow.
-    const surfaceY = surfaceWorldY(this.lastSurfaceNav, u.x, u.z);
-    if (u.y > surfaceY - 0.4) {
-      sampleSurfaceFollow(u, this.lastSurfaceNav, dt);
-    } else {
-      applyPathOrientation(u, dx, dy, dz, dt);
+    applyPathOrientation(u, dx, dy, dz, dt);
+    // Surface-follow only when we've actually emerged onto the surface — otherwise the
+    // unit is following its 3D path Y, no snapping.
+    if (!isUnderground(u, nav)) {
+      sampleSurfaceFollow(u, nav, dt);
     }
-    // The cutter still grinds anything the disc clips even while moving through clear cells.
     this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, carveOut);
   }
 
-  /**
-   * If the unit is a tunneler and is moving, fire a sphere damage at the cutter head
-   * position throttled by TUNNELER_CARVE_PERIOD. The spot is the front of the unit along
-   * its motion vector. The carve is a no-op (no rebuild) when no solid voxels are in range.
-   */
   private maybeCarveAtCutter(
     u: Unit, dt: number,
     dx: number, dy: number, dz: number, d: number,
@@ -302,14 +319,50 @@ export class UnitManager {
       unit: u,
     });
   }
-  /** Last surface nav passed to tick — kept so the tunneler clear-cell branch can slope-follow. */
   private lastSurfaceNav!: SurfaceNavBuffers;
 }
 
 /**
- * Set heading + pitch from the unit's instantaneous motion vector. Roll is eased to 0 since
- * 3D path waypoints don't define a sensible roll. Used while underground or in flight.
+ * True when the unit is meaningfully below the local surface — used to suppress the
+ * surface-follow Y snap (which otherwise yanks underground units up to the ceiling).
  */
+function isUnderground(u: Unit, nav: SurfaceNavBuffers): boolean {
+  return u.y < surfaceWorldY(nav, u.x, u.z) - 0.5;
+}
+
+/**
+ * Returns true if the next surface cell is within the unit's climb limit. Cliffs above
+ * maxStepVoxels are impassable — this is what prevents soldiers from teleporting up walls.
+ */
+function stepClimbOk(u: Unit, nav: SurfaceNavBuffers, nextWX: number, nextWZ: number): boolean {
+  const cx0 = Math.max(0, Math.min(NAV_W - 1, Math.floor(u.x / NAV_CELL_METERS)));
+  const cz0 = Math.max(0, Math.min(NAV_H - 1, Math.floor(u.z / NAV_CELL_METERS)));
+  const cx1 = Math.max(0, Math.min(NAV_W - 1, Math.floor(nextWX / NAV_CELL_METERS)));
+  const cz1 = Math.max(0, Math.min(NAV_H - 1, Math.floor(nextWZ / NAV_CELL_METERS)));
+  const t0 = nav.topY[navIndex(cx0, cz0)]!;
+  const t1 = nav.topY[navIndex(cx1, cz1)]!;
+  if (t0 < 0 || t1 < 0) return false;
+  return Math.abs(t1 - t0) <= u.maxStepVoxels;
+}
+
+/**
+ * True if the world-space position (wx, wy, wz) is enterable for this unit:
+ *  - inside the world's volume bounds
+ *  - not bedrock
+ *  - not solid (unless the unit can dig — tunnelers carve their way in)
+ */
+function volumePassable(u: Unit, vnav: VolumeNavBuffers, wx: number, wy: number, wz: number): boolean {
+  const cx = Math.floor(wx / VNAV_CELL_METERS);
+  const cy = Math.floor(wy / VNAV_CELL_METERS);
+  const cz = Math.floor(wz / VNAV_CELL_METERS);
+  if (cx < 0 || cy < 0 || cz < 0 || cx >= VNAV_X || cy >= VNAV_Y || cz >= VNAV_Z) return false;
+  const i = vnavIndex(cx, cy, cz);
+  if (getBit(vnav.bedrock, i)) return false;
+  const isSolid = getBit(vnav.solid, i) === 1;
+  if (isSolid && !u.canDig) return false;
+  return true;
+}
+
 function applyPathOrientation(u: Unit, dx: number, dy: number, dz: number, dt: number): void {
   const horiz = Math.hypot(dx, dz);
   if (horiz > 1e-4) u.heading = Math.atan2(-dx, -dz);
@@ -319,7 +372,13 @@ function applyPathOrientation(u: Unit, dx: number, dy: number, dz: number, dt: n
   u.roll  += (0           - u.roll ) * k;
 }
 
-/** Surface world-space Y at (wx, wz) from the surface nav grid (meters). */
+/** Idle underground / aerial: ease pitch & roll to neutral so the unit doesn't sit askew. */
+function relaxOrientation(u: Unit, dt: number): void {
+  const k = Math.min(1, dt * 4);
+  u.pitch += (0 - u.pitch) * k;
+  u.roll  += (0 - u.roll)  * k;
+}
+
 function surfaceWorldY(nav: SurfaceNavBuffers, wx: number, wz: number): number {
   const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(wx / NAV_CELL_METERS)));
   const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(wz / NAV_CELL_METERS)));
@@ -327,34 +386,24 @@ function surfaceWorldY(nav: SurfaceNavBuffers, wx: number, wz: number): number {
   return top < 0 ? 0 : (top + 1) * VOXEL_SIZE;
 }
 
-/**
- * Snap a surface unit's Y to the topY under it, and ease its pitch / roll toward the slope
- * vector projected into the unit's forward / right axes.
- */
 function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, dt: number): void {
   const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(u.x / NAV_CELL_METERS)));
   const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(u.z / NAV_CELL_METERS)));
   const top = nav.topY[navIndex(cx, cz)]!;
   if (top < 0) return;
   const targetY = (top + 1) * VOXEL_SIZE;
-  // Ease vertical position so going over crests doesn't snap.
   u.y += (targetY - u.y) * Math.min(1, dt * 12);
 
-  // Central differences (in voxels per cell) → meters per meter.
   const xm1 = nav.topY[navIndex(Math.max(0, cx - 1), cz)]!;
   const xp1 = nav.topY[navIndex(Math.min(NAV_W - 1, cx + 1), cz)]!;
   const zm1 = nav.topY[navIndex(cx, Math.max(0, cz - 1))]!;
   const zp1 = nav.topY[navIndex(cx, Math.min(NAV_H - 1, cz + 1))]!;
-  // Convert voxel-difference per 2 cells into rise/run.
   const dydx = ((xp1 - xm1) * VOXEL_SIZE) / (2 * NAV_CELL_METERS);
   const dydz = ((zp1 - zm1) * VOXEL_SIZE) / (2 * NAV_CELL_METERS);
 
-  // Project gradient into the unit's local forward (heading) and right axes.
-  // Heading: atan2(dx, dz) — forward = (sin h, 0, cos h); right = (cos h, 0, -sin h).
   const ch = Math.cos(u.heading), sh = Math.sin(u.heading);
-  const slopeForward = dydx * sh + dydz * ch;       // along forward
-  const slopeRight   = dydx * ch - dydz * sh;       // along right
-  // Pitch up when going downhill is negative; pitch up when going uphill is positive.
+  const slopeForward = dydx * sh + dydz * ch;
+  const slopeRight   = dydx * ch - dydz * sh;
   const targetPitch = Math.atan(-slopeForward);
   const targetRoll  = Math.atan(slopeRight);
   const k = Math.min(1, dt * 8);
