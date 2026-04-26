@@ -212,13 +212,30 @@ export interface Unit {
   cutterHeight: number;
   /**
    * Trailing body segments for chain-bodied diggers (worm). Empty for everyone else.
-   * Element 0 is the segment closest to the head; each subsequent segment is pulled
-   * by the previous one (rope-like distance constraint). Vertical motion is gravity
-   * + ground snap per segment, so a body draped across a tunnel rim sags into the
-   * tunnel correctly instead of floating at the head's Y.
+   * Element 0 is the segment closest to the head; each subsequent segment trails
+   * further back. Each segment is placed at an exact arc-length offset along the
+   * head's recorded breadcrumb trail (`pathHistory`), so every link follows the
+   * exact same path the lead car took — no corner-cutting, no per-segment gravity.
    */
   segments: WormSegment[];
+  /**
+   * Breadcrumb trail of past head positions, ordered most-recent-first. A new entry
+   * is unshifted whenever the head moves more than `PATH_HISTORY_STEP_MIN` from the
+   * latest breadcrumb. Used by chain-bodied diggers to place each segment at an
+   * exact cumulative distance behind the head — segments trace the head's actual
+   * 3D path (including dive/climb in dug tunnels), not just the head's current
+   * position.
+   *
+   * Pre-seeded at spawn time so segments have a valid trail from frame 0.
+   * Empty for non-chain units (no need to allocate the buffer).
+   */
+  pathHistory: { x: number; y: number; z: number }[];
 }
+
+/** Minimum head movement between recorded breadcrumbs, meters. Smaller values
+ *  give finer curve resolution at the cost of a longer history; 0.15 m keeps the
+ *  buffer to ~60 entries even for the longest chain. */
+const PATH_HISTORY_STEP_MIN = 0.15;
 
 export interface WormSegment {
   x: number; y: number; z: number;
@@ -260,8 +277,8 @@ export class UnitManager {
     const segments: WormSegment[] = [];
     for (let i = 0; i < cfg.segmentCount; i++) {
       // Initial layout: segments stretched out behind the head along +Z (heading = 0
-      // points toward -Z so the chain trails to +Z). They settle visually on the
-      // first tick once gravity + the distance constraint run.
+      // points toward -Z so the chain trails to +Z). The first frame's tickWormChain
+      // re-anchors them onto the pre-seeded path history.
       segments.push({
         x, y,
         z: z + (i + 1) * cfg.segmentSpacing,
@@ -269,6 +286,18 @@ export class UnitManager {
         heading: 0,
         pitch: 0,
       });
+    }
+    // Pre-seed the head's path history with breadcrumbs extending back along +Z (the
+    // initial trail direction), spaced PATH_HISTORY_STEP_MIN apart and covering more
+    // than the full chain length. That way the very first tickWormChain call already
+    // has a path to follow — no special case for "history shorter than chain".
+    const pathHistory: { x: number; y: number; z: number }[] = [];
+    if (cfg.segmentCount > 0) {
+      const totalDist = (cfg.segmentCount + 1) * cfg.segmentSpacing + 1.0;
+      const steps = Math.ceil(totalDist / PATH_HISTORY_STEP_MIN);
+      for (let i = 1; i <= steps; i++) {
+        pathHistory.push({ x, y, z: z + i * PATH_HISTORY_STEP_MIN });
+      }
     }
     const u: Unit = {
       id: this.nextId++,
@@ -303,6 +332,7 @@ export class UnitManager {
       cutterForward: cfg.cutterForward,
       cutterHeight: cfg.cutterHeight,
       segments,
+      pathHistory,
     };
     this.units.push(u);
     return u;
@@ -379,10 +409,12 @@ export class UnitManager {
     }
     // Body-segment chain: runs after every unit has had its head step this frame, so
     // segments always trail the post-tick head position. Only worms (segmentCount > 0)
-    // do anything here.
+    // do anything here. Each tick we (a) update the head's breadcrumb trail, then
+    // (b) place every segment at an exact arc-length offset along that trail.
     for (const u of this.units) {
       if (u.segments.length === 0) continue;
-      tickWormChain(u, this.lastVoxels, nav, dt);
+      recordPathBreadcrumb(u);
+      tickWormChain(u);
     }
   }
 
@@ -894,71 +926,98 @@ function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, voxels: Uint8Array
 }
 
 /**
- * Worm body chain. Each segment chases the link in front of it (segment[0] chases the
- * head; segment[i>0] chases segment[i-1]) and is gravity-pulled to the local ground
- * floor. The chain doesn't carve, doesn't take part in pathing, and doesn't block
- * anything — so a segment can drape over a tunnel rim or sag down into a freshly
- * carved shaft entirely independently of the head.
- *
- * Distance constraint: pull-only. Segments are allowed to bunch up when the head
- * stops, but never to stretch past the configured spacing. That gives the chain a
- * subway-train feel: tight when driving, slack when idle.
+ * Append the current head position to the breadcrumb trail when it has moved more
+ * than `PATH_HISTORY_STEP_MIN` from the most recent breadcrumb. Older breadcrumbs
+ * past the chain's reach are trimmed off so the buffer stays bounded.
  */
-function tickWormChain(u: Unit, voxels: Uint8Array, nav: SurfaceNavBuffers, dt: number): void {
-  const spacing = WORM_SEGMENT_SPACING;
+function recordPathBreadcrumb(u: Unit): void {
+  const history = u.pathHistory;
+  const head = history[0];
+  if (!head) {
+    history.push({ x: u.x, y: u.y, z: u.z });
+  } else {
+    const dx = u.x - head.x, dy = u.y - head.y, dz = u.z - head.z;
+    if (dx * dx + dy * dy + dz * dz > PATH_HISTORY_STEP_MIN * PATH_HISTORY_STEP_MIN) {
+      history.unshift({ x: u.x, y: u.y, z: u.z });
+    }
+  }
+
+  // Trim: drop any breadcrumbs older than the chain length plus a buffer. We need
+  // enough trail to cover (segmentCount + 1) * spacing of arc-length backward; a
+  // small extra margin avoids re-trimming on every frame.
+  const maxDist = (u.segments.length + 1) * WORM_SEGMENT_SPACING + 2.0;
+  let accum = 0;
   let prevX = u.x, prevY = u.y, prevZ = u.z;
-  for (const seg of u.segments) {
-    const dx = seg.x - prevX;
-    const dz = seg.z - prevZ;
-    const horiz = Math.hypot(dx, dz);
-    if (horiz > spacing && horiz > 1e-4) {
-      const t = spacing / horiz;
-      seg.x = prevX + dx * t;
-      seg.z = prevZ + dz * t;
-    } else if (horiz < 1e-4) {
-      // Degenerate: link directly on top of leader. Push slightly behind on the
-      // leader's heading so the chain can re-form rather than collapsing in place.
-      seg.x = prevX + Math.sin(u.heading) * spacing;
-      seg.z = prevZ + Math.cos(u.heading) * spacing;
+  for (let i = 0; i < history.length; i++) {
+    const cur = history[i]!;
+    accum += Math.hypot(cur.x - prevX, cur.y - prevY, cur.z - prevZ);
+    if (accum > maxDist) {
+      history.length = i + 1;
+      return;
     }
+    prevX = cur.x; prevY = cur.y; prevZ = cur.z;
+  }
+}
 
-    const surfaceTop = surfaceWorldY(nav, seg.x, seg.z);
-    const segUnderground = seg.y < surfaceTop - 0.5;
-    let targetY: number | null = null;
-    if (!segUnderground) {
-      const top = findFootprintTopVoxel(voxels, nav, seg.x, seg.z, 0.4);
-      if (top !== null) targetY = (top + 1) * VOXEL_SIZE;
-    } else {
-      const probe = Math.max(3.0, -seg.vy * dt + 1.0);
-      targetY = findFloorBelow(voxels, seg.x, seg.y + 0.3, seg.z, probe);
-    }
+/**
+ * Worm body chain — exact-path follower. Each segment is placed at the point along
+ * the head's recorded breadcrumb trail that is exactly `(i + 1) * spacing` of arc
+ * length behind the current head. Linear interpolation between adjacent breadcrumbs
+ * gives sub-step accuracy on curves, so segments trace the same dive/climb/turn
+ * profile the head executed — no corner-cutting, no per-segment gravity drift.
+ *
+ * The chain still doesn't carve, doesn't take part in pathing, and doesn't block
+ * anything; it's purely visual / cosmetic body geometry following the head's wake.
+ */
+function tickWormChain(u: Unit): void {
+  const spacing = WORM_SEGMENT_SPACING;
+  const segments = u.segments;
+  const history = u.pathHistory;
 
-    if (targetY !== null && seg.y <= targetY + 1e-4) {
-      seg.y = targetY;
-      seg.vy = 0;
-    } else {
-      seg.vy = Math.max(-u.terminalFallSpeed, seg.vy - GRAVITY * dt);
-      seg.y += seg.vy * dt;
-      if (targetY !== null && seg.y < targetY) {
-        seg.y = targetY;
-        seg.vy = 0;
+  let segIdx = 0;
+  let target = spacing;            // arc-length to segment[0] from head
+  let accum = 0;
+  let prevX = u.x, prevY = u.y, prevZ = u.z;
+
+  for (let i = 0; i < history.length && segIdx < segments.length; i++) {
+    const cur = history[i]!;
+    const dx = cur.x - prevX, dy = cur.y - prevY, dz = cur.z - prevZ;
+    const segLen = Math.hypot(dx, dy, dz);
+    while (segIdx < segments.length && segLen > 1e-6 && accum + segLen >= target) {
+      const t = (target - accum) / segLen;
+      const seg = segments[segIdx]!;
+      const newX = prevX + dx * t;
+      const newY = prevY + dy * t;
+      const newZ = prevZ + dz * t;
+      // Heading + pitch from the local tangent: vector from this segment toward its
+      // leader (the previous link on the chain, or the head for segment 0). Matches
+      // the heading convention used by tickSurface (heading = 0 → forward = -Z).
+      const linkDx = prevX - newX;
+      const linkDy = prevY - newY;
+      const linkDz = prevZ - newZ;
+      const linkH = Math.hypot(linkDx, linkDz);
+      if (linkH > 1e-4) {
+        seg.heading = Math.atan2(-linkDx, -linkDz);
       }
+      seg.pitch = clamp(
+        Math.atan2(linkDy, Math.max(linkH, 1e-4)),
+        -u.maxPitchRad, u.maxPitchRad,
+      );
+      seg.x = newX; seg.y = newY; seg.z = newZ;
+      seg.vy = 0;
+      segIdx++;
+      target = (segIdx + 1) * spacing;
     }
-
-    const linkDx = prevX - seg.x;
-    const linkDz = prevZ - seg.z;
-    const linkDy = prevY - seg.y;
-    const linkH = Math.hypot(linkDx, linkDz);
-    if (linkH > 1e-4) {
-      const targetHeading = Math.atan2(-linkDx, -linkDz);
-      const angDiff = wrapAngle(targetHeading - seg.heading);
-      const turnStep = u.turnRateRadPerSec * 1.5 * dt;
-      seg.heading += clamp(angDiff, -turnStep, turnStep);
-    }
-    const targetPitch = clamp(Math.atan2(linkDy, Math.max(linkH, 1e-4)), -u.maxPitchRad, u.maxPitchRad);
-    const k = Math.min(1, dt * 8);
-    seg.pitch += (targetPitch - seg.pitch) * k;
-
-    prevX = seg.x; prevY = seg.y; prevZ = seg.z;
+    accum += segLen;
+    prevX = cur.x; prevY = cur.y; prevZ = cur.z;
+  }
+  // History too short to cover the whole chain (only happens if a unit is
+  // teleported and the buffer hasn't refilled yet). Anchor any leftover segments
+  // at the tail of what we do have, so they don't fly off to stale positions.
+  while (segIdx < segments.length) {
+    const seg = segments[segIdx]!;
+    seg.x = prevX; seg.y = prevY; seg.z = prevZ;
+    seg.vy = 0;
+    segIdx++;
   }
 }

@@ -68,10 +68,24 @@ describe('worm spawn', () => {
       expect(dz).toBeCloseTo(WORM_SEGMENT_SPACING, 6);
     }
   });
+
+  it('seeds a path history covering the full chain length', () => {
+    const um = new UnitManager();
+    const u = um.spawn('worm', 10, 5, 10);
+    // History must extend back at least the full chain reach so the very first
+    // tickWormChain can place every segment without needing to extrapolate.
+    let acc = 0;
+    let prevX = u.x, prevY = u.y, prevZ = u.z;
+    for (const b of u.pathHistory) {
+      acc += Math.hypot(b.x - prevX, b.y - prevY, b.z - prevZ);
+      prevX = b.x; prevY = b.y; prevZ = b.z;
+    }
+    expect(acc).toBeGreaterThan(WORM_SEGMENT_COUNT * WORM_SEGMENT_SPACING);
+  });
 });
 
 describe('worm chain follows the head', () => {
-  it('segment positions are pulled toward the head when it moves', () => {
+  it('every segment is exactly WORM_SEGMENT_SPACING of arc length apart', () => {
     const surfaceY = 96;
     const world = buildDirtWorld(surfaceY);
     const voxels = world.buffers.voxels;
@@ -85,8 +99,7 @@ describe('worm chain follows the head', () => {
     const headY = (surfaceY + 1) * VOXEL_SIZE;
     const u = um.spawn('worm', startX, headY, startZ);
 
-    // Path the head a long way along +X. After many ticks the head will have moved
-    // far from its spawn; the chain should be dragged along it.
+    // Path the head a long way along +X.
     um.setPath(u, [{ x: startX + 30, y: headY, z: startZ }]);
 
     const dt = 1 / 60;
@@ -97,22 +110,23 @@ describe('worm chain follows the head', () => {
     // Head must have advanced significantly along +X.
     expect(u.x).toBeGreaterThan(startX + 5);
 
-    // Pull-only constraint: every adjacent link is at most WORM_SEGMENT_SPACING apart in
-    // the horizontal plane (with a tiny epsilon for floating-point slack).
-    let prevX = u.x, prevZ = u.z;
+    // Each adjacent link is WORM_SEGMENT_SPACING apart in 3D (path-exact placement,
+    // not pull-only — so this is an equality check, not just an upper bound).
+    let prevX = u.x, prevY = u.y, prevZ = u.z;
     for (const s of u.segments) {
-      const d = Math.hypot(s.x - prevX, s.z - prevZ);
-      expect(d).toBeLessThanOrEqual(WORM_SEGMENT_SPACING + 1e-3);
-      prevX = s.x; prevZ = s.z;
+      const d = Math.hypot(s.x - prevX, s.y - prevY, s.z - prevZ);
+      expect(d).toBeCloseTo(WORM_SEGMENT_SPACING, 3);
+      prevX = s.x; prevY = s.y; prevZ = s.z;
     }
-    // The chain has rotated to follow the head along +X — segment 0 sits behind the
+    // Chain has rotated to follow the head along +X — segment 0 sits behind the
     // head on the head's track (i.e. at smaller X than the head).
     expect(u.segments[0]!.x).toBeLessThan(u.x);
   });
-});
 
-describe('worm segment gravity', () => {
-  it('a segment held above the surface falls and settles on the ground', () => {
+  it('every segment lies on a position the head actually visited (no corner-cutting)', () => {
+    // The head is dragged through a sharp 90° turn. Each segment must trace the
+    // exact same path — landing on points the head was at earlier — instead of
+    // cutting the inside of the corner like a pull-only chain would.
     const surfaceY = 96;
     const world = buildDirtWorld(surfaceY);
     const voxels = world.buffers.voxels;
@@ -122,72 +136,76 @@ describe('worm segment gravity', () => {
     buildVolumeNav(voxels, vnav);
 
     const um = new UnitManager();
+    const startX = 60, startZ = 60;
     const headY = (surfaceY + 1) * VOXEL_SIZE;
-    const u = um.spawn('worm', 40, headY, 40);
+    const u = um.spawn('worm', startX, headY, startZ);
 
-    // Put segment 0 floating well above the surface — well within the chain spacing
-    // so the constraint doesn't tug it down by itself, but high enough that gravity
-    // is the obvious explanation.
-    u.segments[0]!.x = 40;
-    u.segments[0]!.z = 41;
-    u.segments[0]!.y = headY + 6.0;
-    u.segments[0]!.vy = 0;
-
+    // Drive the head straight along +X for ~12 m, then turn hard onto +Z. Record
+    // every head position we observe so we can check segment placement against it.
+    const trail: { x: number; y: number; z: number }[] = [{ x: u.x, y: u.y, z: u.z }];
     const dt = 1 / 60;
-    const startY = u.segments[0]!.y;
-    for (let i = 0; i < 120; i++) {
+
+    um.setPath(u, [{ x: startX + 12, y: headY, z: startZ }]);
+    for (let i = 0; i < 400 && u.path.length > 0; i++) {
       um.tick(dt, nav, vnav, voxels, () => { /* no-op carve */ });
+      trail.push({ x: u.x, y: u.y, z: u.z });
     }
-    const expectedFloor = (surfaceY + 1) * VOXEL_SIZE;
-    // Segment must have descended from its perched starting height.
-    expect(u.segments[0]!.y).toBeLessThan(startY - 1.0);
-    // And settled on top of the surface, never inside or below it.
-    expect(u.segments[0]!.y).toBeGreaterThanOrEqual(expectedFloor - 1e-3);
-    expect(u.segments[0]!.y).toBeLessThanOrEqual(expectedFloor + 0.4);
-    expect(u.segments[0]!.vy).toBe(0);
+    um.setPath(u, [{ x: startX + 12, y: headY, z: startZ + 12 }]);
+    for (let i = 0; i < 400 && u.path.length > 0; i++) {
+      um.tick(dt, nav, vnav, voxels, () => { /* no-op carve */ });
+      trail.push({ x: u.x, y: u.y, z: u.z });
+    }
+
+    // For every segment, find the closest point on the recorded head trail. With
+    // exact path-following, the maximum distance from the head's actual track must
+    // be small (a corner-cutting chain would jump straight across the L and miss
+    // the trail by several meters at the bend).
+    for (const s of u.segments) {
+      let best = Infinity;
+      for (const p of trail) {
+        const d = Math.hypot(s.x - p.x, s.z - p.z);
+        if (d < best) best = d;
+      }
+      // Tolerance: PATH_HISTORY_STEP_MIN (0.15 m) plus a small slack — the segment
+      // sits between two breadcrumbs, never far from the head's recorded track.
+      expect(best).toBeLessThan(0.3);
+    }
   });
 
-  it('an underground segment over a tunnel floor lands on the floor, not the surface', () => {
+  it('segment Y mirrors the head Y profile when the head climbs', () => {
+    // Head surfaces from underground up to the surface. With path-following each
+    // segment passes through the same Y profile a moment later — so segments
+    // further back are at lower Y than segments closer to the head.
     const surfaceY = 96;
     const world = buildDirtWorld(surfaceY);
     const voxels = world.buffers.voxels;
-
-    // Carve a wide air pocket buried well below the surface so isUnderground is true
-    // for the segment but solid dirt remains far below as the floor.
-    const cx = 60, cz = 60;
-    for (let y = 30; y <= 70; y++) {
-      for (let dz = -10; dz <= 10; dz++) {
-        for (let dx = -10; dx <= 10; dx++) {
-          voxels[worldIndex(cx + dx, y, cz + dz)] = 0;
-        }
-      }
-    }
-    // Plug a 1-voxel "tunnel floor" at y=29 (top of solid).
-    const tunnelFloorY = 30 * VOXEL_SIZE; // air starts at y=30, top of solid voxel y=29
     const nav = allocateNav(false);
     buildSurfaceNav(voxels, nav);
     const vnav = allocateVolumeNav(false);
     buildVolumeNav(voxels, vnav);
 
     const um = new UnitManager();
-    // Head sits underground in the air pocket. Its actual gravity / floor logic is
-    // handled by tickVolume; we only care about a segment dropping toward the
-    // tunnel floor here.
-    const headY = 50 * VOXEL_SIZE;
-    const u = um.spawn('worm', (cx + 0.5) * VOXEL_SIZE, headY, (cz + 0.5) * VOXEL_SIZE);
-    // Place a segment in the air pocket above the tunnel floor.
-    u.segments[0]!.x = (cx + 0.5) * VOXEL_SIZE;
-    u.segments[0]!.z = (cz + 0.5) * VOXEL_SIZE;
-    u.segments[0]!.y = 60 * VOXEL_SIZE;
-    u.segments[0]!.vy = 0;
+    const startX = 60, startZ = 60;
+    const headY = (surfaceY + 1) * VOXEL_SIZE;
+    const u = um.spawn('worm', startX, headY, startZ);
 
+    // Manually crank the head Y up a step at a time as we tick — emulates a climb
+    // out of a freshly carved shaft. We don't carve here; we just want to check
+    // that segments inherit the head's Y trajectory along the breadcrumb trail.
     const dt = 1 / 60;
-    for (let i = 0; i < 240; i++) {
+    for (let i = 0; i < 200; i++) {
+      // Advance head along +X and step Y up over the run.
+      u.x += 0.05;
+      u.y = headY + (i * 0.02);
       um.tick(dt, nav, vnav, voxels, () => { /* no-op carve */ });
     }
-    // Segment 0 should have settled on the underground tunnel floor — way below the
-    // surface, not floating.
-    expect(u.segments[0]!.y).toBeGreaterThanOrEqual(tunnelFloorY - 1e-3);
-    expect(u.segments[0]!.y).toBeLessThan((surfaceY + 1) * VOXEL_SIZE);
+
+    // The head ended at the highest Y it ever held. Segments behind the head
+    // should be at lower Y (they're sitting on parts of the trail recorded
+    // earlier in the climb), and progressively lower the further back you go.
+    for (let i = 1; i < u.segments.length; i++) {
+      expect(u.segments[i]!.y).toBeLessThanOrEqual(u.segments[i - 1]!.y + 1e-3);
+    }
+    expect(u.segments[u.segments.length - 1]!.y).toBeLessThan(u.y);
   });
 });
