@@ -12,6 +12,11 @@ import {
 
 export type UnitKind = 'soldier' | 'tank' | 'tunneler';
 
+/** Downward acceleration in m/s². Slightly snappier than real-world 9.81 — units feel
+ *  "weighty" without dragging out the fall arc. Per-unit terminal velocity then sets
+ *  how hard each kind eventually falls. */
+const GRAVITY = 22;
+
 interface UnitConfig {
   footprintRadius: number;
   widthMeters: number;
@@ -43,6 +48,13 @@ interface UnitConfig {
   speed: number;
   speedDigging: number;
   hp: number;
+  /** Unit mass in kilograms. Drives terminal-velocity scaling (heavier units settle
+   *  to a higher cap because they shed more drag per kilogram). Also useful as a
+   *  general weight reference for any later "tank crushes a soldier" interactions. */
+  massKg: number;
+  /** Magnitude of the terminal vertical velocity in m/s. Stored positive; falling
+   *  velocity is clamped at -terminalFallSpeed. */
+  terminalFallSpeed: number;
 }
 
 export function unitConfig(kind: UnitKind): UnitConfig {
@@ -63,6 +75,8 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         canDig: false, requiresGround: true,
         speed: 4.5, speedDigging: 0,
         hp: 80,
+        massKg: 80,                              // a person in full kit
+        terminalFallSpeed: 28,                   // skydiver-ish cap
       };
     case 'tank':
       // Tanks are restricted to fairly flat terrain.
@@ -83,6 +97,8 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         canDig: false, requiresGround: true,
         speed: 3.5, speedDigging: 0,
         hp: 220,
+        massKg: 50_000,                          // ~50 t — main battle tank
+        terminalFallSpeed: 45,                   // heavier shell, drags less per kg
       };
     case 'tunneler':
       // 5x5 cells (5 m x 5 m); 9 voxels (≈1.1 m) residual tolerance — generous because
@@ -102,6 +118,8 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         canDig: true, requiresGround: true,
         speed: 1.6, speedDigging: 1.2,
         hp: 320,
+        massKg: 150_000,                         // ~150 t — full TBM with cutter head
+        terminalFallSpeed: 55,                   // dense + low drag per kg → falls hardest
       };
   }
 }
@@ -139,6 +157,10 @@ export interface Unit {
   blockedFrames: number;
   /** Vertical velocity in m/s. Negative = falling. Reset to 0 on landing. */
   vy: number;
+  /** Mass in kg — see UnitConfig.massKg. */
+  massKg: number;
+  /** Magnitude of terminal fall velocity in m/s — see UnitConfig.terminalFallSpeed. */
+  terminalFallSpeed: number;
 }
 
 export interface CarveRequest {
@@ -197,6 +219,8 @@ export class UnitManager {
       lastTrackDistance: 0,
       blockedFrames: 0,
       vy: 0,
+      massKg: cfg.massKg,
+      terminalFallSpeed: cfg.terminalFallSpeed,
     };
     this.units.push(u);
     return u;
@@ -370,6 +394,9 @@ export class UnitManager {
         u.z += fz * step;
         u.distanceWalked += step;
       }
+      // The cutter face is grinding into solid — that contact holds the unit, so any
+      // residual fall velocity from a previous mid-air arc is killed here.
+      u.vy = 0;
       applyPathOrientation(u, dx, dy, dz, dt);
       return;
     }
@@ -413,14 +440,23 @@ export class UnitManager {
     if (!isUnderground(u, nav)) {
       sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
     } else {
-      const floorY = findFloorBelow(this.lastVoxels, u.x, u.y + 0.4, u.z, 3.0);
-      if (floorY !== null) {
-        const dyDesired = floorY - u.y;
-        if (dyDesired > 0) {
-          u.y += dyDesired * Math.min(1, dt * 12);
-        } else if (dyDesired < 0) {
-          const maxDescent = 4.0;
-          u.y = Math.max(floorY, u.y - maxDescent * dt);
+      // Probe deep enough that a fast-falling unit (tunneler at terminal velocity)
+      // still sees the floor it's about to hit this frame.
+      const probeDepth = Math.max(3.0, -u.vy * dt + 1.0);
+      const floorY = findFloorBelow(this.lastVoxels, u.x, u.y + 0.4, u.z, probeDepth);
+      if (floorY !== null && floorY >= u.y) {
+        // Floor is at or above feet — climb the step (e.g. up onto a tunnel ledge).
+        u.y += (floorY - u.y) * Math.min(1, dt * 12);
+        u.vy = 0;
+      } else {
+        // No floor under our feet within reach (or it's below us): accelerate downward
+        // under gravity and clamp at the unit's terminal velocity. When a floor is
+        // present below, land on it crisply.
+        u.vy = Math.max(-u.terminalFallSpeed, u.vy - GRAVITY * dt);
+        u.y += u.vy * dt;
+        if (floorY !== null && u.y < floorY) {
+          u.y = floorY;
+          u.vy = 0;
         }
       }
     }
@@ -468,7 +504,9 @@ export class UnitManager {
       radiusMeters: radius,
       // Don't carve below the unit's body bottom — keeps the cutter from eating
       // the floor underneath the tunneler and dropping it into its own hole.
-      floorMeters: u.y,
+      // Exception: when the dig direction is downward, eating the floor is the
+      // whole point, so drop the guard and let the cutter chew straight down.
+      floorMeters: fy < 0 ? -Infinity : u.y,
       unit: u,
     });
   }
@@ -736,9 +774,7 @@ function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, voxels: Uint8Array
     u.y += dyDesired * Math.min(1, dt * 12);
     u.vy = 0;
   } else {
-    const GRAVITY = 22;            // m/s² — slightly snappier than real
-    const TERMINAL_VY = -28;       // m/s — falls cap out at ~28 m/s
-    u.vy = Math.max(TERMINAL_VY, u.vy - GRAVITY * dt);
+    u.vy = Math.max(-u.terminalFallSpeed, u.vy - GRAVITY * dt);
     u.y += u.vy * dt;
     if (u.y <= targetY) {
       u.y = targetY;
