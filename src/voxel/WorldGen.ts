@@ -1,7 +1,7 @@
 import { WORLD_X, WORLD_Z } from './types';
 import { VoxelWorld } from './VoxelWorld';
 import { placeTrees } from './Trees';
-import { placeRoads } from './Roads';
+import { placeRoads, clearAboveRoads } from './Roads';
 
 import WorldgenWorker from '../workers/worldgen.worker?worker';
 
@@ -63,7 +63,10 @@ export async function generateWorld(
   // Then trees, which skip non-grass cells — road cells are naturally
   // tree-free without any extra check. Both run on the main thread post-merge
   // to avoid races on writes that cross worker slab boundaries.
-  placeRoads(world.buffers.voxels, seed);
+  const roadStats = placeRoads(world.buffers.voxels, seed);
   placeTrees(world.buffers.voxels, seed);
+  // Trim any tree canopy that drifted across a road column so the road
+  // surface stays open to the sky.
+  clearAboveRoads(world.buffers.voxels, roadStats.columnMask);
   world.markAllDirty();
 }
