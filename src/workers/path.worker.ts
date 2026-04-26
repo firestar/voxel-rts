@@ -62,7 +62,11 @@ self.onmessage = (ev: MessageEvent<Message>) => {
       }
       const r = findPathSurface(nav, ws2, msg.req);
       const smoothed = r.cells.length > 2
-        ? smoothPath(nav, r.cells, msg.req.footprintRadius, msg.req.maxStepVoxels)
+        ? smoothPath(
+            nav, r.cells,
+            msg.req.footprintRadius, msg.req.maxStepVoxels,
+            msg.req.bodyHalfCells, msg.req.bodyRoughnessVoxels,
+          )
         : r.cells;
       (self as unknown as Worker).postMessage({
         kind: 'path', reqId: msg.reqId,

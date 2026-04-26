@@ -15,6 +15,17 @@ interface UnitConfig {
   widthMeters: number;
   maxStepVoxels: number;
   slopePenalty: number;
+  /**
+   * Half-extent in nav cells of the unit's body footprint, used by the per-unit
+   * "is this terrain even enough under me" check. 0 disables the check (single cell).
+   */
+  bodyHalfCells: number;
+  /**
+   * Max allowed (max topY - min topY) in voxels across the footprint cells. If the
+   * spread exceeds this, the cell is too rough for this unit and the path search
+   * rejects it. Set to a very large number to disable.
+   */
+  bodyRoughnessVoxels: number;
   canDig: boolean;
   requiresGround: boolean;
   speed: number;
@@ -25,32 +36,33 @@ interface UnitConfig {
 export function unitConfig(kind: UnitKind): UnitConfig {
   switch (kind) {
     case 'soldier':
-      // Agile (footprintRadius <= 1) so the surface pather skips the flatness gate.
-      // maxStepVoxels = 16 voxels (2 m) — soldiers can scramble up very steep slopes
-      // but anything taller than 2 m is a cliff and is hard-rejected by both the path
-      // search and the smoother.
+      // Single-cell footprint, so the body-roughness check is a no-op for soldiers.
       return {
         footprintRadius: 1, widthMeters: 0.75,
         maxStepVoxels: 16, slopePenalty: 0.15,
+        bodyHalfCells: 0, bodyRoughnessVoxels: 999,
         canDig: false, requiresGround: true,
         speed: 4.5, speedDigging: 0,
         hp: 80,
       };
     case 'tank':
-      // 14 voxels (1.75 m) — tanks can drive up surprisingly steep terrain but a
-      // 2 m+ rock face still blocks them.
+      // 3x3 cells (3 m x 3 m) under the body; spread must stay within 0.75 m. Slopes are
+      // fine, ridges or stairs that lift one corner above the rest are not.
       return {
         footprintRadius: 2, widthMeters: 2.4,
         maxStepVoxels: 14, slopePenalty: 0.12,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 6,
         canDig: false, requiresGround: true,
         speed: 3.5, speedDigging: 0,
         hp: 220,
       };
     case 'tunneler':
-      // 10 voxels (1.25 m) — bigger, less nimble than the tank on the surface.
+      // 5x5 cells (5 m x 5 m); 1 m spread tolerance — bigger machine, more forgiving
+      // because it carries its own bench when underground.
       return {
         footprintRadius: 2, widthMeters: 3.6,
         maxStepVoxels: 10, slopePenalty: 0.18,
+        bodyHalfCells: 2, bodyRoughnessVoxels: 8,
         canDig: true, requiresGround: false,
         speed: 2.5, speedDigging: 1.8,
         hp: 320,
@@ -65,6 +77,8 @@ export interface Unit {
   widthMeters: number;
   maxStepVoxels: number;
   slopePenalty: number;
+  bodyHalfCells: number;
+  bodyRoughnessVoxels: number;
   canDig: boolean;
   requiresGround: boolean;
   x: number; y: number; z: number;
@@ -104,6 +118,8 @@ export class UnitManager {
       widthMeters: cfg.widthMeters,
       maxStepVoxels: cfg.maxStepVoxels,
       slopePenalty: cfg.slopePenalty,
+      bodyHalfCells: cfg.bodyHalfCells,
+      bodyRoughnessVoxels: cfg.bodyRoughnessVoxels,
       canDig: cfg.canDig,
       requiresGround: cfg.requiresGround,
       x, y, z,

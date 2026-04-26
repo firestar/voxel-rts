@@ -404,6 +404,8 @@ export class Game {
       footprintRadius: unit.footprintRadius,
       maxStepVoxels: unit.maxStepVoxels,
       slopePenalty: unit.slopePenalty,
+      bodyHalfCells: unit.bodyHalfCells,
+      bodyRoughnessVoxels: unit.bodyRoughnessVoxels,
       prefersRoads: false,
     });
     if (res.cells.length === 0 || !res.reached) return;

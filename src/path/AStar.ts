@@ -13,6 +13,10 @@ export interface AStarRequest {
   maxStepVoxels: number;
   /** Per-voxel-step cost coefficient — lets soldiers pay more for slope than tanks. */
   slopePenalty: number;
+  /** Half-extent in nav cells of the unit's body footprint (0 = single cell, no check). */
+  bodyHalfCells: number;
+  /** Max permitted spread of topY across the footprint cells, in voxels. */
+  bodyRoughnessVoxels: number;
   /** If true, road cells are cheaper to traverse. */
   prefersRoads: boolean;
   /** Hard cap on expansions before bailing with partial path. */
@@ -30,6 +34,36 @@ export interface AStarResult {
 const NB_DX = [ 1,-1, 0, 0,  1, 1,-1,-1];
 const NB_DZ = [ 0, 0, 1,-1,  1,-1, 1,-1];
 const NB_COST = [1, 1, 1, 1, Math.SQRT2, Math.SQRT2, Math.SQRT2, Math.SQRT2];
+
+/**
+ * Sample topY across a (2*halfCells+1) x (2*halfCells+1) square centered at (cx, cz)
+ * and return whether (max - min) stays within `maxRangeVoxels`. Out-of-bounds or blocked
+ * cells in the footprint also fail. Used by the path search and the smoother to keep
+ * vehicles off ledges that span their body.
+ */
+export function bodyRoughnessOk(
+  nav: SurfaceNavBuffers,
+  cx: number, cz: number,
+  halfCells: number,
+  maxRangeVoxels: number,
+): boolean {
+  let minY = 1 << 30;
+  let maxY = -(1 << 30);
+  for (let dz = -halfCells; dz <= halfCells; dz++) {
+    const z = cz + dz;
+    if (z < 0 || z >= NAV_H) return false;
+    for (let dx = -halfCells; dx <= halfCells; dx++) {
+      const x = cx + dx;
+      if (x < 0 || x >= NAV_W) return false;
+      const i = navIndex(x, z);
+      if (nav.blocked[i]) return false;
+      const y = nav.topY[i]!;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  return (maxY - minY) <= maxRangeVoxels;
+}
 
 function octileH(ax: number, az: number, bx: number, bz: number): number {
   const dx = Math.abs(ax - bx), dz = Math.abs(az - bz);
@@ -65,7 +99,8 @@ export function findPathSurface(
   req: AStarRequest,
 ): AStarResult {
   const gen = ws.resetGeneration();
-  const { startCx, startCz, goalCx, goalCz, prefersRoads, maxStepVoxels, slopePenalty } = req;
+  const { startCx, startCz, goalCx, goalCz, prefersRoads, maxStepVoxels, slopePenalty,
+          bodyHalfCells, bodyRoughnessVoxels } = req;
   void req.footprintRadius; // currently used only by building placement; surface pathing uses climb-step alone
   const maxExpansions = req.maxExpansions ?? 20000;
 
@@ -75,9 +110,12 @@ export function findPathSurface(
   if (nav.blocked[startI] || nav.blocked[goalI]) {
     return { cells: [], reached: false, expanded: 0 };
   }
-  // Flatness was a clearance proxy for vehicles, but maxStepVoxels already gates whether
-  // a unit can physically climb between adjacent cells. Surface pathing relies on the
-  // climb check exclusively now, so the flatness gate is dropped here for everyone.
+  // Goal must satisfy the body-roughness check too; no point pathing somewhere the
+  // unit can't actually park.
+  if (req.bodyHalfCells > 0
+      && !bodyRoughnessOk(nav, goalCx, goalCz, req.bodyHalfCells, req.bodyRoughnessVoxels)) {
+    return { cells: [], reached: false, expanded: 0 };
+  }
 
   ws.gScore[startI] = 0;
   ws.gen[startI] = gen;
@@ -109,6 +147,11 @@ export function findPathSurface(
       const nyTop = nav.topY[ni]!;
       const dY = Math.abs(nyTop - cy);
       if (dY > maxStepVoxels) continue;
+
+      // Body-roughness gate: the spread of topY across the unit's footprint area must
+      // stay under bodyRoughnessVoxels, otherwise the cell would have the unit straddling
+      // a ledge / step / boulder. Soldiers (bodyHalfCells = 0) skip this check.
+      if (bodyHalfCells > 0 && !bodyRoughnessOk(nav, nx, nz, bodyHalfCells, bodyRoughnessVoxels)) continue;
 
       // Diagonal corner cutting: at least one adjacent cardinal must be passable
       // (not blocked) AND within the unit's climb limit. The far diagonal is otherwise

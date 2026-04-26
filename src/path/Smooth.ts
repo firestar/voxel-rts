@@ -1,4 +1,5 @@
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H } from './SurfaceNav';
+import { bodyRoughnessOk } from './AStar';
 
 /**
  * String-pulling: walk a line between two cells using a 2D Bresenham-style supercover and
@@ -11,6 +12,8 @@ function navLineClear(
   bx: number, bz: number,
   footprintRadius: number,
   maxStepVoxels: number,
+  bodyHalfCells: number,
+  bodyRoughnessVoxels: number,
 ): boolean {
   let x0 = ax, z0 = az;
   const x1 = bx, z1 = bz;
@@ -34,6 +37,7 @@ function navLineClear(
     const y = nav.topY[idx]!;
     if (Math.abs(y - prevY) > stepLimit) return false;
     prevY = y;
+    if (bodyHalfCells > 0 && !bodyRoughnessOk(nav, x0, z0, bodyHalfCells, bodyRoughnessVoxels)) return false;
     if (x0 === x1 && z0 === z1) return true;
     const e2 = 2 * err;
     if (e2 > -dz) { err -= dz; x0 += sx; }
@@ -51,6 +55,8 @@ export function smoothPath(
   cells: { cx: number; cz: number }[],
   footprintRadius: number,
   maxStepVoxels: number,
+  bodyHalfCells: number,
+  bodyRoughnessVoxels: number,
 ): { cx: number; cz: number }[] {
   if (cells.length <= 2) return cells;
   const out: { cx: number; cz: number }[] = [cells[0]!];
@@ -60,7 +66,7 @@ export function smoothPath(
     while (j > i + 1) {
       const a = cells[i]!;
       const b = cells[j]!;
-      if (navLineClear(nav, a.cx, a.cz, b.cx, b.cz, footprintRadius, maxStepVoxels)) break;
+      if (navLineClear(nav, a.cx, a.cz, b.cx, b.cz, footprintRadius, maxStepVoxels, bodyHalfCells, bodyRoughnessVoxels)) break;
       j--;
     }
     out.push(cells[j]!);
