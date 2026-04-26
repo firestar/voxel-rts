@@ -61,10 +61,12 @@ const FACES: FaceDef[] = [
   { nx: 0, ny:  1, nz: 0, a1x: 1, a1y: 0, a1z: 0, a2x: 0, a2y: 0, a2z: 1, ox: 0, oy: 1, oz: 0, flipWinding: true },
   // -Y: outside at -y; tangents +X, +Z; origin (0,0,0)
   { nx: 0, ny: -1, nz: 0, a1x: 1, a1y: 0, a1z: 0, a2x: 0, a2y: 0, a2z: 1, ox: 0, oy: 0, oz: 0, flipWinding: false },
-  // +Z: outside at +z; tangents +Y, +X; origin (0,0,1)
-  { nx: 0, ny: 0, nz:  1, a1x: 0, a1y: 1, a1z: 0, a2x: 1, a2y: 0, a2z: 0, ox: 0, oy: 0, oz: 1, flipWinding: false },
+  // +Z: outside at +z; tangents +Y, +X; origin (0,0,1).
+  // With this (a1, a2) order the natural quad winding cross-products to -Z, so flip
+  // it to put the outward normal back at +Z. Same fix for -Z below.
+  { nx: 0, ny: 0, nz:  1, a1x: 0, a1y: 1, a1z: 0, a2x: 1, a2y: 0, a2z: 0, ox: 0, oy: 0, oz: 1, flipWinding: true },
   // -Z: outside at -z; tangents +X, +Y; origin (0,0,0)
-  { nx: 0, ny: 0, nz: -1, a1x: 1, a1y: 0, a1z: 0, a2x: 0, a2y: 1, a2z: 0, ox: 0, oy: 0, oz: 0, flipWinding: false },
+  { nx: 0, ny: 0, nz: -1, a1x: 1, a1y: 0, a1z: 0, a2x: 0, a2y: 1, a2z: 0, ox: 0, oy: 0, oz: 0, flipWinding: true },
 ];
 
 function aoScore(side1: boolean, side2: boolean, corner: boolean): number {
