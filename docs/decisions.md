@@ -133,6 +133,27 @@ Per project rule (CLAUDE.md). Verify changes with `tsc --noEmit`,
 `vitest run`, and `vite build` (one-shot). The user runs the dev server
 themselves when they want to look visually.
 
+## Roads: chain of slope-weighted A* paths through 5 POIs
+
+`placeRoads` runs after worldgen workers and before tree placement. It builds
+a coarse 1 m grid (matches surface nav), picks 5 POIs spaced ≥ 20 m apart on
+flat-ish grass, and connects POIᵢ → POIᵢ₊₁ with a slope-weighted A* (slope
+penalty 0.6 per voxel of |ΔY|, mud cells blocked). Each path cell stamps a
+disc of `M_PATH` voxels (4-voxel radius ≈ 1 m wide, 2 voxels deep). When
+`buildSurfaceNav` rebuilds, cells whose top voxel is `M_PATH` get
+`nav.road = 200`, which the existing `edgeCost` discounts by up to 47%.
+
+Why a chain instead of MST: chain is fully connected, simpler, and the slice
+doesn't need branching networks. POIs sit only on grass with mild local slope
+so roads have stable anchors.
+
+The road bias is provably weaker than the heuristic in tests with abundant
+flat alternatives (weighted bidirectional first-meet A* terminates before
+exploring the road option). In real generated terrain, where slopes and
+obstacles make the off-road option costlier, the bias kicks in. Tests cover
+the wiring (nav.road population, on-road paths stay on the road, per-edge
+cost shape) rather than asserting an idealised detour.
+
 ## Test-driven for sim behaviour
 
 If a behavior isn't covered by an existing test and we want to confirm it,
