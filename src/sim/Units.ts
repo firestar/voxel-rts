@@ -120,7 +120,6 @@ export interface CarveRequest {
   unit: Unit;
 }
 
-const TUNNELER_CARVE_PERIOD = 0.4; // seconds between carves per tunneler
 const COLLISION_BLOCK_LIMIT = 6;   // frames stalled before we drop the path
 
 export class UnitManager {
@@ -344,35 +343,41 @@ export class UnitManager {
   }
 
   private maybeCarveAtCutter(
-    u: Unit, dt: number,
+    u: Unit, _dt: number,
     dx: number, dy: number, dz: number, d: number,
     carveOut: (req: CarveRequest) => void,
   ): void {
     if (!u.canDig) return;
     if (d < 1e-3) return;
-    u.carveCooldown += dt;
-    if (u.carveCooldown < TUNNELER_CARVE_PERIOD) return;
-    u.carveCooldown = 0;
     const inv = 1 / d;
     const fx = dx * inv, fy = dy * inv, fz = dz * inv;
 
-    // Tunneling only happens at the blade itself: an oriented cylinder 2 voxels deep
-    // along the unit's forward axis, with its perpendicular extent equal to the cutter
-    // radius plus one voxel of clearance on every side.
-    //
-    // The cylinder center sits one voxel in front of the blade face, so the cylinder
-    // covers from the blade face out to two voxels ahead.
     const VOXEL = 0.125;
-    const halfLength = VOXEL;                   // 2 voxels of total depth
+    const halfLength = VOXEL;                          // 2 voxels of total depth
     const radius = TUNNELER_CUTTER_RADIUS + VOXEL;
-    // Blade face is at TUNNELER_CUTTER_FORWARD relative to the unit. Push the cylinder
-    // center halfLength forward of that so the cylinder occupies the volume immediately
-    // in front of the blade.
     const centerForward = TUNNELER_CUTTER_FORWARD + halfLength;
+    const cutterX = u.x + fx * centerForward;
+    const cutterY = u.y + TUNNELER_CUTTER_HEIGHT + fy * centerForward;
+    const cutterZ = u.z + fz * centerForward;
+
+    // Engagement gate. Without this, the cutter disc on a surface tunneler dips below
+    // the ground (radius ≈ 1.83 m vs cutter height of 1.10 m above the feet) and the
+    // unit chews stripes of grass as it drives. Two ways to qualify:
+    //   1. The unit itself is meaningfully below the local surface (in a tunnel).
+    //   2. The cutter face has dropped below the surface ahead (nosing into a hill).
+    const surfaceAtUnit = surfaceWorldY(this.lastSurfaceNav, u.x, u.z);
+    const surfaceAtCutter = surfaceWorldY(this.lastSurfaceNav, cutterX, cutterZ);
+    const unitUnderground = u.y < surfaceAtUnit - 0.4;
+    const cutterInSolid = cutterY < surfaceAtCutter - 0.3;
+    if (!unitUnderground && !cutterInSolid) return;
+
+    // Carve every frame the unit is engaged. Previously a 0.4 s cooldown left ~0.7 m
+    // gaps at digging speed (1.8 m/s) and only the 0.25 m slab was cut each fire — so
+    // the tunnel ended up as a row of discs separated by uncut stripes. The cylinder
+    // is tiny (≈0.25 m × 1.83 m × 1.83 m), so per-frame carving is cheap and
+    // consecutive carves overlap regardless of frame rate or unit speed.
     carveOut({
-      x: u.x + fx * centerForward,
-      y: u.y + TUNNELER_CUTTER_HEIGHT + fy * centerForward,
-      z: u.z + fz * centerForward,
+      x: cutterX, y: cutterY, z: cutterZ,
       axisX: fx, axisY: fy, axisZ: fz,
       halfLengthMeters: halfLength,
       radiusMeters: radius,
