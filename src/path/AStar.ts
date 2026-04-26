@@ -25,7 +25,7 @@ export interface AStarRequest {
    * Zero or undefined disables the jitter.
    */
   routeSeed?: number;
-  /** Hard cap on expansions before bailing with partial path. */
+  /** Hard cap on expansions (combined across forward + backward) before bailing. */
   maxExpansions?: number;
 }
 
@@ -41,24 +41,12 @@ const NB_DX = [ 1,-1, 0, 0,  1, 1,-1,-1];
 const NB_DZ = [ 0, 0, 1,-1,  1,-1, 1,-1];
 const NB_COST = [1, 1, 1, 1, Math.SQRT2, Math.SQRT2, Math.SQRT2, Math.SQRT2];
 
-/**
- * Sample topY across a (2*halfCells+1)² square centered on (cx, cz), fit a least-squares
- * plane to those samples, and return whether every cell's residual from that plane stays
- * within `maxResidualVoxels`. Out-of-bounds or blocked cells in the footprint also fail.
- *
- * This passes uniform slopes (the unit can sit on a tilted hill) and rejects bumps, steps,
- * and ridges that span the body — which is the actual physics we want for a vehicle's
- * chassis. The previous max-min range version was over-eager: every steep slope failed.
- */
 export function bodyRoughnessOk(
   nav: SurfaceNavBuffers,
   cx: number, cz: number,
   halfCells: number,
   maxResidualVoxels: number,
 ): boolean {
-  // For a centered symmetric square, the cross-term sum(dx*dz) is 0 and sum(dx) = sum(dz) = 0,
-  // so the least-squares plane decouples: y_pred = a*dx + b*dz + c, with c = mean(y),
-  // a = sum(dx*y) / sum(dx²), b = sum(dz*y) / sum(dz²).
   let sumY = 0;
   let sumDxY = 0, sumDzY = 0;
   let sumDx2 = 0, sumDz2 = 0;
@@ -84,8 +72,6 @@ export function bodyRoughnessOk(
   const meanY = sumY / n;
   const a = sumDx2 > 0 ? sumDxY / sumDx2 : 0;
   const b = sumDz2 > 0 ? sumDzY / sumDz2 : 0;
-
-  // Second pass: check residuals against the fitted plane.
   for (let dz = -halfCells; dz <= halfCells; dz++) {
     for (let dx = -halfCells; dx <= halfCells; dx++) {
       const i = navIndex(cx + dx, cz + dz);
@@ -103,28 +89,87 @@ function octileH(ax: number, az: number, bx: number, bz: number): number {
   return (M - m) + Math.SQRT2 * m;
 }
 
-/** Reusable workspace, allocated once per worker. */
+/**
+ * Workspace for the bidirectional surface A*. We keep two of every per-cell state
+ * (g-score, came-from, closed, generation) — one set for the forward search rooted
+ * at start, one for the backward search rooted at goal. Heaps live here too so we
+ * don't reallocate them per query.
+ */
 export class AStarWorkspace {
-  readonly gScore = new Float32Array(NAV_COUNT);
-  readonly cameFrom = new Int32Array(NAV_COUNT);
-  readonly closed = new Uint8Array(NAV_COUNT);
-  readonly open = new FourAryHeap(2048);
-  /** Generation marker so we can skip O(N) reset between queries. */
-  readonly gen = new Int32Array(NAV_COUNT);
+  // Forward (from start)
+  readonly fG = new Float32Array(NAV_COUNT);
+  readonly fCameFrom = new Int32Array(NAV_COUNT);
+  readonly fClosed = new Uint8Array(NAV_COUNT);
+  readonly fGen = new Int32Array(NAV_COUNT);
+  readonly fOpen = new FourAryHeap(2048);
+  // Backward (from goal)
+  readonly bG = new Float32Array(NAV_COUNT);
+  readonly bCameFrom = new Int32Array(NAV_COUNT);
+  readonly bClosed = new Uint8Array(NAV_COUNT);
+  readonly bGen = new Int32Array(NAV_COUNT);
+  readonly bOpen = new FourAryHeap(2048);
   private genTick = 0;
 
   resetGeneration(): number {
     this.genTick = (this.genTick + 1) | 0;
     if (this.genTick === 0) {
-      // Wraparound — clear arrays once to be safe.
-      this.gen.fill(0);
+      this.fGen.fill(0);
+      this.bGen.fill(0);
       this.genTick = 1;
     }
-    this.open.clear();
+    this.fOpen.clear();
+    this.bOpen.clear();
     return this.genTick;
   }
 }
 
+/**
+ * Symmetric edge cost between cells idxA and idxB. The two endpoints are passed
+ * symmetrically (we deliberately avoid using "destination" anywhere) so the cost
+ * forward(a→b) === backward(b→a). That's a hard requirement for bidirectional
+ * A*: if the two searches saw different costs for the same edge, the meeting
+ * point cost wouldn't equal the actual shortest-path cost.
+ */
+function edgeCost(
+  nav: SurfaceNavBuffers,
+  idxA: number, idxB: number,
+  baseCost: number,
+  slopePenalty: number,
+  prefersRoads: boolean,
+  routeSeed: number,
+): number {
+  const dY = Math.abs(nav.topY[idxA]! - nav.topY[idxB]!);
+  let cost = baseCost + dY * slopePenalty;
+  if (prefersRoads) {
+    // Use the maximum road weight on either endpoint — symmetric and treats either
+    // cell being a road as enough to grant the discount.
+    const rwA = nav.road[idxA]!;
+    const rwB = nav.road[idxB]!;
+    const rw = Math.max(rwA, rwB) / 255;
+    cost *= 1.0 - 0.6 * rw;
+  }
+  if (routeSeed !== 0) {
+    // Hash keyed by min/max so the edge has the same jitter regardless of direction.
+    const lo = idxA < idxB ? idxA : idxB;
+    const hi = idxA < idxB ? idxB : idxA;
+    const h = ((Math.imul(lo, 0x9e3779b9) ^ Math.imul(hi, 0x85ebca6b) ^ routeSeed) >>> 0);
+    const jitter = ((h & 0xff) / 255 - 0.5) * 0.6; // ±0.3 cost units
+    cost += jitter;
+  }
+  return cost;
+}
+
+/**
+ * Bidirectional A* on the surface grid. Forward search expands from the start with
+ * heuristic h(n) = octile(n, goal); backward search expands from the goal with
+ * h(n) = octile(n, start). The two frontiers meet in the middle, so the explored
+ * area looks like two converging cones rather than one big circle from the start.
+ *
+ * Termination is conservative: when the smaller of the two heaps' top priority
+ * already exceeds the best meeting cost we've seen, neither side can find a
+ * cheaper path and we stop. Reconstruction concatenates the forward chain
+ * (start → meet) with the reversed backward chain (meet → goal).
+ */
 export function findPathSurface(
   nav: SurfaceNavBuffers,
   ws: AStarWorkspace,
@@ -134,7 +179,7 @@ export function findPathSurface(
   const { startCx, startCz, goalCx, goalCz, prefersRoads, maxStepVoxels, slopePenalty,
           bodyHalfCells, bodyRoughnessVoxels } = req;
   const routeSeed = req.routeSeed ?? 0;
-  void req.footprintRadius; // currently used only by building placement; surface pathing uses climb-step alone
+  void req.footprintRadius;
   const maxExpansions = req.maxExpansions ?? 20000;
 
   const startI = navIndex(startCx, startCz);
@@ -143,27 +188,63 @@ export function findPathSurface(
   if (nav.blocked[startI] || nav.blocked[goalI]) {
     return { cells: [], reached: false, expanded: 0 };
   }
-  // Goal must satisfy the body-roughness check too; no point pathing somewhere the
-  // unit can't actually park.
-  if (req.bodyHalfCells > 0
-      && !bodyRoughnessOk(nav, goalCx, goalCz, req.bodyHalfCells, req.bodyRoughnessVoxels)) {
+  if (bodyHalfCells > 0
+      && !bodyRoughnessOk(nav, goalCx, goalCz, bodyHalfCells, bodyRoughnessVoxels)) {
     return { cells: [], reached: false, expanded: 0 };
   }
+  if (startI === goalI) {
+    return { cells: [{ cx: startCx, cz: startCz }], reached: true, expanded: 0 };
+  }
 
-  ws.gScore[startI] = 0;
-  ws.gen[startI] = gen;
-  ws.cameFrom[startI] = -1;
-  ws.open.push(startI, octileH(startCx, startCz, goalCx, goalCz));
+  // Forward init.
+  ws.fG[startI] = 0;
+  ws.fGen[startI] = gen;
+  ws.fCameFrom[startI] = -1;
+  ws.fOpen.push(startI, octileH(startCx, startCz, goalCx, goalCz));
+  // Backward init.
+  ws.bG[goalI] = 0;
+  ws.bGen[goalI] = gen;
+  ws.bCameFrom[goalI] = -1;
+  ws.bOpen.push(goalI, octileH(goalCx, goalCz, startCx, startCz));
 
+  let bestCost = Infinity;
+  let meetNode = -1;
   let expanded = 0;
-  let reached = false;
-  while (ws.open.length > 0) {
-    const i = ws.open.pop();
-    if (ws.closed[i] === gen) continue;
-    ws.closed[i] = gen;
-    expanded++;
-    if (i === goalI) { reached = true; break; }
+
+  while (ws.fOpen.length > 0 && ws.bOpen.length > 0) {
+    const topF = ws.fOpen.topPriority();
+    const topB = ws.bOpen.topPriority();
+    // Termination: if both frontiers are looking at f-values that already exceed our
+    // best found path, neither side can do better.
+    if (topF >= bestCost && topB >= bestCost) break;
     if (expanded >= maxExpansions) break;
+
+    // Expand the smaller-priority side. Roughly balances exploration on both ends.
+    const expandForward = topF <= topB;
+    const open = expandForward ? ws.fOpen : ws.bOpen;
+    const myG = expandForward ? ws.fG : ws.bG;
+    const myCameFrom = expandForward ? ws.fCameFrom : ws.bCameFrom;
+    const myClosed = expandForward ? ws.fClosed : ws.bClosed;
+    const myGen = expandForward ? ws.fGen : ws.bGen;
+    const otherG = expandForward ? ws.bG : ws.fG;
+    const otherGen = expandForward ? ws.bGen : ws.fGen;
+    const heuristicTargetCx = expandForward ? goalCx : startCx;
+    const heuristicTargetCz = expandForward ? goalCz : startCz;
+
+    const i = open.pop();
+    if (myClosed[i] === gen) continue;
+    myClosed[i] = gen;
+    expanded++;
+
+    // Meet check on pop. If the other side has reached this cell, the sum of g-scores
+    // gives a candidate complete-path cost.
+    if (otherGen[i] === gen) {
+      const total = myG[i]! + otherG[i]!;
+      if (total < bestCost) {
+        bestCost = total;
+        meetNode = i;
+      }
+    }
 
     const cx = i % NAV_W;
     const cz = (i / NAV_W) | 0;
@@ -174,21 +255,12 @@ export function findPathSurface(
       const nz = cz + NB_DZ[n]!;
       if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) continue;
       const ni = navIndex(nx, nz);
-      if (ws.closed[ni] === gen) continue;
+      if (myClosed[ni] === gen) continue;
       if (nav.blocked[ni]) continue;
-      // Step-up/down limit: bail on jumps the unit can't physically climb.
       const nyTop = nav.topY[ni]!;
       const dY = Math.abs(nyTop - cy);
       if (dY > maxStepVoxels) continue;
-
-      // Body-roughness gate: the spread of topY across the unit's footprint area must
-      // stay under bodyRoughnessVoxels, otherwise the cell would have the unit straddling
-      // a ledge / step / boulder. Soldiers (bodyHalfCells = 0) skip this check.
       if (bodyHalfCells > 0 && !bodyRoughnessOk(nav, nx, nz, bodyHalfCells, bodyRoughnessVoxels)) continue;
-
-      // Diagonal corner cutting: at least one adjacent cardinal must be passable
-      // (not blocked) AND within the unit's climb limit. The far diagonal is otherwise
-      // a "squeeze through a wall" move which we still want to forbid.
       if (n >= 4) {
         const a = navIndex(cx + NB_DX[n]!, cz);
         const b = navIndex(cx, cz + NB_DZ[n]!);
@@ -198,61 +270,55 @@ export function findPathSurface(
         if (!aOk && !bOk) continue;
       }
 
-      let stepCost = NB_COST[n]!;
-      // Slope penalty scales with the unit's tolerance — soldiers care more, tanks less.
-      stepCost += dY * slopePenalty;
-      // Road preference.
-      if (prefersRoads) {
-        const rw = nav.road[ni]! / 255;
-        stepCost *= 1.0 - 0.6 * rw;
-      }
-      // Per-cell deterministic jitter keyed by routeSeed — different units passed
-      // different seeds explore the map along different routes instead of all funneling
-      // through the single A*-shortest line.
-      if (routeSeed !== 0) {
-        const h = ((Math.imul(ni, 0x9e3779b9) ^ routeSeed) >>> 0);
-        const jitter = ((h & 0xff) / 255 - 0.5) * 0.6; // ±0.3 cost units
-        stepCost += jitter;
-      }
+      const stepCost = edgeCost(nav, i, ni, NB_COST[n]!, slopePenalty, prefersRoads, routeSeed);
+      const g = myG[i]! + stepCost;
+      const seen = myGen[ni] === gen;
+      if (!seen || g < myG[ni]!) {
+        myGen[ni] = gen;
+        myG[ni] = g;
+        myCameFrom[ni] = i;
+        const f = g + octileH(nx, nz, heuristicTargetCx, heuristicTargetCz);
+        if (f < bestCost) open.push(ni, f);
 
-      const g = (ws.gen[i] === gen ? ws.gScore[i]! : 0) + stepCost;
-      const seen = ws.gen[ni] === gen;
-      if (!seen || g < ws.gScore[ni]!) {
-        ws.gen[ni] = gen;
-        ws.gScore[ni] = g;
-        ws.cameFrom[ni] = i;
-        const f = g + octileH(nx, nz, goalCx, goalCz);
-        ws.open.push(ni, f);
+        // Early meet — if the other side has already settled this neighbor, update
+        // bestCost without waiting for the pop. This helps termination converge.
+        if (otherGen[ni] === gen) {
+          const total = g + otherG[ni]!;
+          if (total < bestCost) {
+            bestCost = total;
+            meetNode = ni;
+          }
+        }
       }
     }
   }
 
-  // Reconstruct path (or partial path to whichever closed cell came nearest).
-  let endI = goalI;
-  if (!reached) {
-    // Find the closed cell with smallest h to goal.
-    let bestH = Infinity, best = -1;
-    for (let i = 0; i < NAV_COUNT; i++) {
-      if (ws.closed[i] !== gen) continue;
-      const cx = i % NAV_W, cz = (i / NAV_W) | 0;
-      const h = octileH(cx, cz, goalCx, goalCz);
-      if (h < bestH) { bestH = h; best = i; }
-    }
-    if (best < 0) return { cells: [], reached: false, expanded };
-    endI = best;
+  if (meetNode < 0) {
+    return { cells: [], reached: false, expanded };
   }
 
-  const out: { cx: number; cz: number }[] = [];
-  let cur = endI;
-  while (cur !== -1) {
-    const cx = cur % NAV_W, cz = (cur / NAV_W) | 0;
-    out.push({ cx, cz });
+  // Reconstruct: walk forward chain from meet → start (then reverse), append backward
+  // chain meet → goal (excluding meet itself which was already pushed).
+  const forwardCells: { cx: number; cz: number }[] = [];
+  for (let cur = meetNode; cur !== -1; cur = ws.fCameFrom[cur]!) {
+    forwardCells.push({ cx: cur % NAV_W, cz: (cur / NAV_W) | 0 });
     if (cur === startI) break;
-    if (ws.gen[cur] !== gen) break;
-    cur = ws.cameFrom[cur]!;
+    if (ws.fGen[cur] !== gen) {
+      // Forward chain doesn't reach the start — search met but couldn't reconstruct
+      // forward. Shouldn't happen in practice; bail out cleanly.
+      return { cells: [], reached: false, expanded };
+    }
   }
-  out.reverse();
-  return { cells: out, reached, expanded };
+  forwardCells.reverse();
+  const backwardCells: { cx: number; cz: number }[] = [];
+  for (let cur = ws.bCameFrom[meetNode]!; cur !== -1; cur = ws.bCameFrom[cur]!) {
+    backwardCells.push({ cx: cur % NAV_W, cz: (cur / NAV_W) | 0 });
+    if (cur === goalI) break;
+    if (ws.bGen[cur] !== gen) {
+      return { cells: [], reached: false, expanded };
+    }
+  }
+  return { cells: [...forwardCells, ...backwardCells], reached: true, expanded };
 }
 
-export { NAV_CELL_METERS };
+export { NAV_CELL_METERS, FLAT_TOLERANCE_VOXELS };

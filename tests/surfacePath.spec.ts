@@ -105,4 +105,49 @@ describe('surface A* + smoother on flat ground', () => {
 
     void M_DIRT;
   });
+
+  it('bidirectional reconstruction is contiguous from start to goal', () => {
+    // The bidirectional search splices the forward chain (start→meet) with the
+    // reversed backward chain (meet→goal). Verify the result is still 8-connected
+    // end-to-end with no duplicate cells at the join.
+    const world = buildFlatWorld();
+    const nav = allocateNav(false);
+    buildSurfaceNav(world.buffers.voxels, nav);
+    const ws = new AStarWorkspace();
+    const r = findPathSurface(nav, ws, {
+      startCx: 12, startCz: 12,
+      goalCx: 70, goalCz: 50,
+      footprintRadius: 1, maxStepVoxels: 16, slopePenalty: 0.15,
+      bodyHalfCells: 0, bodyRoughnessVoxels: 999, prefersRoads: false,
+    });
+    expect(r.reached).toBe(true);
+    expect(r.cells.length).toBeGreaterThan(0);
+    expect(r.cells[0]).toEqual({ cx: 12, cz: 12 });
+    expect(r.cells[r.cells.length - 1]).toEqual({ cx: 70, cz: 50 });
+    // No duplicate consecutive cells (would happen if the meet node was double-counted).
+    for (let i = 1; i < r.cells.length; i++) {
+      const a = r.cells[i - 1]!;
+      const b = r.cells[i]!;
+      expect(a.cx === b.cx && a.cz === b.cz).toBe(false);
+      const dx = Math.abs(a.cx - b.cx);
+      const dz = Math.abs(a.cz - b.cz);
+      expect(dx).toBeLessThanOrEqual(1);
+      expect(dz).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it('start === goal returns a single-cell path', () => {
+    const world = buildFlatWorld();
+    const nav = allocateNav(false);
+    buildSurfaceNav(world.buffers.voxels, nav);
+    const ws = new AStarWorkspace();
+    const r = findPathSurface(nav, ws, {
+      startCx: 30, startCz: 30, goalCx: 30, goalCz: 30,
+      footprintRadius: 1, maxStepVoxels: 16, slopePenalty: 0.15,
+      bodyHalfCells: 0, bodyRoughnessVoxels: 999, prefersRoads: false,
+    });
+    expect(r.reached).toBe(true);
+    expect(r.cells.length).toBe(1);
+    expect(r.cells[0]).toEqual({ cx: 30, cz: 30 });
+  });
 });
