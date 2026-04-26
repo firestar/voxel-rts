@@ -20,6 +20,9 @@ export const MATERIALS: Material[] = [
   // Mud — soft and dark, sucks vehicles in. Hp deliberately low so each tread pass
   // chews through it quickly.
   { id: 8, name: 'mud',    hp: 10,  r: 70,  g: 52,  b: 28  },
+  // Dirt road — graded, compacted dirt. Warmer/redder than raw dirt so the
+  // network is visually distinct from exposed soil.
+  { id: 9, name: 'dirt_road', hp: 28, r: 126, g: 92, b: 56 },
 ];
 
 export const M_AIR = 0;
@@ -31,6 +34,7 @@ export const M_LEAF = 5;
 export const M_PATH = 6;
 export const M_BEDROCK = 7;
 export const M_MUD = 8;
+export const M_DIRT_ROAD = 9;
 
 // Flat RGBA palette (length = MATERIALS.length * 4) for fast worker lookup.
 export function materialColors(): Uint8Array {
@@ -62,6 +66,7 @@ export function digSpeedMultiplier(m: MaterialId): number {
     case M_MUD:     return 1.3;  // soft, sloppy — easy to push through
     case M_DIRT:    return 1.0;  // baseline
     case M_GRASS:   return 0.95; // grass + topsoil
+    case M_DIRT_ROAD: return 0.9; // graded, compacted
     case M_PATH:    return 0.85; // compacted dirt
     case M_WOOD:    return 0.55; // medium
     case M_STONE:   return 0.30; // hard — really slows the dig
@@ -80,6 +85,7 @@ export function groundSpeedMultiplier(m: MaterialId): number {
     case M_MUD:   return 0.4;   // sinks in mud
     case M_GRASS: return 1.0;   // baseline
     case M_DIRT:  return 1.0;
+    case M_DIRT_ROAD: return 1.05; // graded dirt road — minor speed bonus
     case M_PATH:  return 1.15;  // fastest — a beaten road
     case M_LEAF:  return 0.9;   // soft canopy underfoot
     case M_STONE: return 0.95;  // bare rock is slightly less grippy
@@ -103,6 +109,8 @@ export function trackDamageFor(m: MaterialId): TrackMark {
     case M_GRASS: return { peak: 6,  radiusMeters: 0.3 };
     // Dirt: very faint grooves, ~12 passes.
     case M_DIRT:  return { peak: 3,  radiusMeters: 0.25 };
+    // Dirt road: graded, but still loose — slightly more wear than raw dirt.
+    case M_DIRT_ROAD: return { peak: 2, radiusMeters: 0.22 };
     // Path: well-trodden, almost no marks.
     case M_PATH:  return { peak: 1,  radiusMeters: 0.2 };
     // Anything else (stone, bedrock, wood, leaf): no track marks.

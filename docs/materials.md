@@ -15,9 +15,10 @@ Source: `src/voxel/Materials.ts`.
 | 3 | `M_STONE` | stone | 120 | (138, 138, 138) | Hard; deep layer |
 | 4 | `M_WOOD` | wood | 60 | (106, 74, 42) | Tree trunks; skipped by surface topY scan |
 | 5 | `M_LEAF` | leaf | 15 | (47, 106, 42) | Tree canopy; soft; skipped by surface topY scan |
-| 6 | `M_PATH` | path | 35 | (184, 160, 106) | Roads — speed bonus + low slopePenalty bias |
+| 6 | `M_PATH` | path | 35 | (184, 160, 106) | Paved trunk roads — speed bonus + strong A* discount |
 | 7 | `M_BEDROCK` | bedrock | 0 | (40, 40, 50) | Indestructible (`hp = 0` sentinel) |
 | 8 | `M_MUD` | mud | 10 | (70, 52, 28) | Soft; tank tread marks chew through fast |
+| 9 | `M_DIRT_ROAD` | dirt_road | 28 | (126, 92, 56) | Dirt branches off paved roads — milder A* discount |
 
 `hp = 0` means **indestructible** for non-air ids (bedrock). Air uses 0 hp
 as a sentinel because it isn't damageable anyway.
@@ -33,6 +34,7 @@ as a sentinel because it isn't damageable anyway.
 | mud | 1.3 | Soft, sloppy |
 | dirt | 1.0 | Baseline |
 | grass | 0.95 | Topsoil |
+| dirt_road | 0.9 | Graded, compacted |
 | path | 0.85 | Compacted dirt |
 | wood | 0.55 | Medium |
 | stone | 0.30 | Hard |
@@ -46,6 +48,7 @@ as a sentinel because it isn't damageable anyway.
 | mud | 0.4 | Bog |
 | grass | 1.0 | Baseline |
 | dirt | 1.0 | Baseline |
+| dirt_road | 1.05 | Graded — minor speed bonus |
 | path | 1.15 | Fastest — beaten road |
 | leaf | 0.9 | Soft canopy underfoot |
 | stone | 0.95 | Slightly less grippy |
@@ -62,6 +65,7 @@ tank actually sinks into mud as it rolls.
 | mud | 14 | 0.4 | Sinks fast |
 | grass | 6 | 0.3 | Light grooves; ~6 passes to expose dirt |
 | dirt | 3 | 0.25 | Faint grooves |
+| dirt_road | 2 | 0.22 | Graded but loose — slight wear |
 | path | 1 | 0.2 | Almost no marks |
 | (default) | 0 | 0 | Stone, bedrock, wood, leaf — no marks |
 

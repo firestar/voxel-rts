@@ -1,6 +1,6 @@
 import { WORLD_X, WORLD_Y, WORLD_Z, VOXEL_SIZE, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
-import { M_WOOD, M_LEAF, M_PATH } from '../voxel/Materials';
+import { M_WOOD, M_LEAF, M_PATH, M_DIRT_ROAD } from '../voxel/Materials';
 
 // 1 m surface cells = 8 voxels (at 0.125 m).
 export const NAV_CELL_VOXELS = 8;
@@ -75,11 +75,10 @@ export function buildSurfaceNav(voxels: Uint8Array, nav: SurfaceNavBuffers): voi
       nav.topY[i] = top;
       nav.material[i] = mat;
       nav.blocked[i] = top < 0 ? 1 : 0;
-      // Road weight: M_PATH cells get a strong discount in A* edge cost
-      // (see edgeCost in AStar.ts). 200/255 ≈ 0.78 → ~0.47x cost on roads,
-      // enough to bias paths through the network even when it costs a small
-      // detour.
-      nav.road[i] = mat === M_PATH ? 200 : 0;
+      // Road weight: paved (M_PATH) gets a strong discount in A* edge cost,
+      // dirt roads (M_DIRT_ROAD) a milder one. See edgeCost in AStar.ts:
+      // 200/255 ≈ 0.78 → ~0.47x cost on paved, 120/255 ≈ 0.47 → ~0.72x on dirt.
+      nav.road[i] = mat === M_PATH ? 200 : (mat === M_DIRT_ROAD ? 120 : 0);
       // Headroom: air voxels above topY before the next solid voxel. Capped at 255.
       // Sample MULTIPLE columns within the cell — corners + centre — and take the
       // minimum so a tree trunk sitting at a cell corner still flags the whole
