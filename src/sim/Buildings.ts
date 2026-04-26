@@ -114,7 +114,7 @@ export const TECH_LAB: BuildingSpec = {
 };
 
 /** All building specs in the order they appear on the build-mode hotkeys (1..N). */
-export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, POWER_PLANT, REFINERY, TECH_LAB];
+export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, FARM, STORAGE, POWER_PLANT, REFINERY, TECH_LAB];
 
 export interface FootprintHit {
   ok: boolean;

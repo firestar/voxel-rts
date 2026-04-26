@@ -59,14 +59,14 @@ export class UnitRenderer {
   private tmpEuler = new THREE.Euler();
   private tmpV = new THREE.Vector3();
 
-  private selectionRingSoldier: THREE.LineSegments;
-  private selectionRingTank: THREE.LineSegments;
-  private selectionRingTunneler: THREE.LineSegments;
-  private selectionRingWorm: THREE.LineSegments;
-  private selectionRingWorker: THREE.LineSegments;
-  private selectionRingDozer: THREE.LineSegments;
-  private selectionRingHauler: THREE.LineSegments;
-  private selectionRingRocketTruck: THREE.LineSegments;
+  /**
+   * Pool of selection rings keyed by unit kind. Each frame we lay out the
+   * first `n` rings of a given kind onto the first `n` selected units of
+   * that kind and hide the rest. The pool grows as needed; capped only by
+   * how many units the player can select in practice.
+   */
+  private ringPools: Map<string, THREE.LineSegments[]> = new Map();
+  private ringTemplates: Map<string, { radius: number; color: number }> = new Map();
 
   constructor(capacity = 256) {
     this.capacity = capacity;
@@ -108,36 +108,34 @@ export class UnitRenderer {
       this.rocketTruckHull, this.rocketTruckPod,
     );
 
-    this.selectionRingSoldier = makeSelectionRing(0.6, 0x00ff88);
-    this.selectionRingTank = makeSelectionRing(1.6, 0xffaa33);
-    this.selectionRingTunneler = makeSelectionRing(0.7, 0xffe066);
-    this.selectionRingWorm = makeSelectionRing(0.9, 0xc266ff);
-    this.selectionRingWorker = makeSelectionRing(0.55, 0x33ccff);
-    this.selectionRingDozer = makeSelectionRing(1.7, 0xffc044);
-    this.selectionRingHauler = makeSelectionRing(1.5, 0xff5544);
-    this.selectionRingRocketTruck = makeSelectionRing(1.55, 0xff8855);
-    this.selectionRingSoldier.visible = false;
-    this.selectionRingTank.visible = false;
-    this.selectionRingTunneler.visible = false;
-    this.selectionRingWorm.visible = false;
-    this.selectionRingWorker.visible = false;
-    this.selectionRingDozer.visible = false;
-    this.selectionRingHauler.visible = false;
-    this.selectionRingRocketTruck.visible = false;
-    this.group.add(
-      this.selectionRingSoldier, this.selectionRingTank,
-      this.selectionRingTunneler, this.selectionRingWorm,
-      this.selectionRingWorker,
-      this.selectionRingDozer, this.selectionRingHauler,
-      this.selectionRingRocketTruck,
-    );
+    this.ringTemplates.set('soldier',      { radius: 0.6,  color: 0x00ff88 });
+    this.ringTemplates.set('tank',         { radius: 1.6,  color: 0xffaa33 });
+    this.ringTemplates.set('tunneler',     { radius: 0.7,  color: 0xffe066 });
+    this.ringTemplates.set('worm',         { radius: 0.9,  color: 0xc266ff });
+    this.ringTemplates.set('worker',       { radius: 0.55, color: 0x33ccff });
+    this.ringTemplates.set('dozer',        { radius: 1.7,  color: 0xffc044 });
+    this.ringTemplates.set('hauler',       { radius: 1.5,  color: 0xff5544 });
+    this.ringTemplates.set('rocket_truck', { radius: 1.55, color: 0xff8855 });
+    for (const kind of this.ringTemplates.keys()) this.ringPools.set(kind, []);
+  }
+
+  private getRing(kind: string, idx: number): THREE.LineSegments {
+    const pool = this.ringPools.get(kind)!;
+    while (pool.length <= idx) {
+      const tpl = this.ringTemplates.get(kind)!;
+      const ring = makeSelectionRing(tpl.radius, tpl.color);
+      ring.visible = false;
+      this.group.add(ring);
+      pool.push(ring);
+    }
+    return pool[idx]!;
   }
 
   update(units: UnitManager): void {
     let nSold = 0, nTank = 0, nTun = 0, nWorm = 0, nWormSeg = 0;
     let nWork = 0, nCrateW = 0, nCrateM = 0;
     let nDoz = 0, nHaul = 0, nRkt = 0;
-    let selected: Unit | null = null;
+    const ringCounts = new Map<string, number>();
     const now = performance.now() / 1000;
 
     for (const u of units.units) {
@@ -336,7 +334,13 @@ export class UnitRenderer {
         nRkt++;
       }
 
-      if (u.selected && !selected) selected = u;
+      if (u.selected) {
+        const idx = ringCounts.get(u.kind) ?? 0;
+        const ring = this.getRing(u.kind, idx);
+        ring.position.set(u.x, u.y + 0.05, u.z);
+        ring.visible = true;
+        ringCounts.set(u.kind, idx + 1);
+      }
     }
 
     this.soldierBody.count = nSold;
@@ -374,26 +378,10 @@ export class UnitRenderer {
       m.instanceMatrix.needsUpdate = true;
     }
 
-    this.selectionRingSoldier.visible = false;
-    this.selectionRingTank.visible = false;
-    this.selectionRingTunneler.visible = false;
-    this.selectionRingWorm.visible = false;
-    this.selectionRingWorker.visible = false;
-    this.selectionRingDozer.visible = false;
-    this.selectionRingHauler.visible = false;
-    this.selectionRingRocketTruck.visible = false;
-    if (selected) {
-      const ring =
-        selected.kind === 'soldier' ? this.selectionRingSoldier
-        : selected.kind === 'tank' ? this.selectionRingTank
-        : selected.kind === 'tunneler' ? this.selectionRingTunneler
-        : selected.kind === 'worm' ? this.selectionRingWorm
-        : selected.kind === 'worker' ? this.selectionRingWorker
-        : selected.kind === 'dozer' ? this.selectionRingDozer
-        : selected.kind === 'rocket_truck' ? this.selectionRingRocketTruck
-        : this.selectionRingHauler;
-      ring.position.set(selected.x, selected.y + 0.05, selected.z);
-      ring.visible = true;
+    // Hide any leftover rings from frames where more units were selected.
+    for (const [kind, pool] of this.ringPools) {
+      const used = ringCounts.get(kind) ?? 0;
+      for (let i = used; i < pool.length; i++) pool[i]!.visible = false;
     }
   }
 

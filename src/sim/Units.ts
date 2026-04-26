@@ -767,18 +767,35 @@ export class UnitManager {
     const groundMult = groundSpeedMultiplier(groundMat);
     const step = u.speed * align * groundMult * dt;
 
-    let moved = 0;
+    let nx = u.x, nz = u.z;
+    let snap = false;
     if (step >= d) {
-      moved = d;
-      u.x = tgt.x; u.z = tgt.z;
-      u.path.shift();
+      nx = tgt.x; nz = tgt.z;
+      snap = true;
     } else if (step > 0) {
       const inv = 1 / d;
-      u.x += dx * inv * step;
-      u.z += dz * inv * step;
-      moved = step;
+      nx = u.x + dx * inv * step;
+      nz = u.z + dz * inv * step;
     }
-    u.blockedFrames = 0;
+    // Unit-vs-unit collision: if the next foothold overlaps another unit,
+    // hold position this frame. The path is preserved — the blocker will
+    // hopefully clear out of the way; if it doesn't within
+    // BLOCKED_GIVE_UP_FRAMES the unit drops its path so it stops grinding
+    // against an occupied slot forever.
+    let moved = 0;
+    if (this.unitCollidesAt(u, nx, nz)) {
+      u.blockedFrames++;
+      if (u.blockedFrames > BLOCKED_GIVE_UP_FRAMES) {
+        u.path = [];
+        u.blockedFrames = 0;
+        if (u.kind === 'dozer') u.levelTargetY = null;
+      }
+    } else {
+      u.x = nx; u.z = nz;
+      moved = snap ? d : step;
+      if (snap) u.path.shift();
+      u.blockedFrames = 0;
+    }
     sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
     u.distanceWalked += moved;
     // Dozer: each frame the unit is moving, emit a level request covering the
@@ -858,10 +875,11 @@ export class UnitManager {
       return;
     }
 
-    // Collision detection is intentionally off — we trust the planned path and
-    // advance toward the waypoint regardless of whether the next cell happens to
-    // be solid. Stuck units would otherwise sit forever on a path the planner
-    // already considered valid; just letting them through keeps motion crisp.
+    // Voxel collision is intentionally off — we trust the planned path and
+    // advance toward the waypoint regardless of whether the next cell happens
+    // to be solid. We DO honour unit-vs-unit collision so a moving unit
+    // doesn't walk through a parked one; if blocked, hold position this
+    // frame and bail out of the path after a stall threshold.
     const step = u.speed * dt;
     let nextX: number, nextY: number, nextZ: number, snapping = false;
     if (d <= step) {
@@ -873,14 +891,21 @@ export class UnitManager {
       nextY = u.y + dy * inv * step;
       nextZ = u.z + dz * inv * step;
     }
-    u.blockedFrames = 0;
-    const consumed = snapping ? d : step;
-    u.x = nextX; u.y = nextY; u.z = nextZ;
-    if (snapping) {
-      u.path.shift();
-      u.carveCooldown = 0;
+    if (this.unitCollidesAt(u, nextX, nextZ)) {
+      u.blockedFrames++;
+      if (u.blockedFrames > BLOCKED_GIVE_UP_FRAMES) {
+        u.path = [];
+        u.blockedFrames = 0;
+      }
+    } else {
+      u.x = nextX; u.y = nextY; u.z = nextZ;
+      u.distanceWalked += snapping ? d : step;
+      if (snapping) {
+        u.path.shift();
+        u.carveCooldown = 0;
+      }
+      u.blockedFrames = 0;
     }
-    u.distanceWalked += consumed;
     applyPathOrientation(u, dx, dy, dz, dt);
     // Vertical positioning. Three regimes:
     //   1. Above the local surface — surface nav drives the snap (handles hills).
@@ -962,9 +987,57 @@ export class UnitManager {
       unit: u,
     });
   }
+
+  /**
+   * True when stepping unit `u` into world-space (px, pz) would intrude on
+   * the body cylinder of another live unit. The collision rules:
+   *
+   *  - Only stationary peers (empty path) block — two moving units phase
+   *    through each other so a column of marching units doesn't jam on
+   *    minor desync between their per-frame steps.
+   *  - If `u` is *already* overlapping a peer (e.g. multi-spawn stack at a
+   *    barracks door), the step is allowed as long as it increases
+   *    separation, so stuck units can shuffle apart instead of jamming
+   *    forever.
+   *  - Vertical separation > 2 m exempts the pair (one unit on a bridge,
+   *    another walking under it).
+   */
+  private unitCollidesAt(u: Unit, px: number, pz: number): boolean {
+    const r1 = unitCollisionRadius(u);
+    for (const other of this.units) {
+      if (other === u) continue;
+      if (other.hp <= 0) continue;
+      if (other.path.length > 0) continue;
+      if (Math.abs(other.y - u.y) > 2.0) continue;
+      const r2 = unitCollisionRadius(other);
+      const minDist2 = (r1 + r2) * (r1 + r2);
+      const ndx = other.x - px;
+      const ndz = other.z - pz;
+      const newD2 = ndx * ndx + ndz * ndz;
+      if (newD2 >= minDist2) continue;
+      const cdx = other.x - u.x;
+      const cdz = other.z - u.z;
+      const curD2 = cdx * cdx + cdz * cdz;
+      if (curD2 < minDist2 && newD2 > curD2) continue; // already overlapping, separating
+      return true;
+    }
+    return false;
+  }
   private lastSurfaceNav!: SurfaceNavBuffers;
   private lastVoxels!: Uint8Array;
 }
+
+/**
+ * Body-cylinder radius used for unit-vs-unit collision. Slightly less than
+ * `widthMeters * 0.5` so two units in adjacent formation slots can stand
+ * shoulder to shoulder without the planner refusing to seat them.
+ */
+function unitCollisionRadius(u: Unit): number {
+  return Math.max(0.3, u.widthMeters * 0.45);
+}
+
+/** Frames a unit can be blocked by a peer before its path is dropped. */
+const BLOCKED_GIVE_UP_FRAMES = 240;
 
 /**
  * True when the unit is meaningfully below the local surface — used to suppress the
