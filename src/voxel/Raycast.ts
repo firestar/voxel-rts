@@ -59,25 +59,34 @@ export function raycastVoxel(
         return { x, y, z, tMeters, nx, ny, nz };
       }
     }
-    if (tMaxX < tMaxY && tMaxX < tMaxZ) {
+    // Step on whichever axis crosses the next cell boundary first. Compare
+    // BEFORE incrementing tMax{X,Y,Z}: whichever current value is smallest
+    // is the next crossing along the ray. Then advance the chosen axis and
+    // bump that tMax by its tDelta. The break is keyed off the stepped-onto
+    // tMeters (= the smallest tMax), so when even the closest next crossing
+    // already lies past the ray's max length we stop — but stepping a tiny
+    // sliver on one axis no longer prematurely aborts traversal of the
+    // other axes (which was the bug for near-axis-aligned rays like
+    // ballistic projectiles fired almost-horizontally).
+    let nextT: number;
+    if (tMaxX <= tMaxY && tMaxX <= tMaxZ) {
+      nextT = tMaxX;
       x += stepX;
-      tMeters = tMaxX * VOXEL_SIZE;
       tMaxX += tDeltaX;
       nx = -stepX; ny = 0; nz = 0;
-      if (tMaxX > maxVoxelDist) break;
-    } else if (tMaxY < tMaxZ) {
+    } else if (tMaxY <= tMaxZ) {
+      nextT = tMaxY;
       y += stepY;
-      tMeters = tMaxY * VOXEL_SIZE;
       tMaxY += tDeltaY;
       nx = 0; ny = -stepY; nz = 0;
-      if (tMaxY > maxVoxelDist) break;
     } else {
+      nextT = tMaxZ;
       z += stepZ;
-      tMeters = tMaxZ * VOXEL_SIZE;
       tMaxZ += tDeltaZ;
       nx = 0; ny = 0; nz = -stepZ;
-      if (tMaxZ > maxVoxelDist) break;
     }
+    tMeters = nextT * VOXEL_SIZE;
+    if (nextT > maxVoxelDist) break;
   }
   return null;
 }

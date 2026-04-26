@@ -23,6 +23,12 @@ import { Resources } from '../sim/Resources';
 import { PileManager } from '../sim/Piles';
 import { SaplingManager } from '../sim/Saplings';
 import { tickWorkers } from '../sim/Workers';
+import { ProjectileManager, PROJECTILES, muzzleOrigin, ProjectileImpact } from '../sim/Projectiles';
+import { WEAPONS } from '../sim/Weapons';
+import { tickWeapons } from '../sim/WeaponTick';
+import {
+  ProjectileRenderer, FlashPool, ImpactRingPool, TrajectoryPreview, ImpactMarker,
+} from '../render/ProjectileRenderer';
 
 /**
  * Player UI mode. `build*` modes preview a building footprint; `plant` mode
@@ -50,6 +56,13 @@ export class Game {
   readonly resources = new Resources();
   readonly piles = new PileManager();
   readonly saplings = new SaplingManager();
+  readonly projectiles = new ProjectileManager();
+  readonly projectileRenderer = new ProjectileRenderer();
+  readonly muzzleFlashes = new FlashPool(256);
+  readonly impactFlashes = new FlashPool(128);
+  readonly impactRings = new ImpactRingPool(64);
+  readonly trajectoryPreview = new TrajectoryPreview();
+  readonly impactMarker = new ImpactMarker();
   pathClient: PathClient | null = null;
   /** Pixels of vertical drag = 1 m of altitude offset for tunneler targets. */
   private readonly altitudeDragSensitivity = 8;
@@ -86,6 +99,12 @@ export class Game {
     this.renderer.scene.add(this.ghost.group);
     this.renderer.scene.add(this.pathPreview.object);
     this.renderer.scene.add(this.target.group);
+    this.renderer.scene.add(this.projectileRenderer.mesh);
+    this.renderer.scene.add(this.muzzleFlashes.mesh);
+    this.renderer.scene.add(this.impactFlashes.mesh);
+    this.renderer.scene.add(this.impactRings.group);
+    this.renderer.scene.add(this.trajectoryPreview.object);
+    this.renderer.scene.add(this.impactMarker.object);
     this.ghost.setSpec(this.buildSpec);
 
     this.buildings.spawner = (kind, x, y, z): Unit | null => this.spawnUnit(kind, x, y, z);
@@ -131,6 +150,17 @@ export class Game {
     this.spawnUnit('worm', c.x + 0.5, c.y, c.z + 4.0);
     this.spawnUnit('dozer', c.x + 5.0, c.y, c.z + 1.5);
     this.spawnUnit('hauler', c.x - 5.0, c.y, c.z + 1.5);
+    // Vehicle rocket platforms — one cluster, one heavy. The cluster_pod is
+    // the rocket_truck default; the heavy platform spawns with the
+    // single-warhead rocket_pod weapon override.
+    this.spawnUnit('rocket_truck', c.x + 7.0, c.y, c.z + 2.0);
+    this.units.spawn('rocket_truck', c.x + 8.5, c.y, c.z + 2.0, { weapon: 'rocket_pod' });
+    // Soldier loadouts — one of each archetype so the player can RMB-fire
+    // any weapon without chasing the build menu first.
+    this.units.spawn('soldier', c.x + 1.5, c.y, c.z - 2.0, { weapon: 'sniper' });
+    this.units.spawn('soldier', c.x - 1.5, c.y, c.z - 2.0, { weapon: 'machine_gun' });
+    this.units.spawn('soldier', c.x + 0.0, c.y, c.z - 3.0, { weapon: 'rpg_launcher' });
+    this.units.spawn('soldier', c.x + 2.5, c.y, c.z - 3.0, { weapon: 'pistol' });
     // Two harvester workers + one transporter so the player sees the
     // economy loop running from the first frame. They auto-pick targets
     // via tickWorkers — the player can still override with click commands.
@@ -180,11 +210,17 @@ export class Game {
     this.input.beginFrame();
     const w = window.innerWidth, h = window.innerHeight;
 
+    // RMB is overloaded: when a weapon-bearing unit is selected and we're not
+    // in build / plant mode, the right mouse button is the fire-aim gesture
+    // (hold to aim, release to fire, vertical drag = target altitude). In
+    // every other case it falls through to the camera yaw drag.
+    const fireAimActive = this.isFireAimActive();
     this.camera.update({
       keys: this.input.keys,
       mouseX: this.input.mouseX, mouseY: this.input.mouseY,
-      rmbDown: this.input.rmbDown,
-      rmbDx: this.input.rmbDx, rmbDy: this.input.rmbDy,
+      rmbDown: fireAimActive ? false : this.input.rmbDown,
+      rmbDx: fireAimActive ? 0 : this.input.rmbDx,
+      rmbDy: fireAimActive ? 0 : this.input.rmbDy,
       wheel: this.input.wheel,
       width: w, height: h,
     }, dt);
@@ -240,10 +276,32 @@ export class Game {
       this.handleRelease(this.input.release, w, h);
     }
 
+    // Fire-aim preview: if the player is currently holding RMB with a
+    // weapon-bearing unit selected, draw the predicted trajectory + impact
+    // marker. Released aim becomes a `firingTarget` on the unit, which the
+    // weapon-tick consumes (slewing turret/hull and firing once aligned).
+    this.updateFireAim(w, h);
+    if (this.input.rmbRelease) this.handleFireRelease(this.input.rmbRelease, w, h);
+
     if (this.pathClient) {
       this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, this.world.buffers.voxels, (req) => this.handleWorldEdit(req));
       this.buildings.tick(dt, this.world, this.units);
       this.paintTankTracks();
+      // Weapon firing pipeline. Slews turret/hull toward each unit's
+      // firingTarget, fires when aligned, drops projectiles into the
+      // ProjectileManager, and emits muzzle flashes for the renderer.
+      tickWeapons(dt, this.units, this.projectiles, {
+        onMuzzleFlash: (x, y, z, radius, life, color) => {
+          this.muzzleFlashes.spawn(x, y, z, radius, life, color.r, color.g, color.b);
+        },
+      });
+      // Projectile physics + collision detection. Pending impacts drain into
+      // the world-edit machinery (damage spheres, debris bursts, impact rings)
+      // immediately so a hit is felt the same frame the projectile lands.
+      this.projectiles.tick(dt, this.world);
+      for (const imp of this.projectiles.pendingImpacts) {
+        this.handleProjectileImpact(imp);
+      }
       // Worker automation: drive harvesters / transporters. Routing is
       // delegated back to routePath via the routeWorker callback so the
       // existing path client is reused unchanged.
@@ -262,6 +320,10 @@ export class Game {
     }
     this.unitRenderer.update(this.units);
     this.buildingRenderer.update(this.buildings.buildings);
+    this.projectileRenderer.update(this.projectiles);
+    this.muzzleFlashes.update(dt);
+    this.impactFlashes.update(dt);
+    this.impactRings.update(dt);
 
     // Dashed path preview for the selected unit (if any).
     const sel = this.units.units.find(u => u.selected);
@@ -289,12 +351,15 @@ export class Game {
       const selDesc = sel
         ? (sel.kind === 'worker' ? `worker(${sel.workerRole}) #${sel.id}` : `${sel.kind} #${sel.id}`)
         : 'none';
+      const weaponDesc = sel && sel.weapon !== null
+        ? ` weapon: ${WEAPONS[sel.weapon].label} (RMB to fire, drag Y for altitude)`
+        : '';
       const buildDesc = this.mode === 'build'
         ? `MODE: BUILD ${this.buildSpec.label} (LMB place, B/1-${ALL_BUILDINGS.length} cycle, Esc cancel)`
         : this.mode === 'plant'
           ? 'MODE: PLANT SAPLING (LMB on grass, P cancel)'
           : 'MODE: PLAY';
-      this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}`;
+      this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}${weaponDesc}`;
     }
   }
 
@@ -843,6 +908,147 @@ export class Game {
       if (getBit(vnav.bedrock, idx)) return false;
     }
     return true;
+  }
+
+  /**
+   * True when the player is mid-aim with the right mouse button on a
+   * weapon-bearing unit. While active, the camera's RMB-yaw input is
+   * suppressed and the trajectory preview / impact marker are drawn.
+   */
+  private isFireAimActive(): boolean {
+    if (this.mode !== 'play') return false;
+    if (!this.input.rmbHold) return false;
+    const sel = this.units.units.find(u => u.selected);
+    if (!sel || sel.weapon === null) return false;
+    return true;
+  }
+
+  /**
+   * Each frame while RMB is held with a weapon-bearing unit selected, ray-cast
+   * from the cursor's start position into the world and use vertical drag to
+   * raise/lower the impact altitude. Then ask the projectile manager to
+   * predict the actual flight path with full physics, draw it as a dashed arc,
+   * and place an impact marker at the predicted landing point.
+   */
+  private updateFireAim(w: number, h: number): void {
+    if (!this.isFireAimActive()) {
+      this.trajectoryPreview.update([]);
+      this.impactMarker.hide();
+      return;
+    }
+    const hold = this.input.rmbHold!;
+    const sel = this.units.units.find(u => u.selected)!;
+    const wcfg = WEAPONS[sel.weapon!];
+    // Start cursor position is the aim point; vertical drag (down = +pixels)
+    // lowers the altitude, drag-up raises it. Same convention as the LMB
+    // tunneler altitude drag, so the player only learns one gesture.
+    const verticalDrag = hold.currentY - hold.startY;
+    const r = this.resolveTarget(hold.startX, hold.startY, w, h, verticalDrag);
+    if (!r) {
+      this.trajectoryPreview.update([]);
+      this.impactMarker.hide();
+      return;
+    }
+    const target = r.target;
+    // Aim direction from the unit's muzzle to the target. We use the unit's
+    // *current* turretYaw / heading to seed the yaw, then we let the target's
+    // pitch component drive the elevation. The trajectory we draw is exactly
+    // what the projectile will do once fired (matching physics in
+    // ProjectileManager.predictTrajectory).
+    const dx = target.x - sel.x;
+    const dy = target.y - (sel.y + 1.2);
+    const dz = target.z - sel.z;
+    const dl = Math.hypot(dx, dy, dz) || 1;
+    const dirX = dx / dl, dirY = dy / dl, dirZ = dz / dl;
+    const muzzle = muzzleOrigin(sel.x, sel.y, sel.z, dirX, dirY, dirZ, 1.4, 1.2);
+    const points = this.projectiles.predictTrajectory(
+      wcfg.projectile,
+      muzzle.x, muzzle.y, muzzle.z,
+      dirX, dirY, dirZ,
+      this.world,
+      0,
+      120, 0.05,
+      wcfg.velocityScale,
+    );
+    this.trajectoryPreview.update(points);
+    const last = points[points.length - 1];
+    if (last) {
+      const pcfg = PROJECTILES[wcfg.projectile];
+      const ringRadius = pcfg.explosive ? pcfg.explosionRadiusMeters : 0.6;
+      this.impactMarker.show(last.x, last.y, last.z, ringRadius);
+    }
+  }
+
+  /**
+   * On RMB release, commit the aimed target to the unit. The weapon-tick will
+   * slew the turret / hull toward the target, then fire when within tolerance.
+   * Burst weapons (rifle, MG) consume the target on the first shot and then
+   * spray follow-up rounds along the same heading without needing re-aim.
+   */
+  private handleFireRelease(release: { startX: number; startY: number; endX: number; endY: number; shift: boolean }, w: number, h: number): void {
+    this.trajectoryPreview.update([]);
+    this.impactMarker.hide();
+    if (this.mode !== 'play') return;
+    const sel = this.units.units.find(u => u.selected);
+    if (!sel || sel.weapon === null) return;
+    const verticalDrag = release.endY - release.startY;
+    const r = this.resolveTarget(release.startX, release.startY, w, h, verticalDrag);
+    if (!r) return;
+    sel.firingTarget = { x: r.target.x, y: r.target.y, z: r.target.z };
+  }
+
+  /**
+   * Resolve a projectile impact: spawn a damage sphere on the world (so the
+   * crater + debris pipeline is identical to a player-placed shift-LMB
+   * detonation), spawn a fire-flash sphere at the impact point, and start an
+   * expanding ring on the ground tuned to the explosion radius. Cluster
+   * detonations also kick out submunitions in random downward-tilted
+   * directions.
+   */
+  private handleProjectileImpact(imp: ProjectileImpact): void {
+    const cfg = PROJECTILES[imp.kind];
+    const cx = imp.x / VOXEL_SIZE;
+    const cy = imp.y / VOXEL_SIZE;
+    const cz = imp.z / VOXEL_SIZE;
+    const radiusMeters = imp.explosive ? imp.explosionRadiusMeters : imp.hitRadiusMeters;
+    const result = this.world.damageSphere(cx, cy, cz, radiusMeters / VOXEL_SIZE, imp.damagePeak);
+    if (result.destroyed.length > 0) {
+      const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
+      const burst = imp.explosive
+        ? Math.min(220, 30 + result.destroyed.length * 2)
+        : Math.min(20, 4 + result.destroyed.length);
+      this.debris.spawnBurst(imp.x, imp.y, imp.z, burst, sample.material);
+      this.requestNavRebuild(false);
+    }
+    // Fire flash — bigger and longer for explosives so the player feels the
+    // weight of an RPG / cluster hit. Bullets get a small spark.
+    if (imp.explosive) {
+      this.impactFlashes.spawn(imp.x, imp.y, imp.z, radiusMeters * 1.6, 0.32, 1.0, 0.55, 0.25);
+    } else {
+      this.impactFlashes.spawn(imp.x, imp.y, imp.z, radiusMeters * 0.8, 0.14, 1.0, 0.85, 0.45);
+    }
+    // Expanding shockwave ring — radius scales with the explosion, so a tank
+    // shell sweeps a much wider ring than a 9 mm pit.
+    const ringRadius = imp.explosive ? imp.explosionRadiusMeters * 1.4 : 0.6;
+    const ringLife = imp.explosive ? 0.7 : 0.25;
+    this.impactRings.spawn(imp.x, imp.y, imp.z, ringRadius, ringLife, cfg.colorR, cfg.colorG, cfg.colorB);
+    // Cluster: spawn submunitions in a random downward cone from the burst
+    // point, using the projectile catalog's `cluster_submunition` entry.
+    if (cfg.clusterSubmunitions > 0) {
+      const n = cfg.clusterSubmunitions;
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * Math.PI * 2 + Math.random() * 0.4;
+        const tilt = 0.3 + Math.random() * 0.5;     // 17°–46° outward
+        const horiz = Math.cos(tilt);
+        const dx = Math.cos(a) * horiz;
+        const dz = Math.sin(a) * horiz;
+        const dy = -Math.sin(tilt) - 0.2;           // slightly downward
+        // Submunitions are anonymous (ownerId = -1) so they can damage any
+        // future unit-vs-unit logic without the originating launcher being
+        // counted as the shooter.
+        this.projectiles.spawn('cluster_submunition', imp.x, imp.y + 0.2, imp.z, dx, dy, dz, -1, 1);
+      }
+    }
   }
 
   /** World-space Y (meters) of the topY voxel under the given world-space (x, z). */
