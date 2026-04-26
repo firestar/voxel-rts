@@ -1,7 +1,7 @@
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { VOXEL_SIZE, WORLD_X, WORLD_Y, WORLD_Z, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
-import { digSpeedMultiplier, groundSpeedMultiplier, M_WOOD, M_LEAF } from '../voxel/Materials';
+import { digSpeedMultiplier, groundSpeedMultiplier, M_WOOD, M_LEAF, M_DIRT } from '../voxel/Materials';
 import {
   worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers, VNAV_CELL_METERS,
   VNAV_X, VNAV_Y, VNAV_Z,
@@ -12,7 +12,7 @@ import {
   WORM_SEGMENT_COUNT, WORM_SEGMENT_SPACING,
 } from '../render/UnitModels';
 
-export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm';
+export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'dozer' | 'hauler';
 
 /** Downward acceleration in m/s². Slightly snappier than real-world 9.81 — units feel
  *  "weighty" without dragging out the fall arc. Per-unit terminal velocity then sets
@@ -67,6 +67,14 @@ interface UnitConfig {
   segmentCount: number;
   /** Target spacing between adjacent body segments along the chain, meters. */
   segmentSpacing: number;
+  /** Half-width of the dozer blade strip in meters (perpendicular to forward). 0 for non-dozers. */
+  bladeHalfWidthMeters: number;
+  /** Forward distance from the unit origin to the blade leading edge, meters. 0 for non-dozers. */
+  bladeForwardMeters: number;
+  /** Length of the levelling strip behind the blade leading edge, meters. 0 for non-dozers. */
+  bladeDepthMeters: number;
+  /** Maximum carried-spoil capacity in voxel units (1 voxel = 0.125³ m³). 0 for non-earthmovers. */
+  spoilCapacityVoxels: number;
 }
 
 export function unitConfig(kind: UnitKind): UnitConfig {
@@ -91,6 +99,8 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         terminalFallSpeed: 28,                   // skydiver-ish cap
         cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
         segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
       };
     case 'tank':
       // Tanks are restricted to fairly flat terrain.
@@ -115,6 +125,8 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         terminalFallSpeed: 45,                   // heavier shell, drags less per kg
         cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
         segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
       };
     case 'tunneler':
       // 5x5 cells (5 m x 5 m); 9 voxels (≈1.1 m) residual tolerance — generous because
@@ -140,6 +152,8 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         cutterForward: TUNNELER_CUTTER_FORWARD,
         cutterHeight: TUNNELER_CUTTER_HEIGHT,
         segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
       };
     case 'worm':
       // Smaller, articulated tunneler. Head (the controlled body) carries a narrower
@@ -165,6 +179,67 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         cutterHeight: WORM_CUTTER_HEIGHT,
         segmentCount: WORM_SEGMENT_COUNT,
         segmentSpacing: WORM_SEGMENT_SPACING,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
+      };
+    case 'dozer':
+      // Tracked bulldozer. Walks the surface like a tank, but each frame the strip
+      // ahead of the blade is levelled to `levelTargetY`. Cut volume goes into the
+      // unit's spoilLoad up to spoilCapacityVoxels; fill draws from the same load.
+      // Excess (when the load saturates) is dropped behind the unit as a M_DIRT
+      // spoil mound the hauler can later collect.
+      //   Footprint mirrors the tank (2-cell radius, ~2.6 m wide chassis).
+      //   Speed is somewhat slower than the tank — heavier vehicle pushing earth.
+      return {
+        footprintRadius: 2, widthMeters: 2.6,
+        maxStepVoxels: 5, slopePenalty: 0.22,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 6,
+        turnRateRadPerSec: 1.2,                  // ~70°/s
+        maxPitchRad: Math.PI / 6,                // 30° — same chassis cap as tank
+        heightVoxels: 16,                        // ~2 m
+        canDig: false, requiresGround: true,
+        speed: 2.8, speedDigging: 0,
+        hp: 260,
+        massKg: 40_000,                          // 40 t
+        terminalFallSpeed: 42,
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
+        // Blade is wider than the chassis (1.6 m half-width = 3.2 m total) so the
+        // levelled strip is a comfortable two-lane width. Depth covers the
+        // expected per-frame travel (~5 cm at 60 fps + headroom) so the strip
+        // overlaps cleanly between frames.
+        bladeHalfWidthMeters: 1.6,
+        bladeForwardMeters: 1.6,
+        bladeDepthMeters: 0.6,
+        // ~8 m³ of carried dirt at a 0.125 m voxel — comfortably more than a
+        // single hill-flatten run produces, so the dozer rarely runs dry mid-job.
+        spoilCapacityVoxels: 4096,
+      };
+    case 'hauler':
+      // Dump truck. Carries up to spoilCapacityVoxels of loose voxels. A single
+      // click commands one job, picked from the unit's current load:
+      //   - Empty hauler  → drive to the click XZ, scoop up to capacity from
+      //     the top of that column.
+      //   - Loaded hauler → drive to the click XZ, dump the entire load on top
+      //     of that column as M_DIRT.
+      // Triple the dozer's capacity so a hauler trip is meaningful relative to
+      // the spoil one dozer pass produces.
+      return {
+        footprintRadius: 2, widthMeters: 2.4,
+        maxStepVoxels: 4, slopePenalty: 0.25,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 5,
+        turnRateRadPerSec: 1.4,
+        maxPitchRad: Math.PI / 6,
+        heightVoxels: 18,
+        canDig: false, requiresGround: true,
+        speed: 4.0, speedDigging: 0,
+        hp: 200,
+        massKg: 25_000,                          // 25 t
+        terminalFallSpeed: 40,
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 12_288,
       };
   }
 }
@@ -230,6 +305,32 @@ export interface Unit {
    * Empty for non-chain units (no need to allocate the buffer).
    */
   pathHistory: { x: number; y: number; z: number }[];
+  /**
+   * Earth-moving state.
+   * `spoilLoad` — voxels currently carried (0..spoilCapacity).
+   * `spoilCapacity` — max load.
+   * `levelTargetY` — voxel-space Y the dozer levels every column it sweeps to.
+   *   Set by Game.handleRelease from the click's voxel y; cleared on path drop.
+   * `haulerJob` — pending one-shot job for the hauler. Set when the player
+   *   issues a command; consumed when the unit reaches the goal column.
+   */
+  spoilLoad: number;
+  spoilCapacity: number;
+  levelTargetY: number | null;
+  haulerJob: HaulerJob | null;
+  /** Cached blade dimensions, copied from the config so the renderer + sim share them. */
+  bladeHalfWidthMeters: number;
+  bladeForwardMeters: number;
+  bladeDepthMeters: number;
+}
+
+/** Pending hauler one-shot. Resolved into one ScoopRequest or DumpRequest on arrival. */
+export interface HaulerJob {
+  /** Voxel-space target column. */
+  vx: number;
+  vz: number;
+  /** Snapshot of mode at command time — captures the intent at click. */
+  mode: 'load' | 'dump';
 }
 
 /** Minimum head movement between recorded breadcrumbs, meters. Smaller values
@@ -246,6 +347,7 @@ export interface WormSegment {
 }
 
 export interface CarveRequest {
+  kind: 'carve';
   /** Center of the carve volume in world meters. */
   x: number; y: number; z: number;
   /** Carve radius (perpendicular extent for cylinders, full radius for spheres) in meters. */
@@ -266,6 +368,43 @@ export interface CarveRequest {
   floorMeters?: number;
   unit: Unit;
 }
+
+/**
+ * Strip-level request emitted by the dozer once per surface tick. The handler iterates
+ * voxel columns covered by the oriented rectangle and applies `editColumnToY` to each.
+ *
+ * Geometry: rectangle centered at (x, z) in world meters, with forward unit-vector
+ * (fx, fz), half-length `halfDepthMeters` along forward, half-width `halfWidthMeters`
+ * across forward. `targetVoxY` is the voxel-space Y the dozer is levelling to.
+ */
+export interface LevelRequest {
+  kind: 'level';
+  unit: Unit;
+  x: number; z: number;
+  fx: number; fz: number;
+  halfDepthMeters: number;
+  halfWidthMeters: number;
+  targetVoxY: number;
+}
+
+/** One-shot scoop: take up to `maxVoxels` from the top of voxel column (vx, vz). */
+export interface ScoopRequest {
+  kind: 'scoop';
+  unit: Unit;
+  vx: number; vz: number;
+  maxVoxels: number;
+}
+
+/** One-shot dump: stack `voxels` of `material` on top of column (vx, vz). */
+export interface DumpRequest {
+  kind: 'dump';
+  unit: Unit;
+  vx: number; vz: number;
+  voxels: number;
+  material: number;
+}
+
+export type WorldEditRequest = CarveRequest | LevelRequest | ScoopRequest | DumpRequest;
 
 
 export class UnitManager {
@@ -333,6 +472,13 @@ export class UnitManager {
       cutterHeight: cfg.cutterHeight,
       segments,
       pathHistory,
+      spoilLoad: 0,
+      spoilCapacity: cfg.spoilCapacityVoxels,
+      levelTargetY: null,
+      haulerJob: null,
+      bladeHalfWidthMeters: cfg.bladeHalfWidthMeters,
+      bladeForwardMeters: cfg.bladeForwardMeters,
+      bladeDepthMeters: cfg.bladeDepthMeters,
     };
     this.units.push(u);
     return u;
@@ -376,7 +522,7 @@ export class UnitManager {
     nav: SurfaceNavBuffers,
     vnav: VolumeNavBuffers,
     voxels: Uint8Array,
-    carveOut: (req: CarveRequest) => void,
+    worldEdit: (req: WorldEditRequest) => void,
   ): void {
     this.lastSurfaceNav = nav;
     this.lastVoxels = voxels;
@@ -389,6 +535,27 @@ export class UnitManager {
           sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
         } else {
           relaxOrientation(u, dt);
+        }
+        // Hauler: a job persists on the unit until the path empties (i.e. the
+        // unit reached its goal cell). Emit exactly one scoop/dump request and
+        // clear the job so we don't fire it again on subsequent idle frames.
+        if (u.kind === 'hauler' && u.haulerJob !== null) {
+          const job = u.haulerJob;
+          u.haulerJob = null;
+          if (job.mode === 'load') {
+            const headroom = u.spoilCapacity - u.spoilLoad;
+            if (headroom > 0) {
+              worldEdit({ kind: 'scoop', unit: u, vx: job.vx, vz: job.vz, maxVoxels: headroom });
+            }
+          } else {
+            if (u.spoilLoad > 0) {
+              worldEdit({ kind: 'dump', unit: u, vx: job.vx, vz: job.vz, voxels: u.spoilLoad, material: M_DIRT });
+            }
+          }
+        }
+        // Dozer: stop levelling once the path completes.
+        if (u.kind === 'dozer' && u.levelTargetY !== null) {
+          u.levelTargetY = null;
         }
         continue;
       }
@@ -404,8 +571,8 @@ export class UnitManager {
       const tgtSurfaceY = surfaceWorldY(nav, tgt.x, tgt.z);
       const tgtUnderground = tgt.y < tgtSurfaceY - 0.5;
       const using3D = u.canDig || underground || tgtUnderground;
-      if (using3D) this.tickVolume(u, dt, nav, vnav, carveOut);
-      else this.tickSurface(u, dt, nav);
+      if (using3D) this.tickVolume(u, dt, nav, vnav, worldEdit);
+      else this.tickSurface(u, dt, nav, worldEdit);
     }
     // Body-segment chain: runs after every unit has had its head step this frame, so
     // segments always trail the post-tick head position. Only worms (segmentCount > 0)
@@ -426,7 +593,7 @@ export class UnitManager {
    * always sits in a volume cell that contains the top voxel itself, which would always
    * read as solid. That false-positive is what was freezing soldiers and tanks.
    */
-  private tickSurface(u: Unit, dt: number, nav: SurfaceNavBuffers): void {
+  private tickSurface(u: Unit, dt: number, nav: SurfaceNavBuffers, worldEdit: (req: WorldEditRequest) => void): void {
     const tgt = u.path[0]!;
     const dx = tgt.x - u.x;
     const dz = tgt.z - u.z;
@@ -465,6 +632,33 @@ export class UnitManager {
     u.blockedFrames = 0;
     sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
     u.distanceWalked += moved;
+    // Dozer: each frame the unit is moving, emit a level request covering the
+    // strip ahead of the blade. The handler iterates voxel columns inside the
+    // oriented rectangle and edits each to the unit's target Y. Levelling only
+    // runs while the dozer is actually advancing — idle dozers don't grind.
+    // If the path just emptied this tick, clear the dozer's level target so a
+    // later unrelated move doesn't accidentally re-level using a stale Y.
+    if (u.kind === 'dozer' && u.path.length === 0) {
+      u.levelTargetY = null;
+    }
+    if (u.kind === 'dozer' && u.levelTargetY !== null && moved > 1e-4) {
+      // Forward unit-vector matches the surface motion convention: heading 0
+      // points toward -Z, so forward = (-sin h, -cos h).
+      const fx = -Math.sin(u.heading);
+      const fz = -Math.cos(u.heading);
+      const halfDepth = u.bladeDepthMeters * 0.5;
+      const centerX = u.x + fx * (u.bladeForwardMeters - halfDepth);
+      const centerZ = u.z + fz * (u.bladeForwardMeters - halfDepth);
+      worldEdit({
+        kind: 'level',
+        unit: u,
+        x: centerX, z: centerZ,
+        fx, fz,
+        halfDepthMeters: halfDepth,
+        halfWidthMeters: u.bladeHalfWidthMeters,
+        targetVoxY: u.levelTargetY,
+      });
+    }
   }
 
   private tickVolume(
@@ -472,7 +666,7 @@ export class UnitManager {
     dt: number,
     nav: SurfaceNavBuffers,
     vnav: VolumeNavBuffers,
-    carveOut: (req: CarveRequest) => void,
+    worldEdit: (req: WorldEditRequest) => void,
   ): void {
     const tgt = u.path[0]!;
     const dx = tgt.x - u.x;
@@ -495,7 +689,7 @@ export class UnitManager {
       // Always carve at the blade — we're explicitly digging through solid here, so
       // bypass the surface engagement gate. Forward motion is gated below on the
       // cleared volume so the body never moves through unbroken voxels.
-      this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, carveOut, true);
+      this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, worldEdit, true);
       // Per-material dig speed. Sample the live voxel sitting at (or just past) the
       // blade face — that's the material the cutter is currently chewing through. A
       // multiplier of 0.3 in stone vs 1.0 in dirt makes the tunneler feel like an
@@ -581,13 +775,13 @@ export class UnitManager {
         }
       }
     }
-    this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, carveOut);
+    this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, worldEdit);
   }
 
   private maybeCarveAtCutter(
     u: Unit, _dt: number,
     dx: number, dy: number, dz: number, d: number,
-    carveOut: (req: CarveRequest) => void,
+    worldEdit: (req: WorldEditRequest) => void,
     forceCarve = false,
   ): void {
     if (!u.canDig) return;
@@ -618,7 +812,8 @@ export class UnitManager {
       if (!unitUnderground && !cutterInSolid) return;
     }
 
-    carveOut({
+    worldEdit({
+      kind: 'carve',
       x: cutterX, y: cutterY, z: cutterZ,
       axisX: fx, axisY: fy, axisZ: fz,
       halfLengthMeters: halfLength,

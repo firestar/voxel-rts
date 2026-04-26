@@ -7,6 +7,10 @@ import {
   TUNNELER_DRILL_PIVOT_Y, TUNNELER_DRILL_PIVOT_Z,
   buildWormHeadGeometry, buildWormSegmentGeometry, buildWormDrillGeometry,
   WORM_DRILL_PIVOT_Y, WORM_DRILL_PIVOT_Z, WORM_SEGMENT_COUNT,
+  buildDozerHullGeometry, buildDozerBladeGeometry,
+  DOZER_BLADE_PIVOT_Y, DOZER_BLADE_PIVOT_Z,
+  buildHaulerHullGeometry, buildHaulerBedGeometry,
+  HAULER_BED_PIVOT_Y, HAULER_BED_PIVOT_Z,
 } from './UnitModels';
 
 /**
@@ -29,6 +33,10 @@ export class UnitRenderer {
   private wormHead: THREE.InstancedMesh;
   private wormDrill: THREE.InstancedMesh;
   private wormSegment: THREE.InstancedMesh;
+  private dozerHull: THREE.InstancedMesh;
+  private dozerBlade: THREE.InstancedMesh;
+  private haulerHull: THREE.InstancedMesh;
+  private haulerBed: THREE.InstancedMesh;
 
   private capacity: number;
   private bodyM = new THREE.Matrix4();
@@ -44,6 +52,8 @@ export class UnitRenderer {
   private selectionRingTank: THREE.LineSegments;
   private selectionRingTunneler: THREE.LineSegments;
   private selectionRingWorm: THREE.LineSegments;
+  private selectionRingDozer: THREE.LineSegments;
+  private selectionRingHauler: THREE.LineSegments;
 
   constructor(capacity = 256) {
     this.capacity = capacity;
@@ -61,30 +71,41 @@ export class UnitRenderer {
     // The body-segment mesh holds capacity * SEGMENT_COUNT instances — one per
     // (worm, segment) pair — so a roomful of worms doesn't run out of slots.
     this.wormSegment = makeIM(buildWormSegmentGeometry(), mat, capacity * WORM_SEGMENT_COUNT);
+    this.dozerHull = makeIM(buildDozerHullGeometry(), mat, capacity);
+    this.dozerBlade = makeIM(buildDozerBladeGeometry(), mat, capacity);
+    this.haulerHull = makeIM(buildHaulerHullGeometry(), mat, capacity);
+    this.haulerBed = makeIM(buildHaulerBedGeometry(), mat, capacity);
 
     this.group.add(
       this.soldierBody, this.soldierLegL, this.soldierLegR,
       this.tankHull, this.tankTurret,
       this.tunnelerHull, this.tunnelerDrill,
       this.wormHead, this.wormDrill, this.wormSegment,
+      this.dozerHull, this.dozerBlade,
+      this.haulerHull, this.haulerBed,
     );
 
     this.selectionRingSoldier = makeSelectionRing(0.6, 0x00ff88);
     this.selectionRingTank = makeSelectionRing(1.6, 0xffaa33);
     this.selectionRingTunneler = makeSelectionRing(0.7, 0xffe066);
     this.selectionRingWorm = makeSelectionRing(0.9, 0xc266ff);
+    this.selectionRingDozer = makeSelectionRing(1.7, 0xffc044);
+    this.selectionRingHauler = makeSelectionRing(1.5, 0xff5544);
     this.selectionRingSoldier.visible = false;
     this.selectionRingTank.visible = false;
     this.selectionRingTunneler.visible = false;
     this.selectionRingWorm.visible = false;
+    this.selectionRingDozer.visible = false;
+    this.selectionRingHauler.visible = false;
     this.group.add(
       this.selectionRingSoldier, this.selectionRingTank,
       this.selectionRingTunneler, this.selectionRingWorm,
+      this.selectionRingDozer, this.selectionRingHauler,
     );
   }
 
   update(units: UnitManager): void {
-    let nSold = 0, nTank = 0, nTun = 0, nWorm = 0, nWormSeg = 0;
+    let nSold = 0, nTank = 0, nTun = 0, nWorm = 0, nWormSeg = 0, nDoz = 0, nHaul = 0;
     let selected: Unit | null = null;
     const now = performance.now() / 1000;
 
@@ -95,7 +116,10 @@ export class UnitRenderer {
       // so it still leans into the slope a bit, then push the rest of the pitch
       // onto the drill via an extra X-rotation at its pivot. Soldier and tank
       // bodies still use the full pitch as before.
-      const bodyPitchScale = (u.kind === 'tunneler' || u.kind === 'worm') ? 0.2 : 1.0;
+      const bodyPitchScale =
+        (u.kind === 'tunneler' || u.kind === 'worm') ? 0.2
+        : (u.kind === 'dozer' || u.kind === 'hauler') ? 0.6
+        : 1.0;
       const bodyPitch = u.pitch * bodyPitchScale;
       const cutterExtraPitch = u.pitch - bodyPitch;
       this.tmpEuler.set(bodyPitch, u.heading, u.roll, 'YXZ');
@@ -106,8 +130,18 @@ export class UnitRenderer {
       // / treads into the voxel underneath. Collision/path always use u.y as
       // the static feet position; the renderer must never draw the model lower
       // than that. Amplitude doubled to keep the same visual lift.
-      const bobFreq = u.kind === 'soldier' ? 6.0 : u.kind === 'tank' ? 3.0 : u.kind === 'tunneler' ? 4.0 : 5.0;
-      const bobAmp  = u.kind === 'soldier' ? 0.08 : u.kind === 'tank' ? 0.04 : u.kind === 'tunneler' ? 0.05 : 0.03;
+      const bobFreq = u.kind === 'soldier' ? 6.0
+        : u.kind === 'tank' ? 3.0
+        : u.kind === 'tunneler' ? 4.0
+        : u.kind === 'worm' ? 5.0
+        : u.kind === 'dozer' ? 3.5
+        : 3.5; // hauler
+      const bobAmp  = u.kind === 'soldier' ? 0.08
+        : u.kind === 'tank' ? 0.04
+        : u.kind === 'tunneler' ? 0.05
+        : u.kind === 'worm' ? 0.03
+        : u.kind === 'dozer' ? 0.04
+        : 0.05; // hauler — slightly more bounce on tires
       const sineRaw = Math.sin(u.distanceWalked * bobFreq + u.id);
       const bodyBob = isMoving ? Math.max(0, sineRaw) * bobAmp : 0;
       // Per-kind feet offset. Each model has its lowest geometry at a different
@@ -118,7 +152,9 @@ export class UnitRenderer {
       //   Tank:    tread bottom at body-local y = 0.05 → -0.05 drops the treads
       //            to u.y (was 5 cm of ground clearance which read as floating).
       //   Tunneler: tread bottom at body-local y = 0.0 already → no offset.
-      const feetOffset = u.kind === 'soldier' ? 0.05 : u.kind === 'tank' ? -0.05 : 0.0;
+      const feetOffset = u.kind === 'soldier' ? 0.05
+        : u.kind === 'tank' ? -0.05
+        : 0.0;
       this.tmpV.set(u.x, u.y + feetOffset + bodyBob, u.z);
       this.bodyM.compose(this.tmpV, this.quat, new THREE.Vector3(1, 1, 1));
 
@@ -162,8 +198,7 @@ export class UnitRenderer {
         this.partM.multiplyMatrices(this.bodyM, drillLocal);
         this.tunnelerDrill.setMatrixAt(nTun, this.partM);
         nTun++;
-      } else {
-        // worm
+      } else if (u.kind === 'worm') {
         if (nWorm >= this.capacity) continue;
         this.wormHead.setMatrixAt(nWorm, this.bodyM);
         // Same drill-spin idea as the tunneler — cutter rotates around its forward
@@ -194,6 +229,30 @@ export class UnitRenderer {
           this.wormSegment.setMatrixAt(nWormSeg, segM);
           nWormSeg++;
         }
+      } else if (u.kind === 'dozer') {
+        if (nDoz >= this.capacity) continue;
+        this.dozerHull.setMatrixAt(nDoz, this.bodyM);
+        // Blade rides at the front of the chassis. No moving pivot for now —
+        // it's a static plate. Blade model origin is centred at the leading
+        // edge, so we translate to the pivot then leave the geometry as-is.
+        this.partM.makeTranslation(0, DOZER_BLADE_PIVOT_Y, DOZER_BLADE_PIVOT_Z);
+        this.partM.premultiply(this.bodyM);
+        this.dozerBlade.setMatrixAt(nDoz, this.partM);
+        nDoz++;
+      } else if (u.kind === 'hauler') {
+        if (nHaul >= this.capacity) continue;
+        this.haulerHull.setMatrixAt(nHaul, this.bodyM);
+        // Bed tilts up when there's a pending dump job. Pivot at the rear lower
+        // edge of the bed; positive X-rotation lifts the front of the bed.
+        const tipping = u.haulerJob !== null && u.haulerJob.mode === 'dump' && u.spoilLoad > 0;
+        const tilt = tipping ? 0.45 : 0.0;
+        const bedTiltM = new THREE.Matrix4().makeRotationX(tilt);
+        const bedLocal = new THREE.Matrix4()
+          .makeTranslation(0, HAULER_BED_PIVOT_Y, HAULER_BED_PIVOT_Z)
+          .multiply(bedTiltM);
+        this.partM.multiplyMatrices(this.bodyM, bedLocal);
+        this.haulerBed.setMatrixAt(nHaul, this.partM);
+        nHaul++;
       }
 
       if (u.selected && !selected) selected = u;
@@ -209,11 +268,17 @@ export class UnitRenderer {
     this.wormHead.count = nWorm;
     this.wormDrill.count = nWorm;
     this.wormSegment.count = nWormSeg;
+    this.dozerHull.count = nDoz;
+    this.dozerBlade.count = nDoz;
+    this.haulerHull.count = nHaul;
+    this.haulerBed.count = nHaul;
     for (const m of [
       this.soldierBody, this.soldierLegL, this.soldierLegR,
       this.tankHull, this.tankTurret,
       this.tunnelerHull, this.tunnelerDrill,
       this.wormHead, this.wormDrill, this.wormSegment,
+      this.dozerHull, this.dozerBlade,
+      this.haulerHull, this.haulerBed,
     ]) {
       m.instanceMatrix.needsUpdate = true;
     }
@@ -222,12 +287,16 @@ export class UnitRenderer {
     this.selectionRingTank.visible = false;
     this.selectionRingTunneler.visible = false;
     this.selectionRingWorm.visible = false;
+    this.selectionRingDozer.visible = false;
+    this.selectionRingHauler.visible = false;
     if (selected) {
       const ring =
         selected.kind === 'soldier' ? this.selectionRingSoldier
         : selected.kind === 'tank' ? this.selectionRingTank
         : selected.kind === 'tunneler' ? this.selectionRingTunneler
-        : this.selectionRingWorm;
+        : selected.kind === 'worm' ? this.selectionRingWorm
+        : selected.kind === 'dozer' ? this.selectionRingDozer
+        : this.selectionRingHauler;
       ring.position.set(selected.x, selected.y + 0.05, selected.z);
       ring.visible = true;
     }
