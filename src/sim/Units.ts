@@ -11,15 +11,14 @@ import {
   WORM_CUTTER_RADIUS, WORM_CUTTER_FORWARD, WORM_CUTTER_HEIGHT,
   WORM_SEGMENT_COUNT, WORM_SEGMENT_SPACING,
 } from '../render/UnitModels';
+import { GRAVITY } from './gravity';
+import { WeaponKind } from './Weapons';
 
 export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'dozer' | 'hauler';
 
-/** Downward acceleration in m/s². Slightly snappier than real-world 9.81 — units feel
- *  "weighty" without dragging out the fall arc. Per-unit terminal velocity then sets
- *  how hard each kind eventually falls. */
-const GRAVITY = 22;
-
 interface UnitConfig {
+  /** Default weapon for this unit kind. null = unarmed (e.g. tunneler). */
+  defaultWeapon: WeaponKind | null;
   footprintRadius: number;
   widthMeters: number;
   maxStepVoxels: number;
@@ -86,6 +85,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       // skips the diagonal corner-cut for agile units (footprintRadius <= 1), so
       // a soldier can scramble onto a ledge from the inside of an L-shaped corner.
       return {
+        defaultWeapon: 'rifle',
         footprintRadius: 1, widthMeters: 0.75,
         maxStepVoxels: 32, slopePenalty: 0.08,
         bodyHalfCells: 0, bodyRoughnessVoxels: 999,
@@ -112,6 +112,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       // Cliffs / steep hills now hard-block tank routes; the unit will detour around
       // them instead of trying to scale them.
       return {
+        defaultWeapon: 'cluster_rocket',
         footprintRadius: 2, widthMeters: 2.4,
         maxStepVoxels: 4, slopePenalty: 0.25,
         bodyHalfCells: 1, bodyRoughnessVoxels: 5,
@@ -137,6 +138,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       // maxStepVoxels = 14 voxels (1.75 m climb ≈ 60° slope) — wider machine than the
       // tank, but with the cutter pulling it up steep grades.
       return {
+        defaultWeapon: null,
         footprintRadius: 2, widthMeters: 3.6,
         maxStepVoxels: 14, slopePenalty: 0.15,
         bodyHalfCells: 2, bodyRoughnessVoxels: 9,
@@ -163,6 +165,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       // collision-free trail; only the head participates in pathing and carving, so
       // routing reuses the existing tunneler volume-A* code path unchanged.
       return {
+        defaultWeapon: null,
         footprintRadius: 1, widthMeters: 1.8,
         maxStepVoxels: 16, slopePenalty: 0.12,
         bodyHalfCells: 1, bodyRoughnessVoxels: 12,
@@ -191,6 +194,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       //   Footprint mirrors the tank (2-cell radius, ~2.6 m wide chassis).
       //   Speed is somewhat slower than the tank — heavier vehicle pushing earth.
       return {
+        defaultWeapon: null,
         footprintRadius: 2, widthMeters: 2.6,
         maxStepVoxels: 5, slopePenalty: 0.22,
         bodyHalfCells: 1, bodyRoughnessVoxels: 6,
@@ -225,6 +229,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       // Triple the dozer's capacity so a hauler trip is meaningful relative to
       // the spoil one dozer pass produces.
       return {
+        defaultWeapon: null,
         footprintRadius: 2, widthMeters: 2.4,
         maxStepVoxels: 4, slopePenalty: 0.25,
         bodyHalfCells: 1, bodyRoughnessVoxels: 5,
@@ -305,6 +310,10 @@ export interface Unit {
    * Empty for non-chain units (no need to allocate the buffer).
    */
   pathHistory: { x: number; y: number; z: number }[];
+  /** Weapon held by this unit. null = unarmed (e.g. tunneler / worm). */
+  weapon: WeaponKind | null;
+  /** Seconds until this unit can fire again. Counts down each tick. */
+  weaponCooldown: number;
   /**
    * Earth-moving state.
    * `spoilLoad` — voxels currently carried (0..spoilCapacity).
@@ -411,8 +420,12 @@ export class UnitManager {
   units: Unit[] = [];
   private nextId = 1;
 
-  spawn(kind: UnitKind, x: number, y: number, z: number): Unit {
+  spawn(kind: UnitKind, x: number, y: number, z: number, weapon?: WeaponKind | null): Unit {
     const cfg = unitConfig(kind);
+    // Weapon override only applies when caller passed something explicit. Passing
+    // `null` is meaningful (force-unarm a soldier); passing `undefined` falls back
+    // to the kind's default.
+    const finalWeapon: WeaponKind | null = weapon === undefined ? cfg.defaultWeapon : weapon;
     const segments: WormSegment[] = [];
     for (let i = 0; i < cfg.segmentCount; i++) {
       // Initial layout: segments stretched out behind the head along +Z (heading = 0
@@ -472,6 +485,8 @@ export class UnitManager {
       cutterHeight: cfg.cutterHeight,
       segments,
       pathHistory,
+      weapon: finalWeapon,
+      weaponCooldown: 0,
       spoilLoad: 0,
       spoilCapacity: cfg.spoilCapacityVoxels,
       levelTargetY: null,
@@ -527,6 +542,9 @@ export class UnitManager {
     this.lastSurfaceNav = nav;
     this.lastVoxels = voxels;
     for (const u of this.units) {
+      // Weapon cooldown decays even when idle so a unit re-engaged quickly is
+      // ready to fire on the next valid command.
+      if (u.weaponCooldown > 0) u.weaponCooldown = Math.max(0, u.weaponCooldown - dt);
       const underground = isUnderground(u, nav);
       if (u.path.length === 0) {
         // Idle: surface-follow only when actually on the surface; underground tunnelers

@@ -4,6 +4,7 @@ import { WORLD_X, WORLD_Y, WORLD_Z, AIR, MaterialId, VOXEL_SIZE } from '../voxel
 import { M_WOOD } from '../voxel/Materials';
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_VOXELS, NAV_CELL_METERS, FLAT_TOLERANCE_VOXELS } from '../path/SurfaceNav';
 import { UnitManager, UnitKind, Unit } from './Units';
+import { WeaponKind } from './Weapons';
 
 export type BuildingKind = 'barracks';
 
@@ -20,6 +21,11 @@ export interface BuildingSpec {
   productionInterval: number;
   /** Cycled through on each spawn; lets one Barracks alternate Soldier/Tunneler. */
   produces: UnitKind[];
+  /** Optional per-cycle weapon override (parallel array to `produces`). When the
+   *  spawn at index i lands a soldier, the weapon at the same index is applied —
+   *  so one barracks can hand out a rotating loadout (rifle / sniper / mg / rpg).
+   *  `undefined` slots fall back to the unit kind's default weapon. */
+  producesWeapon?: (WeaponKind | null | undefined)[];
 }
 
 export const BARRACKS: BuildingSpec = {
@@ -29,7 +35,26 @@ export const BARRACKS: BuildingSpec = {
   headroomVoxels: 24, // 3 m at 0.125 m voxels
   wall: M_WOOD,
   productionInterval: 6.0,
-  produces: ['soldier', 'tank', 'tunneler', 'worm', 'dozer', 'hauler'],
+  // Cycle through every unit kind, with rotating soldier loadouts mixed in so
+  // a single barracks turns out a varied force. Vehicles (tank / tunneler /
+  // worm / dozer / hauler) ignore the weapon slot — the tank picks up its
+  // default cluster_rocket; the diggers and earth-movers stay unarmed.
+  produces: [
+    'soldier', 'tank', 'tunneler', 'worm', 'dozer', 'hauler',
+    'soldier', 'soldier', 'soldier', 'soldier',
+  ],
+  producesWeapon: [
+    'rifle',          // baseline grunt
+    undefined,        // tank → default cluster_rocket
+    undefined,        // tunneler → unarmed
+    undefined,        // worm → unarmed
+    undefined,        // dozer → unarmed
+    undefined,        // hauler → unarmed
+    'sniper',         // long-range
+    'machinegun',     // suppression
+    'rpg',            // anti-armor
+    'pistol',         // sidearm / scout
+  ],
 };
 
 export interface FootprintHit {
@@ -206,7 +231,7 @@ export class BuildingManager {
   buildings: Building[] = [];
   private nextId = 1;
   /** Called when a building wants to spawn a unit. Returns true if accepted. */
-  spawner: ((kind: UnitKind, x: number, y: number, z: number) => Unit | null) | null = null;
+  spawner: ((kind: UnitKind, x: number, y: number, z: number, weapon?: WeaponKind | null) => Unit | null) | null = null;
 
   place(world: VoxelWorld, spec: BuildingSpec, ox: number, oz: number, floorY: number): Building {
     const wallCount = stampBarracks(world, spec, ox, oz, floorY);
@@ -241,9 +266,13 @@ export class BuildingManager {
             b.destroyed = true;
             continue;
           }
-          const kind = b.spec.produces[b.nextProduceIdx % b.spec.produces.length]!;
+          const idx = b.nextProduceIdx % b.spec.produces.length;
+          const kind = b.spec.produces[idx]!;
+          // Per-slot weapon override; falls back to the kind default when the
+          // slot is undefined (or the building has no weapon array).
+          const weapon = b.spec.producesWeapon ? b.spec.producesWeapon[idx] : undefined;
           b.nextProduceIdx++;
-          this.spawner(kind, door.x, door.y, door.z);
+          this.spawner(kind, door.x, door.y, door.z, weapon);
         }
       }
     }

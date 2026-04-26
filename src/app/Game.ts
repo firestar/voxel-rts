@@ -18,6 +18,9 @@ import { BuildingManager, BARRACKS, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { PathPreview } from '../render/PathPreview';
 import { TargetMarker } from '../render/TargetMarker';
+import { ProjectileManager, PROJECTILES, ProjectileImpact } from '../sim/Projectiles';
+import { WEAPONS, fireAt } from '../sim/Weapons';
+import { ProjectileRenderer } from '../render/ProjectileRenderer';
 
 type Mode = 'play' | 'build';
 
@@ -34,6 +37,8 @@ export class Game {
   readonly ghost = new BuildingGhost();
   readonly pathPreview = new PathPreview();
   readonly target = new TargetMarker();
+  readonly projectiles = new ProjectileManager();
+  readonly projectileRenderer = new ProjectileRenderer();
   pathClient: PathClient | null = null;
   /** Pixels of vertical drag = 1 m of altitude offset for tunneler targets. */
   private readonly altitudeDragSensitivity = 8;
@@ -69,9 +74,10 @@ export class Game {
     this.renderer.scene.add(this.ghost.group);
     this.renderer.scene.add(this.pathPreview.object);
     this.renderer.scene.add(this.target.group);
+    this.renderer.scene.add(this.projectileRenderer.mesh);
     this.ghost.setSpec(BARRACKS);
 
-    this.buildings.spawner = (kind, x, y, z): Unit | null => this.spawnUnit(kind, x, y, z);
+    this.buildings.spawner = (kind, x, y, z, weapon): Unit | null => this.spawnUnit(kind, x, y, z, weapon);
 
     this.fpsEl = statsEl;
     this.modeEl = document.getElementById('mode');
@@ -114,8 +120,8 @@ export class Game {
     this.camera.target.set(c.x, 0, c.z);
   }
 
-  private spawnUnit(kind: UnitKind, x: number, y: number, z: number): Unit | null {
-    return this.units.spawn(kind, x, y, z);
+  private spawnUnit(kind: UnitKind, x: number, y: number, z: number, weapon?: import('../sim/Weapons').WeaponKind | null): Unit | null {
+    return this.units.spawn(kind, x, y, z, weapon);
   }
 
   start(): void {
@@ -165,8 +171,10 @@ export class Game {
       this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, this.world.buffers.voxels, (req) => this.handleWorldEdit(req));
       this.buildings.tick(dt, this.world, this.units);
       this.paintTankTracks();
+      this.projectiles.tick(dt, this.world, (impact) => this.handleProjectileImpact(impact));
     }
     this.unitRenderer.update(this.units);
+    this.projectileRenderer.update(this.projectiles);
 
     // Dashed path preview for the selected unit (if any).
     const sel = this.units.units.find(u => u.selected);
@@ -307,7 +315,16 @@ export class Game {
     }
     if (release.shift) {
       const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
-      if (r) this.detonateAt(r.voxelXYZ);
+      if (!r) return;
+      // Shift+click is "fire" when an armed unit is selected. If the selected
+      // unit has no weapon (tunneler / worm) or nothing's selected, fall back
+      // to the freebie debug detonation so we keep that tool while testing.
+      const sel = this.units.units.find(u => u.selected);
+      if (sel && sel.weapon) {
+        this.fireSelectedAt(sel, r.target.x, r.target.y, r.target.z);
+      } else {
+        this.detonateAt(r.voxelXYZ);
+      }
       return;
     }
     const selected = this.units.units.find(u => u.selected);
@@ -371,6 +388,73 @@ export class Game {
       this.debris.spawnBurst(wx, wy, wz, burst, sample.material);
       this.requestNavRebuild();
     }
+  }
+
+  /**
+   * Fire the selected unit's weapon at a world target. Honors the weapon's
+   * cooldown so spamming shift+click doesn't fire faster than `fireInterval`.
+   * Returns true if a projectile was actually spawned.
+   */
+  private fireSelectedAt(unit: import('../sim/Units').Unit, tx: number, ty: number, tz: number): boolean {
+    if (!unit.weapon) return false;
+    if (unit.weaponCooldown > 0) return false;
+    const spec = WEAPONS[unit.weapon];
+    const ok = fireAt(unit, spec, tx, ty, tz, this.projectiles);
+    if (ok) unit.weaponCooldown = spec.fireInterval;
+    return ok;
+  }
+
+  /**
+   * Resolve a projectile impact: damage the world appropriately for the round
+   * type, spawn a debris burst, and (for the bigger rounds) ask the nav graph
+   * to refresh so the new crater is routable.
+   */
+  private handleProjectileImpact(impact: ProjectileImpact): void {
+    const { projectile, hit, x, y, z } = impact;
+    const spec = PROJECTILES[projectile.kind];
+    // Air-burst time-out for unarmed submunitions / stray rounds: no damage,
+    // just disappear silently. Submunitions can still hit terrain via `hit`.
+    if (impact.timedOut && spec.family === 'submunition') return;
+
+    const cx = x / VOXEL_SIZE;
+    const cy = y / VOXEL_SIZE;
+    const cz = z / VOXEL_SIZE;
+    const radiusVoxels = spec.impactRadiusMeters / VOXEL_SIZE;
+    const result = this.world.damageSphere(cx, cy, cz, radiusVoxels, spec.impactPeak);
+    if (result.destroyed.length > 0) {
+      const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
+      const burst = spec.family === 'bullet'
+        ? Math.min(20, 4 + result.destroyed.length)
+        : Math.min(160, 20 + result.destroyed.length * 2);
+      this.debris.spawnBurst(x, y, z, burst, sample.material);
+    }
+
+    // Cluster shells spawn submunitions outward from the impact, with an
+    // upward bias so they fan out before raining back down.
+    if (spec.family === 'cluster' && spec.clusterChildren && spec.clusterChildKind) {
+      const childKind = spec.clusterChildKind;
+      const spread = spec.clusterSpreadMS ?? 12;
+      const count = spec.clusterChildren;
+      for (let i = 0; i < count; i++) {
+        // Even fan in the horizontal plane, slight randomness in elevation.
+        const a = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.4;
+        const elev = 0.45 + Math.random() * 0.35; // ~25-50° above horizon
+        const cosE = Math.cos(elev);
+        const sinE = Math.sin(elev);
+        const vx = Math.cos(a) * spread * cosE;
+        const vz = Math.sin(a) * spread * cosE;
+        const vy = sinE * spread + 4;
+        // Spawn slightly above the impact so the children clear the immediate ground.
+        this.projectiles.spawn(childKind, x, y + 0.8, z, vx, vy, vz, projectile.ownerUnitId);
+      }
+    }
+
+    // Big detonations open enough terrain to matter for nav. Bullets chip a
+    // single voxel column at most — nav rebuild would be wasteful.
+    if (spec.family !== 'bullet' && result.destroyed.length > 0) {
+      this.requestNavRebuild(false);
+    }
+    void hit;
   }
 
   /** Single dispatch for every kind of world edit a unit can request. */
