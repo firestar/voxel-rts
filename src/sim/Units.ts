@@ -227,7 +227,7 @@ export class UnitManager {
         // Idle: surface-follow only when actually on the surface; underground tunnelers
         // (and any unit caught in a cave) just relax pitch/roll instead of snapping Y up.
         if (!underground) {
-          sampleSurfaceFollow(u, nav, dt);
+          sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
         } else {
           relaxOrientation(u, dt);
         }
@@ -263,7 +263,7 @@ export class UnitManager {
     const dx = tgt.x - u.x;
     const dz = tgt.z - u.z;
     const d = Math.hypot(dx, dz);
-    if (d < 1e-4) { sampleSurfaceFollow(u, nav, dt); return; }
+    if (d < 1e-4) { sampleSurfaceFollow(u, nav, this.lastVoxels, dt); return; }
 
     // Slew the heading toward the path direction at the unit's turn rate. Until the unit
     // is roughly facing forward, forward speed is reduced (cosine of misalignment), so a
@@ -295,7 +295,7 @@ export class UnitManager {
       moved = step;
     }
     u.blockedFrames = 0;
-    sampleSurfaceFollow(u, nav, dt);
+    sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
     u.distanceWalked += moved;
   }
 
@@ -386,7 +386,7 @@ export class UnitManager {
     //   3. Underground in air with no solid within reach — leave the path Y alone (the
     //      unit is genuinely in the middle of an open volume, e.g. mid-jump into a cave).
     if (!isUnderground(u, nav)) {
-      sampleSurfaceFollow(u, nav, dt);
+      sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
     } else {
       const floorY = findFloorBelow(this.lastVoxels, u.x, u.y + 0.4, u.z, 3.0);
       if (floorY !== null) {
@@ -633,12 +633,67 @@ function surfaceWorldY(nav: SurfaceNavBuffers, wx: number, wz: number): number {
   return top < 0 ? 0 : (top + 1) * VOXEL_SIZE;
 }
 
-function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, dt: number): void {
-  const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(u.x / NAV_CELL_METERS)));
-  const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(u.z / NAV_CELL_METERS)));
-  const top = nav.topY[navIndex(cx, cz)]!;
-  if (top < 0) return;
-  const targetY = (top + 1) * VOXEL_SIZE;
+/**
+ * Find the highest top voxel anywhere under the unit's footprint at (wx, wz). We
+ * scan the live voxel column at a small grid of points spanning ±halfWidth, walking
+ * downward from a search ceiling sourced from the surface nav's cell-level topY.
+ *
+ * Returning the MAX over the footprint is what stops a wide chassis from clipping
+ * into voxels that are taller than the cell-average — the unit is placed on top
+ * of the highest voxel under any tread/foot, never inside one. (The path search
+ * already guaranteed the cells are climb-feasible.)
+ *
+ * Returns null if no solid voxel is found in the search range.
+ */
+function findFootprintTopVoxel(
+  voxels: Uint8Array,
+  nav: SurfaceNavBuffers,
+  wx: number, wz: number,
+  halfWidthM: number,
+  searchRangeVoxels = 12,
+): number | null {
+  const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(wx / NAV_CELL_METERS)));
+  const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(wz / NAV_CELL_METERS)));
+  const cellTop = nav.topY[navIndex(cx, cz)]!;
+  if (cellTop < 0) return null;
+  // Sample a small grid covering the footprint. 3x3 is enough — the path search
+  // already verified roughness over a wider radius for vehicles.
+  const SAMPLES: number = 3;
+  const startY = Math.min(cellTop + searchRangeVoxels, WORLD_Y - 1);
+  const endY = Math.max(0, cellTop - searchRangeVoxels);
+  let best = -1;
+  for (let i = 0; i < SAMPLES; i++) {
+    for (let j = 0; j < SAMPLES; j++) {
+      const t = SAMPLES === 1 ? 0 : (i / (SAMPLES - 1)) * 2 - 1; // -1..+1
+      const u = SAMPLES === 1 ? 0 : (j / (SAMPLES - 1)) * 2 - 1;
+      const sx = wx + t * halfWidthM;
+      const sz = wz + u * halfWidthM;
+      const vx = Math.floor(sx / VOXEL_SIZE);
+      const vz = Math.floor(sz / VOXEL_SIZE);
+      if (vx < 0 || vz < 0 || vx >= WORLD_X || vz >= WORLD_Z) continue;
+      // Walk down from the ceiling looking for the first solid voxel.
+      const top = Math.min(startY, WORLD_Y - 1);
+      for (let y = top; y >= endY; y--) {
+        if (voxels[worldIndex(vx, y, vz)] !== AIR) {
+          if (y > best) best = y;
+          break;
+        }
+      }
+    }
+  }
+  return best >= 0 ? best : null;
+}
+
+function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, voxels: Uint8Array, dt: number): void {
+  // Use the live voxel column under the unit's footprint to find the actual highest
+  // top voxel — not the cell-average topY (which can leave a wide chassis clipping
+  // into a higher voxel inside the same cell). The path search already proved the
+  // cells are climb-feasible, so we trust it and just keep the unit visually on
+  // top of the terrain.
+  const halfWidthM = u.widthMeters * 0.5;
+  const topVoxel = findFootprintTopVoxel(voxels, nav, u.x, u.z, halfWidthM);
+  if (topVoxel === null) return;
+  const targetY = (topVoxel + 1) * VOXEL_SIZE;
   // Climb is fast (the unit was already gated by maxStepVoxels at path time so we trust
   // the path here). Descent is capped at a constant rate so walking off a ledge doesn't
   // snap straight down — the unit falls at a controlled speed and then catches up to
@@ -651,6 +706,10 @@ function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, dt: number): void 
     u.y = Math.max(targetY, u.y - maxDescentMPS * dt);
   }
 
+  // Pitch + roll come from the cell-level slope still — they only need to be
+  // accurate enough to tilt the model, not collision-correct.
+  const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(u.x / NAV_CELL_METERS)));
+  const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(u.z / NAV_CELL_METERS)));
   const xm1 = nav.topY[navIndex(Math.max(0, cx - 1), cz)]!;
   const xp1 = nav.topY[navIndex(Math.min(NAV_W - 1, cx + 1), cz)]!;
   const zm1 = nav.topY[navIndex(cx, Math.max(0, cz - 1))]!;
