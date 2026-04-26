@@ -26,26 +26,31 @@ export function unitConfig(kind: UnitKind): UnitConfig {
   switch (kind) {
     case 'soldier':
       // Agile (footprintRadius <= 1) so the surface pather skips the flatness gate.
-      // maxStepVoxels acts as the hard cliff gate — anything taller is impassable.
+      // maxStepVoxels = 16 voxels (2 m) — soldiers can scramble up very steep slopes
+      // but anything taller than 2 m is a cliff and is hard-rejected by both the path
+      // search and the smoother.
       return {
         footprintRadius: 1, widthMeters: 0.75,
-        maxStepVoxels: 8, slopePenalty: 0.2,
+        maxStepVoxels: 16, slopePenalty: 0.15,
         canDig: false, requiresGround: true,
         speed: 4.5, speedDigging: 0,
         hp: 80,
       };
     case 'tank':
+      // 14 voxels (1.75 m) — tanks can drive up surprisingly steep terrain but a
+      // 2 m+ rock face still blocks them.
       return {
         footprintRadius: 2, widthMeters: 2.4,
-        maxStepVoxels: 8, slopePenalty: 0.15,
+        maxStepVoxels: 14, slopePenalty: 0.12,
         canDig: false, requiresGround: true,
         speed: 3.5, speedDigging: 0,
         hp: 220,
       };
     case 'tunneler':
+      // 10 voxels (1.25 m) — bigger, less nimble than the tank on the surface.
       return {
         footprintRadius: 2, widthMeters: 3.6,
-        maxStepVoxels: 6, slopePenalty: 0.2,
+        maxStepVoxels: 10, slopePenalty: 0.18,
         canDig: true, requiresGround: false,
         speed: 2.5, speedDigging: 1.8,
         hp: 320,
