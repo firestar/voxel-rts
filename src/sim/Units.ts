@@ -29,6 +29,10 @@ interface UnitConfig {
   bodyRoughnessVoxels: number;
   /** How fast the unit can rotate around Y, in radians per second. */
   turnRateRadPerSec: number;
+  /** Hard cap on visual + path-plan pitch angle, radians. Volume A* rejects edges that
+   *  would require a steeper climb/dive, and applyPathOrientation clamps the rendered
+   *  body pitch to this value so the model never tips past it. */
+  maxPitchRad: number;
   canDig: boolean;
   requiresGround: boolean;
   speed: number;
@@ -45,6 +49,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         maxStepVoxels: 16, slopePenalty: 0.15,
         bodyHalfCells: 0, bodyRoughnessVoxels: 999,
         turnRateRadPerSec: 6.0,                  // ~340°/s, snappy infantry turn
+        maxPitchRad: Math.PI / 2,                // soldiers are flexible — no real pitch cap
         canDig: false, requiresGround: true,
         speed: 4.5, speedDigging: 0,
         hp: 80,
@@ -58,6 +63,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         maxStepVoxels: 14, slopePenalty: 0.12,
         bodyHalfCells: 1, bodyRoughnessVoxels: 4,
         turnRateRadPerSec: 1.4,                  // ~80°/s — tank pivots are slow
+        maxPitchRad: Math.PI / 3,                // 60° — steep slopes OK, no flipping
         canDig: false, requiresGround: true,
         speed: 3.5, speedDigging: 0,
         hp: 220,
@@ -72,6 +78,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         maxStepVoxels: 10, slopePenalty: 0.18,
         bodyHalfCells: 2, bodyRoughnessVoxels: 6,
         turnRateRadPerSec: 0.7,                  // ~40°/s — heavy machine pivots slowly
+        maxPitchRad: Math.PI / 4,                // 45° — never goes vertical, no straight-down digs
         canDig: true, requiresGround: true,
         speed: 2.5, speedDigging: 1.8,
         hp: 320,
@@ -90,6 +97,8 @@ export interface Unit {
   bodyRoughnessVoxels: number;
   /** Max angular velocity in rad/s. */
   turnRateRadPerSec: number;
+  /** Max climb / dive pitch in radians. */
+  maxPitchRad: number;
   canDig: boolean;
   requiresGround: boolean;
   x: number; y: number; z: number;
@@ -141,6 +150,7 @@ export class UnitManager {
       bodyHalfCells: cfg.bodyHalfCells,
       bodyRoughnessVoxels: cfg.bodyRoughnessVoxels,
       turnRateRadPerSec: cfg.turnRateRadPerSec,
+      maxPitchRad: cfg.maxPitchRad,
       canDig: cfg.canDig,
       requiresGround: cfg.requiresGround,
       x, y, z,
@@ -440,7 +450,11 @@ function applyPathOrientation(u: Unit, dx: number, dy: number, dz: number, dt: n
     const turnStep = u.turnRateRadPerSec * dt;
     u.heading += clamp(angDiff, -turnStep, turnStep);
   }
-  const targetPitch = Math.atan2(-dy, Math.max(horiz, 1e-4));
+  const rawPitch = Math.atan2(-dy, Math.max(horiz, 1e-4));
+  // Cap pitch to the unit's limit so the body never tips past it — even if the path
+  // happens to require a steeper local slope, the model stays at the cap and the
+  // motion uses the un-clamped path Y under the hood.
+  const targetPitch = clamp(rawPitch, -u.maxPitchRad, u.maxPitchRad);
   const k = Math.min(1, dt * 8);
   u.pitch += (targetPitch - u.pitch) * k;
   u.roll  += (0           - u.roll ) * k;
@@ -540,9 +554,13 @@ function clamp(v: number, lo: number, hi: number): number {
 
 /** Idle underground / aerial: ease pitch & roll to neutral so the unit doesn't sit askew. */
 function relaxOrientation(u: Unit, dt: number): void {
-  const k = Math.min(1, dt * 4);
-  u.pitch += (0 - u.pitch) * k;
-  u.roll  += (0 - u.roll)  * k;
+  // Pitch eases noticeably faster than before (was dt*4) so when a tunneler reaches its
+  // destination it stops nose-down within a fraction of a second instead of holding the
+  // last dig pitch for ~1 s. Roll eases at the original rate.
+  const kPitch = Math.min(1, dt * 10);
+  const kRoll  = Math.min(1, dt * 4);
+  u.pitch += (0 - u.pitch) * kPitch;
+  u.roll  += (0 - u.roll)  * kRoll;
 }
 
 function surfaceWorldY(nav: SurfaceNavBuffers, wx: number, wz: number): number {

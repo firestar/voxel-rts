@@ -396,6 +396,7 @@ export class Game {
         canDig: unit.canDig,
         requiresGround: unit.requiresGround,
         footprintRadius: unit.footprintRadius,
+        maxPitchRad: unit.maxPitchRad,
       });
       // Refuse partial paths — the unit only moves if A* could reach the destination.
       if (res.cells.length === 0 || !res.reached) return;

@@ -13,6 +13,12 @@ export interface AStar3DRequest {
   requiresGround: boolean;
   /** Cell-radius footprint — adjacent cells in XZ within this radius must also be enterable. */
   footprintRadius: number;
+  /**
+   * Optional maximum climb / dive angle in radians. Edges whose vertical component sits
+   * above the slope tan(maxPitchRad) are rejected — keeps the tunneler from being asked
+   * to dig straight up or down.
+   */
+  maxPitchRad?: number;
   /** Hard cap on expansions before bailing with partial path. */
   maxExpansions?: number;
 }
@@ -114,6 +120,7 @@ export function findPathVolume(
 ): AStar3DResult {
   const gen = ws.resetGeneration();
   const { startCx, startCy, startCz, goalCx, goalCy, goalCz, canDig, requiresGround, footprintRadius } = req;
+  const maxTanPitch = req.maxPitchRad === undefined ? Infinity : Math.tan(req.maxPitchRad);
   const maxExpansions = req.maxExpansions ?? 8000;
 
   const startI = vnavIndex(startCx, startCy, startCz);
@@ -154,6 +161,12 @@ export function findPathVolume(
       const ni = vnavIndex(nx, ny, nz);
       if (ws.closed[ni] === gen) continue;
       if (!footprintPassable(vnav, nx, ny, nz, canDig, requiresGround, footprintRadius, ni === goalI)) continue;
+      // Pitch gate: |dy| / horizontal_distance must stay within tan(maxPitchRad).
+      // Pure-vertical edges (horiz == 0) are blocked the moment the pitch limit is set.
+      if (off.dy !== 0 && maxTanPitch !== Infinity) {
+        const horiz = Math.hypot(off.dx, off.dz);
+        if (horiz === 0 || Math.abs(off.dy) > horiz * maxTanPitch) continue;
+      }
 
       let stepCost = off.cost;
       const isSolid = getBit(vnav.solid, ni);
