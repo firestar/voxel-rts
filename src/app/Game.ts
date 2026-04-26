@@ -18,6 +18,9 @@ import { BuildingManager, BARRACKS, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { PathPreview } from '../render/PathPreview';
 import { TargetMarker } from '../render/TargetMarker';
+import { ProjectileManager, PROJECTILES, DetonationEvent } from '../sim/Projectiles';
+import { ProjectileRenderer } from '../render/ProjectileRenderer';
+import { tickWeapon } from '../sim/Weapons';
 
 type Mode = 'play' | 'build';
 
@@ -34,6 +37,8 @@ export class Game {
   readonly ghost = new BuildingGhost();
   readonly pathPreview = new PathPreview();
   readonly target = new TargetMarker();
+  readonly projectiles = new ProjectileManager();
+  readonly projectileRenderer = new ProjectileRenderer();
   pathClient: PathClient | null = null;
   /** Pixels of vertical drag = 1 m of altitude offset for tunneler targets. */
   private readonly altitudeDragSensitivity = 8;
@@ -69,6 +74,7 @@ export class Game {
     this.renderer.scene.add(this.ghost.group);
     this.renderer.scene.add(this.pathPreview.object);
     this.renderer.scene.add(this.target.group);
+    this.renderer.scene.add(this.projectileRenderer.group);
     this.ghost.setSpec(BARRACKS);
 
     this.buildings.spawner = (kind, x, y, z): Unit | null => this.spawnUnit(kind, x, y, z);
@@ -163,8 +169,11 @@ export class Game {
       this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, this.world.buffers.voxels, (req) => this.handleCarve(req));
       this.buildings.tick(dt, this.world, this.units);
       this.paintTankTracks();
+      this.tickWeaponsAndProjectiles(dt);
     }
     this.unitRenderer.update(this.units);
+    this.projectileRenderer.update(this.projectiles);
+    this.cullDeadUnits();
 
     // Dashed path preview for the selected unit (if any).
     const sel = this.units.units.find(u => u.selected);
@@ -305,7 +314,16 @@ export class Game {
     }
     if (release.shift) {
       const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
-      if (r) this.detonateAt(r.voxelXYZ);
+      if (!r) return;
+      // If we have an armed selected unit, treat shift-click as a fire order.
+      // Otherwise fall back to the standalone "blow up the terrain" cheat so
+      // map-editing without a unit still works.
+      const sel = this.units.units.find(u => u.selected);
+      if (sel?.weaponState) {
+        sel.weaponState.fireTarget = { x: r.target.x, y: r.target.y, z: r.target.z };
+      } else {
+        this.detonateAt(r.voxelXYZ);
+      }
       return;
     }
     const selected = this.units.units.find(u => u.selected);
@@ -356,6 +374,96 @@ export class Game {
       this.debris.spawnBurst(wx, wy, wz, burst, sample.material);
       this.requestNavRebuild();
     }
+  }
+
+  /**
+   * Per-frame weapons + projectile update. Each unit with a fire target attempts to
+   * shoot (subject to its weapon's cooldown and range), then we step every live
+   * projectile forward one frame. Detonations carve voxels and damage units.
+   */
+  private tickWeaponsAndProjectiles(dt: number): void {
+    for (const u of this.units.units) {
+      if (!u.weaponState) continue;
+      tickWeapon(u, u.weaponState, this.projectiles, dt);
+    }
+    const events = this.projectiles.tick(dt, this.world);
+    if (events.length === 0) return;
+    let anyVoxelDestroyed = false;
+    for (const ev of events) {
+      if (this.handleDetonation(ev)) anyVoxelDestroyed = true;
+    }
+    // Refresh nav whenever an explosion actually opened up the terrain. Bullets
+    // generally don't change topology, but RPGs and rockets do.
+    if (anyVoxelDestroyed) this.requestNavRebuild(false);
+  }
+
+  /**
+   * React to a single projectile detonation: damage voxels (sphere or pinpoint),
+   * apply unit splash damage, spawn cluster submunitions, and emit a debris
+   * burst for the impact. Returns true when at least one voxel was destroyed.
+   */
+  private handleDetonation(ev: DetonationEvent): boolean {
+    const spec = PROJECTILES[ev.kind];
+    let destroyedAny = false;
+    if (spec.explodeRadiusMeters > 0) {
+      const cx = ev.x / VOXEL_SIZE;
+      const cy = ev.y / VOXEL_SIZE;
+      const cz = ev.z / VOXEL_SIZE;
+      const radiusVoxels = spec.explodeRadiusMeters / VOXEL_SIZE;
+      const result = this.world.damageSphere(cx, cy, cz, radiusVoxels, spec.peakDamage);
+      if (result.destroyed.length > 0) {
+        destroyedAny = true;
+        const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
+        const burst = Math.min(120, 12 + result.destroyed.length * 2);
+        this.debris.spawnBurst(ev.x, ev.y, ev.z, burst, sample.material);
+      } else {
+        // No voxels destroyed but we still want a visual puff at the impact.
+        this.debris.spawnBurst(ev.x, ev.y, ev.z, 6, 2);
+      }
+      ProjectileManager.damageUnitsInRadius(this.units, ev.x, ev.y, ev.z, spec.explodeRadiusMeters, spec.unitDamage);
+    } else {
+      // Pinpoint bullet hit: nudge into the voxel along the surface normal so the
+      // hit cell sits inside the carve radius, then run a tight damageSphere.
+      const cx = ev.x / VOXEL_SIZE - ev.nx * 0.5;
+      const cy = ev.y / VOXEL_SIZE - ev.ny * 0.5;
+      const cz = ev.z / VOXEL_SIZE - ev.nz * 0.5;
+      const result = this.world.damageSphere(cx, cy, cz, 0.6, spec.peakDamage);
+      if (result.destroyed.length > 0) {
+        destroyedAny = true;
+        const sample = result.destroyed[0]!;
+        this.debris.spawnBurst(ev.x, ev.y, ev.z, 4, sample.material);
+      }
+      ProjectileManager.damageUnitsInRadius(this.units, ev.x, ev.y, ev.z, 0.5, spec.unitDamage);
+    }
+    if (spec.category === 'cluster') {
+      // Find the parent in the despawn list to thread the spawn (we don't actually
+      // need the parent here — spawnCluster only consumes its position + ownerId).
+      // Reuse a dummy placeholder by spawning children directly through the manager.
+      const fakeParent = {
+        id: -1, kind: ev.kind, x: ev.x, y: ev.y, z: ev.z,
+        vx: 0, vy: 0, vz: 0, life: 0, ownerId: 0, dead: true,
+      };
+      this.projectiles.spawnCluster(fakeParent, ev.x, ev.y, ev.z);
+    }
+    return destroyedAny;
+  }
+
+  /** Drop any units whose hp went non-positive this frame. */
+  private cullDeadUnits(): void {
+    const arr = this.units.units;
+    let write = 0;
+    for (let read = 0; read < arr.length; read++) {
+      const u = arr[read]!;
+      if (u.hp > 0) {
+        if (write !== read) arr[write] = u;
+        write++;
+      } else if (u.weaponState) {
+        // Clear any stale fire target so other units' weapon ticks don't reference
+        // a dead one (they don't, but it's cheap defence in depth).
+        u.weaponState.fireTarget = null;
+      }
+    }
+    arr.length = write;
   }
 
   /** Tunneler asks to clear voxels at the cutter — sphere by default, oriented cylinder when axis is supplied. */

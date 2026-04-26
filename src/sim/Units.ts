@@ -11,6 +11,7 @@ import {
   WORM_CUTTER_RADIUS, WORM_CUTTER_FORWARD, WORM_CUTTER_HEIGHT,
   WORM_SEGMENT_COUNT, WORM_SEGMENT_SPACING,
 } from '../render/UnitModels';
+import { WeaponState, defaultWeaponFor, makeWeaponState } from './Weapons';
 
 export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm';
 
@@ -219,6 +220,12 @@ export interface Unit {
    */
   segments: WormSegment[];
   /**
+   * Weapon mounted on this unit. Null for unarmed kinds (tunneler, worm). Spawned
+   * with a default loadout per kind in `UnitManager.spawn` so the simulation has
+   * something to fire whenever the player designates a target.
+   */
+  weaponState: WeaponState | null;
+  /**
    * Breadcrumb trail of past head positions, ordered most-recent-first. A new entry
    * is unshifted whenever the head moves more than `PATH_HISTORY_STEP_MIN` from the
    * latest breadcrumb. Used by chain-bodied diggers to place each segment at an
@@ -271,6 +278,9 @@ export interface CarveRequest {
 export class UnitManager {
   units: Unit[] = [];
   private nextId = 1;
+  /** Per-kind monotonic counter, used to vary soldier loadouts so a fresh barracks
+   *  produces a mixed squad instead of six identical riflemen. */
+  private kindSpawnCount: Record<UnitKind, number> = { soldier: 0, tank: 0, tunneler: 0, worm: 0 };
 
   spawn(kind: UnitKind, x: number, y: number, z: number): Unit {
     const cfg = unitConfig(kind);
@@ -299,6 +309,9 @@ export class UnitManager {
         pathHistory.push({ x, y, z: z + i * PATH_HISTORY_STEP_MIN });
       }
     }
+    const spawnIdx = this.kindSpawnCount[kind]++;
+    const weaponKind = defaultWeaponFor(kind, spawnIdx);
+    const weaponState = weaponKind ? makeWeaponState(weaponKind) : null;
     const u: Unit = {
       id: this.nextId++,
       kind,
@@ -331,6 +344,7 @@ export class UnitManager {
       cutterRadius: cfg.cutterRadius,
       cutterForward: cfg.cutterForward,
       cutterHeight: cfg.cutterHeight,
+      weaponState,
       segments,
       pathHistory,
     };
