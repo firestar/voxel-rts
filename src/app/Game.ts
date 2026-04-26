@@ -14,8 +14,9 @@ import { UnitRenderer } from '../render/UnitRenderer';
 import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { worldToVolumeCell, vnavIndex, getBit } from '../path/VolumeNav';
 import { trackDamageFor, M_DIRT, M_WOOD, M_METAL } from '../voxel/Materials';
-import { BuildingManager, BARRACKS, FARM, STORAGE, BuildingSpec, checkFootprint } from '../sim/Buildings';
+import { BuildingManager, BARRACKS, FARM, STORAGE, ALL_BUILDINGS, BuildingSpec, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
+import { BuildingRenderer } from '../render/BuildingRenderer';
 import { PathPreview } from '../render/PathPreview';
 import { TargetMarker } from '../render/TargetMarker';
 import { Resources } from '../sim/Resources';
@@ -28,7 +29,7 @@ import { tickWorkers } from '../sim/Workers';
  * tells the next LMB-on-grass to dispatch a sapling-plant task to the
  * selected worker. `play` is everything else.
  */
-type Mode = 'play' | 'buildBarracks' | 'buildFarm' | 'buildStorage' | 'plant';
+type Mode = 'play' | 'build' | 'plant';
 
 export class Game {
   readonly renderer: Renderer;
@@ -40,7 +41,10 @@ export class Game {
   readonly units = new UnitManager();
   readonly unitRenderer = new UnitRenderer();
   readonly buildings = new BuildingManager();
+  readonly buildingRenderer = new BuildingRenderer();
   readonly ghost = new BuildingGhost();
+  /** The spec the user will place next while in build mode. Cycled via 1..N keys. */
+  private buildSpec: BuildingSpec = BARRACKS;
   readonly pathPreview = new PathPreview();
   readonly target = new TargetMarker();
   readonly resources = new Resources();
@@ -78,10 +82,11 @@ export class Game {
     this.debris = new DebrisParticles(4096);
     this.renderer.scene.add(this.debris.mesh);
     this.renderer.scene.add(this.unitRenderer.group);
+    this.renderer.scene.add(this.buildingRenderer.group);
     this.renderer.scene.add(this.ghost.group);
     this.renderer.scene.add(this.pathPreview.object);
     this.renderer.scene.add(this.target.group);
-    this.ghost.setSpec(BARRACKS);
+    this.ghost.setSpec(this.buildSpec);
 
     this.buildings.spawner = (kind, x, y, z): Unit | null => this.spawnUnit(kind, x, y, z);
     // Farms feed the resource counter via the manager's foodSink hook so the
@@ -188,9 +193,21 @@ export class Game {
     // of 'B' advances one step. 'P' toggles plant mode (only meaningful with
     // a worker selected; the click handler enforces that).
     if (this.input.pressed.has('KeyB')) {
-      this.mode = nextBuildMode(this.mode);
-      this.applyGhostSpec();
-      if (!isBuildMode(this.mode)) this.ghost.hide();
+      if (this.mode !== 'build') {
+        this.mode = 'build';
+        this.buildSpec = ALL_BUILDINGS[0]!;
+        this.ghost.setSpec(this.buildSpec);
+      } else {
+        const idx = ALL_BUILDINGS.indexOf(this.buildSpec);
+        const next = idx + 1;
+        if (next >= ALL_BUILDINGS.length) {
+          this.mode = 'play';
+          this.ghost.hide();
+        } else {
+          this.buildSpec = ALL_BUILDINGS[next]!;
+          this.ghost.setSpec(this.buildSpec);
+        }
+      }
     }
     if (this.input.pressed.has('KeyP')) {
       this.mode = this.mode === 'plant' ? 'play' : 'plant';
@@ -199,6 +216,17 @@ export class Game {
     if (this.input.pressed.has('Escape') && this.mode !== 'play') {
       this.mode = 'play';
       this.ghost.hide();
+    }
+    // Cycle building spec via Digit1..Digit{ALL_BUILDINGS.length}. Works in either
+    // mode — pressing a digit also enters build mode so the user doesn't have to
+    // hit B first.
+    for (let i = 0; i < ALL_BUILDINGS.length; i++) {
+      const code = `Digit${i + 1}`;
+      if (this.input.pressed.has(code)) {
+        this.buildSpec = ALL_BUILDINGS[i]!;
+        this.ghost.setSpec(this.buildSpec);
+        this.mode = 'build';
+      }
     }
     if (this.input.pressed.has('Tab')) this.cycleSelection();
 
@@ -233,6 +261,7 @@ export class Game {
       if (grow.matured > 0) this.requestNavRebuild(false);
     }
     this.unitRenderer.update(this.units);
+    this.buildingRenderer.update(this.buildings.buildings);
 
     // Dashed path preview for the selected unit (if any).
     const sel = this.units.units.find(u => u.selected);
@@ -260,7 +289,12 @@ export class Game {
       const selDesc = sel
         ? (sel.kind === 'worker' ? `worker(${sel.workerRole}) #${sel.id}` : `${sel.kind} #${sel.id}`)
         : 'none';
-      this.modeEl.textContent = `${describeMode(this.mode)} | selected: ${selDesc}`;
+      const buildDesc = this.mode === 'build'
+        ? `MODE: BUILD ${this.buildSpec.label} (LMB place, B/1-${ALL_BUILDINGS.length} cycle, Esc cancel)`
+        : this.mode === 'plant'
+          ? 'MODE: PLANT SAPLING (LMB on grass, P cancel)'
+          : 'MODE: PLAY';
+      this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}`;
     }
   }
 
@@ -299,18 +333,7 @@ export class Game {
 
   /** The BuildingSpec that matches the current build-mode (or null in non-build modes). */
   private activeBuildSpec(): BuildingSpec | null {
-    switch (this.mode) {
-      case 'buildBarracks': return BARRACKS;
-      case 'buildFarm':     return FARM;
-      case 'buildStorage':  return STORAGE;
-      default:              return null;
-    }
-  }
-
-  /** Make the ghost preview reflect the current build spec (resizes the box). */
-  private applyGhostSpec(): void {
-    const spec = this.activeBuildSpec();
-    if (spec) this.ghost.setSpec(spec);
+    return this.mode === 'build' ? this.buildSpec : null;
   }
 
   /**
@@ -838,27 +861,6 @@ export class Game {
   };
 }
 
-/** Cycle Play → Barracks → Farm → Storage → Play on each press of B. */
-function nextBuildMode(m: Mode): Mode {
-  switch (m) {
-    case 'play':           return 'buildBarracks';
-    case 'buildBarracks':  return 'buildFarm';
-    case 'buildFarm':      return 'buildStorage';
-    case 'buildStorage':   return 'play';
-    case 'plant':          return 'buildBarracks';
-  }
-}
-
 function isBuildMode(m: Mode): boolean {
-  return m === 'buildBarracks' || m === 'buildFarm' || m === 'buildStorage';
-}
-
-function describeMode(m: Mode): string {
-  switch (m) {
-    case 'play':           return 'MODE: PLAY';
-    case 'buildBarracks':  return 'MODE: BUILD BARRACKS (LMB place, B cycle, Esc cancel)';
-    case 'buildFarm':      return 'MODE: BUILD FARM (LMB place, B cycle, Esc cancel)';
-    case 'buildStorage':   return 'MODE: BUILD STORAGE (LMB place, B cycle, Esc cancel)';
-    case 'plant':          return 'MODE: PLANT SAPLING (LMB on grass, P cancel)';
-  }
+  return m === 'build';
 }
