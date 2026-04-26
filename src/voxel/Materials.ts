@@ -44,3 +44,23 @@ export function materialColors(): Uint8Array {
 export function isSolid(m: MaterialId): boolean {
   return m !== 0;
 }
+
+/**
+ * Per-material multiplier on the tunneler's base digging speed. 1.0 = normal soil
+ * (dirt baseline), <1.0 = harder material that slows the cutter, >1.0 = soft material
+ * the cutter rips through. Indestructible materials return 0; air is 1.0 since the
+ * cutter just spins through it without resistance.
+ */
+export function digSpeedMultiplier(m: MaterialId): number {
+  switch (m) {
+    case M_AIR:     return 1.0;
+    case M_LEAF:    return 1.4;  // very soft
+    case M_DIRT:    return 1.0;  // baseline
+    case M_GRASS:   return 0.95; // grass + topsoil
+    case M_PATH:    return 0.85; // compacted dirt
+    case M_WOOD:    return 0.55; // medium
+    case M_STONE:   return 0.30; // hard — really slows the dig
+    case M_BEDROCK: return 0;    // can't be cut
+    default:        return 0.5;  // unknown = play safe
+  }
+}

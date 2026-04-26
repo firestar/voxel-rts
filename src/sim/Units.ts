@@ -1,6 +1,7 @@
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { VOXEL_SIZE, WORLD_X, WORLD_Y, WORLD_Z, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
+import { digSpeedMultiplier } from '../voxel/Materials';
 import {
   worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers, VNAV_CELL_METERS,
   VNAV_X, VNAV_Y, VNAV_Z,
@@ -73,6 +74,9 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       // Ground-locked like the tank: it can carve through anything but it can't levitate
       // through open air. Tunnels it digs leave a solid floor underneath, so this still
       // lets the unit walk along its own freshly-bored shafts.
+      // Slow heavy machine. Surface speed roughly half a tank; digging speed is the
+      // baseline 1.2 m/s in dirt, scaled per-material by digSpeedMultiplier (so stone
+      // crawls at ~0.36 m/s, leaf rips along at ~1.7 m/s).
       return {
         footprintRadius: 2, widthMeters: 3.6,
         maxStepVoxels: 10, slopePenalty: 0.18,
@@ -80,7 +84,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         turnRateRadPerSec: 0.7,                  // ~40°/s — heavy machine pivots slowly
         maxPitchRad: Math.PI / 4,                // 45° — never goes vertical, no straight-down digs
         canDig: true, requiresGround: true,
-        speed: 2.5, speedDigging: 1.8,
+        speed: 1.6, speedDigging: 1.2,
         hp: 320,
       };
   }
@@ -303,15 +307,20 @@ export class UnitManager {
       // bypass the surface engagement gate. Forward motion is gated below on the
       // cleared volume so the body never moves through unbroken voxels.
       this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, carveOut, true);
-      // Only advance once the cutter has actually cleared the slab immediately past the
-      // blade. While it's still solid, the unit pivots toward the path and waits.
-      const step = u.speedDigging * dt;
+      // Per-material dig speed. Sample the live voxel sitting at (or just past) the
+      // blade face — that's the material the cutter is currently chewing through. A
+      // multiplier of 0.3 in stone vs 1.0 in dirt makes the tunneler feel like an
+      // actual TBM rather than a uniform cell-eater. Air at the cutter (e.g. cutter
+      // is poking into a chamber) reads as 1.0 so the unit can coast through.
       const inv = d > 1e-3 ? 1 / d : 0;
       const fx = dx * inv, fy = dy * inv, fz = dz * inv;
+      const cutterMat = sampleCutterMaterial(this.lastVoxels, u, fx, fy, fz);
+      const speedMult = digSpeedMultiplier(cutterMat);
+      const step = u.speedDigging * speedMult * dt;
       const clearAhead = inv === 0
         ? true
         : voxelSlabClear(this.lastVoxels, u.x, u.y, u.z, fx, fy, fz, step);
-      if (clearAhead && d > 0.001) {
+      if (clearAhead && d > 0.001 && step > 0) {
         u.x += fx * step;
         u.y += fy * step;
         u.z += fz * step;
@@ -467,6 +476,30 @@ function applyPathOrientation(u: Unit, dx: number, dy: number, dz: number, dt: n
   const k = Math.min(1, dt * 8);
   u.pitch += (targetPitch - u.pitch) * k;
   u.roll  += (0           - u.roll ) * k;
+}
+
+/**
+ * Read the voxel at the cutter face — used to pick the per-material dig speed.
+ *
+ * We sample the voxel sitting at TUNNELER_CUTTER_FORWARD + 1 voxel ahead of the unit
+ * along its current motion direction, at the cutter's vertical offset. That's the
+ * voxel the cutter is actively grinding, so its material drives how fast we advance.
+ * Out-of-bounds reads as AIR.
+ */
+function sampleCutterMaterial(
+  voxels: Uint8Array,
+  u: Unit,
+  fx: number, fy: number, fz: number,
+): number {
+  const aheadM = TUNNELER_CUTTER_FORWARD + 0.125; // 1 voxel past the blade face
+  const wx = u.x + fx * aheadM;
+  const wy = u.y + TUNNELER_CUTTER_HEIGHT + fy * aheadM;
+  const wz = u.z + fz * aheadM;
+  const vx = Math.floor(wx / VOXEL_SIZE);
+  const vy = Math.floor(wy / VOXEL_SIZE);
+  const vz = Math.floor(wz / VOXEL_SIZE);
+  if (vx < 0 || vy < 0 || vz < 0 || vx >= WORLD_X || vy >= WORLD_Y || vz >= WORLD_Z) return AIR;
+  return voxels[worldIndex(vx, vy, vz)]!;
 }
 
 /**
