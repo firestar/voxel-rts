@@ -234,8 +234,17 @@ export class UnitManager {
         continue;
       }
       const tgt = u.path[0]!;
-      const dy = tgt.y - u.y;
-      const using3D = u.canDig || underground || Math.abs(dy) > 0.3;
+      // Pick the surface tick whenever the unit is on the surface and the next waypoint
+      // is also on the surface. The previous heuristic — "switch to volume motion if
+      // |dy| > 0.3" — fired for every uphill step on natural hills (waypoints sit at
+      // each cell's topY, so a 1 m hillside produces dy = 1 m). tickVolume's clear
+      // branch then ran a volumePassable() check whose volume cell *contains* the
+      // surface voxel, so it always read as solid → blockedFrames ticked up →
+      // path cleared after 6 frames. The result was paths planned correctly but
+      // canceled mid-stride on any climb.
+      const tgtSurfaceY = surfaceWorldY(nav, tgt.x, tgt.z);
+      const tgtUnderground = tgt.y < tgtSurfaceY - 0.5;
+      const using3D = u.canDig || underground || tgtUnderground;
       if (using3D) this.tickVolume(u, dt, nav, vnav, carveOut);
       else this.tickSurface(u, dt, nav);
     }
