@@ -7,6 +7,7 @@ Source of truth:
 - Sim configs and `Unit` shape — `src/sim/Units.ts`
 - Geometry / parts — `src/render/UnitModels.ts`
 - Renderer (instanced meshes, animation, pivots) — `src/render/UnitRenderer.ts`
+- Per-unit weapon (held / mounted) — `src/sim/Weapons.ts` and `docs/weapons.md`
 
 ---
 

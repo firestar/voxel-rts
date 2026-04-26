@@ -154,6 +154,39 @@ obstacles make the off-road option costlier, the bias kicks in. Tests cover
 the wiring (nav.road population, on-road paths stay on the road, per-edge
 cost shape) rather than asserting an idealised detour.
 
+## Projectiles + weapons (ballistic with gravity drop)
+
+`src/sim/Projectiles.ts` and `src/sim/Weapons.ts`. Each projectile carries
+mass + reference muzzle velocity; weapons override muzzle speed and cycle
+rate. All flight uses the same `GRAVITY = 22 m/s²` constant the units use
+for falling, so bullet drop matches the rest of the sim's "snappy" feel
+(½·g·t² with g=22 — see "Real gravity" above).
+
+Launch direction is the closed-form ballistic solver:
+`tan θ = (v² ± √(v⁴ − g(g·d² + 2·dy·v²))) / (g·d)`. We return the
+lower-angle solution by default (flat trajectory bullets / RPGs want).
+The high-angle / lobbed solution is exposed but not wired to a UI.
+
+### Single-step per-frame integration
+
+`Projectiles.stepOne` does drag + gravity + raycast in one go per frame
+(no substepping). Within-frame arc due to gravity at 1/60 s is `½·g·dt² ≈
+3 mm` — sub-voxel — so multi-substep would be wasted work. The raycast
+budget is extended by 2 voxels past the per-frame travel to work around
+the Amanatides & Woo step-then-break pattern in `raycastVoxel`, which
+otherwise skips the very last cell on a fixed-budget ray; we treat any
+hit beyond `stepLen` as no-hit so the projectile only flags collisions
+that actually fall inside this frame's segment.
+
+### Soldier weapon variation via barracks cycle
+
+`BARRACKS.producesWeapon` is an optional parallel array to `produces`.
+When the slot at index i lands a soldier, the weapon at the same index
+applies; vehicle slots leave it `undefined` and pick up the kind's default
+(`cluster_rocket` for tank, none for diggers). This way the barracks
+rotates `rifle / sniper / machinegun / rpg / pistol` soldiers without a
+new `UnitKind` per loadout.
+
 ## Test-driven for sim behaviour
 
 If a behavior isn't covered by an existing test and we want to confirm it,
