@@ -335,17 +335,35 @@ export class UnitManager {
     u.carveCooldown = 0;
     const inv = 1 / d;
     const fx = dx * inv, fy = dy * inv, fz = dz * inv;
-    // Cutter head — the spinning disc grinds whatever's directly in front.
+
+    // Where is the cutter face right now, in world meters?
+    const cutterX = u.x + fx * TUNNELER_CUTTER_FORWARD;
+    const cutterY = u.y + TUNNELER_CUTTER_HEIGHT + fy * TUNNELER_CUTTER_FORWARD;
+    const cutterZ = u.z + fz * TUNNELER_CUTTER_FORWARD;
+
+    // Only "engage" — fire the body-clearance + follow-through carves — when the cutter
+    // is actually pushing into solid material. On flat ground the front sphere sits in
+    // air and damageSphere is a no-op, but the body sphere (centered on the chassis)
+    // would otherwise dig a trench under the moving tunneler and have it sink into its
+    // own hole the moment it stopped. Two ways to be "engaged":
+    //   1. The unit itself is meaningfully below the local surface (we're in a tunnel).
+    //   2. The cutter face has dropped below the surface ahead (we're nosing into a hill).
+    const surfaceAtUnit = surfaceWorldY(this.lastSurfaceNav, u.x, u.z);
+    const surfaceAtCutter = surfaceWorldY(this.lastSurfaceNav, cutterX, cutterZ);
+    const unitUnderground = u.y < surfaceAtUnit - 0.4;
+    const cutterInSolid = cutterY < surfaceAtCutter - 0.3;
+    const engaged = unitUnderground || cutterInSolid;
+
+    // Cutter head — always fires; harmless when in air.
     carveOut({
-      x: u.x + fx * TUNNELER_CUTTER_FORWARD,
-      y: u.y + TUNNELER_CUTTER_HEIGHT + fy * TUNNELER_CUTTER_FORWARD,
-      z: u.z + fz * TUNNELER_CUTTER_FORWARD,
+      x: cutterX, y: cutterY, z: cutterZ,
       radiusMeters: TUNNELER_CUTTER_RADIUS,
       unit: u,
     });
-    // Body clearance — second sphere centered on the chassis. Together they leave a
-    // smooth tube along the unit's path, so the body doesn't get hung up on the lip
-    // of a freshly-cut tunnel or a small rise on the ground in front of it.
+    if (!engaged) return;
+
+    // Body clearance — sphere centered on the chassis. Keeps the body from snagging on
+    // the lip of a freshly-cut tunnel.
     carveOut({
       x: u.x,
       y: u.y + TUNNELER_CUTTER_HEIGHT,
@@ -353,8 +371,8 @@ export class UnitManager {
       radiusMeters: TUNNELER_CUTTER_RADIUS * 0.9,
       unit: u,
     });
-    // And a follow-through sphere half a step behind the cutter, sweeping the lower
-    // arc the cutter face missed — this is what flattens lumpy tunnel floors.
+    // Follow-through sphere — sweeps the lower arc the cutter face missed and smooths
+    // lumpy tunnel floors.
     carveOut({
       x: u.x + fx * TUNNELER_CUTTER_FORWARD * 0.5,
       y: u.y + TUNNELER_CUTTER_HEIGHT * 0.7 + fy * TUNNELER_CUTTER_FORWARD * 0.5,
