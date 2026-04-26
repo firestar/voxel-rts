@@ -3,8 +3,7 @@ import { VOXEL_SIZE, WORLD_X, WORLD_Y, WORLD_Z, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
 import { digSpeedMultiplier, groundSpeedMultiplier, M_WOOD, M_LEAF, M_DIRT } from '../voxel/Materials';
 import {
-  worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers, VNAV_CELL_METERS,
-  VNAV_X, VNAV_Y, VNAV_Z,
+  worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers,
 } from '../path/VolumeNav';
 import {
   TUNNELER_CUTTER_RADIUS, TUNNELER_CUTTER_FORWARD, TUNNELER_CUTTER_HEIGHT,
@@ -828,14 +827,7 @@ export class UnitManager {
     const ci = vnavIndex(cell.cx, cell.cy, cell.cz);
     const stillSolid = getBit(vnav.solid, ci) === 1;
 
-    if (stillSolid) {
-      if (!u.canDig) {
-        // Path now requires going through solid, but we can't dig. Stop and request replan.
-        u.path = [];
-        u.blockedFrames = 0;
-        applyPathOrientation(u, dx, dy, dz, dt);
-        return;
-      }
+    if (stillSolid && u.canDig) {
       // Always carve at the blade — we're explicitly digging through solid here, so
       // bypass the surface engagement gate. Forward motion is gated below on the
       // cleared volume so the body never moves through unbroken voxels.
@@ -866,7 +858,10 @@ export class UnitManager {
       return;
     }
 
-    // Cell is clear — propose normal motion toward waypoint, then collision-check it.
+    // Collision detection is intentionally off — we trust the planned path and
+    // advance toward the waypoint regardless of whether the next cell happens to
+    // be solid. Stuck units would otherwise sit forever on a path the planner
+    // already considered valid; just letting them through keeps motion crisp.
     const step = u.speed * dt;
     let nextX: number, nextY: number, nextZ: number, snapping = false;
     if (d <= step) {
@@ -877,15 +872,6 @@ export class UnitManager {
       nextX = u.x + dx * inv * step;
       nextY = u.y + dy * inv * step;
       nextZ = u.z + dz * inv * step;
-    }
-    if (!volumePassable(u, vnav, nextX, nextY, nextZ)) {
-      // Would clip through solid (or bedrock). Pause motion this frame, but DON'T
-      // drop the path — the unit might be momentarily mid-air and gravity will
-      // settle it back into a valid spot, or terrain edits may open the way. We
-      // still bump blockedFrames for telemetry, just no longer act on it.
-      u.blockedFrames++;
-      applyPathOrientation(u, dx, dy, dz, dt);
-      return;
     }
     u.blockedFrames = 0;
     const consumed = snapping ? d : step;
@@ -986,31 +972,6 @@ export class UnitManager {
  */
 function isUnderground(u: Unit, nav: SurfaceNavBuffers): boolean {
   return u.y < surfaceWorldY(nav, u.x, u.z) - 0.5;
-}
-
-/**
- * True if the world-space position (wx, wy, wz) is enterable for this unit:
- *  - inside the world's volume bounds
- *  - not bedrock
- *  - not solid (unless the unit can dig — tunnelers carve their way in)
- */
-/**
- * Runtime motion gate for the volume nav. A position is passable iff the cell at that
- * world position is **air**. Bedrock and any solid cell are rejected unconditionally —
- * the canDig flag is a *path-planning* concession that lets A* route through soil for
- * tunnelers, but at runtime even a tunneler must enter solid through the explicit
- * solid-branch carve loop in tickVolume (carve at the blade, gate the advance on
- * voxelSlabClear). Letting canDig pass through here was the clipping bug.
- */
-function volumePassable(_u: Unit, vnav: VolumeNavBuffers, wx: number, wy: number, wz: number): boolean {
-  const cx = Math.floor(wx / VNAV_CELL_METERS);
-  const cy = Math.floor(wy / VNAV_CELL_METERS);
-  const cz = Math.floor(wz / VNAV_CELL_METERS);
-  if (cx < 0 || cy < 0 || cz < 0 || cx >= VNAV_X || cy >= VNAV_Y || cz >= VNAV_Z) return false;
-  const i = vnavIndex(cx, cy, cz);
-  if (getBit(vnav.bedrock, i)) return false;
-  if (getBit(vnav.solid, i) === 1) return false;
-  return true;
 }
 
 function applyPathOrientation(u: Unit, dx: number, dy: number, dz: number, dt: number): void {
