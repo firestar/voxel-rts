@@ -11,8 +11,19 @@ import {
   WORM_CUTTER_RADIUS, WORM_CUTTER_FORWARD, WORM_CUTTER_HEIGHT,
   WORM_SEGMENT_COUNT, WORM_SEGMENT_SPACING,
 } from '../render/UnitModels';
+import { WeaponId, weaponSpec } from './Weapons';
 
 export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm';
+
+/**
+ * Default weapon loadout per unit kind. Soldier loadouts cycle through this
+ * list at spawn time so a barracks turns out a mixed squad (rifle, sniper,
+ * pistol, machine gunner, RPG trooper). Vehicles each get one mounted system.
+ */
+export const SOLDIER_WEAPON_CYCLE: WeaponId[] = ['rifle', 'sniper', 'pistol', 'machine_gun', 'rpg'];
+export const TANK_WEAPON: WeaponId = 'cluster_launcher';
+export const TUNNELER_WEAPON: WeaponId = 'heavy_launcher';
+export const WORM_WEAPON: WeaponId = 'cluster_launcher';
 
 /** Downward acceleration in m/s². Slightly snappier than real-world 9.81 — units feel
  *  "weighty" without dragging out the fall arc. Per-unit terminal velocity then sets
@@ -211,6 +222,18 @@ export interface Unit {
   cutterForward: number;
   cutterHeight: number;
   /**
+   * Weapon currently held / mounted on this unit. Soldiers carry hand-held
+   * weapons (rifle, sniper, pistol, machine gun, RPG); tanks/tunnelers/worms
+   * mount vehicle launchers (cluster, heavy). Undefined = unarmed.
+   */
+  weapon?: WeaponId;
+  /**
+   * Seconds until this unit can fire its weapon again. Decremented every tick;
+   * `tryFire` only succeeds when it reaches zero. Each successful fire resets
+   * it to `1 / fireRate`.
+   */
+  fireCooldown: number;
+  /**
    * Trailing body segments for chain-bodied diggers (worm). Empty for everyone else.
    * Element 0 is the segment closest to the head; each subsequent segment trails
    * further back. Each segment is placed at an exact arc-length offset along the
@@ -236,6 +259,101 @@ export interface Unit {
  *  give finer curve resolution at the cost of a longer history; 0.15 m keeps the
  *  buffer to ~60 entries even for the longest chain. */
 const PATH_HISTORY_STEP_MIN = 0.15;
+
+/**
+ * Pick the default weapon for a freshly-spawned unit. Soldiers cycle through
+ * `SOLDIER_WEAPON_CYCLE` so a barracks turns out a varied squad; vehicles each
+ * get one mounted launcher.
+ */
+function defaultWeaponFor(kind: UnitKind, soldierIndex: number): WeaponId | undefined {
+  switch (kind) {
+    case 'soldier':  return SOLDIER_WEAPON_CYCLE[soldierIndex % SOLDIER_WEAPON_CYCLE.length]!;
+    case 'tank':     return TANK_WEAPON;
+    case 'tunneler': return TUNNELER_WEAPON;
+    case 'worm':     return WORM_WEAPON;
+  }
+}
+
+/**
+ * Aiming + fire helpers. `tryFire` checks the unit's cooldown vs its weapon's
+ * fire rate, rotates the unit's heading toward the target, applies a random
+ * spread to the muzzle direction, and resets the cooldown. The caller then
+ * spawns a projectile from the returned spawn parameters — keeps `Units.ts`
+ * decoupled from `ProjectileManager` (the dependency goes the other way, so
+ * units can be ticked without a projectile world to point at).
+ */
+export interface FireSolution {
+  weapon: WeaponId;
+  projectileSpec: string;
+  origin: { x: number; y: number; z: number };
+  /** Unit-vector aim direction, post-spread. */
+  dir: { x: number; y: number; z: number };
+}
+
+export function tryFire(
+  unit: Unit,
+  target: { x: number; y: number; z: number },
+): FireSolution | null {
+  if (!unit.weapon) return null;
+  if (unit.fireCooldown > 0) return null;
+  const w = weaponSpec(unit.weapon);
+  const muzzle = muzzleWorld(unit);
+  if (!muzzle) return null;
+  const dx = target.x - muzzle.x;
+  const dy = target.y - muzzle.y;
+  const dz = target.z - muzzle.z;
+  const dist = Math.hypot(dx, dy, dz);
+  if (dist < 1e-3 || dist > w.rangeM) return null;
+  const inv = 1 / dist;
+  let ax = dx * inv, ay = dy * inv, az = dz * inv;
+  // Apply spread: random offset in the plane perpendicular to the aim.
+  if (w.spread > 0) {
+    let rx = -az, ry = 0, rz = ax;
+    let rl = Math.hypot(rx, ry, rz);
+    if (rl < 1e-4) { rx = 1; ry = 0; rz = 0; rl = 1; }
+    rx /= rl; ry /= rl; rz /= rl;
+    const ux = ay * rz - az * ry;
+    const uy = az * rx - ax * rz;
+    const uz = ax * ry - ay * rx;
+    const angle = Math.random() * Math.PI * 2;
+    const radial = Math.tan(w.spread * (Math.random() + Math.random() - 1));
+    ax += (rx * Math.cos(angle) + ux * Math.sin(angle)) * radial;
+    ay += (ry * Math.cos(angle) + uy * Math.sin(angle)) * radial;
+    az += (rz * Math.cos(angle) + uz * Math.sin(angle)) * radial;
+    const al = Math.hypot(ax, ay, az) || 1;
+    ax /= al; ay /= al; az /= al;
+  }
+  unit.fireCooldown = 1 / w.fireRate;
+  // Snap heading toward the target so the unit visibly faces the shot.
+  const horiz = Math.hypot(dx, dz);
+  if (horiz > 1e-3) unit.heading = Math.atan2(-dx, -dz);
+  return {
+    weapon: unit.weapon,
+    projectileSpec: w.projectile,
+    origin: muzzle,
+    dir: { x: ax, y: ay, z: az },
+  };
+}
+
+/**
+ * World-space muzzle position for `unit`'s currently-equipped weapon, derived
+ * from the weapon spec's `muzzleForward / muzzleUp / muzzleRight` offsets and
+ * the unit's heading. The unit faces -Z when heading=0 (matches the rest of
+ * the codebase: forward = (-sin h, 0, -cos h)).
+ */
+export function muzzleWorld(unit: Unit): { x: number; y: number; z: number } | null {
+  if (!unit.weapon) return null;
+  const w = weaponSpec(unit.weapon);
+  const fx = -Math.sin(unit.heading);
+  const fz = -Math.cos(unit.heading);
+  const rx =  Math.cos(unit.heading);
+  const rz = -Math.sin(unit.heading);
+  return {
+    x: unit.x + fx * w.muzzleForward + rx * w.muzzleRight,
+    y: unit.y + w.muzzleUp,
+    z: unit.z + fz * w.muzzleForward + rz * w.muzzleRight,
+  };
+}
 
 export interface WormSegment {
   x: number; y: number; z: number;
@@ -272,8 +390,18 @@ export class UnitManager {
   units: Unit[] = [];
   private nextId = 1;
 
-  spawn(kind: UnitKind, x: number, y: number, z: number): Unit {
+  /**
+   * Tracks how many soldiers we've spawned overall so each new soldier gets
+   * the next weapon in `SOLDIER_WEAPON_CYCLE`. That way a barracks producing
+   * five soldiers in a row turns out a mixed squad (rifle/sniper/pistol/MG/RPG)
+   * instead of five identical riflemen.
+   */
+  private soldierSpawnCount = 0;
+
+  spawn(kind: UnitKind, x: number, y: number, z: number, weapon?: WeaponId): Unit {
     const cfg = unitConfig(kind);
+    const resolvedWeapon = weapon ?? defaultWeaponFor(kind, this.soldierSpawnCount);
+    if (kind === 'soldier') this.soldierSpawnCount++;
     const segments: WormSegment[] = [];
     for (let i = 0; i < cfg.segmentCount; i++) {
       // Initial layout: segments stretched out behind the head along +Z (heading = 0
@@ -331,6 +459,8 @@ export class UnitManager {
       cutterRadius: cfg.cutterRadius,
       cutterForward: cfg.cutterForward,
       cutterHeight: cfg.cutterHeight,
+      weapon: resolvedWeapon,
+      fireCooldown: 0,
       segments,
       pathHistory,
     };
@@ -381,6 +511,7 @@ export class UnitManager {
     this.lastSurfaceNav = nav;
     this.lastVoxels = voxels;
     for (const u of this.units) {
+      if (u.fireCooldown > 0) u.fireCooldown = Math.max(0, u.fireCooldown - dt);
       const underground = isUnderground(u, nav);
       if (u.path.length === 0) {
         // Idle: surface-follow only when actually on the surface; underground tunnelers

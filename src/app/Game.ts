@@ -9,8 +9,10 @@ import { raycastVoxel } from '../voxel/Raycast';
 import { VOXEL_SIZE } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
 import { PathClient } from '../path/PathClient';
-import { UnitManager, Unit, UnitKind, CarveRequest } from '../sim/Units';
+import { UnitManager, Unit, UnitKind, CarveRequest, tryFire } from '../sim/Units';
+import { ProjectileManager, ExplosionEvent } from '../sim/Projectiles';
 import { UnitRenderer } from '../render/UnitRenderer';
+import { ProjectileRenderer } from '../render/ProjectileRenderer';
 import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { worldToVolumeCell, vnavIndex, getBit } from '../path/VolumeNav';
 import { trackDamageFor } from '../voxel/Materials';
@@ -30,10 +32,14 @@ export class Game {
   readonly debris: DebrisParticles;
   readonly units = new UnitManager();
   readonly unitRenderer = new UnitRenderer();
+  readonly projectiles = new ProjectileManager();
+  readonly projectileRenderer = new ProjectileRenderer();
   readonly buildings = new BuildingManager();
   readonly ghost = new BuildingGhost();
   readonly pathPreview = new PathPreview();
   readonly target = new TargetMarker();
+  /** Whether LMB-click should command movement (false) or fire weapon (true). Toggle with F. */
+  private fireMode = false;
   pathClient: PathClient | null = null;
   /** Pixels of vertical drag = 1 m of altitude offset for tunneler targets. */
   private readonly altitudeDragSensitivity = 8;
@@ -66,6 +72,7 @@ export class Game {
     this.debris = new DebrisParticles(4096);
     this.renderer.scene.add(this.debris.mesh);
     this.renderer.scene.add(this.unitRenderer.group);
+    this.renderer.scene.add(this.projectileRenderer.object);
     this.renderer.scene.add(this.ghost.group);
     this.renderer.scene.add(this.pathPreview.object);
     this.renderer.scene.add(this.target.group);
@@ -148,6 +155,7 @@ export class Game {
       this.ghost.hide();
     }
     if (this.input.pressed.has('Tab')) this.cycleSelection();
+    if (this.input.pressed.has('KeyF')) this.fireMode = !this.fireMode;
 
     if (this.mode === 'build') {
       this.updateGhost(w, h);
@@ -163,8 +171,10 @@ export class Game {
       this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, this.world.buffers.voxels, (req) => this.handleCarve(req));
       this.buildings.tick(dt, this.world, this.units);
       this.paintTankTracks();
+      this.projectiles.tick(dt, this.world, this.units.units, (e) => this.handleExplosion(e));
     }
     this.unitRenderer.update(this.units);
+    this.projectileRenderer.update(this.projectiles.projectiles);
 
     // Dashed path preview for the selected unit (if any).
     const sel = this.units.units.find(u => u.selected);
@@ -188,8 +198,12 @@ export class Game {
     }
     if (this.modeEl) {
       const sel = this.units.units.find(u => u.selected);
-      const selDesc = sel ? `${sel.kind} #${sel.id}` : 'none';
-      this.modeEl.textContent = `${this.mode === 'build' ? 'MODE: BUILD (LMB place, Esc cancel)' : 'MODE: PLAY'} | selected: ${selDesc}`;
+      const selDesc = sel ? `${sel.kind} #${sel.id}${sel.weapon ? ' [' + sel.weapon + ']' : ''}` : 'none';
+      const modeText = this.mode === 'build'
+        ? 'MODE: BUILD (LMB place, Esc cancel)'
+        : this.fireMode ? 'MODE: FIRE (LMB shoot, F to exit)'
+        : 'MODE: PLAY (F to fire)';
+      this.modeEl.textContent = `${modeText} | selected: ${selDesc}`;
     }
   }
 
@@ -308,6 +322,11 @@ export class Game {
       if (r) this.detonateAt(r.voxelXYZ);
       return;
     }
+    if (this.fireMode) {
+      const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
+      if (r) this.fireSelectedAt(r.target.x, r.target.y, r.target.z);
+      return;
+    }
     const selected = this.units.units.find(u => u.selected);
     const verticalDrag = release.endY - release.startY;
     const useDrag = selected?.canDig === true;
@@ -354,6 +373,42 @@ export class Game {
       const wx = cx * VOXEL_SIZE, wy = cy * VOXEL_SIZE, wz = cz * VOXEL_SIZE;
       const burst = Math.min(160, 20 + result.destroyed.length * 2);
       this.debris.spawnBurst(wx, wy, wz, burst, sample.material);
+      this.requestNavRebuild();
+    }
+  }
+
+  /**
+   * Fire the selected unit's currently-equipped weapon at the world point
+   * `(wx, wy, wz)`. No-op if nothing is selected, the unit is unarmed, the
+   * weapon is on cooldown, or the target is past the weapon's effective
+   * range. Successful fires push a projectile into `ProjectileManager`.
+   */
+  private fireSelectedAt(wx: number, wy: number, wz: number): void {
+    const sel = this.units.units.find(u => u.selected);
+    if (!sel) return;
+    const sol = tryFire(sel, { x: wx, y: wy, z: wz });
+    if (!sol) return;
+    this.projectiles.spawn(
+      sol.projectileSpec,
+      sol.origin.x, sol.origin.y, sol.origin.z,
+      sol.dir.x, sol.dir.y, sol.dir.z,
+      sel.id,
+    );
+  }
+
+  /**
+   * Sink for projectile explosions — spawns a debris burst proportional to the
+   * blast and asks for a nav rebuild when ground was destroyed. Mid-air cluster
+   * bursts skip the nav rebuild (no voxels were removed at the burst point).
+   */
+  private handleExplosion(e: ExplosionEvent): void {
+    if (e.midAir) {
+      this.debris.spawnBurst(e.x, e.y, e.z, 24, 3);
+      return;
+    }
+    if (e.destroyedCount > 0) {
+      const burst = Math.min(160, 20 + e.destroyedCount * 2);
+      this.debris.spawnBurst(e.x, e.y, e.z, burst, e.material || 2);
       this.requestNavRebuild();
     }
   }
