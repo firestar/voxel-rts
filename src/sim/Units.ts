@@ -430,15 +430,22 @@ function isUnderground(u: Unit, nav: SurfaceNavBuffers): boolean {
  *  - not bedrock
  *  - not solid (unless the unit can dig — tunnelers carve their way in)
  */
-function volumePassable(u: Unit, vnav: VolumeNavBuffers, wx: number, wy: number, wz: number): boolean {
+/**
+ * Runtime motion gate for the volume nav. A position is passable iff the cell at that
+ * world position is **air**. Bedrock and any solid cell are rejected unconditionally —
+ * the canDig flag is a *path-planning* concession that lets A* route through soil for
+ * tunnelers, but at runtime even a tunneler must enter solid through the explicit
+ * solid-branch carve loop in tickVolume (carve at the blade, gate the advance on
+ * voxelSlabClear). Letting canDig pass through here was the clipping bug.
+ */
+function volumePassable(_u: Unit, vnav: VolumeNavBuffers, wx: number, wy: number, wz: number): boolean {
   const cx = Math.floor(wx / VNAV_CELL_METERS);
   const cy = Math.floor(wy / VNAV_CELL_METERS);
   const cz = Math.floor(wz / VNAV_CELL_METERS);
   if (cx < 0 || cy < 0 || cz < 0 || cx >= VNAV_X || cy >= VNAV_Y || cz >= VNAV_Z) return false;
   const i = vnavIndex(cx, cy, cz);
   if (getBit(vnav.bedrock, i)) return false;
-  const isSolid = getBit(vnav.solid, i) === 1;
-  if (isSolid && !u.canDig) return false;
+  if (getBit(vnav.solid, i) === 1) return false;
   return true;
 }
 
