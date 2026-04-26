@@ -22,3 +22,11 @@ to confirm something we could have asserted programmatically.
 
 The user can run the dev server themselves when they want to look at
 things visually. Our job is to keep typecheck + tests + build green.
+
+## Don't use sub agents
+
+Don't delegate work to sub agents via the `Agent` tool (Explore,
+general-purpose, Plan, etc.). Do the searching, reading, and editing
+directly in the main session. Sub agents fragment context, hide what
+actually got run, and make it harder to verify the work — which matters
+more here than the parallelism they buy.
