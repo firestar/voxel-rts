@@ -75,10 +75,26 @@ export class UnitRenderer {
       const isMoving = u.path.length > 0;
       this.tmpEuler.set(u.pitch, u.heading, u.roll, 'YXZ');
       this.quat.setFromEuler(this.tmpEuler);
-      const bodyBob = isMoving
-        ? Math.sin(u.distanceWalked * (u.kind === 'soldier' ? 6.0 : 3.0) + u.id) * (u.kind === 'soldier' ? 0.04 : 0.02)
-        : 0;
-      this.tmpV.set(u.x, u.y + bodyBob, u.z);
+      // One-sided bob: max(0, sin) lifts the body up and lets it settle back to
+      // u.y, never dipping below. The previous symmetric ±sin had the model
+      // descend ~4 cm below the snapped feet on the down-swing, clipping boots
+      // / treads into the voxel underneath. Collision/path always use u.y as
+      // the static feet position; the renderer must never draw the model lower
+      // than that. Amplitude doubled to keep the same visual lift.
+      const bobFreq = u.kind === 'soldier' ? 6.0 : u.kind === 'tank' ? 3.0 : 4.0;
+      const bobAmp  = u.kind === 'soldier' ? 0.08 : u.kind === 'tank' ? 0.04 : 0.05;
+      const sineRaw = Math.sin(u.distanceWalked * bobFreq + u.id);
+      const bodyBob = isMoving ? Math.max(0, sineRaw) * bobAmp : 0;
+      // Per-kind feet offset. Each model has its lowest geometry at a different
+      // body-local Y; this lifts/drops the body so that lowest point lines up
+      // exactly with u.y (the snapped voxel-top position).
+      //   Soldier: boot bottom is at body-local y = -0.05 (hip 0.55, leg 0.60)
+      //            → +0.05 lifts the boots to u.y.
+      //   Tank:    tread bottom at body-local y = 0.05 → -0.05 drops the treads
+      //            to u.y (was 5 cm of ground clearance which read as floating).
+      //   Tunneler: tread bottom at body-local y = 0.0 already → no offset.
+      const feetOffset = u.kind === 'soldier' ? 0.05 : u.kind === 'tank' ? -0.05 : 0.0;
+      this.tmpV.set(u.x, u.y + feetOffset + bodyBob, u.z);
       this.bodyM.compose(this.tmpV, this.quat, new THREE.Vector3(1, 1, 1));
 
       if (u.kind === 'soldier') {
