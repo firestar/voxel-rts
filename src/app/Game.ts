@@ -14,7 +14,7 @@ import { UnitRenderer } from '../render/UnitRenderer';
 import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { worldToVolumeCell, vnavIndex, getBit } from '../path/VolumeNav';
 import { trackDamageFor, M_DIRT, M_WOOD, M_METAL } from '../voxel/Materials';
-import { BuildingManager, BARRACKS, FARM, STORAGE, ALL_BUILDINGS, BuildingSpec, checkFootprint } from '../sim/Buildings';
+import { BuildingManager, BARRACKS, STORAGE, ALL_BUILDINGS, BuildingSpec, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { BuildingRenderer } from '../render/BuildingRenderer';
 import { PathPreview } from '../render/PathPreview';
@@ -70,6 +70,8 @@ export class Game {
   private readonly altitudeDragSensitivity = 8;
   /** Squared px threshold above which a click is treated as a "drag". */
   private readonly dragThresholdPx2 = 6 * 6;
+  /** DOM element used to draw the LMB box-select rectangle while dragging. */
+  private selBoxEl: HTMLElement | null = null;
 
   private last = performance.now();
   private fpsAcc = 0;
@@ -117,6 +119,7 @@ export class Game {
 
     this.fpsEl = statsEl;
     this.modeEl = document.getElementById('mode');
+    this.selBoxEl = document.getElementById('selbox');
 
     this.onResize();
     window.addEventListener('resize', this.onResize);
@@ -146,8 +149,7 @@ export class Game {
       }
     }
     const c = navCenter(nav, found.cx, found.cz);
-    const soldier = this.spawnUnit('soldier', c.x, c.y, c.z);
-    if (soldier) soldier.selected = true;
+    this.spawnUnit('soldier', c.x, c.y, c.z);
     this.spawnUnit('tank', c.x + 3.0, c.y, c.z);
     this.spawnUnit('tunneler', c.x - 2.0, c.y, c.z);
     this.spawnUnit('worm', c.x + 0.5, c.y, c.z + 4.0);
@@ -275,6 +277,7 @@ export class Game {
 
     // LMB hold → preview marker (tunneler altitude drag); release → fire actual command.
     this.updateLmbPreview(w, h);
+    this.updateSelectionBox();
     if (this.input.release) {
       this.handleRelease(this.input.release, w, h);
     }
@@ -336,7 +339,7 @@ export class Game {
     this.impactFlashes.update(dt);
     this.impactRings.update(dt);
 
-    // Dashed path preview for the selected unit (if any).
+    // Dashed path preview for the first selected unit (if any).
     const sel = this.units.units.find(u => u.selected);
     if (sel && sel.path.length > 0) {
       this.pathPreview.update({ x: sel.x, y: sel.y, z: sel.z }, sel.path);
@@ -358,11 +361,14 @@ export class Game {
       this.fpsAcc = 0; this.fpsCount = 0; this.fpsTimer = 0;
     }
     if (this.modeEl) {
-      const sel = this.units.units.find(u => u.selected);
-      const selDesc = sel
-        ? (sel.kind === 'worker' ? `worker(${sel.workerRole}) #${sel.id}` : `${sel.kind} #${sel.id}`)
-        : 'none';
-      const weaponDesc = sel && sel.weapon !== null
+      const selected = this.units.units.filter(u => u.selected);
+      const sel = selected[0];
+      const selDesc = !sel
+        ? 'none'
+        : selected.length > 1
+          ? `${selected.length} units (lead: ${sel.kind} #${sel.id})`
+          : sel.kind === 'worker' ? `worker(${sel.workerRole}) #${sel.id}` : `${sel.kind} #${sel.id}`;
+      const weaponDesc = sel && selected.length === 1 && sel.weapon !== null
         ? ` weapon: ${WEAPONS[sel.weapon].label} (RMB to fire, drag Y for altitude)`
         : '';
       const buildDesc = this.mode === 'build'
@@ -468,6 +474,11 @@ export class Game {
       this.target.hide();
       return;
     }
+    // While dragging the box-select rectangle, suppress the move-target marker.
+    if (this.isDragging(hold.startX, hold.startY, hold.currentX, hold.currentY)) {
+      this.target.hide();
+      return;
+    }
     const selected = this.units.units.find(u => u.selected);
     // Preview only matters for tunnelers (vertical drag) — keep marker visible when held over terrain.
     if (!selected) { this.target.hide(); return; }
@@ -484,23 +495,184 @@ export class Game {
     this.target.show(r.surface, r.target);
   }
 
+  /** True when the cursor has moved past the click/drag threshold from its press point. */
+  private isDragging(sx: number, sy: number, cx: number, cy: number): boolean {
+    const dx = cx - sx, dy = cy - sy;
+    return dx * dx + dy * dy > this.dragThresholdPx2;
+  }
+
+  /**
+   * Show / hide / size the screen-space box-select rectangle while LMB is
+   * held. Only visible in play mode when the cursor has moved past the
+   * drag threshold; build / plant mode keep their own placement preview.
+   */
+  private updateSelectionBox(): void {
+    if (!this.selBoxEl) return;
+    const hold = this.input.hold;
+    if (!hold || this.mode !== 'play') {
+      this.selBoxEl.style.display = 'none';
+      return;
+    }
+    if (!this.isDragging(hold.startX, hold.startY, hold.currentX, hold.currentY)) {
+      this.selBoxEl.style.display = 'none';
+      return;
+    }
+    const x0 = Math.min(hold.startX, hold.currentX);
+    const y0 = Math.min(hold.startY, hold.currentY);
+    const x1 = Math.max(hold.startX, hold.currentX);
+    const y1 = Math.max(hold.startY, hold.currentY);
+    this.selBoxEl.style.display = 'block';
+    this.selBoxEl.style.left = `${x0}px`;
+    this.selBoxEl.style.top = `${y0}px`;
+    this.selBoxEl.style.width = `${x1 - x0}px`;
+    this.selBoxEl.style.height = `${y1 - y0}px`;
+  }
+
+  /**
+   * Pick the unit nearest the cursor along the camera ray. Returns null when
+   * no unit's bounding sphere is hit. Used by single-click LMB to select.
+   */
+  private pickUnitAt(px: number, py: number, w: number, h: number): Unit | null {
+    const { origin, dir } = this.rayFromScreen(px, py, w, h);
+    let bestT = Infinity;
+    let best: Unit | null = null;
+    for (const u of this.units.units) {
+      if (u.hp <= 0) continue;
+      const radius = u.widthMeters * 0.55 + 0.35;
+      const cx = u.x;
+      const cy = u.y + Math.max(0.7, u.widthMeters * 0.6);
+      const cz = u.z;
+      const ox = origin.x - cx, oy = origin.y - cy, oz = origin.z - cz;
+      const b = ox * dir.x + oy * dir.y + oz * dir.z;
+      const cTerm = ox * ox + oy * oy + oz * oz - radius * radius;
+      const disc = b * b - cTerm;
+      if (disc < 0) continue;
+      const sq = Math.sqrt(disc);
+      let t = -b - sq;
+      if (t < 0) t = -b + sq;
+      if (t < 0 || t > 400) continue;
+      if (t < bestT) { bestT = t; best = u; }
+    }
+    return best;
+  }
+
+  /**
+   * Project every unit's world position to screen pixels and select those
+   * whose projected point lies inside the rectangle defined by the two
+   * cursor positions. With `additive`, existing selection is preserved and
+   * units in the box are added; without it, the existing selection is
+   * replaced.
+   */
+  private boxSelect(sx: number, sy: number, ex: number, ey: number, w: number, h: number, additive: boolean): void {
+    const x0 = Math.min(sx, ex), x1 = Math.max(sx, ex);
+    const y0 = Math.min(sy, ey), y1 = Math.max(sy, ey);
+    if (!additive) for (const u of this.units.units) u.selected = false;
+    const v = new THREE.Vector3();
+    for (const u of this.units.units) {
+      if (u.hp <= 0) continue;
+      v.set(u.x, u.y + Math.max(0.5, u.widthMeters * 0.5), u.z);
+      v.project(this.camera.cam);
+      // project() returns NDC (−1..+1) in x/y and a z that is < −1 / > +1
+      // when behind / past the camera. Skip those so back-facing units
+      // don't accidentally land in the box.
+      if (v.z < -1 || v.z > 1) continue;
+      const px = (v.x * 0.5 + 0.5) * w;
+      const py = (-v.y * 0.5 + 0.5) * h;
+      if (px >= x0 && px <= x1 && py >= y0 && py <= y1) u.selected = true;
+    }
+  }
+
+  /**
+   * Build a deterministic grid of formation slots centered on (cx, cz). One
+   * slot per selected unit. Layout is a roughly-square grid with the unit
+   * that is currently nearest the destination assigned the centre; remaining
+   * slots fan outward by row. Slot spacing is set from the largest selected
+   * unit's footprint so vehicles don't try to share the same nav cell.
+   */
+  private formationSlots(units: Unit[], cx: number, cz: number): { unit: Unit; x: number; z: number }[] {
+    const n = units.length;
+    if (n === 0) return [];
+    if (n === 1) return [{ unit: units[0]!, x: cx, z: cz }];
+    let maxWidth = 0;
+    for (const u of units) maxWidth = Math.max(maxWidth, u.widthMeters);
+    const spacing = Math.max(1.6, maxWidth + 0.8);
+    const cols = Math.ceil(Math.sqrt(n));
+    const rows = Math.ceil(n / cols);
+    // Forward direction = from the formation centroid TO the destination, so
+    // the front row faces the destination and the rest line up behind.
+    let avgX = 0, avgZ = 0;
+    for (const u of units) { avgX += u.x; avgZ += u.z; }
+    avgX /= n; avgZ /= n;
+    let fx = cx - avgX, fz = cz - avgZ;
+    const fl = Math.hypot(fx, fz);
+    if (fl < 1e-3) { fx = 0; fz = 1; } else { fx /= fl; fz /= fl; }
+    const rx = -fz, rz = fx; // right perpendicular
+    const slots: { x: number; z: number }[] = [];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        if (slots.length >= n) break;
+        const colOff = c - (cols - 1) * 0.5;
+        const rowOff = r - (rows - 1) * 0.5;
+        slots.push({
+          x: cx + rx * colOff * spacing - fx * rowOff * spacing,
+          z: cz + rz * colOff * spacing - fz * rowOff * spacing,
+        });
+      }
+    }
+    // Greedy assignment: for each slot (closest-to-destination first), pick the
+    // unselected unit with the smallest distance to it. Keeps the formation
+    // tight without anyone walking across the whole pack.
+    slots.sort((a, b) => {
+      const da = (a.x - cx) ** 2 + (a.z - cz) ** 2;
+      const db = (b.x - cx) ** 2 + (b.z - cz) ** 2;
+      return da - db;
+    });
+    const remaining = units.slice();
+    const out: { unit: Unit; x: number; z: number }[] = [];
+    for (const s of slots) {
+      let bestI = -1, bestD = Infinity;
+      for (let i = 0; i < remaining.length; i++) {
+        const u = remaining[i]!;
+        const d = (u.x - s.x) ** 2 + (u.z - s.z) ** 2;
+        if (d < bestD) { bestD = d; bestI = i; }
+      }
+      if (bestI < 0) break;
+      const u = remaining.splice(bestI, 1)[0]!;
+      out.push({ unit: u, x: s.x, z: s.z });
+    }
+    return out;
+  }
+
   private handleRelease(release: { startX: number; startY: number; endX: number; endY: number; shift: boolean }, w: number, h: number): void {
     this.target.hide();
+    const dragged = this.isDragging(release.startX, release.startY, release.endX, release.endY);
+
     if (isBuildMode(this.mode)) {
+      // Drag in build mode is meaningless — only the release-point cell matters.
       const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
       if (r) this.tryPlaceBuilding(r.voxelXYZ);
       return;
     }
-    if (release.shift) {
+
+    // Box-select on drag (play mode only). Shift makes it additive.
+    if (dragged && this.mode === 'play') {
+      this.boxSelect(release.startX, release.startY, release.endX, release.endY, w, h, release.shift);
+      return;
+    }
+
+    // Shift + click (no drag) preserves the legacy detonate gesture so the
+    // player can still blow up terrain with shift-LMB.
+    if (release.shift && this.mode === 'play') {
       const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
       if (r) this.detonateAt(r.voxelXYZ);
       return;
     }
-    const selected = this.units.units.find(u => u.selected);
+
     if (this.mode === 'plant') {
       // Plant mode: only meaningful with a harvester worker selected. Click
       // anywhere on terrain — we drop the plant task at the click voxel xz
       // and let tickWorkers route the worker to it.
+      const selected = this.units.units.find(u => u.selected);
       const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
       if (!r || !selected || selected.kind !== 'worker' || selected.workerRole !== 'harvester') return;
       const wx = r.target.x, wz = r.target.z;
@@ -508,21 +680,52 @@ export class Game {
       void this.routePath(selected, wx, selected.y, wz);
       return;
     }
+
+    // Click in play mode. First check if the cursor landed on a unit — a
+    // hit selects that unit (replacing the current selection unless shift
+    // is held, in which case it toggles).
+    const picked = this.pickUnitAt(release.startX, release.startY, w, h);
+    if (picked) {
+      if (release.shift) {
+        picked.selected = !picked.selected;
+      } else {
+        for (const u of this.units.units) u.selected = false;
+        picked.selected = true;
+      }
+      return;
+    }
+
+    // Click on terrain → command the current selection to move. Solo
+    // selection keeps the per-unit task / earth-mover wiring; multi
+    // selection issues a formation move and skips per-unit task pickers.
+    const selected = this.units.units.filter(u => u.selected);
+    if (selected.length === 0) return;
+    const lead = selected[0]!;
     const verticalDrag = release.endY - release.startY;
-    const useDrag = selected?.canDig === true;
-    // Same as updateLmbPreview — tunneler base height = its own y, so a no-drag
-    // click means "head toward the click XZ at my current height". And the dive
-    // angle is clamped to the unit's maxPitchRad so dragging past the cap still
-    // commits a valid (steep-but-legal) dig.
-    const baseY = useDrag && selected ? selected.y : undefined;
-    const pitchCap = useDrag && selected ? selected.maxPitchRad : undefined;
-    const pitchOrigin = useDrag && selected ? { x: selected.x, z: selected.z } : undefined;
+    const useDrag = selected.length === 1 && lead.canDig;
+    const baseY = useDrag ? lead.y : undefined;
+    const pitchCap = useDrag ? lead.maxPitchRad : undefined;
+    const pitchOrigin = useDrag ? { x: lead.x, z: lead.z } : undefined;
     const r = this.resolveTarget(release.startX, release.startY, w, h, useDrag ? verticalDrag : 0, baseY, pitchCap, pitchOrigin);
     if (!r) return;
 
-    // Worker LMB targets a specific voxel. If it's wood / metal we set the
-    // matching task; otherwise fall through to a generic move.
-    if (selected && selected.kind === 'worker' && selected.workerRole === 'harvester') {
+    if (selected.length === 1) {
+      this.commandSingle(lead, r);
+      return;
+    }
+    this.commandFormation(selected, r.target.x, r.target.z);
+  }
+
+  /**
+   * Single-unit command path — preserves the per-kind tasking we already had:
+   * harvesters chop / mine specific voxels; dozers latch their level Y;
+   * haulers attach a load/dump job.
+   */
+  private commandSingle(
+    selected: Unit,
+    r: { surface: THREE.Vector3; target: THREE.Vector3; voxelXYZ: { x: number; y: number; z: number; nx: number; ny: number; nz: number } },
+  ): void {
+    if (selected.kind === 'worker' && selected.workerRole === 'harvester') {
       const m = this.world.get(r.voxelXYZ.x, r.voxelXYZ.y, r.voxelXYZ.z);
       if (m === M_WOOD) {
         selected.task = {
@@ -544,31 +747,32 @@ export class Game {
         void this.routePath(selected, selected.task.wx, selected.task.wy, selected.task.wz);
         return;
       }
-      // Empty click → cancel any task and walk to the surface point.
       selected.task = { kind: 'idle' };
     }
-
-    // Earth-mover bookkeeping. Both attachments survive the path replan because
-    // we set them before dispatching commandMoveToWorld.
-    if (selected) {
-      if (selected.kind === 'dozer') {
-        // Click voxel y becomes the dozer's target level. editColumnToY cuts
-        // strictly above this y and preserves the voxel itself, so the strip
-        // ends up with its top face flush with the clicked voxel's top face.
-        selected.levelTargetY = r.voxelXYZ.y;
-      } else if (selected.kind === 'hauler') {
-        const mode = selected.spoilLoad > 0 ? 'dump' : 'load';
-        selected.haulerJob = { vx: r.voxelXYZ.x, vz: r.voxelXYZ.z, mode };
-      }
+    if (selected.kind === 'dozer') {
+      selected.levelTargetY = r.voxelXYZ.y;
+    } else if (selected.kind === 'hauler') {
+      const mode = selected.spoilLoad > 0 ? 'dump' : 'load';
+      selected.haulerJob = { vx: r.voxelXYZ.x, vz: r.voxelXYZ.z, mode };
     }
-    void this.commandMoveToWorld(r.target.x, r.target.y, r.target.z);
+    void this.routePath(selected, r.target.x, r.target.y, r.target.z);
   }
 
-  private async commandMoveToWorld(wx: number, wy: number, wz: number): Promise<void> {
-    if (!this.pathClient) return;
-    const selected = this.units.units.find(u => u.selected);
-    if (!selected) return;
-    await this.routePath(selected, wx, wy, wz);
+  /**
+   * Multi-unit command path — generates a formation grid centered on the
+   * click and routes each unit to its assigned slot. Earth-mover and
+   * harvester per-voxel tasks are skipped (those don't compose well with
+   * formations); each unit just walks to its slot.
+   */
+  private commandFormation(units: Unit[], cx: number, cz: number): void {
+    const slots = this.formationSlots(units, cx, cz);
+    for (const s of slots) {
+      const u = s.unit;
+      if (u.kind === 'dozer') u.levelTargetY = null;
+      if (u.kind === 'hauler') u.haulerJob = null;
+      if (u.kind === 'worker') u.task = { kind: 'idle' };
+      void this.routePath(u, s.x, u.y, s.z);
+    }
   }
 
   private tryPlaceBuilding(hit: { x: number; z: number }): void {
@@ -1016,12 +1220,14 @@ export class Game {
     this.trajectoryPreview.update([]);
     this.impactMarker.hide();
     if (this.mode !== 'play') return;
-    const sel = this.units.units.find(u => u.selected);
-    if (!sel || sel.weapon === null) return;
+    const armed = this.units.units.filter(u => u.selected && u.weapon !== null);
+    if (armed.length === 0) return;
     const verticalDrag = release.endY - release.startY;
     const r = this.resolveTarget(release.startX, release.startY, w, h, verticalDrag);
     if (!r) return;
-    sel.firingTarget = { x: r.target.x, y: r.target.y, z: r.target.z };
+    for (const u of armed) {
+      u.firingTarget = { x: r.target.x, y: r.target.y, z: r.target.z };
+    }
   }
 
   /**

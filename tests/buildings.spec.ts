@@ -23,9 +23,9 @@ function buildFlatWorld(surfaceY = 32): VoxelWorld {
 }
 
 describe('building specs', () => {
-  it('exposes all four kinds via ALL_BUILDINGS in registry order', () => {
+  it('exposes all kinds via ALL_BUILDINGS in registry order', () => {
     expect(ALL_BUILDINGS.map(s => s.kind)).toEqual([
-      'barracks', 'power_plant', 'refinery', 'tech_lab',
+      'barracks', 'farm', 'storage', 'power_plant', 'refinery', 'tech_lab',
     ]);
   });
 
