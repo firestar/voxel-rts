@@ -142,6 +142,12 @@ export interface CarveRequest {
    */
   axisX?: number; axisY?: number; axisZ?: number;
   halfLengthMeters?: number;
+  /**
+   * Optional hard floor in world meters. Voxels below this Y are not damaged. The
+   * tunneler uses this to cap its cutter at its own body bottom (u.y) so the
+   * disc-shaped cylinder doesn't carve out the floor underneath.
+   */
+  floorMeters?: number;
   unit: Unit;
 }
 
@@ -445,6 +451,9 @@ export class UnitManager {
       axisX: fx, axisY: fy, axisZ: fz,
       halfLengthMeters: halfLength,
       radiusMeters: radius,
+      // Don't carve below the unit's body bottom — keeps the cutter from eating
+      // the floor underneath the tunneler and dropping it into its own hole.
+      floorMeters: u.y,
       unit: u,
     });
   }

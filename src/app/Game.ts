@@ -336,6 +336,9 @@ export class Game {
     const cx = req.x / VOXEL_SIZE;
     const cy = req.y / VOXEL_SIZE;
     const cz = req.z / VOXEL_SIZE;
+    const minYVoxels = req.floorMeters !== undefined
+      ? req.floorMeters / VOXEL_SIZE
+      : -Infinity;
     const result = req.axisX !== undefined
       ? this.world.damageOrientedCylinder(
           cx, cy, cz,
@@ -343,6 +346,7 @@ export class Game {
           (req.halfLengthMeters ?? 0) / VOXEL_SIZE,
           radiusVoxels,
           250,
+          minYVoxels,
         )
       : this.world.damageSphere(cx, cy, cz, radiusVoxels, 250);
     if (result.destroyed.length > 0) {

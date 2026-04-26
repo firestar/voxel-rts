@@ -95,6 +95,39 @@ describe('tunneler carve covers a continuous tube', () => {
     expect(cleared).toBeGreaterThan(0);
   });
 
+  it('respects minYVoxels — no voxels below the floor get damaged', () => {
+    const world = VoxelWorld.create(false);
+    const voxels = world.buffers.voxels;
+    // Fill a thick block of dirt centred on a known Y.
+    const cy = 96;
+    const cz = 200;
+    const cx = 150;
+    for (let x = cx - 16; x <= cx + 16; x++) {
+      for (let y = cy - 16; y <= cy + 16; y++) {
+        for (let z = cz - 16; z <= cz + 16; z++) {
+          voxels[worldIndex(x, y, z)] = M_DIRT;
+        }
+      }
+    }
+    // Carve straight down (axis -Y) through the block, with a floor at cy.
+    const radius = (TUNNELER_CUTTER_RADIUS + VOXEL_SIZE * 3) / VOXEL_SIZE;
+    const halfLen = (VOXEL_SIZE * 2) / VOXEL_SIZE;
+    world.damageOrientedCylinder(
+      cx + 0.5, cy + 0.5, cz + 0.5,
+      0, -1, 0, // axis points down
+      halfLen, radius, 250,
+      cy, // minYVoxels — nothing below this y should be destroyed
+    );
+    // Anything strictly below the floor must still be M_DIRT.
+    for (let x = cx - 8; x <= cx + 8; x++) {
+      for (let z = cz - 8; z <= cz + 8; z++) {
+        for (let y = cy - 8; y < cy; y++) {
+          expect(voxels[worldIndex(x, y, z)]).toBe(M_DIRT);
+        }
+      }
+    }
+  });
+
   it('leaves voxels far outside the cutter radius alone', () => {
     const world = VoxelWorld.create(false);
     const voxels = world.buffers.voxels;

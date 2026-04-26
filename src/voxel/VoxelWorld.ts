@@ -135,6 +135,7 @@ export class VoxelWorld {
     ax: number, ay: number, az: number,
     halfLength: number, radius: number,
     peakDamage: number,
+    minYVoxels: number = -Infinity,
   ): ExplosionResult {
     const result: ExplosionResult = { destroyed: [], touched: 0 };
     const halfLen = Math.max(0.1, halfLength);
@@ -150,7 +151,11 @@ export class VoxelWorld {
     const z1 = Math.min(WORLD_Z - 1, Math.ceil(cz + bound));
     const voxels = this.buffers.voxels;
 
-    for (let y = y0; y <= y1; y++) {
+    // Hard floor for the carve. Lets the tunneler cap its cutter so the disc-shaped
+    // carve volume never bites voxels below the unit's body bottom (which would dig
+    // out the floor under the unit and have it sink into its own hole).
+    const yFloor = Math.max(y0, Math.ceil(minYVoxels));
+    for (let y = yFloor; y <= y1; y++) {
       const dy = y + 0.5 - cy;
       for (let z = z0; z <= z1; z++) {
         const dz = z + 0.5 - cz;
