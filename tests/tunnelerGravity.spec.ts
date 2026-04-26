@@ -61,7 +61,9 @@ describe('tunneler cutter — dig-down floor exception', () => {
     um.setPath(u, [{ x: ux, y: uy - 4.0, z: uz }]);
 
     const carves: CarveRequest[] = [];
-    um.tick(1 / 60, nav, vnav, voxels, (req) => carves.push(req));
+    um.tick(1 / 60, nav, vnav, voxels, (req) => {
+      if (req.kind === 'carve') carves.push(req);
+    });
 
     expect(carves.length).toBeGreaterThan(0);
     const c = carves[0]!;
@@ -101,7 +103,9 @@ describe('tunneler cutter — dig-down floor exception', () => {
     um.setPath(u, [{ x: ux + 4.0, y: uy, z: uz }]);
 
     const carves: CarveRequest[] = [];
-    um.tick(1 / 60, nav, vnav, voxels, (req) => carves.push(req));
+    um.tick(1 / 60, nav, vnav, voxels, (req) => {
+      if (req.kind === 'carve') carves.push(req);
+    });
 
     expect(carves.length).toBeGreaterThan(0);
     const c = carves[0]!;
