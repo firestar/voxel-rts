@@ -29,7 +29,10 @@ export const BARRACKS: BuildingSpec = {
   headroomVoxels: 24, // 3 m at 0.125 m voxels
   wall: M_WOOD,
   productionInterval: 6.0,
-  produces: ['soldier', 'tank', 'tunneler', 'worm', 'worker'],
+  // Cycle through every kind the barracks can produce so a single building
+  // visibly outputs a balanced mix. Order is roughly "infantry → vehicles
+  // → diggers → economy" so the early ticks favour combat units.
+  produces: ['soldier', 'tank', 'tunneler', 'worm', 'dozer', 'hauler', 'worker'],
 };
 
 /**

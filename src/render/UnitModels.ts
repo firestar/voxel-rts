@@ -445,3 +445,135 @@ export const WORM_CUTTER_HEIGHT = 0.55;
 /** Number of trailing body segments and their target spacing in metres. */
 export const WORM_SEGMENT_COUNT = 6;
 export const WORM_SEGMENT_SPACING = 1.30;
+
+// ---------- Dozer (bulldozer) ------------------------------------------------
+// Tracked chassis like the tank, with a wide curved blade angled forward of the
+// hull. Origin = feet, centred in XZ. Faces -Z so blade is at -Z relative to origin.
+
+const DOZER_HULL = { r: 0.78, g: 0.55, b: 0.18 };       // construction yellow
+const DOZER_HULL_DARK = { r: 0.55, g: 0.36, b: 0.10 };
+const DOZER_HULL_HI = { r: 0.92, g: 0.72, b: 0.26 };
+const DOZER_BLADE = { r: 0.55, g: 0.42, b: 0.16 };
+const DOZER_BLADE_TRIM = { r: 0.30, g: 0.22, b: 0.10 };
+const DOZER_TREAD = { r: 0.08, g: 0.08, b: 0.10 };
+const DOZER_TREAD_HI = { r: 0.20, g: 0.22, b: 0.24 };
+const DOZER_HUB = { r: 0.45, g: 0.45, b: 0.45 };
+const DOZER_CAB = { r: 0.20, g: 0.45, b: 0.55 };
+
+export function buildDozerHullGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Treads — same length / wider than tank for a stockier look.
+  for (const sx of [-1.05, 1.05]) {
+    blocks.push({ x: sx, y: 0.40, z: 0.10, sx: 0.46, sy: 0.70, sz: 3.10, ...DOZER_TREAD });
+  }
+  for (let i = -6; i <= 6; i++) {
+    const z = i * 0.22;
+    blocks.push({ x: -1.30, y: 0.40, z: z + 0.10, sx: 0.06, sy: 0.20, sz: 0.18, ...DOZER_TREAD_HI });
+    blocks.push({ x:  1.30, y: 0.40, z: z + 0.10, sx: 0.06, sy: 0.20, sz: 0.18, ...DOZER_TREAD_HI });
+  }
+  // Drive sprockets.
+  for (const sx of [-1.05, 1.05]) {
+    for (const sz of [1.45, -1.25]) {
+      blocks.push({ x: sx, y: 0.40, z: sz, sx: 0.50, sy: 0.46, sz: 0.46, ...DOZER_HUB });
+    }
+  }
+  // Lower hull skirt.
+  blocks.push({ x: 0.0, y: 0.55, z: 0.10, sx: 1.60, sy: 0.36, sz: 2.60, ...DOZER_HULL_DARK });
+  // Main hull.
+  blocks.push({ x: 0.0, y: 0.92, z: 0.10, sx: 1.80, sy: 0.50, sz: 2.30, ...DOZER_HULL });
+  // Upper deck.
+  blocks.push({ x: 0.0, y: 1.20, z: 0.20, sx: 1.50, sy: 0.10, sz: 1.80, ...DOZER_HULL_HI });
+  // Cab toward the back.
+  blocks.push({ x: 0.0, y: 1.45, z: 0.80, sx: 1.10, sy: 0.50, sz: 0.80, ...DOZER_CAB });
+  blocks.push({ x: 0.0, y: 1.74, z: 0.80, sx: 1.20, sy: 0.10, sz: 0.90, ...DOZER_HULL_DARK });
+  // Exhaust stack on top of the hull.
+  blocks.push({ x: -0.45, y: 1.45, z: 0.20, sx: 0.16, sy: 0.55, sz: 0.16, ...DOZER_TREAD });
+  // Push arms — angled steel members from the chassis flank to the blade pivot.
+  // Approximated as two long thin blocks on each side.
+  for (const sx of [-1.10, 1.10]) {
+    blocks.push({ x: sx, y: 0.85, z: -0.90, sx: 0.10, sy: 0.20, sz: 1.40, ...DOZER_BLADE_TRIM });
+  }
+  return buildVoxelModel(blocks);
+}
+
+/** The dozer blade — a wide curved (stepped) plate mounted at the front of the hull. */
+export function buildDozerBladeGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Main blade face: 3.6 m wide (matches half-width 1.6 m + 0.2 m clearance on each side),
+  // 1.2 m tall, ~0.3 m thick.
+  blocks.push({ x: 0, y: 0.50, z: 0.00, sx: 3.60, sy: 1.10, sz: 0.30, ...DOZER_BLADE });
+  // Top reinforcing rib.
+  blocks.push({ x: 0, y: 1.05, z: 0.05, sx: 3.60, sy: 0.10, sz: 0.20, ...DOZER_BLADE_TRIM });
+  // Bottom cutting edge.
+  blocks.push({ x: 0, y: 0.05, z: -0.08, sx: 3.60, sy: 0.10, sz: 0.16, ...DOZER_BLADE_TRIM });
+  // Back-curve impression: a second slimmer plate behind.
+  blocks.push({ x: 0, y: 0.55, z: 0.18, sx: 3.30, sy: 0.90, sz: 0.16, ...DOZER_BLADE_TRIM });
+  // Side wings (angled inward — approximated as two outboard plates).
+  for (const sx of [-1.78, 1.78]) {
+    blocks.push({ x: sx, y: 0.55, z: 0.20, sx: 0.20, sy: 0.95, sz: 0.50, ...DOZER_BLADE });
+  }
+  return buildVoxelModel(blocks);
+}
+
+/** Blade pivot in unit-local coords — sits in front of and slightly below the hull. */
+export const DOZER_BLADE_PIVOT_Y = 0.10;
+export const DOZER_BLADE_PIVOT_Z = -1.80;
+
+// ---------- Hauler (dump truck) ----------------------------------------------
+// Boxy cab + tall open-top dump bed. Origin = feet, centred in XZ. Faces -Z.
+
+const HAULER_BODY = { r: 0.78, g: 0.32, b: 0.18 };       // industrial red-orange
+const HAULER_BODY_DARK = { r: 0.55, g: 0.20, b: 0.10 };
+const HAULER_BED = { r: 0.34, g: 0.34, b: 0.36 };
+const HAULER_BED_DARK = { r: 0.20, g: 0.20, b: 0.22 };
+const HAULER_BED_RIB = { r: 0.55, g: 0.55, b: 0.58 };
+const HAULER_GLASS = { r: 0.20, g: 0.45, b: 0.55 };
+const HAULER_TIRE = { r: 0.08, g: 0.08, b: 0.10 };
+const HAULER_HUB = { r: 0.45, g: 0.45, b: 0.45 };
+
+export function buildHaulerHullGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Wheels: four large tires.
+  for (const sx of [-1.00, 1.00]) {
+    for (const sz of [-1.10, 1.10]) {
+      blocks.push({ x: sx, y: 0.40, z: sz, sx: 0.40, sy: 0.80, sz: 0.80, ...HAULER_TIRE });
+      blocks.push({ x: sx, y: 0.40, z: sz, sx: 0.30, sy: 0.40, sz: 0.40, ...HAULER_HUB });
+    }
+  }
+  // Lower frame.
+  blocks.push({ x: 0.0, y: 0.50, z: 0.0, sx: 1.80, sy: 0.30, sz: 2.80, ...HAULER_BODY_DARK });
+  // Cab over the front wheels.
+  blocks.push({ x: 0.0, y: 0.95, z: -1.05, sx: 1.50, sy: 0.85, sz: 0.95, ...HAULER_BODY });
+  blocks.push({ x: 0.0, y: 1.42, z: -1.05, sx: 1.55, sy: 0.10, sz: 1.00, ...HAULER_BODY_DARK });
+  // Cab windscreen.
+  blocks.push({ x: 0.0, y: 1.10, z: -1.50, sx: 1.20, sy: 0.45, sz: 0.05, ...HAULER_GLASS });
+  // Side windows.
+  blocks.push({ x: -0.78, y: 1.10, z: -1.05, sx: 0.05, sy: 0.40, sz: 0.70, ...HAULER_GLASS });
+  blocks.push({ x:  0.78, y: 1.10, z: -1.05, sx: 0.05, sy: 0.40, sz: 0.70, ...HAULER_GLASS });
+  // Front bumper.
+  blocks.push({ x: 0.0, y: 0.55, z: -1.55, sx: 1.70, sy: 0.20, sz: 0.10, ...HAULER_BED_RIB });
+  return buildVoxelModel(blocks);
+}
+
+/** Open-top dump bed. Built to pivot around its rear lower edge for tip-up animation. */
+export function buildHaulerBedGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Bed sits with origin at the rear-lower edge so a positive X-rotation tips it
+  // up at the front. Bed is 1.8 m wide × 1.6 m long × 0.7 m tall.
+  // Floor.
+  blocks.push({ x: 0, y: 0.05, z: -0.80, sx: 1.70, sy: 0.10, sz: 1.60, ...HAULER_BED });
+  // Side walls.
+  blocks.push({ x: -0.85, y: 0.45, z: -0.80, sx: 0.10, sy: 0.70, sz: 1.60, ...HAULER_BED });
+  blocks.push({ x:  0.85, y: 0.45, z: -0.80, sx: 0.10, sy: 0.70, sz: 1.60, ...HAULER_BED });
+  // Front wall (tall).
+  blocks.push({ x: 0, y: 0.55, z: -1.55, sx: 1.80, sy: 0.90, sz: 0.10, ...HAULER_BED_DARK });
+  // Rear wall (shorter — tipping gate).
+  blocks.push({ x: 0, y: 0.30, z: -0.05, sx: 1.80, sy: 0.50, sz: 0.10, ...HAULER_BED_DARK });
+  // Top rib for visual structure.
+  blocks.push({ x: 0, y: 0.78, z: -0.80, sx: 1.80, sy: 0.06, sz: 1.60, ...HAULER_BED_RIB });
+  return buildVoxelModel(blocks);
+}
+
+/** Bed pivot in unit-local coords — placed at the rear lower edge of the bed. */
+export const HAULER_BED_PIVOT_Y = 0.85;
+export const HAULER_BED_PIVOT_Z = 1.10;
