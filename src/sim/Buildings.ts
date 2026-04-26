@@ -35,16 +35,21 @@ export const BARRACKS: BuildingSpec = {
   headroomVoxels: 24, // 3 m at 0.125 m voxels
   wall: M_WOOD,
   productionInterval: 6.0,
-  // Cycle: rifle soldier → tank → tunneler → worm → sniper → MG soldier → RPG
-  // soldier → pistol soldier. Vehicles ignore the weapon slot (tank picks up
-  // its default cluster_rocket). Tunneler / worm have no weapon, so the slot
-  // is also a no-op for them.
-  produces: ['soldier', 'tank', 'tunneler', 'worm', 'soldier', 'soldier', 'soldier', 'soldier'],
+  // Cycle through every unit kind, with rotating soldier loadouts mixed in so
+  // a single barracks turns out a varied force. Vehicles (tank / tunneler /
+  // worm / dozer / hauler) ignore the weapon slot — the tank picks up its
+  // default cluster_rocket; the diggers and earth-movers stay unarmed.
+  produces: [
+    'soldier', 'tank', 'tunneler', 'worm', 'dozer', 'hauler',
+    'soldier', 'soldier', 'soldier', 'soldier',
+  ],
   producesWeapon: [
     'rifle',          // baseline grunt
     undefined,        // tank → default cluster_rocket
     undefined,        // tunneler → unarmed
     undefined,        // worm → unarmed
+    undefined,        // dozer → unarmed
+    undefined,        // hauler → unarmed
     'sniper',         // long-range
     'machinegun',     // suppression
     'rpg',            // anti-armor

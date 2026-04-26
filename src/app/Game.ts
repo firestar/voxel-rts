@@ -9,11 +9,11 @@ import { raycastVoxel } from '../voxel/Raycast';
 import { VOXEL_SIZE } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
 import { PathClient } from '../path/PathClient';
-import { UnitManager, Unit, UnitKind, CarveRequest } from '../sim/Units';
+import { UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest, ScoopRequest, DumpRequest } from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
 import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { worldToVolumeCell, vnavIndex, getBit } from '../path/VolumeNav';
-import { trackDamageFor } from '../voxel/Materials';
+import { trackDamageFor, M_DIRT } from '../voxel/Materials';
 import { BuildingManager, BARRACKS, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { PathPreview } from '../render/PathPreview';
@@ -115,6 +115,8 @@ export class Game {
     this.spawnUnit('tank', c.x + 3.0, c.y, c.z);
     this.spawnUnit('tunneler', c.x - 2.0, c.y, c.z);
     this.spawnUnit('worm', c.x + 0.5, c.y, c.z + 4.0);
+    this.spawnUnit('dozer', c.x + 5.0, c.y, c.z + 1.5);
+    this.spawnUnit('hauler', c.x - 5.0, c.y, c.z + 1.5);
     this.camera.target.set(c.x, 0, c.z);
   }
 
@@ -166,7 +168,7 @@ export class Game {
     }
 
     if (this.pathClient) {
-      this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, this.world.buffers.voxels, (req) => this.handleCarve(req));
+      this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, this.world.buffers.voxels, (req) => this.handleWorldEdit(req));
       this.buildings.tick(dt, this.world, this.units);
       this.paintTankTracks();
       this.projectiles.tick(dt, this.world, (impact) => this.handleProjectileImpact(impact));
@@ -337,6 +339,19 @@ export class Game {
     const pitchOrigin = useDrag && selected ? { x: selected.x, z: selected.z } : undefined;
     const r = this.resolveTarget(release.startX, release.startY, w, h, useDrag ? verticalDrag : 0, baseY, pitchCap, pitchOrigin);
     if (!r) return;
+    // Earth-mover bookkeeping. Both attachments survive the path replan because
+    // we set them before dispatching commandMoveToWorld.
+    if (selected) {
+      if (selected.kind === 'dozer') {
+        // Click voxel y becomes the dozer's target level. editColumnToY cuts
+        // strictly above this y and preserves the voxel itself, so the strip
+        // ends up with its top face flush with the clicked voxel's top face.
+        selected.levelTargetY = r.voxelXYZ.y;
+      } else if (selected.kind === 'hauler') {
+        const mode = selected.spoilLoad > 0 ? 'dump' : 'load';
+        selected.haulerJob = { vx: r.voxelXYZ.x, vz: r.voxelXYZ.z, mode };
+      }
+    }
     void this.commandMoveToWorld(r.target.x, r.target.y, r.target.z);
   }
 
@@ -442,6 +457,16 @@ export class Game {
     void hit;
   }
 
+  /** Single dispatch for every kind of world edit a unit can request. */
+  private handleWorldEdit(req: WorldEditRequest): void {
+    switch (req.kind) {
+      case 'carve': this.handleCarve(req); return;
+      case 'level': this.handleLevel(req); return;
+      case 'scoop': this.handleScoop(req); return;
+      case 'dump':  this.handleDump(req); return;
+    }
+  }
+
   /** Tunneler asks to clear voxels at the cutter — sphere by default, oriented cylinder when axis is supplied. */
   private handleCarve(req: CarveRequest): void {
     const radiusVoxels = req.radiusMeters / VOXEL_SIZE;
@@ -466,6 +491,89 @@ export class Game {
       this.debris.spawnBurst(req.x, req.y, req.z, 30, sample.material);
       // Carving only opens new space — it never blocks an existing path. Refresh nav so
       // future routes see the tunnel, but skip the replan that would yank live paths.
+      this.requestNavRebuild(false);
+    }
+  }
+
+  /**
+   * Dozer asks to level a strip ahead of its blade. We walk every voxel column inside
+   * the oriented rectangle, calling editColumnToY on each, and accumulate cut/fill
+   * totals into the unit's spoil load. When the load saturates, the surplus is dropped
+   * as a M_DIRT mound a few cells behind the unit.
+   */
+  private handleLevel(req: LevelRequest): void {
+    const u = req.unit;
+    // Right vector perpendicular to forward in the XZ plane.
+    const rx = -req.fz, rz = req.fx;
+    // Sample at half-voxel pitch so we hit every column under the rectangle.
+    const SAMPLE = VOXEL_SIZE * 0.5;
+    const sampledCols = new Set<number>();
+    let cutTotal = 0;
+    let filledTotal = 0;
+    let touched = false;
+    for (let a = -req.halfDepthMeters; a <= req.halfDepthMeters; a += SAMPLE) {
+      for (let b = -req.halfWidthMeters; b <= req.halfWidthMeters; b += SAMPLE) {
+        const wx = req.x + req.fx * a + rx * b;
+        const wz = req.z + req.fz * a + rz * b;
+        const vx = Math.floor(wx / VOXEL_SIZE);
+        const vz = Math.floor(wz / VOXEL_SIZE);
+        const key = vz * 100000 + vx;
+        if (sampledCols.has(key)) continue;
+        sampledCols.add(key);
+        const r = this.world.editColumnToY(vx, vz, req.targetVoxY, M_DIRT);
+        cutTotal += r.cut;
+        filledTotal += r.filled;
+        if (r.cut > 0 || r.filled > 0) touched = true;
+      }
+    }
+    // Reconcile the unit's load: cuts add spoil, fills consume it.
+    let net = u.spoilLoad + cutTotal - filledTotal;
+    let overflow = 0;
+    if (net > u.spoilCapacity) {
+      overflow = net - u.spoilCapacity;
+      net = u.spoilCapacity;
+    } else if (net < 0) {
+      // Filled more than we had carried — the dozer fabricated dirt out of nowhere.
+      // For now we just clamp; gameplay-wise the strip still gets levelled.
+      net = 0;
+    }
+    u.spoilLoad = net;
+    if (overflow > 0) {
+      // Drop the spoil ~2 m behind the unit in a small disc so it doesn't all
+      // stack into a single column. Spread across a 3x3 voxel-column patch.
+      const back = 2.0;
+      const baseX = u.x - req.fx * back;
+      const baseZ = u.z - req.fz * back;
+      const perCol = Math.max(1, Math.ceil(overflow / 9));
+      let remaining = overflow;
+      for (let dz = -1; dz <= 1 && remaining > 0; dz++) {
+        for (let dx = -1; dx <= 1 && remaining > 0; dx++) {
+          const vx = Math.floor(baseX / VOXEL_SIZE) + dx;
+          const vz = Math.floor(baseZ / VOXEL_SIZE) + dz;
+          const place = Math.min(perCol, remaining);
+          const placed = this.world.dumpColumn(vx, vz, place, M_DIRT);
+          remaining -= placed;
+          if (placed > 0) touched = true;
+        }
+      }
+    }
+    if (touched) this.requestNavRebuild(false);
+  }
+
+  private handleScoop(req: ScoopRequest): void {
+    if (req.maxVoxels <= 0) return;
+    const taken = this.world.scoopColumn(req.vx, req.vz, req.maxVoxels);
+    if (taken > 0) {
+      req.unit.spoilLoad = Math.min(req.unit.spoilCapacity, req.unit.spoilLoad + taken);
+      this.requestNavRebuild(false);
+    }
+  }
+
+  private handleDump(req: DumpRequest): void {
+    if (req.voxels <= 0) return;
+    const placed = this.world.dumpColumn(req.vx, req.vz, req.voxels, req.material);
+    if (placed > 0) {
+      req.unit.spoilLoad = Math.max(0, req.unit.spoilLoad - placed);
       this.requestNavRebuild(false);
     }
   }

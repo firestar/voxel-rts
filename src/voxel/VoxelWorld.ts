@@ -2,7 +2,7 @@ import {
   WORLD_X, WORLD_Y, WORLD_Z, CHUNK, CHUNKS_X, CHUNKS_Y, CHUNKS_Z, CHUNK_COUNT,
   AIR, MaterialId, chunkKey,
 } from './types';
-import { MATERIALS } from './Materials';
+import { MATERIALS, M_BEDROCK } from './Materials';
 
 // Linear voxel index in the entire world (Y-major, then Z, then X).
 // Chosen so that horizontal slabs are contiguous (cache-friendly heightmap fill, Y-axis greedy sweeps).
@@ -191,6 +191,105 @@ export class VoxelWorld {
       }
     }
     return result;
+  }
+
+  /**
+   * Cut every non-bedrock voxel above `targetY` to AIR, and fill every AIR voxel from
+   * `targetY` down to the first existing solid voxel with `fillMaterial`. Used by the
+   * dozer to level a single column to a target Y while driving through it.
+   *
+   * Returns the number of voxels cut (above targetY) and filled (at/below targetY) so
+   * the caller can update the dozer's spoil bookkeeping.
+   */
+  editColumnToY(wx: number, wz: number, targetY: number, fillMaterial: MaterialId): { cut: number; filled: number } {
+    const out = { cut: 0, filled: 0 };
+    if (wx < 0 || wz < 0 || wx >= WORLD_X || wz >= WORLD_Z) return out;
+    const v = this.buffers.voxels;
+    const ty = Math.max(0, Math.min(WORLD_Y - 1, targetY | 0));
+    // Cut: clear everything strictly above targetY (skip bedrock).
+    for (let y = WORLD_Y - 1; y > ty; y--) {
+      const idx = worldIndex(wx, y, wz);
+      const m = v[idx]!;
+      if (m === AIR) continue;
+      if (m === M_BEDROCK) continue;
+      v[idx] = AIR;
+      this.markDirty(wx, y, wz);
+      out.cut++;
+    }
+    // Fill: starting at targetY and walking down, replace AIR with fillMaterial until
+    // the first solid (or bedrock, which is treated as solid). This intentionally
+    // doesn't touch existing solid voxels under the target — we only fill the dip.
+    for (let y = ty; y >= 0; y--) {
+      const idx = worldIndex(wx, y, wz);
+      const m = v[idx]!;
+      if (m === AIR) {
+        v[idx] = fillMaterial;
+        this.markDirty(wx, y, wz);
+        out.filled++;
+      } else {
+        break;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Remove up to `maxVoxels` non-bedrock voxels from the top of the column at (wx, wz),
+   * walking downward from the highest solid voxel. Returns the number actually removed.
+   * Stops on the first bedrock voxel (or empty column) so the hauler can't dig forever.
+   */
+  scoopColumn(wx: number, wz: number, maxVoxels: number): number {
+    if (maxVoxels <= 0) return 0;
+    if (wx < 0 || wz < 0 || wx >= WORLD_X || wz >= WORLD_Z) return 0;
+    const v = this.buffers.voxels;
+    // Find the highest solid voxel.
+    let top = -1;
+    for (let y = WORLD_Y - 1; y >= 0; y--) {
+      const m = v[worldIndex(wx, y, wz)]!;
+      if (m !== AIR) { top = y; break; }
+    }
+    if (top < 0) return 0;
+    let taken = 0;
+    for (let y = top; y >= 0 && taken < maxVoxels; y--) {
+      const idx = worldIndex(wx, y, wz);
+      const m = v[idx]!;
+      if (m === AIR) continue;
+      if (m === M_BEDROCK) break;
+      v[idx] = AIR;
+      this.markDirty(wx, y, wz);
+      taken++;
+    }
+    return taken;
+  }
+
+  /**
+   * Stack `count` voxels of `material` on top of the column at (wx, wz), starting at the
+   * voxel directly above the current top (or y=0 if the column is empty). Returns the
+   * number actually placed (capped by `WORLD_Y`).
+   */
+  dumpColumn(wx: number, wz: number, count: number, material: MaterialId): number {
+    if (count <= 0) return 0;
+    if (wx < 0 || wz < 0 || wx >= WORLD_X || wz >= WORLD_Z) return 0;
+    const v = this.buffers.voxels;
+    let top = -1;
+    for (let y = WORLD_Y - 1; y >= 0; y--) {
+      const m = v[worldIndex(wx, y, wz)]!;
+      if (m !== AIR) { top = y; break; }
+    }
+    let placed = 0;
+    let y = top + 1;
+    while (placed < count && y < WORLD_Y) {
+      const idx = worldIndex(wx, y, wz);
+      // Defensive: only place into AIR. (top is the highest solid; everything above
+      // should be air, but a future caller might pass an arbitrary column.)
+      if (v[idx]! === AIR) {
+        v[idx] = material;
+        this.markDirty(wx, y, wz);
+        placed++;
+      }
+      y++;
+    }
+    return placed;
   }
 
   /** Mark the chunk containing (x,y,z) dirty, plus any neighbor whose face the voxel touches. */
