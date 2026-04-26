@@ -133,7 +133,12 @@ export class UnitRenderer {
         // The X-rotation makes the cutter point the rest of the way along the path
         // pitch (the body only got a fraction). Pivots around the drill's mounting
         // point on the chassis.
-        const cutterPitchM = new THREE.Matrix4().makeRotationX(cutterExtraPitch);
+        // Negative because the body uses a positive X-rotation in YXZ Euler to
+        // represent "nose down toward the dig"; the drill is offset in +Z (forward
+        // of the chassis pivot) so to visually tip the cutter down with the path
+        // we need the OPPOSITE-signed rotation around X at the pivot. Without the
+        // negation the cutter swung up while the path went down.
+        const cutterPitchM = new THREE.Matrix4().makeRotationX(-cutterExtraPitch);
         const drillLocal = new THREE.Matrix4()
           .makeTranslation(0, TUNNELER_DRILL_PIVOT_Y, TUNNELER_DRILL_PIVOT_Z)
           .multiply(cutterPitchM)

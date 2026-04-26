@@ -1,7 +1,7 @@
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { VOXEL_SIZE, WORLD_X, WORLD_Y, WORLD_Z, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
-import { digSpeedMultiplier, groundSpeedMultiplier } from '../voxel/Materials';
+import { digSpeedMultiplier, groundSpeedMultiplier, M_WOOD, M_LEAF } from '../voxel/Materials';
 import {
   worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers, VNAV_CELL_METERS,
   VNAV_X, VNAV_Y, VNAV_Z,
@@ -134,8 +134,11 @@ export interface Unit {
   carveCooldown: number;
   distanceWalked: number;
   lastTrackDistance: number;
-  /** Frames the unit has been blocked by collision. After enough, the path is cleared. */
+  /** Frames the unit has been blocked by collision. We pause motion but don't drop
+   *  the path — gravity / terrain edits may resolve the block. */
   blockedFrames: number;
+  /** Vertical velocity in m/s. Negative = falling. Reset to 0 on landing. */
+  vy: number;
 }
 
 export interface CarveRequest {
@@ -160,7 +163,6 @@ export interface CarveRequest {
   unit: Unit;
 }
 
-const COLLISION_BLOCK_LIMIT = 6;   // frames stalled before we drop the path
 
 export class UnitManager {
   units: Unit[] = [];
@@ -194,6 +196,7 @@ export class UnitManager {
       distanceWalked: 0,
       lastTrackDistance: 0,
       blockedFrames: 0,
+      vy: 0,
     };
     this.units.push(u);
     return u;
@@ -384,9 +387,11 @@ export class UnitManager {
       nextZ = u.z + dz * inv * step;
     }
     if (!volumePassable(u, vnav, nextX, nextY, nextZ)) {
-      // Would clip through solid (or bedrock). Don't move this frame.
+      // Would clip through solid (or bedrock). Pause motion this frame, but DON'T
+      // drop the path — the unit might be momentarily mid-air and gravity will
+      // settle it back into a valid spot, or terrain edits may open the way. We
+      // still bump blockedFrames for telemetry, just no longer act on it.
       u.blockedFrames++;
-      if (u.blockedFrames >= COLLISION_BLOCK_LIMIT) u.path = [];
       applyPathOrientation(u, dx, dy, dz, dt);
       return;
     }
@@ -694,13 +699,16 @@ function findFootprintTopVoxel(
       const vx = Math.floor(sx / VOXEL_SIZE);
       const vz = Math.floor(sz / VOXEL_SIZE);
       if (vx < 0 || vz < 0 || vx >= WORLD_X || vz >= WORLD_Z) continue;
-      // Walk down from the ceiling looking for the first solid voxel.
+      // Walk down from the ceiling looking for the first WALKABLE voxel. Tree
+      // voxels (wood / leaf) are skipped — units stand on the ground under
+      // canopies, not on top of the canopy. Without this skip, a footprint
+      // sample landing in a tree column made the unit hover at the canopy top.
       const top = Math.min(startY, WORLD_Y - 1);
       for (let y = top; y >= endY; y--) {
-        if (voxels[worldIndex(vx, y, vz)] !== AIR) {
-          if (y > best) best = y;
-          break;
-        }
+        const m = voxels[worldIndex(vx, y, vz)];
+        if (m === AIR || m === M_WOOD || m === M_LEAF) continue;
+        if (y > best) best = y;
+        break;
       }
     }
   }
@@ -718,15 +726,24 @@ function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, voxels: Uint8Array
   if (topVoxel === null) return;
   const targetY = (topVoxel + 1) * VOXEL_SIZE;
   // Climb is fast (the unit was already gated by maxStepVoxels at path time so we trust
-  // the path here). Descent is capped at a constant rate so walking off a ledge doesn't
-  // snap straight down — the unit falls at a controlled speed and then catches up to
-  // the ground.
+  // the path here). Falling uses real gravity so the unit accelerates downward
+  // off a ledge or out of mid-air, with a terminal-velocity cap, and lands
+  // crisply on the surface (vy reset to 0). Both directions sit on top of the
+  // walkable topY — never below — so the unit's feet are always on solid ground.
   const dyDesired = targetY - u.y;
   if (dyDesired >= 0) {
+    // Climbing or already at floor: snap up, kill any residual fall velocity.
     u.y += dyDesired * Math.min(1, dt * 12);
+    u.vy = 0;
   } else {
-    const maxDescentMPS = 4.0;
-    u.y = Math.max(targetY, u.y - maxDescentMPS * dt);
+    const GRAVITY = 22;            // m/s² — slightly snappier than real
+    const TERMINAL_VY = -28;       // m/s — falls cap out at ~28 m/s
+    u.vy = Math.max(TERMINAL_VY, u.vy - GRAVITY * dt);
+    u.y += u.vy * dt;
+    if (u.y <= targetY) {
+      u.y = targetY;
+      u.vy = 0;
+    }
   }
 
   // Pitch + roll come from the cell-level slope still — they only need to be
