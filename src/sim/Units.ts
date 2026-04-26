@@ -1,5 +1,6 @@
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_METERS } from '../path/SurfaceNav';
-import { VOXEL_SIZE } from '../voxel/types';
+import { VOXEL_SIZE, WORLD_X, WORLD_Y, WORLD_Z, AIR } from '../voxel/types';
+import { worldIndex } from '../voxel/VoxelWorld';
 import {
   worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers, VNAV_CELL_METERS,
   VNAV_X, VNAV_Y, VNAV_Z,
@@ -194,9 +195,11 @@ export class UnitManager {
     dt: number,
     nav: SurfaceNavBuffers,
     vnav: VolumeNavBuffers,
+    voxels: Uint8Array,
     carveOut: (req: CarveRequest) => void,
   ): void {
     this.lastSurfaceNav = nav;
+    this.lastVoxels = voxels;
     for (const u of this.units) {
       const underground = isUnderground(u, nav);
       if (u.path.length === 0) {
@@ -284,16 +287,23 @@ export class UnitManager {
         applyPathOrientation(u, dx, dy, dz, dt);
         return;
       }
-      const step = u.speedDigging * dt;
-      if (d > 0.001) {
-        const inv = 1 / d;
-        u.x += dx * inv * step;
-        u.y += dy * inv * step;
-        u.z += dz * inv * step;
-        applyPathOrientation(u, dx, dy, dz, dt);
-      }
-      u.distanceWalked += step;
+      // Always carve at the blade. Forward motion is gated below on the cleared volume.
       this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, carveOut);
+      // Only advance once the cutter has actually cleared the slab immediately past the
+      // blade. While it's still solid, the unit pivots toward the path and waits.
+      const step = u.speedDigging * dt;
+      const inv = d > 1e-3 ? 1 / d : 0;
+      const fx = dx * inv, fy = dy * inv, fz = dz * inv;
+      const clearAhead = inv === 0
+        ? true
+        : voxelSlabClear(this.lastVoxels, u.x, u.y, u.z, fx, fy, fz, step);
+      if (clearAhead && d > 0.001) {
+        u.x += fx * step;
+        u.y += fy * step;
+        u.z += fz * step;
+        u.distanceWalked += step;
+      }
+      applyPathOrientation(u, dx, dy, dz, dt);
       return;
     }
 
@@ -370,6 +380,7 @@ export class UnitManager {
     });
   }
   private lastSurfaceNav!: SurfaceNavBuffers;
+  private lastVoxels!: Uint8Array;
 }
 
 /**
@@ -410,6 +421,59 @@ function applyPathOrientation(u: Unit, dx: number, dy: number, dz: number, dt: n
   const k = Math.min(1, dt * 8);
   u.pitch += (targetPitch - u.pitch) * k;
   u.roll  += (0           - u.roll ) * k;
+}
+
+/**
+ * Probe a thin slab of voxels right past the cutter face. Returns true when every sample
+ * is air, i.e. the carve has actually opened the volume the body would advance into.
+ *
+ * `(fx, fy, fz)` is the unit-vector forward direction; `step` is how far the unit wants to
+ * move this frame. We sample a 4x4 grid of voxels in the plane perpendicular to forward,
+ * sized to the cutter, located at `TUNNELER_CUTTER_FORWARD + step / 2` in front of the
+ * unit's origin so the slab covers the volume between the blade face and where the body
+ * would be after the move.
+ */
+function voxelSlabClear(
+  voxels: Uint8Array,
+  ux: number, uy: number, uz: number,
+  fx: number, fy: number, fz: number,
+  step: number,
+): boolean {
+  // Build any unit vector orthogonal to forward in the horizontal plane, then a third
+  // perpendicular to both. Together they span the disc we want to sample.
+  let rx = -fz, ry = 0, rz = fx;
+  let rl = Math.hypot(rx, ry, rz);
+  if (rl < 1e-4) { rx = 1; ry = 0; rz = 0; rl = 1; }
+  rx /= rl; ry /= rl; rz /= rl;
+  // up = forward × right
+  const ux2 = fy * rz - fz * ry;
+  const uy2 = fz * rx - fx * rz;
+  const uz2 = fx * ry - fy * rx;
+
+  const aheadDist = TUNNELER_CUTTER_FORWARD + step * 0.5;
+  const cx = ux + fx * aheadDist;
+  const cy = uy + TUNNELER_CUTTER_HEIGHT + fy * aheadDist;
+  const cz = uz + fz * aheadDist;
+  // Sample a 4x4 grid covering the cutter cross-section (radius + 1 voxel margin).
+  const SAMPLES = 4;
+  const r = TUNNELER_CUTTER_RADIUS + VOXEL_SIZE;
+  for (let i = 0; i < SAMPLES; i++) {
+    const a = (i / (SAMPLES - 1)) * 2 - 1; // -1..+1
+    for (let j = 0; j < SAMPLES; j++) {
+      const b = (j / (SAMPLES - 1)) * 2 - 1;
+      // Inside the cutter disc only.
+      if (a * a + b * b > 1) continue;
+      const px = cx + (rx * a + ux2 * b) * r;
+      const py = cy + (ry * a + uy2 * b) * r;
+      const pz = cz + (rz * a + uz2 * b) * r;
+      const vx = Math.floor(px / VOXEL_SIZE);
+      const vy = Math.floor(py / VOXEL_SIZE);
+      const vz = Math.floor(pz / VOXEL_SIZE);
+      if (vx < 0 || vy < 0 || vz < 0 || vx >= WORLD_X || vy >= WORLD_Y || vz >= WORLD_Z) continue;
+      if (voxels[worldIndex(vx, vy, vz)] !== AIR) return false;
+    }
+  }
+  return true;
 }
 
 /** Shortest signed angle in (-π, π]. */

@@ -159,7 +159,7 @@ export class Game {
     }
 
     if (this.pathClient) {
-      this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, (req) => this.handleCarve(req));
+      this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, this.world.buffers.voxels, (req) => this.handleCarve(req));
       this.buildings.tick(dt, this.world, this.units);
       this.paintTankTracks();
     }
