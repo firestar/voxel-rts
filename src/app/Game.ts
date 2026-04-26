@@ -318,14 +318,21 @@ export class Game {
     }
   }
 
-  /** Tunneler asks to clear a cell — issue a destructive sphere edit and queue a rebuild. */
+  /** Tunneler asks to clear voxels at the cutter — sphere by default, oriented cylinder when axis is supplied. */
   private handleCarve(req: CarveRequest): void {
     const radiusVoxels = req.radiusMeters / VOXEL_SIZE;
     const cx = req.x / VOXEL_SIZE;
     const cy = req.y / VOXEL_SIZE;
     const cz = req.z / VOXEL_SIZE;
-    // Use a peak well above any soft-material HP so the cell fully clears.
-    const result = this.world.damageSphere(cx, cy, cz, radiusVoxels, 250);
+    const result = req.axisX !== undefined
+      ? this.world.damageOrientedCylinder(
+          cx, cy, cz,
+          req.axisX, req.axisY!, req.axisZ!,
+          (req.halfLengthMeters ?? 0) / VOXEL_SIZE,
+          radiusVoxels,
+          250,
+        )
+      : this.world.damageSphere(cx, cy, cz, radiusVoxels, 250);
     if (result.destroyed.length > 0) {
       const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
       this.debris.spawnBurst(req.x, req.y, req.z, 30, sample.material);

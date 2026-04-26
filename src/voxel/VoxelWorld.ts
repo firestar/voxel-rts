@@ -122,6 +122,72 @@ export class VoxelWorld {
     return result;
   }
 
+  /**
+   * Oriented cylinder damage. The cylinder's axis is `(ax, ay, az)` (unit length), the
+   * cylinder extends from `-halfLength` to `+halfLength` along that axis from `(cx, cy, cz)`,
+   * and `radius` is its perpendicular half-extent. All inputs in voxel units.
+   *
+   * Used by the tunneler so the carve hugs the blade face instead of being a fat sphere
+   * that digs out the ground around it.
+   */
+  damageOrientedCylinder(
+    cx: number, cy: number, cz: number,
+    ax: number, ay: number, az: number,
+    halfLength: number, radius: number,
+    peakDamage: number,
+  ): ExplosionResult {
+    const result: ExplosionResult = { destroyed: [], touched: 0 };
+    const halfLen = Math.max(0.1, halfLength);
+    const r = Math.max(0.1, radius);
+    const r2 = r * r;
+    // Bounding box of the oriented cylinder = bounding sphere of radius (halfLen + r).
+    const bound = halfLen + r;
+    const x0 = Math.max(0, Math.floor(cx - bound));
+    const y0 = Math.max(0, Math.floor(cy - bound));
+    const z0 = Math.max(0, Math.floor(cz - bound));
+    const x1 = Math.min(WORLD_X - 1, Math.ceil(cx + bound));
+    const y1 = Math.min(WORLD_Y - 1, Math.ceil(cy + bound));
+    const z1 = Math.min(WORLD_Z - 1, Math.ceil(cz + bound));
+    const voxels = this.buffers.voxels;
+
+    for (let y = y0; y <= y1; y++) {
+      const dy = y + 0.5 - cy;
+      for (let z = z0; z <= z1; z++) {
+        const dz = z + 0.5 - cz;
+        for (let x = x0; x <= x1; x++) {
+          const dx = x + 0.5 - cx;
+          // Project onto axis.
+          const t = dx * ax + dy * ay + dz * az;
+          if (t < -halfLen || t > halfLen) continue;
+          // Radial distance² (subtract axial component).
+          const px = dx - t * ax;
+          const py = dy - t * ay;
+          const pz = dz - t * az;
+          const rad2 = px * px + py * py + pz * pz;
+          if (rad2 > r2) continue;
+          const idx = worldIndex(x, y, z);
+          const m = voxels[idx]!;
+          if (m === AIR) continue;
+          const mat = MATERIALS[m]!;
+          if (mat.hp === 0) continue;
+          result.touched++;
+          const dmg = Math.max(1, Math.min(255, peakDamage));
+          const prev = this.damage.get(idx) ?? 0;
+          const total = prev + dmg;
+          if (total >= mat.hp) {
+            voxels[idx] = AIR;
+            this.damage.delete(idx);
+            this.markDirty(x, y, z);
+            result.destroyed.push({ x, y, z, material: m });
+          } else {
+            this.damage.set(idx, total);
+          }
+        }
+      }
+    }
+    return result;
+  }
+
   /** Mark the chunk containing (x,y,z) dirty, plus any neighbor whose face the voxel touches. */
   markDirty(x: number, y: number, z: number): void {
     const cx = (x / CHUNK) | 0;

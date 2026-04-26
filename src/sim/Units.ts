@@ -104,8 +104,18 @@ export interface Unit {
 }
 
 export interface CarveRequest {
+  /** Center of the carve volume in world meters. */
   x: number; y: number; z: number;
+  /** Carve radius (perpendicular extent for cylinders, full radius for spheres) in meters. */
   radiusMeters: number;
+  /**
+   * Optional oriented-cylinder carve. When set, the carve volume is a cylinder centered at
+   * (x, y, z), extending +/- `halfLengthMeters` along the unit-vector axis (axisX, Y, Z),
+   * with `radiusMeters` perpendicular extent. When unset, the carve is a sphere of radius
+   * `radiusMeters` centered at (x, y, z).
+   */
+  axisX?: number; axisY?: number; axisZ?: number;
+  halfLengthMeters?: number;
   unit: Unit;
 }
 
@@ -336,48 +346,26 @@ export class UnitManager {
     const inv = 1 / d;
     const fx = dx * inv, fy = dy * inv, fz = dz * inv;
 
-    // Where is the cutter face right now, in world meters?
-    const cutterX = u.x + fx * TUNNELER_CUTTER_FORWARD;
-    const cutterY = u.y + TUNNELER_CUTTER_HEIGHT + fy * TUNNELER_CUTTER_FORWARD;
-    const cutterZ = u.z + fz * TUNNELER_CUTTER_FORWARD;
-
-    // Only "engage" — fire the body-clearance + follow-through carves — when the cutter
-    // is actually pushing into solid material. On flat ground the front sphere sits in
-    // air and damageSphere is a no-op, but the body sphere (centered on the chassis)
-    // would otherwise dig a trench under the moving tunneler and have it sink into its
-    // own hole the moment it stopped. Two ways to be "engaged":
-    //   1. The unit itself is meaningfully below the local surface (we're in a tunnel).
-    //   2. The cutter face has dropped below the surface ahead (we're nosing into a hill).
-    const surfaceAtUnit = surfaceWorldY(this.lastSurfaceNav, u.x, u.z);
-    const surfaceAtCutter = surfaceWorldY(this.lastSurfaceNav, cutterX, cutterZ);
-    const unitUnderground = u.y < surfaceAtUnit - 0.4;
-    const cutterInSolid = cutterY < surfaceAtCutter - 0.3;
-    const engaged = unitUnderground || cutterInSolid;
-
-    // Cutter head — always fires; harmless when in air.
+    // Tunneling only happens at the blade itself: an oriented cylinder 2 voxels deep
+    // along the unit's forward axis, with its perpendicular extent equal to the cutter
+    // radius plus one voxel of clearance on every side.
+    //
+    // The cylinder center sits one voxel in front of the blade face, so the cylinder
+    // covers from the blade face out to two voxels ahead.
+    const VOXEL = 0.125;
+    const halfLength = VOXEL;                   // 2 voxels of total depth
+    const radius = TUNNELER_CUTTER_RADIUS + VOXEL;
+    // Blade face is at TUNNELER_CUTTER_FORWARD relative to the unit. Push the cylinder
+    // center halfLength forward of that so the cylinder occupies the volume immediately
+    // in front of the blade.
+    const centerForward = TUNNELER_CUTTER_FORWARD + halfLength;
     carveOut({
-      x: cutterX, y: cutterY, z: cutterZ,
-      radiusMeters: TUNNELER_CUTTER_RADIUS,
-      unit: u,
-    });
-    if (!engaged) return;
-
-    // Body clearance — sphere centered on the chassis. Keeps the body from snagging on
-    // the lip of a freshly-cut tunnel.
-    carveOut({
-      x: u.x,
-      y: u.y + TUNNELER_CUTTER_HEIGHT,
-      z: u.z,
-      radiusMeters: TUNNELER_CUTTER_RADIUS * 0.9,
-      unit: u,
-    });
-    // Follow-through sphere — sweeps the lower arc the cutter face missed and smooths
-    // lumpy tunnel floors.
-    carveOut({
-      x: u.x + fx * TUNNELER_CUTTER_FORWARD * 0.5,
-      y: u.y + TUNNELER_CUTTER_HEIGHT * 0.7 + fy * TUNNELER_CUTTER_FORWARD * 0.5,
-      z: u.z + fz * TUNNELER_CUTTER_FORWARD * 0.5,
-      radiusMeters: TUNNELER_CUTTER_RADIUS * 0.85,
+      x: u.x + fx * centerForward,
+      y: u.y + TUNNELER_CUTTER_HEIGHT + fy * centerForward,
+      z: u.z + fz * centerForward,
+      axisX: fx, axisY: fy, axisZ: fz,
+      halfLengthMeters: halfLength,
+      radiusMeters: radius,
       unit: u,
     });
   }
