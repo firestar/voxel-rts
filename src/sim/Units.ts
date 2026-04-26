@@ -384,8 +384,10 @@ export class UnitManager {
     const fx = dx * inv, fy = dy * inv, fz = dz * inv;
 
     const VOXEL = 0.125;
-    const halfLength = VOXEL;                          // 2 voxels of total depth
-    const radius = TUNNELER_CUTTER_RADIUS + VOXEL;
+    // Total cylinder depth = 2 * halfLength = 4 voxels along the forward axis.
+    // Perpendicular extent = cutter radius + 3 voxels of clearance on every side.
+    const halfLength = VOXEL * 2;                          // 4 voxels of total depth
+    const radius = TUNNELER_CUTTER_RADIUS + VOXEL * 3;
     const centerForward = TUNNELER_CUTTER_FORWARD + halfLength;
     const cutterX = u.x + fx * centerForward;
     const cutterY = u.y + TUNNELER_CUTTER_HEIGHT + fy * centerForward;

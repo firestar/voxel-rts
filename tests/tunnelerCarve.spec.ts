@@ -42,8 +42,8 @@ describe('tunneler carve covers a continuous tube', () => {
     // The tunneler's "world" position in metres — feet at the cutter-height-below offset.
     // Forward direction is +X (axisX = 1).
     const fx = 1, fy = 0, fz = 0;
-    const halfLength = VOXEL_SIZE; // 2 voxels deep
-    const radius = TUNNELER_CUTTER_RADIUS + VOXEL_SIZE;
+    const halfLength = VOXEL_SIZE * 2;             // 4 voxels deep total
+    const radius = TUNNELER_CUTTER_RADIUS + VOXEL_SIZE * 3; // 3-voxel side clearance
     const centerForward = TUNNELER_CUTTER_FORWARD + halfLength;
 
     // The tunneler's feet Y in metres so the cutter centre lands at (cy + 0.5) voxels.
@@ -98,12 +98,13 @@ describe('tunneler carve covers a continuous tube', () => {
   it('leaves voxels far outside the cutter radius alone', () => {
     const world = VoxelWorld.create(false);
     const voxels = world.buffers.voxels;
-    // Fill a small region with dirt outside the cutter swath.
+    // Fill a region with dirt that extends comfortably past the outer edge of the carve.
     const cy = 96, cz = 200;
-    const farRadius = (TUNNELER_CUTTER_RADIUS + VOXEL_SIZE) / VOXEL_SIZE + 4; // a few voxels past the outer edge
+    const carveRadiusVox = (TUNNELER_CUTTER_RADIUS + VOXEL_SIZE * 3) / VOXEL_SIZE;
+    const farRadiusVox = Math.ceil(carveRadiusVox) + 4; // a few voxels past the outer edge
     for (let x = 100; x <= 200; x++) {
-      for (let y = cy - 30; y <= cy + 30; y++) {
-        for (let z = cz - 30; z <= cz + 30; z++) {
+      for (let y = cy - farRadiusVox - 4; y <= cy + farRadiusVox + 4; y++) {
+        for (let z = cz - farRadiusVox - 4; z <= cz + farRadiusVox + 4; z++) {
           voxels[worldIndex(x, y, z)] = M_DIRT;
         }
       }
@@ -116,13 +117,13 @@ describe('tunneler carve covers a continuous tube', () => {
     world.damageOrientedCylinder(
       cutterX, cutterY, cutterZ,
       1, 0, 0,
-      VOXEL_SIZE / VOXEL_SIZE,
-      (TUNNELER_CUTTER_RADIUS + VOXEL_SIZE) / VOXEL_SIZE,
+      (VOXEL_SIZE * 2) / VOXEL_SIZE,            // 4-voxel total depth
+      carveRadiusVox,
       250,
     );
 
     // A voxel that is FAR perpendicular from the cutter axis must be untouched.
-    const farY = cy + Math.ceil(farRadius);
+    const farY = cy + farRadiusVox;
     const farZ = cz;
     expect(voxels[worldIndex(cutterX, farY, farZ)]).toBe(M_DIRT);
   });
