@@ -404,7 +404,10 @@ export class Game {
       return;
     }
 
-    const goal = this.pathClient.cellAt(wx, wz);
+    // If the click landed on a blocked cell (e.g. a column where every voxel was carved
+    // out, or right at a building edge), pull the goal toward the nearest walkable cell
+    // so the unit at least gets close instead of refusing to move.
+    const goal = this.pathClient.nearestWalkable(wx, wz, 4);
     const start = this.pathClient.cellAt(unit.x, unit.z);
     const res = await this.pathClient.requestPath({
       startCx: start.cx, startCz: start.cz,

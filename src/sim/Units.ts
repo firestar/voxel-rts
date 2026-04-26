@@ -45,11 +45,13 @@ export function unitConfig(kind: UnitKind): UnitConfig {
   switch (kind) {
     case 'soldier':
       // Single-cell footprint, so the body-roughness check is a no-op for soldiers.
-      // maxStepVoxels = 20 voxels (2.5 m climb between adjacent cells ≈ 68° slope) —
-      // soldiers scramble up almost anything that isn't a literal vertical wall.
+      // maxStepVoxels = 32 voxels (4 m climb between adjacent cells) — effectively
+      // soldiers scale anything that isn't a building wall. The path search also
+      // skips the diagonal corner-cut for agile units (footprintRadius <= 1), so
+      // a soldier can scramble onto a ledge from the inside of an L-shaped corner.
       return {
         footprintRadius: 1, widthMeters: 0.75,
-        maxStepVoxels: 20, slopePenalty: 0.10,
+        maxStepVoxels: 32, slopePenalty: 0.08,
         bodyHalfCells: 0, bodyRoughnessVoxels: 999,
         turnRateRadPerSec: 6.0,                  // ~340°/s, snappy infantry turn
         maxPitchRad: Math.PI / 2,                // soldiers are flexible — no real pitch cap

@@ -89,6 +89,32 @@ export class PathClient {
     return { cx, cz, ok: !this.nav.blocked[i] };
   }
 
+  /**
+   * Like cellAt, but if the requested cell is blocked, expands outward in concentric
+   * rings up to `maxRing` cells away looking for the nearest walkable cell. Returns
+   * that cell's coords with ok=true. Useful for resolving ambiguous user clicks that
+   * land on a blocked-but-near-walkable spot — without it, the path search returns
+   * empty and the unit refuses to move.
+   */
+  nearestWalkable(wx: number, wz: number, maxRing = 4): { cx: number; cz: number; ok: boolean } {
+    const c = this.cellAt(wx, wz);
+    if (c.ok) return c;
+    for (let r = 1; r <= maxRing; r++) {
+      // Walk the ring at radius r in cell distance (Chebyshev), check each cell.
+      for (let dz = -r; dz <= r; dz++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (Math.abs(dx) !== r && Math.abs(dz) !== r) continue; // ring perimeter only
+          const nx = c.cx + dx, nz = c.cz + dz;
+          if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) continue;
+          if (!this.nav.blocked[navIndex(nx, nz)]) {
+            return { cx: nx, cz: nz, ok: true };
+          }
+        }
+      }
+    }
+    return c; // give up — caller will see ok=false and skip the move
+  }
+
   dispose(): void {
     this.worker.terminate();
   }

@@ -186,9 +186,12 @@ export function findPathSurface(
 ): AStarResult {
   const gen = ws.resetGeneration();
   const { startCx, startCz, goalCx, goalCz, prefersRoads, maxStepVoxels, slopePenalty,
-          bodyHalfCells, bodyRoughnessVoxels } = req;
+          bodyHalfCells, bodyRoughnessVoxels, footprintRadius } = req;
   const routeSeed = req.routeSeed ?? 0;
-  void req.footprintRadius;
+  // Agile units (single-cell footprint) skip the diagonal corner-cut entirely —
+  // a soldier can scramble around an inside corner where both cardinals are blocked
+  // or too tall to climb, as long as the diagonal itself is climbable.
+  const agile = footprintRadius <= 1;
   const maxExpansions = req.maxExpansions ?? 20000;
 
   const startI = navIndex(startCx, startCz);
@@ -257,7 +260,9 @@ export function findPathSurface(
       const dY = Math.abs(nyTop - cy);
       if (dY > maxStepVoxels) continue;
       if (bodyHalfCells > 0 && !bodyRoughnessOk(nav, nx, nz, bodyHalfCells, bodyRoughnessVoxels)) continue;
-      if (n >= 4) {
+      if (n >= 4 && !agile) {
+        // Vehicles need at least one cardinal that's both passable and within the
+        // climb step — they can't squeeze through a wall corner.
         const a = navIndex(cx + NB_DX[n]!, cz);
         const b = navIndex(cx, cz + NB_DZ[n]!);
         if (nav.blocked[a] && nav.blocked[b]) continue;
