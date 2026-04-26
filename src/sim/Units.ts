@@ -64,12 +64,15 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       };
     case 'tunneler':
       // 5x5 cells (5 m x 5 m); 0.75 m residual tolerance.
+      // Ground-locked like the tank: it can carve through anything but it can't levitate
+      // through open air. Tunnels it digs leave a solid floor underneath, so this still
+      // lets the unit walk along its own freshly-bored shafts.
       return {
         footprintRadius: 2, widthMeters: 3.6,
         maxStepVoxels: 10, slopePenalty: 0.18,
         bodyHalfCells: 2, bodyRoughnessVoxels: 6,
         turnRateRadPerSec: 0.7,                  // ~40°/s — heavy machine pivots slowly
-        canDig: true, requiresGround: false,
+        canDig: true, requiresGround: true,
         speed: 2.5, speedDigging: 1.8,
         hp: 320,
       };
@@ -286,8 +289,10 @@ export class UnitManager {
         applyPathOrientation(u, dx, dy, dz, dt);
         return;
       }
-      // Always carve at the blade. Forward motion is gated below on the cleared volume.
-      this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, carveOut);
+      // Always carve at the blade — we're explicitly digging through solid here, so
+      // bypass the surface engagement gate. Forward motion is gated below on the
+      // cleared volume so the body never moves through unbroken voxels.
+      this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, carveOut, true);
       // Only advance once the cutter has actually cleared the slab immediately past the
       // blade. While it's still solid, the unit pivots toward the path and waits.
       const step = u.speedDigging * dt;
@@ -334,10 +339,25 @@ export class UnitManager {
     }
     u.distanceWalked += consumed;
     applyPathOrientation(u, dx, dy, dz, dt);
-    // Surface-follow only when we've actually emerged onto the surface — otherwise the
-    // unit is following its 3D path Y, no snapping.
+    // Vertical positioning. Three regimes:
+    //   1. Above the local surface — surface nav drives the snap (handles hills).
+    //   2. Underground in air with solid below (a tunnel floor) — snap to that floor so
+    //      the tunneler walks the floor instead of floating at cell center.
+    //   3. Underground in air with no solid within reach — leave the path Y alone (the
+    //      unit is genuinely in the middle of an open volume, e.g. mid-jump into a cave).
     if (!isUnderground(u, nav)) {
       sampleSurfaceFollow(u, nav, dt);
+    } else {
+      const floorY = findFloorBelow(this.lastVoxels, u.x, u.y + 0.4, u.z, 3.0);
+      if (floorY !== null) {
+        const dyDesired = floorY - u.y;
+        if (dyDesired > 0) {
+          u.y += dyDesired * Math.min(1, dt * 12);
+        } else if (dyDesired < 0) {
+          const maxDescent = 4.0;
+          u.y = Math.max(floorY, u.y - maxDescent * dt);
+        }
+      }
     }
     this.maybeCarveAtCutter(u, dt, dx, dy, dz, d, carveOut);
   }
@@ -346,6 +366,7 @@ export class UnitManager {
     u: Unit, _dt: number,
     dx: number, dy: number, dz: number, d: number,
     carveOut: (req: CarveRequest) => void,
+    forceCarve = false,
   ): void {
     if (!u.canDig) return;
     if (d < 1e-3) return;
@@ -360,22 +381,19 @@ export class UnitManager {
     const cutterY = u.y + TUNNELER_CUTTER_HEIGHT + fy * centerForward;
     const cutterZ = u.z + fz * centerForward;
 
-    // Engagement gate. Without this, the cutter disc on a surface tunneler dips below
-    // the ground (radius ≈ 1.83 m vs cutter height of 1.10 m above the feet) and the
-    // unit chews stripes of grass as it drives. Two ways to qualify:
-    //   1. The unit itself is meaningfully below the local surface (in a tunnel).
-    //   2. The cutter face has dropped below the surface ahead (nosing into a hill).
-    const surfaceAtUnit = surfaceWorldY(this.lastSurfaceNav, u.x, u.z);
-    const surfaceAtCutter = surfaceWorldY(this.lastSurfaceNav, cutterX, cutterZ);
-    const unitUnderground = u.y < surfaceAtUnit - 0.4;
-    const cutterInSolid = cutterY < surfaceAtCutter - 0.3;
-    if (!unitUnderground && !cutterInSolid) return;
+    // Engagement gate, only applied when the caller hasn't explicitly opted into carving.
+    // Without this, a surface tunneler driving on flat ground would chew the grass with
+    // its disc-shaped cutter (the disc dips below the ground because the cutter sits
+    // 1.10 m above the feet but the disc has 1.83 m radius). The solid branch passes
+    // forceCarve=true because we already know the destination cell is in solid material.
+    if (!forceCarve) {
+      const surfaceAtUnit = surfaceWorldY(this.lastSurfaceNav, u.x, u.z);
+      const surfaceAtCutter = surfaceWorldY(this.lastSurfaceNav, cutterX, cutterZ);
+      const unitUnderground = u.y < surfaceAtUnit - 0.4;
+      const cutterInSolid = cutterY < surfaceAtCutter - 0.3;
+      if (!unitUnderground && !cutterInSolid) return;
+    }
 
-    // Carve every frame the unit is engaged. Previously a 0.4 s cooldown left ~0.7 m
-    // gaps at digging speed (1.8 m/s) and only the 0.25 m slab was cut each fire — so
-    // the tunnel ended up as a row of discs separated by uncut stripes. The cylinder
-    // is tiny (≈0.25 m × 1.83 m × 1.83 m), so per-frame carving is cheap and
-    // consecutive carves overlap regardless of frame rate or unit speed.
     carveOut({
       x: cutterX, y: cutterY, z: cutterZ,
       axisX: fx, axisY: fy, axisZ: fz,
@@ -426,6 +444,34 @@ function applyPathOrientation(u: Unit, dx: number, dy: number, dz: number, dt: n
   const k = Math.min(1, dt * 8);
   u.pitch += (targetPitch - u.pitch) * k;
   u.roll  += (0           - u.roll ) * k;
+}
+
+/**
+ * Walk the voxel column at (wx, wz) downward from wy until a solid voxel is found.
+ * Returns the world-space Y of that voxel's top face, or null if no solid was hit
+ * within `maxDownM` meters (or we walked off the world).
+ *
+ * Used to snap an underground tunneler onto the floor of whatever tunnel it's in,
+ * instead of floating at the cell-center Y the path waypoints carry.
+ */
+function findFloorBelow(
+  voxels: Uint8Array,
+  wx: number, wy: number, wz: number,
+  maxDownM: number,
+): number | null {
+  const vx = Math.floor(wx / VOXEL_SIZE);
+  const vz = Math.floor(wz / VOXEL_SIZE);
+  if (vx < 0 || vx >= WORLD_X || vz < 0 || vz >= WORLD_Z) return null;
+  const vyStart = Math.floor(wy / VOXEL_SIZE);
+  const maxDown = Math.ceil(maxDownM / VOXEL_SIZE);
+  for (let dy = 0; dy <= maxDown; dy++) {
+    const vy = vyStart - dy;
+    if (vy < 0) return null;
+    if (voxels[worldIndex(vx, vy, vz)] !== AIR) {
+      return (vy + 1) * VOXEL_SIZE; // top of this solid voxel, meters
+    }
+  }
+  return null;
 }
 
 /**
