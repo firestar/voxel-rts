@@ -13,6 +13,8 @@ import {
   DOZER_BLADE_PIVOT_Y, DOZER_BLADE_PIVOT_Z,
   buildHaulerHullGeometry, buildHaulerBedGeometry,
   HAULER_BED_PIVOT_Y, HAULER_BED_PIVOT_Z,
+  buildRocketTruckHullGeometry, buildRocketTruckPodGeometry,
+  ROCKET_TRUCK_POD_PIVOT_Y, ROCKET_TRUCK_POD_PIVOT_Z,
 } from './UnitModels';
 
 /**
@@ -44,6 +46,8 @@ export class UnitRenderer {
   private dozerBlade: THREE.InstancedMesh;
   private haulerHull: THREE.InstancedMesh;
   private haulerBed: THREE.InstancedMesh;
+  private rocketTruckHull: THREE.InstancedMesh;
+  private rocketTruckPod: THREE.InstancedMesh;
 
   private capacity: number;
   private bodyM = new THREE.Matrix4();
@@ -62,6 +66,7 @@ export class UnitRenderer {
   private selectionRingWorker: THREE.LineSegments;
   private selectionRingDozer: THREE.LineSegments;
   private selectionRingHauler: THREE.LineSegments;
+  private selectionRingRocketTruck: THREE.LineSegments;
 
   constructor(capacity = 256) {
     this.capacity = capacity;
@@ -88,6 +93,8 @@ export class UnitRenderer {
     this.dozerBlade = makeIM(buildDozerBladeGeometry(), mat, capacity);
     this.haulerHull = makeIM(buildHaulerHullGeometry(), mat, capacity);
     this.haulerBed = makeIM(buildHaulerBedGeometry(), mat, capacity);
+    this.rocketTruckHull = makeIM(buildRocketTruckHullGeometry(), mat, capacity);
+    this.rocketTruckPod = makeIM(buildRocketTruckPodGeometry(), mat, capacity);
 
     this.group.add(
       this.soldierBody, this.soldierLegL, this.soldierLegR,
@@ -98,6 +105,7 @@ export class UnitRenderer {
       this.workerCrateWood, this.workerCrateMetal,
       this.dozerHull, this.dozerBlade,
       this.haulerHull, this.haulerBed,
+      this.rocketTruckHull, this.rocketTruckPod,
     );
 
     this.selectionRingSoldier = makeSelectionRing(0.6, 0x00ff88);
@@ -107,6 +115,7 @@ export class UnitRenderer {
     this.selectionRingWorker = makeSelectionRing(0.55, 0x33ccff);
     this.selectionRingDozer = makeSelectionRing(1.7, 0xffc044);
     this.selectionRingHauler = makeSelectionRing(1.5, 0xff5544);
+    this.selectionRingRocketTruck = makeSelectionRing(1.55, 0xff8855);
     this.selectionRingSoldier.visible = false;
     this.selectionRingTank.visible = false;
     this.selectionRingTunneler.visible = false;
@@ -114,18 +123,20 @@ export class UnitRenderer {
     this.selectionRingWorker.visible = false;
     this.selectionRingDozer.visible = false;
     this.selectionRingHauler.visible = false;
+    this.selectionRingRocketTruck.visible = false;
     this.group.add(
       this.selectionRingSoldier, this.selectionRingTank,
       this.selectionRingTunneler, this.selectionRingWorm,
       this.selectionRingWorker,
       this.selectionRingDozer, this.selectionRingHauler,
+      this.selectionRingRocketTruck,
     );
   }
 
   update(units: UnitManager): void {
     let nSold = 0, nTank = 0, nTun = 0, nWorm = 0, nWormSeg = 0;
     let nWork = 0, nCrateW = 0, nCrateM = 0;
-    let nDoz = 0, nHaul = 0;
+    let nDoz = 0, nHaul = 0, nRkt = 0;
     let selected: Unit | null = null;
     const now = performance.now() / 1000;
 
@@ -216,9 +227,16 @@ export class UnitRenderer {
       } else if (u.kind === 'tank') {
         if (nTank >= this.capacity) continue;
         this.tankHull.setMatrixAt(nTank, this.bodyM);
-        // Turret rides on the hull at the pivot. Locked to hull yaw for now.
-        this.partM.makeTranslation(0, TANK_TURRET_PIVOT_Y, TANK_TURRET_PIVOT_Z);
-        this.partM.premultiply(this.bodyM);
+        // Turret rides on the hull at the pivot, but yaws independently of
+        // the hull. We rotate the turret geometry by (turretYaw - heading)
+        // around its own pivot so the cannon ends up pointing at the unit's
+        // aim direction in world space, while the hull keeps its own yaw.
+        const turretLocalYaw = wrapAngle(u.turretYaw - u.heading);
+        const turretYawM = new THREE.Matrix4().makeRotationY(turretLocalYaw);
+        const turretLocal = new THREE.Matrix4()
+          .makeTranslation(0, TANK_TURRET_PIVOT_Y, TANK_TURRET_PIVOT_Z)
+          .multiply(turretYawM);
+        this.partM.multiplyMatrices(this.bodyM, turretLocal);
         this.tankTurret.setMatrixAt(nTank, this.partM);
         nTank++;
       } else if (u.kind === 'tunneler') {
@@ -301,6 +319,21 @@ export class UnitRenderer {
         this.partM.multiplyMatrices(this.bodyM, bedLocal);
         this.haulerBed.setMatrixAt(nHaul, this.partM);
         nHaul++;
+      } else if (u.kind === 'rocket_truck') {
+        if (nRkt >= this.capacity) continue;
+        this.rocketTruckHull.setMatrixAt(nRkt, this.bodyM);
+        // Pod rides on the deck, yaws independently of the hull. Same trick
+        // as the tank turret: rotate the pod geometry by (turretYaw -
+        // heading) around its own pivot so it points at the world-space aim
+        // direction while the hull yaws to its path heading.
+        const podLocalYaw = wrapAngle(u.turretYaw - u.heading);
+        const podYawM = new THREE.Matrix4().makeRotationY(podLocalYaw);
+        const podLocal = new THREE.Matrix4()
+          .makeTranslation(0, ROCKET_TRUCK_POD_PIVOT_Y, ROCKET_TRUCK_POD_PIVOT_Z)
+          .multiply(podYawM);
+        this.partM.multiplyMatrices(this.bodyM, podLocal);
+        this.rocketTruckPod.setMatrixAt(nRkt, this.partM);
+        nRkt++;
       }
 
       if (u.selected && !selected) selected = u;
@@ -325,6 +358,8 @@ export class UnitRenderer {
     this.dozerBlade.count = nDoz;
     this.haulerHull.count = nHaul;
     this.haulerBed.count = nHaul;
+    this.rocketTruckHull.count = nRkt;
+    this.rocketTruckPod.count = nRkt;
     for (const m of [
       this.soldierBody, this.soldierLegL, this.soldierLegR,
       this.tankHull, this.tankTurret,
@@ -334,6 +369,7 @@ export class UnitRenderer {
       this.workerCrateWood, this.workerCrateMetal,
       this.dozerHull, this.dozerBlade,
       this.haulerHull, this.haulerBed,
+      this.rocketTruckHull, this.rocketTruckPod,
     ]) {
       m.instanceMatrix.needsUpdate = true;
     }
@@ -345,6 +381,7 @@ export class UnitRenderer {
     this.selectionRingWorker.visible = false;
     this.selectionRingDozer.visible = false;
     this.selectionRingHauler.visible = false;
+    this.selectionRingRocketTruck.visible = false;
     if (selected) {
       const ring =
         selected.kind === 'soldier' ? this.selectionRingSoldier
@@ -353,6 +390,7 @@ export class UnitRenderer {
         : selected.kind === 'worm' ? this.selectionRingWorm
         : selected.kind === 'worker' ? this.selectionRingWorker
         : selected.kind === 'dozer' ? this.selectionRingDozer
+        : selected.kind === 'rocket_truck' ? this.selectionRingRocketTruck
         : this.selectionRingHauler;
       ring.position.set(selected.x, selected.y + 0.05, selected.z);
       ring.visible = true;
@@ -382,6 +420,12 @@ function makeIM(geo: THREE.BufferGeometry, mat: THREE.Material, capacity: number
   im.frustumCulled = false;
   im.count = 0;
   return im;
+}
+
+function wrapAngle(a: number): number {
+  while (a > Math.PI) a -= 2 * Math.PI;
+  while (a < -Math.PI) a += 2 * Math.PI;
+  return a;
 }
 
 function makeSelectionRing(radius: number, color: number): THREE.LineSegments {

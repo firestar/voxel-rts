@@ -11,8 +11,10 @@ import {
   WORM_CUTTER_RADIUS, WORM_CUTTER_FORWARD, WORM_CUTTER_HEIGHT,
   WORM_SEGMENT_COUNT, WORM_SEGMENT_SPACING,
 } from '../render/UnitModels';
+import { WeaponKind, WEAPONS, defaultWeaponFor } from './Weapons';
+import { ProjectileKind } from './Projectiles';
 
-export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'hauler';
+export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'hauler' | 'rocket_truck';
 
 /**
  * Worker role. Harvesters auto-find resources (trees, exposed metal ore) and
@@ -291,6 +293,30 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
         spoilCapacityVoxels: 12_288,
       };
+    case 'rocket_truck':
+      // Rocket-launcher platform. Same chassis class as a hauler (wheeled, can't
+      // dig, fairly nimble), but carries a yawing rocket pod on the deck. The
+      // pod aims independently of the hull — the hull keeps doing path follow,
+      // the pod swings around to face the firing target. Ammunition is
+      // configured via the unit's `weapon` field (cluster_pod by default;
+      // spawn opts can override to rocket_pod for a heavy single-warhead variant).
+      return {
+        footprintRadius: 2, widthMeters: 2.5,
+        maxStepVoxels: 4, slopePenalty: 0.25,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 5,
+        turnRateRadPerSec: 1.2,
+        maxPitchRad: Math.PI / 6,
+        heightVoxels: 18,
+        canDig: false, requiresGround: true,
+        speed: 3.6, speedDigging: 0,
+        hp: 240,
+        massKg: 28_000,
+        terminalFallSpeed: 42,
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
+      };
   }
 }
 
@@ -389,6 +415,47 @@ export interface Unit {
   bladeHalfWidthMeters: number;
   bladeForwardMeters: number;
   bladeDepthMeters: number;
+  /**
+   * Weapon currently mounted on this unit, or null if the unit is unarmed
+   * (workers, tunneler, dozer, hauler, worm). The default is filled from
+   * `defaultWeaponFor(kind)` at spawn time and can be overridden via
+   * `UnitManager.spawn` opts.
+   */
+  weapon: WeaponKind | null;
+  /** Seconds until the weapon is ready to fire again. 0 = ready. */
+  fireCooldown: number;
+  /**
+   * Pending firing job. Set by the player's RMB-release. The weapon-tick
+   * (ticked by Game) slews the appropriate part (hull or turret) to face the
+   * target, fires when the alignment is within `aimToleranceRad`, then
+   * clears the field.
+   */
+  firingTarget: FiringTarget | null;
+  /**
+   * Independent turret yaw in world-space radians. Same convention as
+   * `heading`: yaw=0 means turret forward = -Z. For non-turreted units the
+   * value still tracks `heading` so callers can read it uniformly without
+   * branching on kind.
+   */
+  turretYaw: number;
+  /**
+   * Active burst — when a weapon's `shotsPerBurst > 1`, the first trigger pull
+   * sets `burstShotsRemaining` and `burstShotTimer`. Subsequent shots fire on
+   * `burstInterval` until the burst empties.
+   */
+  burstShotsRemaining: number;
+  burstShotTimer: number;
+}
+
+/**
+ * What the player has asked this unit to shoot at. World-space target xyz +
+ * the projectile kind to launch (the weapon's catalog default unless an
+ * upstream caller wants to override).
+ */
+export interface FiringTarget {
+  x: number; y: number; z: number;
+  /** Optional override for the projectile kind; defaults to the weapon's configured projectile. */
+  projectileOverride?: ProjectileKind;
 }
 
 /** Pending hauler one-shot. Resolved into one ScoopRequest or DumpRequest on arrival. */
@@ -478,7 +545,11 @@ export class UnitManager {
   units: Unit[] = [];
   private nextId = 1;
 
-  spawn(kind: UnitKind, x: number, y: number, z: number, opts?: { workerRole?: WorkerRole }): Unit {
+  spawn(
+    kind: UnitKind,
+    x: number, y: number, z: number,
+    opts?: { workerRole?: WorkerRole; weapon?: WeaponKind | null },
+  ): Unit {
     const cfg = unitConfig(kind);
     const segments: WormSegment[] = [];
     for (let i = 0; i < cfg.segmentCount; i++) {
@@ -549,6 +620,15 @@ export class UnitManager {
       bladeHalfWidthMeters: cfg.bladeHalfWidthMeters,
       bladeForwardMeters: cfg.bladeForwardMeters,
       bladeDepthMeters: cfg.bladeDepthMeters,
+      // Default weapon by unit kind (rifle for soldier, cannon for tank, …);
+      // explicit `opts.weapon` lets the caller swap it out, including passing
+      // null to spawn the unit unarmed.
+      weapon: opts?.weapon !== undefined ? opts.weapon : defaultWeaponFor(kind),
+      fireCooldown: 0,
+      firingTarget: null,
+      turretYaw: 0,
+      burstShotsRemaining: 0,
+      burstShotTimer: 0,
     };
     this.units.push(u);
     return u;

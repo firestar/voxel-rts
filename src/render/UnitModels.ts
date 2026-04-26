@@ -577,3 +577,95 @@ export function buildHaulerBedGeometry(): THREE.BufferGeometry {
 /** Bed pivot in unit-local coords — placed at the rear lower edge of the bed. */
 export const HAULER_BED_PIVOT_Y = 0.85;
 export const HAULER_BED_PIVOT_Z = 1.10;
+
+// ---------- Rocket truck -----------------------------------------------------
+// Wheeled chassis (slimmer than the hauler) with an independently-yawing
+// rocket pod on the deck. Pod pivots around the centre of the deck so the
+// renderer can rotate it freely on (turretYaw - heading) regardless of the
+// hull's orientation.
+
+const ROCKET_HULL = { r: 0.35, g: 0.45, b: 0.30 };       // olive drab
+const ROCKET_HULL_DARK = { r: 0.22, g: 0.28, b: 0.18 };
+const ROCKET_HULL_HI = { r: 0.55, g: 0.62, b: 0.42 };
+const ROCKET_TIRE = { r: 0.08, g: 0.08, b: 0.10 };
+const ROCKET_HUB = { r: 0.45, g: 0.45, b: 0.45 };
+const ROCKET_GLASS = { r: 0.20, g: 0.45, b: 0.55 };
+const ROCKET_POD_BODY = { r: 0.30, g: 0.35, b: 0.30 };
+const ROCKET_POD_TUBE = { r: 0.18, g: 0.20, b: 0.18 };
+const ROCKET_POD_RIM = { r: 0.55, g: 0.55, b: 0.58 };
+const ROCKET_TIP = { r: 0.85, g: 0.55, b: 0.20 };
+
+export function buildRocketTruckHullGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Wheels: four large tires.
+  for (const sx of [-0.95, 0.95]) {
+    for (const sz of [-1.10, 1.10]) {
+      blocks.push({ x: sx, y: 0.40, z: sz, sx: 0.40, sy: 0.80, sz: 0.80, ...ROCKET_TIRE });
+      blocks.push({ x: sx, y: 0.40, z: sz, sx: 0.30, sy: 0.40, sz: 0.40, ...ROCKET_HUB });
+    }
+  }
+  // Lower frame.
+  blocks.push({ x: 0.0, y: 0.50, z: 0.0, sx: 1.70, sy: 0.30, sz: 2.80, ...ROCKET_HULL_DARK });
+  // Cab over the front wheels.
+  blocks.push({ x: 0.0, y: 0.95, z: -1.05, sx: 1.40, sy: 0.85, sz: 0.95, ...ROCKET_HULL });
+  blocks.push({ x: 0.0, y: 1.42, z: -1.05, sx: 1.45, sy: 0.10, sz: 1.00, ...ROCKET_HULL_DARK });
+  // Cab windscreen.
+  blocks.push({ x: 0.0, y: 1.10, z: -1.50, sx: 1.10, sy: 0.45, sz: 0.05, ...ROCKET_GLASS });
+  // Side windows.
+  blocks.push({ x: -0.73, y: 1.10, z: -1.05, sx: 0.05, sy: 0.40, sz: 0.70, ...ROCKET_GLASS });
+  blocks.push({ x:  0.73, y: 1.10, z: -1.05, sx: 0.05, sy: 0.40, sz: 0.70, ...ROCKET_GLASS });
+  // Front bumper.
+  blocks.push({ x: 0.0, y: 0.55, z: -1.55, sx: 1.60, sy: 0.20, sz: 0.10, ...ROCKET_POD_RIM });
+  // Rear deck base where the pod mounts.
+  blocks.push({ x: 0.0, y: 0.85, z: 0.55, sx: 1.50, sy: 0.18, sz: 1.40, ...ROCKET_HULL_HI });
+  // Pod turntable (the visible ring under the rotating pod).
+  blocks.push({ x: 0.0, y: 0.95, z: 0.55, sx: 1.20, sy: 0.05, sz: 1.20, ...ROCKET_POD_RIM });
+  return buildVoxelModel(blocks);
+}
+
+/**
+ * The rocket pod — a 4×2 grid of launch tubes mounted on a low frame. Origin
+ * is at the centre of the turntable so a rotation around Y on this geometry
+ * yaws the pod freely. Faces -Z by default so the tubes point forward.
+ */
+export function buildRocketTruckPodGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Pod base (the frame that holds the tubes).
+  blocks.push({ x: 0, y: 0.10, z: 0.0, sx: 1.20, sy: 0.20, sz: 1.30, ...ROCKET_POD_BODY });
+  // Tube grid: 4 across, 2 stacked. Each tube is a long cylinder approximated
+  // as a stack of two boxes (body + dark inner liner) pointing -Z.
+  const tubeLen = 1.50;
+  const tubeR = 0.12;
+  const tubeGapX = 0.32;
+  const tubeRowY = [0.30, 0.58];
+  for (const ty of tubeRowY) {
+    for (let i = -1.5; i <= 1.5; i += 1) {
+      blocks.push({
+        x: i * tubeGapX, y: ty, z: -0.05,
+        sx: tubeR * 2, sy: tubeR * 2, sz: tubeLen,
+        ...ROCKET_POD_TUBE,
+      });
+      // Tip showing the rocket nose.
+      blocks.push({
+        x: i * tubeGapX, y: ty, z: -0.05 - tubeLen * 0.5 + 0.03,
+        sx: tubeR * 1.4, sy: tubeR * 1.4, sz: 0.06,
+        ...ROCKET_TIP,
+      });
+      // Rear cap (where exhaust would come out).
+      blocks.push({
+        x: i * tubeGapX, y: ty, z: -0.05 + tubeLen * 0.5 - 0.03,
+        sx: tubeR * 2.2, sy: tubeR * 2.2, sz: 0.06,
+        ...ROCKET_POD_RIM,
+      });
+    }
+  }
+  // Side reinforcements.
+  for (const sx of [-0.66, 0.66]) {
+    blocks.push({ x: sx, y: 0.45, z: 0.0, sx: 0.06, sy: 0.55, sz: 1.30, ...ROCKET_POD_RIM });
+  }
+  return buildVoxelModel(blocks);
+}
+
+/** Pod pivot in unit-local coords — sits in the centre of the rear deck. */
+export const ROCKET_TRUCK_POD_PIVOT_Y = 1.00;
+export const ROCKET_TRUCK_POD_PIVOT_Z = 0.55;
