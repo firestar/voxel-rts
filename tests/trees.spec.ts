@@ -3,6 +3,8 @@ import { placeTrees } from '../src/voxel/Trees';
 import { VoxelWorld, worldIndex } from '../src/voxel/VoxelWorld';
 import { WORLD_X, WORLD_Z } from '../src/voxel/types';
 import { M_GRASS, M_WOOD, M_LEAF } from '../src/voxel/Materials';
+import { allocateNav, buildSurfaceNav, navIndex } from '../src/path/SurfaceNav';
+import { findPathSurface, AStarWorkspace } from '../src/path/AStar';
 
 function buildGrassPlane(): VoxelWorld {
   const world = VoxelWorld.create(false);
@@ -75,6 +77,45 @@ describe('placeTrees', () => {
       if (a.buffers.voxels[i] !== b.buffers.voxels[i]) { agree = false; break; }
     }
     expect(agree).toBe(true);
+  });
+});
+
+describe('trees + surface pathing', () => {
+  it('a unit with high-enough headroom requirement detours around tree cells', () => {
+    // Build the same flat grass world the tree tests use, place a single tall tree,
+    // then ask for a path through its trunk cell. With headroomVoxels >= the tree
+    // height, the surface path search should reject the tree's nav cell.
+    const world = buildGrassPlane();
+    const v = world.buffers.voxels;
+    // Place a single tree centred on (96, 32, 96) — that's nav cell (12, 12) at NAV_CELL_VOXELS=8.
+    const baseX = 96, baseZ = 96;
+    // Manually stamp a tall trunk so the tree cell has a known low headroom.
+    const trunkBase = 32;
+    for (let dy = 1; dy <= 16; dy++) {
+      v[worldIndex(baseX, trunkBase + dy, baseZ)] = 4; // wood
+    }
+
+    const nav = allocateNav(false);
+    buildSurfaceNav(v, nav);
+
+    // Cell (12, 12) holds the trunk. Its headroom should be small (just above the
+    // grass voxel until the trunk starts). Sanity-check.
+    const treeCellHead = nav.headroom[navIndex(12, 12)]!;
+    expect(treeCellHead).toBeLessThan(16);
+
+    const ws = new AStarWorkspace();
+    const r = findPathSurface(nav, ws, {
+      startCx: 8, startCz: 12,
+      goalCx: 16, goalCz: 12,
+      footprintRadius: 1, maxStepVoxels: 32, slopePenalty: 0.1,
+      bodyHalfCells: 0, bodyRoughnessVoxels: 999,
+      headroomVoxels: 14, // soldier-height; bigger than the tree's airspace
+      prefersRoads: false,
+    });
+    // Path may detour or fail — but it must not pass through the trunk cell.
+    for (const c of r.cells) {
+      expect(c.cx === 12 && c.cz === 12).toBe(false);
+    }
   });
 });
 

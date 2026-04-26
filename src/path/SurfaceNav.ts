@@ -20,6 +20,10 @@ export interface SurfaceNavBuffers {
   flatness: Uint8Array;    // chamfer distance to nearest "uneven" cell, in cells (0..MAX_FLATNESS_RADIUS)
   road: Uint8Array;        // 0..255 road weight
   blocked: Uint8Array;     // 0/1
+  /** Contiguous air voxels above topY before hitting solid (capped at 255). Used by
+   *  the path search to keep units out of cells where their head would clip a tree
+   *  canopy / overhang / building roof. */
+  headroom: Uint8Array;
 }
 
 export function navIndex(x: number, z: number): number { return z * NAV_W + x; }
@@ -33,6 +37,7 @@ export function allocateNav(useShared: boolean): SurfaceNavBuffers {
     flatness: new Uint8Array(new Buf(NAV_COUNT)),
     road: new Uint8Array(new Buf(NAV_COUNT)),
     blocked: new Uint8Array(new Buf(NAV_COUNT)),
+    headroom: new Uint8Array(new Buf(NAV_COUNT)),
   };
 }
 
@@ -67,6 +72,39 @@ export function buildSurfaceNav(voxels: Uint8Array, nav: SurfaceNavBuffers): voi
       nav.material[i] = mat;
       nav.blocked[i] = top < 0 ? 1 : 0;
       nav.road[i] = 0;
+      // Headroom: air voxels above topY before the next solid voxel. Capped at 255.
+      // Sample MULTIPLE columns within the cell — corners + centre — and take the
+      // minimum so a tree trunk sitting at a cell corner still flags the whole
+      // cell as low-headroom. Without this, anything off the cell-centre column
+      // (e.g. a 1-voxel-wide tree trunk stamped at a cell edge) was invisible.
+      // Headroom: walk up from the WALKABLE surface (cell's topY + 1) at every
+       // probe column and count contiguous air. The minimum across probes is the
+       // cell's headroom — this correctly catches a tree trunk sitting at any
+       // corner because that trunk's first voxel sits right above the grass
+       // surface and shows up as 0 air at that probe.
+      let minHead = 255;
+      if (top >= 0) {
+        const probes: [number, number][] = [
+          [wx, wz],                                                // centre
+          [cx * NAV_CELL_VOXELS,           cz * NAV_CELL_VOXELS],         // -X-Z corner
+          [cx * NAV_CELL_VOXELS + NAV_CELL_VOXELS - 1, cz * NAV_CELL_VOXELS],         // +X-Z
+          [cx * NAV_CELL_VOXELS,           cz * NAV_CELL_VOXELS + NAV_CELL_VOXELS - 1], // -X+Z
+          [cx * NAV_CELL_VOXELS + NAV_CELL_VOXELS - 1, cz * NAV_CELL_VOXELS + NAV_CELL_VOXELS - 1], // +X+Z
+        ];
+        for (const [px, pz] of probes) {
+          let h = 0;
+          for (let y = top + 1; y < WORLD_Y; y++) {
+            if (voxels[worldIndex(px, y, pz)] !== AIR) break;
+            h++;
+            if (h >= 255) { h = 255; break; }
+          }
+          if (h < minHead) minHead = h;
+          if (minHead === 0) break; // can't get any worse
+        }
+      } else {
+        minHead = 0;
+      }
+      nav.headroom[i] = minHead;
     }
   }
 

@@ -228,7 +228,13 @@ export class Game {
    * (px, py) and an optional vertical drag in pixels (positive = drag down = go deeper).
    * Returns null when the ray misses geometry.
    */
-  private resolveTarget(px: number, py: number, w: number, h: number, verticalDragPx: number, baseY?: number): {
+  private resolveTarget(
+    px: number, py: number, w: number, h: number,
+    verticalDragPx: number,
+    baseY?: number,
+    pitchCapRad?: number,
+    pitchOriginXZ?: { x: number; z: number },
+  ): {
     surface: THREE.Vector3;
     target: THREE.Vector3;
     voxelXYZ: { x: number; y: number; z: number; nx: number; ny: number; nz: number };
@@ -244,7 +250,22 @@ export class Game {
     // tunnelers use their CURRENT y so vertical drag adjusts depth relative to where
     // they already are, not relative to whatever the cursor happens to be over.
     const base = baseY !== undefined ? baseY : wy;
-    const target = new THREE.Vector3(wx, Math.max(0.5, base - dragMeters), wz);
+    let targetY = Math.max(0.5, base - dragMeters);
+    // If a pitch cap is supplied, clamp targetY so the line from the unit's xz to
+    // the click xz stays within ±tan(pitchCapRad). Lets the tunneler dig down even
+    // when the user drags past the steepest physically allowed angle — they get
+    // the steepest legal slope instead of nothing.
+    if (pitchCapRad !== undefined && pitchCapRad < Math.PI / 2 && pitchOriginXZ) {
+      const horiz = Math.hypot(wx - pitchOriginXZ.x, wz - pitchOriginXZ.z);
+      const maxDeltaY = horiz * Math.tan(pitchCapRad);
+      const baseRef = baseY !== undefined ? baseY : wy;
+      const minY = baseRef - maxDeltaY;
+      const maxY = baseRef + maxDeltaY;
+      if (targetY < minY) targetY = minY;
+      if (targetY > maxY) targetY = maxY;
+      if (targetY < 0.5) targetY = 0.5;
+    }
+    const target = new THREE.Vector3(wx, targetY, wz);
     return {
       surface: new THREE.Vector3(wx, wy, wz),
       target,
@@ -267,7 +288,9 @@ export class Game {
     // anywhere and a 0-drag click means "stay at this height"). Other units take
     // the click's voxel y as the base.
     const baseY = useDrag ? selected.y : undefined;
-    const r = this.resolveTarget(hold.startX, hold.startY, w, h, useDrag ? verticalDrag : 0, baseY);
+    const pitchCap = useDrag ? selected.maxPitchRad : undefined;
+    const pitchOrigin = useDrag ? { x: selected.x, z: selected.z } : undefined;
+    const r = this.resolveTarget(hold.startX, hold.startY, w, h, useDrag ? verticalDrag : 0, baseY, pitchCap, pitchOrigin);
     if (!r) { this.target.hide(); return; }
     this.target.show(r.surface, r.target);
   }
@@ -288,9 +311,13 @@ export class Game {
     const verticalDrag = release.endY - release.startY;
     const useDrag = selected?.kind === 'tunneler';
     // Same as updateLmbPreview — tunneler base height = its own y, so a no-drag
-    // click means "head toward the click XZ at my current height".
+    // click means "head toward the click XZ at my current height". And the dive
+    // angle is clamped to the unit's maxPitchRad so dragging past the cap still
+    // commits a valid (steep-but-legal) dig.
     const baseY = useDrag && selected ? selected.y : undefined;
-    const r = this.resolveTarget(release.startX, release.startY, w, h, useDrag ? verticalDrag : 0, baseY);
+    const pitchCap = useDrag && selected ? selected.maxPitchRad : undefined;
+    const pitchOrigin = useDrag && selected ? { x: selected.x, z: selected.z } : undefined;
+    const r = this.resolveTarget(release.startX, release.startY, w, h, useDrag ? verticalDrag : 0, baseY, pitchCap, pitchOrigin);
     if (!r) return;
     void this.commandMoveToWorld(r.target.x, r.target.y, r.target.z);
   }
@@ -443,6 +470,7 @@ export class Game {
       slopePenalty: unit.slopePenalty,
       bodyHalfCells: unit.bodyHalfCells,
       bodyRoughnessVoxels: unit.bodyRoughnessVoxels,
+      headroomVoxels: unit.heightVoxels,
       prefersRoads: false,
       // Per-unit seed so units headed to the same goal don't all share the same A*-optimal
       // line — they spread out along nearby alternates instead.

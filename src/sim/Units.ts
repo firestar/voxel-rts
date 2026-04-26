@@ -34,6 +34,10 @@ interface UnitConfig {
    *  would require a steeper climb/dive, and applyPathOrientation clamps the rendered
    *  body pitch to this value so the model never tips past it. */
   maxPitchRad: number;
+  /** Unit's vertical extent in voxels (head/turret/cab clearance). The surface path
+   *  search rejects cells whose `headroom` (air above topY) is less than this — keeps
+   *  units out of cells where their head would clip a tree canopy or overhang. */
+  heightVoxels: number;
   canDig: boolean;
   requiresGround: boolean;
   speed: number;
@@ -55,6 +59,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         bodyHalfCells: 0, bodyRoughnessVoxels: 999,
         turnRateRadPerSec: 6.0,                  // ~340°/s, snappy infantry turn
         maxPitchRad: Math.PI / 2,                // soldiers are flexible — no real pitch cap
+        heightVoxels: 14,                        // ~1.75 m head clearance
         canDig: false, requiresGround: true,
         speed: 4.5, speedDigging: 0,
         hp: 80,
@@ -74,6 +79,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         bodyHalfCells: 1, bodyRoughnessVoxels: 5,
         turnRateRadPerSec: 1.4,                  // ~80°/s — tank pivots are slow
         maxPitchRad: Math.PI / 6,                // 30° — pitched body cap matches the climb cap
+        heightVoxels: 18,                        // ~2.25 m turret + antenna clearance
         canDig: false, requiresGround: true,
         speed: 3.5, speedDigging: 0,
         hp: 220,
@@ -91,7 +97,8 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         maxStepVoxels: 14, slopePenalty: 0.15,
         bodyHalfCells: 2, bodyRoughnessVoxels: 9,
         turnRateRadPerSec: 0.7,                  // ~40°/s — heavy machine pivots slowly
-        maxPitchRad: Math.PI / 4,                // 45° — never goes vertical, no straight-down digs
+        maxPitchRad: 40 * Math.PI / 180,         // 40° — capped dig angle in either direction
+        heightVoxels: 22,                        // ~2.75 m for the cab + exhaust stack
         canDig: true, requiresGround: true,
         speed: 1.6, speedDigging: 1.2,
         hp: 320,
@@ -112,6 +119,8 @@ export interface Unit {
   turnRateRadPerSec: number;
   /** Max climb / dive pitch in radians. */
   maxPitchRad: number;
+  /** Vertical extent of the unit in voxels — used to gate cells with too-low headroom. */
+  heightVoxels: number;
   canDig: boolean;
   requiresGround: boolean;
   x: number; y: number; z: number;
@@ -170,6 +179,7 @@ export class UnitManager {
       bodyRoughnessVoxels: cfg.bodyRoughnessVoxels,
       turnRateRadPerSec: cfg.turnRateRadPerSec,
       maxPitchRad: cfg.maxPitchRad,
+      heightVoxels: cfg.heightVoxels,
       canDig: cfg.canDig,
       requiresGround: cfg.requiresGround,
       x, y, z,

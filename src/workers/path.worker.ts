@@ -66,6 +66,7 @@ self.onmessage = (ev: MessageEvent<Message>) => {
             nav, r.cells,
             msg.req.footprintRadius, msg.req.maxStepVoxels,
             msg.req.bodyHalfCells, msg.req.bodyRoughnessVoxels,
+            msg.req.headroomVoxels,
           )
         : r.cells;
       (self as unknown as Worker).postMessage({

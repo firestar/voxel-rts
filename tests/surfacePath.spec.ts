@@ -38,6 +38,7 @@ describe('surface A* + smoother on flat ground', () => {
       slopePenalty: 0.15,
       bodyHalfCells: 0,
       bodyRoughnessVoxels: 999,
+      headroomVoxels: 0,
       prefersRoads: false,
     });
 
@@ -74,11 +75,11 @@ describe('surface A* + smoother on flat ground', () => {
       startCx: start.cx, startCz: start.cz,
       goalCx: goal.cx, goalCz: goal.cz,
       footprintRadius: 1, maxStepVoxels: 16, slopePenalty: 0.15,
-      bodyHalfCells: 0, bodyRoughnessVoxels: 999, prefersRoads: false,
+      bodyHalfCells: 0, bodyRoughnessVoxels: 999, headroomVoxels: 0, prefersRoads: false,
     });
     expect(r.reached).toBe(true);
 
-    const smoothed = smoothPath(nav, r.cells, 1, 16, 0, 999);
+    const smoothed = smoothPath(nav, r.cells, 1, 16, 0, 999, 0);
     expect(smoothed.length).toBeLessThan(r.cells.length);
     expect(smoothed[0]).toEqual(r.cells[0]);
     expect(smoothed[smoothed.length - 1]).toEqual(r.cells[r.cells.length - 1]);
@@ -98,6 +99,7 @@ describe('surface A* + smoother on flat ground', () => {
       slopePenalty: 0.15,
       bodyHalfCells: 0,
       bodyRoughnessVoxels: 999,
+      headroomVoxels: 0,
       prefersRoads: false,
     });
     // Sanity that the corner IS reachable on flat terrain
@@ -118,7 +120,7 @@ describe('surface A* + smoother on flat ground', () => {
       startCx: 12, startCz: 12,
       goalCx: 70, goalCz: 50,
       footprintRadius: 1, maxStepVoxels: 16, slopePenalty: 0.15,
-      bodyHalfCells: 0, bodyRoughnessVoxels: 999, prefersRoads: false,
+      bodyHalfCells: 0, bodyRoughnessVoxels: 999, headroomVoxels: 0, prefersRoads: false,
     });
     expect(r.reached).toBe(true);
     expect(r.cells.length).toBeGreaterThan(0);
@@ -144,7 +146,7 @@ describe('surface A* + smoother on flat ground', () => {
     const r = findPathSurface(nav, ws, {
       startCx: 30, startCz: 30, goalCx: 30, goalCz: 30,
       footprintRadius: 1, maxStepVoxels: 16, slopePenalty: 0.15,
-      bodyHalfCells: 0, bodyRoughnessVoxels: 999, prefersRoads: false,
+      bodyHalfCells: 0, bodyRoughnessVoxels: 999, headroomVoxels: 0, prefersRoads: false,
     });
     expect(r.reached).toBe(true);
     expect(r.cells.length).toBe(1);
@@ -180,7 +182,7 @@ describe('surface A* + smoother on flat ground', () => {
       startCx: 5, startCz: 40,
       goalCx: 90, goalCz: 40,
       footprintRadius: 1, maxStepVoxels: 16, slopePenalty: 0.15,
-      bodyHalfCells: 0, bodyRoughnessVoxels: 999, prefersRoads: false,
+      bodyHalfCells: 0, bodyRoughnessVoxels: 999, headroomVoxels: 0, prefersRoads: false,
     });
     // Path may either reach (going around) or fail; either way no cell along the
     // returned path may be the blocked column.
@@ -211,7 +213,7 @@ describe('surface A* + smoother on flat ground', () => {
       startCx: 5, startCz: 5,
       goalCx: 90, goalCz: 90,
       footprintRadius: 1, maxStepVoxels: 16, slopePenalty: 0.15,
-      bodyHalfCells: 0, bodyRoughnessVoxels: 999, prefersRoads: false,
+      bodyHalfCells: 0, bodyRoughnessVoxels: 999, headroomVoxels: 0, prefersRoads: false,
     });
     expect(r.reached).toBe(true);
     // Two cones converging: roughly two thin fans on a flat map.

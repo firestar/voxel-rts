@@ -17,6 +17,9 @@ export interface AStarRequest {
   bodyHalfCells: number;
   /** Max permitted spread of topY across the footprint cells, in voxels. */
   bodyRoughnessVoxels: number;
+  /** Required clear-air voxels above topY for the unit to fit (head/turret clearance).
+   *  Cells whose `nav.headroom` is below this are rejected. */
+  headroomVoxels: number;
   /** If true, road cells are cheaper to traverse. */
   prefersRoads: boolean;
   /**
@@ -186,7 +189,7 @@ export function findPathSurface(
 ): AStarResult {
   const gen = ws.resetGeneration();
   const { startCx, startCz, goalCx, goalCz, prefersRoads, maxStepVoxels, slopePenalty,
-          bodyHalfCells, bodyRoughnessVoxels, footprintRadius } = req;
+          bodyHalfCells, bodyRoughnessVoxels, footprintRadius, headroomVoxels } = req;
   const routeSeed = req.routeSeed ?? 0;
   // Agile units (single-cell footprint) skip the diagonal corner-cut entirely —
   // a soldier can scramble around an inside corner where both cardinals are blocked
@@ -202,6 +205,12 @@ export function findPathSurface(
   }
   if (bodyHalfCells > 0
       && !bodyRoughnessOk(nav, goalCx, goalCz, bodyHalfCells, bodyRoughnessVoxels)) {
+    return { cells: [], reached: false, expanded: 0 };
+  }
+  // Goal must have headroom for the unit to fit (head doesn't poke into a tree
+  // canopy / building roof / overhang). Start cell is exempt — the unit may
+  // already be standing on a borderline spot, e.g. just clipped under a tree.
+  if (headroomVoxels > 0 && nav.headroom[goalI]! < headroomVoxels) {
     return { cells: [], reached: false, expanded: 0 };
   }
   if (startI === goalI) {
@@ -260,6 +269,7 @@ export function findPathSurface(
       const dY = Math.abs(nyTop - cy);
       if (dY > maxStepVoxels) continue;
       if (bodyHalfCells > 0 && !bodyRoughnessOk(nav, nx, nz, bodyHalfCells, bodyRoughnessVoxels)) continue;
+      if (headroomVoxels > 0 && nav.headroom[ni]! < headroomVoxels) continue;
       if (n >= 4) {
         const a = navIndex(cx + NB_DX[n]!, cz);
         const b = navIndex(cx, cz + NB_DZ[n]!);

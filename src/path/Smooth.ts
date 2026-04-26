@@ -19,6 +19,7 @@ function navLineClear(
   maxStepVoxels: number,
   bodyHalfCells: number,
   bodyRoughnessVoxels: number,
+  headroomVoxels: number,
 ): boolean {
   const dx = bx - ax;
   const dz = bz - az;
@@ -45,6 +46,7 @@ function navLineClear(
     const y = nav.topY[idx]!;
     if (havePrev && Math.abs(y - prevY) > stepLimit) return false;
     if (bodyHalfCells > 0 && !bodyRoughnessOk(nav, x, z, bodyHalfCells, bodyRoughnessVoxels)) return false;
+    if (headroomVoxels > 0 && nav.headroom[idx]! < headroomVoxels) return false;
     prevX = x; prevZ = z; prevY = y; havePrev = true;
   }
   return true;
@@ -69,6 +71,7 @@ export function smoothPath(
   maxStepVoxels: number,
   bodyHalfCells: number,
   bodyRoughnessVoxels: number,
+  headroomVoxels: number,
   maxLookaheadCells = 12,
 ): { cx: number; cz: number }[] {
   if (cells.length <= 2) return cells;
@@ -79,7 +82,7 @@ export function smoothPath(
     while (j > i + 1) {
       const a = cells[i]!;
       const b = cells[j]!;
-      if (navLineClear(nav, a.cx, a.cz, b.cx, b.cz, footprintRadius, maxStepVoxels, bodyHalfCells, bodyRoughnessVoxels)) break;
+      if (navLineClear(nav, a.cx, a.cz, b.cx, b.cz, footprintRadius, maxStepVoxels, bodyHalfCells, bodyRoughnessVoxels, headroomVoxels)) break;
       j--;
     }
     out.push(cells[j]!);
