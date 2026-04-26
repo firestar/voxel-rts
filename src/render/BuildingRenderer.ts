@@ -1,0 +1,205 @@
+import * as THREE from 'three';
+import { Building } from '../sim/Buildings';
+import { VOXEL_SIZE } from '../voxel/types';
+import { NAV_CELL_VOXELS } from '../path/SurfaceNav';
+import {
+  buildTurbineHubGeometry, buildTurbineBladeGeometry, TURBINE_BLADE_COUNT,
+  POWER_PLANT_TURBINE_Y_M,
+  buildSmokePuffGeometry, SMOKE_PUFF_COUNT, SMOKE_PLUME_HEIGHT_M, SMOKE_PLUME_PERIOD_S,
+  REFINERY_CHIMNEY_X_M, REFINERY_CHIMNEY_Z_M, REFINERY_CHIMNEY_TOP_Y_M,
+  buildSatDishGeometry, buildPulseCoreGeometry,
+  TECH_LAB_MAST_TOP_Y_M,
+} from './BuildingModels';
+
+/**
+ * Per-building, per-part InstancedMesh renderer for animated accessories that sit on
+ * top of the stamped voxel structures.
+ *
+ *   Power plant — wind turbine: hub + 3 blades, blades spin around the hub's
+ *                  forward axis (slow continuous rotation when the building is alive).
+ *   Refinery    — smoke puffs: SMOKE_PUFF_COUNT puff instances rise from the chimney
+ *                  on a staggered loop (translate + scale-down toward the top).
+ *   Tech lab    — satellite dish + pulsing core: dish yaws back and forth, the core
+ *                  brightness pulses with a cosine wave.
+ */
+export class BuildingRenderer {
+  readonly group = new THREE.Group();
+
+  private turbineHub: THREE.InstancedMesh;
+  private turbineBlade: THREE.InstancedMesh;
+  private smoke: THREE.InstancedMesh;
+  private satDish: THREE.InstancedMesh;
+  private pulseCore: THREE.InstancedMesh;
+
+  private capacity: number;
+  private tmpM = new THREE.Matrix4();
+  private tmpQ = new THREE.Quaternion();
+  private tmpV = new THREE.Vector3();
+  private tmpScale = new THREE.Vector3(1, 1, 1);
+  private tmpEuler = new THREE.Euler();
+
+  constructor(capacity = 64) {
+    this.capacity = capacity;
+    const lit = new THREE.MeshLambertMaterial({ vertexColors: true });
+    // Pulse core uses a basic (unlit) material whose colour we modulate — that's how
+    // it reads as "emissive" without paying for a real emissive map.
+    const emissive = new THREE.MeshBasicMaterial({ vertexColors: true });
+
+    this.turbineHub = makeIM(buildTurbineHubGeometry(), lit, capacity);
+    this.turbineBlade = makeIM(buildTurbineBladeGeometry(), lit, capacity * TURBINE_BLADE_COUNT);
+    this.smoke = makeIM(buildSmokePuffGeometry(), lit, capacity * SMOKE_PUFF_COUNT);
+    this.satDish = makeIM(buildSatDishGeometry(), lit, capacity);
+    this.pulseCore = makeIM(buildPulseCoreGeometry(), emissive, capacity);
+
+    this.group.add(
+      this.turbineHub, this.turbineBlade,
+      this.smoke,
+      this.satDish, this.pulseCore,
+    );
+  }
+
+  update(buildings: Building[]): void {
+    let nHub = 0, nBlade = 0, nSmoke = 0, nDish = 0, nCore = 0;
+    const t = performance.now() / 1000;
+
+    // Pulse colour modulation for the tech-lab core (shared across all labs).
+    const pulse = 0.5 + 0.5 * Math.cos(t * 2.4);
+    const coreColor = new THREE.Color(0.4 + 0.6 * pulse, 0.7 + 0.3 * pulse, 1.0);
+    (this.pulseCore.material as THREE.MeshBasicMaterial).color.copy(coreColor);
+
+    for (const b of buildings) {
+      if (b.destroyed) continue;
+      const cx = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const cz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const floorTopY = (b.floorY + 1) * VOXEL_SIZE;
+      // Per-building phase so identical buildings don't pulse / spin in lockstep.
+      const phase = b.id * 0.5710;
+
+      switch (b.spec.kind) {
+        case 'power_plant':
+          if (nHub >= this.capacity) break;
+          this.placePowerPlantTurbine(b.id, cx, cz, floorTopY, t + phase, nHub, nBlade);
+          nHub++;
+          nBlade += TURBINE_BLADE_COUNT;
+          break;
+        case 'refinery':
+          this.placeRefinerySmoke(cx, cz, floorTopY, t + phase, nSmoke);
+          nSmoke += SMOKE_PUFF_COUNT;
+          break;
+        case 'tech_lab':
+          if (nDish >= this.capacity) break;
+          this.placeTechLabAccessories(cx, cz, floorTopY, t + phase, nDish, nCore);
+          nDish++;
+          nCore++;
+          break;
+        default:
+          // Barracks has no animated accessories.
+          break;
+      }
+    }
+
+    this.turbineHub.count = nHub;
+    this.turbineBlade.count = nBlade;
+    this.smoke.count = nSmoke;
+    this.satDish.count = nDish;
+    this.pulseCore.count = nCore;
+    for (const m of [this.turbineHub, this.turbineBlade, this.smoke, this.satDish, this.pulseCore]) {
+      m.instanceMatrix.needsUpdate = true;
+    }
+  }
+
+  private placePowerPlantTurbine(
+    _id: number,
+    cx: number, cz: number, floorTopY: number,
+    t: number,
+    hubSlot: number, bladeStart: number,
+  ): void {
+    // Hub sits at the centre of the building, on top of the pylon stub. Face the
+    // turbine "forward" along -Z (matches unit convention); a slow yaw makes the
+    // nacelle drift over time so the blades sweep different terrain.
+    const yaw = Math.sin(t * 0.15) * 0.8;
+    this.tmpEuler.set(0, yaw, 0, 'YXZ');
+    this.tmpQ.setFromEuler(this.tmpEuler);
+    this.tmpV.set(cx, floorTopY + POWER_PLANT_TURBINE_Y_M, cz);
+    this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+    this.turbineHub.setMatrixAt(hubSlot, this.tmpM);
+
+    // Blades spin around the hub's forward (-Z) axis at a steady rate. Each blade
+    // is 120° offset around that axis so the three together form the rotor.
+    const spin = t * 1.5; // radians/sec ~ ~14 RPM
+    const hubM = this.tmpM.clone();
+    for (let i = 0; i < TURBINE_BLADE_COUNT; i++) {
+      const angle = spin + (i / TURBINE_BLADE_COUNT) * Math.PI * 2;
+      // Blade-local: rotate around Z so the blade (which extends along +Y) sweeps
+      // through the rotor plane. Slight forward Z offset so the blades clear the hub.
+      const bladeLocal = new THREE.Matrix4()
+        .makeTranslation(0, 0, -0.20)
+        .multiply(new THREE.Matrix4().makeRotationZ(angle));
+      const bladeWorld = new THREE.Matrix4().multiplyMatrices(hubM, bladeLocal);
+      this.turbineBlade.setMatrixAt(bladeStart + i, bladeWorld);
+    }
+  }
+
+  private placeRefinerySmoke(
+    cx: number, cz: number, floorTopY: number,
+    t: number,
+    smokeStart: number,
+  ): void {
+    // Chimney top in world meters.
+    const cxStack = cx + REFINERY_CHIMNEY_X_M;
+    const czStack = cz + REFINERY_CHIMNEY_Z_M;
+    const cyStack = floorTopY + REFINERY_CHIMNEY_TOP_Y_M;
+
+    // Each puff cycles through the plume on a phase offset of 1/SMOKE_PUFF_COUNT of
+    // the period. A puff at u = 0 is at the chimney top, u = 1 has reached the top
+    // of the plume; we scale it down + drift it sideways slightly as it rises.
+    for (let i = 0; i < SMOKE_PUFF_COUNT; i++) {
+      const phase = i / SMOKE_PUFF_COUNT;
+      const u = (((t / SMOKE_PLUME_PERIOD_S) + phase) % 1.0);
+      const yOff = u * SMOKE_PLUME_HEIGHT_M;
+      const sideways = Math.sin(t * 0.6 + i * 1.7) * 0.5 * u; // drifts as it rises
+      const scale = (1 - u) * 1.4 + 0.4; // shrinks slightly toward the top
+      this.tmpScale.set(scale, scale, scale);
+      this.tmpEuler.set(0, t * 0.4 + i, 0, 'YXZ'); // slow tumble
+      this.tmpQ.setFromEuler(this.tmpEuler);
+      this.tmpV.set(cxStack + sideways, cyStack + yOff, czStack);
+      this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+      this.smoke.setMatrixAt(smokeStart + i, this.tmpM);
+    }
+    this.tmpScale.set(1, 1, 1); // restore for other branches
+  }
+
+  private placeTechLabAccessories(
+    cx: number, cz: number, floorTopY: number,
+    t: number,
+    dishSlot: number, coreSlot: number,
+  ): void {
+    // Dish sits on top of the antenna mast.
+    const dishY = floorTopY + TECH_LAB_MAST_TOP_Y_M;
+    // Sweep yaw back and forth ±60°.
+    const yaw = Math.sin(t * 0.5) * (Math.PI / 3);
+    // Tilt up slightly so the dish points at the sky rather than the horizon.
+    const tilt = -0.35;
+    this.tmpEuler.set(tilt, yaw, 0, 'YXZ');
+    this.tmpQ.setFromEuler(this.tmpEuler);
+    this.tmpV.set(cx, dishY, cz);
+    this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+    this.satDish.setMatrixAt(dishSlot, this.tmpM);
+
+    // Pulse core sits just below the dish on the mast — small cube whose material
+    // colour is updated globally at the top of update().
+    this.tmpEuler.set(0, 0, 0, 'YXZ');
+    this.tmpQ.setFromEuler(this.tmpEuler);
+    this.tmpV.set(cx, dishY - 0.5, cz);
+    this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+    this.pulseCore.setMatrixAt(coreSlot, this.tmpM);
+  }
+}
+
+function makeIM(geo: THREE.BufferGeometry, mat: THREE.Material, capacity: number): THREE.InstancedMesh {
+  const im = new THREE.InstancedMesh(geo, mat, capacity);
+  im.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  im.frustumCulled = false;
+  im.count = 0;
+  return im;
+}

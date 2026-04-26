@@ -1,36 +1,81 @@
 import { VoxelWorld } from '../voxel/VoxelWorld';
 import { worldIndex } from '../voxel/VoxelWorld';
 import { WORLD_X, WORLD_Y, WORLD_Z, AIR, MaterialId, VOXEL_SIZE } from '../voxel/types';
-import { M_WOOD } from '../voxel/Materials';
-import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_VOXELS, NAV_CELL_METERS, FLAT_TOLERANCE_VOXELS } from '../path/SurfaceNav';
+import { M_WOOD, M_STONE, M_PATH, M_DIRT_ROAD } from '../voxel/Materials';
+import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_VOXELS, FLAT_TOLERANCE_VOXELS } from '../path/SurfaceNav';
 import { UnitManager, UnitKind, Unit } from './Units';
 
-export type BuildingKind = 'barracks';
+export type BuildingKind = 'barracks' | 'power_plant' | 'refinery' | 'tech_lab';
 
 export interface BuildingSpec {
   kind: BuildingKind;
-  /** Footprint in nav cells (square). */
+  /** Display name for HUD. */
+  label: string;
+  /** Footprint in nav cells (square or rectangular). */
   cellsW: number;
   cellsD: number;
   /** Required headroom in voxels above the floor. */
   headroomVoxels: number;
-  /** Construction wall material. */
+  /** Primary wall material — used for the perimeter + countLivingWalls sample. */
   wall: MaterialId;
-  /** Time between unit spawns in seconds. */
+  /** Time between unit spawns in seconds. Infinity disables production. */
   productionInterval: number;
-  /** Cycled through on each spawn; lets one Barracks alternate Soldier/Tunneler. */
+  /** Cycled through on each spawn. Empty array = doesn't produce units. */
   produces: UnitKind[];
+  /** Voxel stamper for this building. Returns the wall-voxel count for liveness math. */
+  stamp: (world: VoxelWorld, ox: number, oz: number, floorY: number) => number;
 }
 
 export const BARRACKS: BuildingSpec = {
   kind: 'barracks',
+  label: 'Barracks',
   cellsW: 4,
   cellsD: 4,
   headroomVoxels: 24, // 3 m at 0.125 m voxels
   wall: M_WOOD,
   productionInterval: 6.0,
   produces: ['soldier', 'tank', 'tunneler', 'worm'],
+  stamp: stampBarracks,
 };
+
+export const POWER_PLANT: BuildingSpec = {
+  kind: 'power_plant',
+  label: 'Power Plant',
+  cellsW: 5,
+  cellsD: 5,
+  headroomVoxels: 24, // 3 m main hall — wind turbine pylon sits above
+  wall: M_STONE,
+  productionInterval: Infinity,
+  produces: [],
+  stamp: stampPowerPlant,
+};
+
+export const REFINERY: BuildingSpec = {
+  kind: 'refinery',
+  label: 'Metal Refinery',
+  cellsW: 6,
+  cellsD: 4,
+  headroomVoxels: 28, // 3.5 m hall — chimney rises above the roof
+  wall: M_STONE,
+  productionInterval: Infinity,
+  produces: [],
+  stamp: stampRefinery,
+};
+
+export const TECH_LAB: BuildingSpec = {
+  kind: 'tech_lab',
+  label: 'Tech Lab',
+  cellsW: 4,
+  cellsD: 4,
+  headroomVoxels: 20, // 2.5 m base — domed roof rises above
+  wall: M_STONE,
+  productionInterval: Infinity,
+  produces: [],
+  stamp: stampTechLab,
+};
+
+/** All building specs in the order they appear on the build-mode hotkeys (1..N). */
+export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, POWER_PLANT, REFINERY, TECH_LAB];
 
 export interface FootprintHit {
   ok: boolean;
@@ -116,10 +161,10 @@ export function checkFootprint(
  */
 export function stampBarracks(
   world: VoxelWorld,
-  spec: BuildingSpec,
   ox: number, oz: number,
   floorY: number,
 ): number {
+  const spec = BARRACKS;
   const wxStart = ox * NAV_CELL_VOXELS;
   const wzStart = oz * NAV_CELL_VOXELS;
   const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
@@ -128,7 +173,7 @@ export function stampBarracks(
   const yRoof = floorY + spec.headroomVoxels;
 
   let wallCount = 0;
-  // Door: a 2-voxel-wide, 6-voxel-tall opening centered on the +X wall at (wxEnd-1, .., wzMid).
+  // Door: a 2-voxel-wide, 6-voxel-tall opening centered on the +X wall.
   const doorWz0 = ((wzStart + wzEnd) >> 1) - 1;
   const doorWz1 = doorWz0 + 1;
   const doorYTop = yFloor + 6;
@@ -167,8 +212,277 @@ export function stampBarracks(
 }
 
 /**
+ * Power plant: stone perimeter walls, M_DIRT_ROAD tiled floor, a recessed second-tier
+ * crown around the parapet, and a stout wood pylon column stub at the centre of the
+ * roof. The pylon stub is what the renderer's wind-turbine accessory bolts to.
+ */
+export function stampPowerPlant(
+  world: VoxelWorld,
+  ox: number, oz: number,
+  floorY: number,
+): number {
+  const spec = POWER_PLANT;
+  const wxStart = ox * NAV_CELL_VOXELS;
+  const wzStart = oz * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const yFloor = floorY + 1;
+  const yRoof = floorY + spec.headroomVoxels;
+  // Door on +X face.
+  const doorWz0 = ((wzStart + wzEnd) >> 1) - 1;
+  const doorWz1 = doorWz0 + 1;
+  const doorYTop = yFloor + 6;
+
+  let wallCount = 0;
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      // Floor: dirt-road tiles for visual contrast vs barracks wood floor.
+      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
+        world.set(x, yFloor, z, M_DIRT_ROAD);
+        wallCount++;
+      }
+      for (let y = yFloor + 1; y <= yRoof; y++) {
+        if (y >= WORLD_Y) break;
+        const onPerimeter =
+          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+        if (y === yRoof) {
+          world.set(x, y, z, spec.wall);
+          wallCount++;
+        } else if (onPerimeter) {
+          const isDoor = (x === wxEnd - 1 && (z === doorWz0 || z === doorWz1) && y < doorYTop);
+          if (!isDoor) {
+            world.set(x, y, z, spec.wall);
+            wallCount++;
+          } else {
+            world.set(x, y, z, AIR);
+          }
+        } else {
+          world.set(x, y, z, AIR);
+        }
+      }
+    }
+  }
+
+  // Crown parapet: a 2-voxel-tall ring of M_STONE on top of the roof, inset 2
+  // voxels from each edge. Reads as a flat-roofed industrial building.
+  const parapetInset = 2;
+  const parapetH = 2;
+  for (let dy = 1; dy <= parapetH; dy++) {
+    const py = yRoof + dy;
+    if (py >= WORLD_Y) break;
+    for (let z = wzStart + parapetInset; z < wzEnd - parapetInset; z++) {
+      for (let x = wxStart + parapetInset; x < wxEnd - parapetInset; x++) {
+        const onParapet =
+          x === wxStart + parapetInset || x === wxEnd - parapetInset - 1 ||
+          z === wzStart + parapetInset || z === wzEnd - parapetInset - 1;
+        if (!onParapet) continue;
+        world.set(x, py, z, spec.wall);
+        wallCount++;
+      }
+    }
+  }
+
+  // Wood turbine pylon stub at the centre — a 2x2 column of M_WOOD, 6 voxels tall,
+  // mounted on top of the roof. The animated turbine head sits above it.
+  const cxv = (wxStart + wxEnd) >> 1;
+  const czv = (wzStart + wzEnd) >> 1;
+  const pylonH = 6;
+  for (let dy = 1; dy <= pylonH; dy++) {
+    const py = yRoof + dy;
+    if (py >= WORLD_Y) break;
+    for (let xo = -1; xo <= 0; xo++) {
+      for (let zo = -1; zo <= 0; zo++) {
+        world.set(cxv + xo, py, czv + zo, M_WOOD);
+        wallCount++;
+      }
+    }
+  }
+  return wallCount;
+}
+
+/**
+ * Metal refinery: a long rectangular hall with a stepped chimney rising above the
+ * back-left corner. The chimney is a 2x2 stone column; visible smoke is drawn by the
+ * BuildingRenderer.
+ */
+export function stampRefinery(
+  world: VoxelWorld,
+  ox: number, oz: number,
+  floorY: number,
+): number {
+  const spec = REFINERY;
+  const wxStart = ox * NAV_CELL_VOXELS;
+  const wzStart = oz * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const yFloor = floorY + 1;
+  const yRoof = floorY + spec.headroomVoxels;
+  const doorWz0 = ((wzStart + wzEnd) >> 1) - 1;
+  const doorWz1 = doorWz0 + 1;
+  const doorYTop = yFloor + 6;
+
+  let wallCount = 0;
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      // Stone floor.
+      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
+        world.set(x, yFloor, z, M_STONE);
+        wallCount++;
+      }
+      for (let y = yFloor + 1; y <= yRoof; y++) {
+        if (y >= WORLD_Y) break;
+        const onPerimeter =
+          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+        if (y === yRoof) {
+          world.set(x, y, z, spec.wall);
+          wallCount++;
+        } else if (onPerimeter) {
+          const isDoor = (x === wxEnd - 1 && (z === doorWz0 || z === doorWz1) && y < doorYTop);
+          if (!isDoor) {
+            world.set(x, y, z, spec.wall);
+            wallCount++;
+          } else {
+            world.set(x, y, z, AIR);
+          }
+        } else {
+          world.set(x, y, z, AIR);
+        }
+      }
+    }
+  }
+
+  // Chimney: a 2x2 stone column rising 24 voxels (~3 m) above the roof, planted at
+  // the back-left corner of the building (interior side of the perimeter so the column
+  // doesn't poke out of the wall).
+  const chimX0 = wxStart + 2;
+  const chimZ0 = wzStart + 2;
+  const chimH = 24;
+  const chimBaseY = yRoof + 1;
+  for (let dy = 0; dy < chimH; dy++) {
+    const py = chimBaseY + dy;
+    if (py >= WORLD_Y) break;
+    for (let xo = 0; xo < 2; xo++) {
+      for (let zo = 0; zo < 2; zo++) {
+        world.set(chimX0 + xo, py, chimZ0 + zo, M_STONE);
+        wallCount++;
+      }
+    }
+  }
+
+  // Loading-bay style hopper: a low wood ramp on the +X side of the building (just
+  // outside the wall, below door height). It's purely cosmetic — just a stack of
+  // M_WOOD voxels making a stepped ramp on the door face.
+  const rampSteps = 4;
+  for (let s = 0; s < rampSteps; s++) {
+    const px = wxEnd + s;
+    if (px >= WORLD_X) break;
+    for (let dy = 0; dy < rampSteps - s; dy++) {
+      const py = yFloor + dy;
+      if (py >= WORLD_Y) break;
+      for (let zo = -1; zo <= 1; zo++) {
+        const pz = ((wzStart + wzEnd) >> 1) + zo;
+        if (pz < 0 || pz >= WORLD_Z) continue;
+        world.set(px, py, pz, M_WOOD);
+        wallCount++;
+      }
+    }
+  }
+  return wallCount;
+}
+
+/**
+ * Tech lab: small square hall with a stepped pyramidal dome on top and a slim wood
+ * antenna mast at the dome's apex. The renderer mounts a sweeping satellite dish
+ * and a pulsing core on the mast.
+ */
+export function stampTechLab(
+  world: VoxelWorld,
+  ox: number, oz: number,
+  floorY: number,
+): number {
+  const spec = TECH_LAB;
+  const wxStart = ox * NAV_CELL_VOXELS;
+  const wzStart = oz * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const yFloor = floorY + 1;
+  const yRoof = floorY + spec.headroomVoxels;
+  const doorWz0 = ((wzStart + wzEnd) >> 1) - 1;
+  const doorWz1 = doorWz0 + 1;
+  const doorYTop = yFloor + 6;
+
+  let wallCount = 0;
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
+        world.set(x, yFloor, z, M_PATH);
+        wallCount++;
+      }
+      for (let y = yFloor + 1; y <= yRoof; y++) {
+        if (y >= WORLD_Y) break;
+        const onPerimeter =
+          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+        if (y === yRoof) {
+          // Roof level — fill solid (this is the base of the dome).
+          world.set(x, y, z, spec.wall);
+          wallCount++;
+        } else if (onPerimeter) {
+          const isDoor = (x === wxEnd - 1 && (z === doorWz0 || z === doorWz1) && y < doorYTop);
+          if (!isDoor) {
+            world.set(x, y, z, spec.wall);
+            wallCount++;
+          } else {
+            world.set(x, y, z, AIR);
+          }
+        } else {
+          world.set(x, y, z, AIR);
+        }
+      }
+    }
+  }
+
+  // Stepped dome: 3 tiers of stone, each one voxel taller and with a smaller footprint.
+  const tiers = 3;
+  for (let t = 1; t <= tiers; t++) {
+    const inset = t * 4; // 4-voxel inset per tier (half a nav cell)
+    const py = yRoof + t * 2;
+    if (py >= WORLD_Y) break;
+    const x0 = wxStart + inset;
+    const x1 = wxEnd - inset;
+    const z0 = wzStart + inset;
+    const z1 = wzEnd - inset;
+    if (x1 <= x0 || z1 <= z0) break;
+    for (let z = z0; z < z1; z++) {
+      for (let x = x0; x < x1; x++) {
+        // Two-voxel-tall tier so the stepping reads at distance.
+        for (let dy = -1; dy <= 0; dy++) {
+          const yy = py + dy;
+          if (yy >= WORLD_Y) continue;
+          world.set(x, yy, z, spec.wall);
+          wallCount++;
+        }
+      }
+    }
+  }
+
+  // Antenna mast: a single-voxel wood column rising 6 voxels above the dome.
+  const cxv = (wxStart + wxEnd) >> 1;
+  const czv = (wzStart + wzEnd) >> 1;
+  const mastBaseY = yRoof + tiers * 2 + 1;
+  const mastH = 6;
+  for (let dy = 0; dy < mastH; dy++) {
+    const py = mastBaseY + dy;
+    if (py >= WORLD_Y) break;
+    world.set(cxv, py, czv, M_WOOD);
+    wallCount++;
+  }
+  return wallCount;
+}
+
+/**
  * Sample wall voxels and return roughly how many remain. Used for "destroyed" check.
- * Cheap: only checks perimeter columns.
+ * Cheap: only checks perimeter columns of the main hall (ignores chimneys / domes —
+ * those are accents, the building is "alive" while the perimeter still stands).
  */
 export function countLivingWalls(world: VoxelWorld, b: Building): number {
   const wxStart = b.ox * NAV_CELL_VOXELS;
@@ -209,7 +523,7 @@ export class BuildingManager {
   spawner: ((kind: UnitKind, x: number, y: number, z: number) => Unit | null) | null = null;
 
   place(world: VoxelWorld, spec: BuildingSpec, ox: number, oz: number, floorY: number): Building {
-    const wallCount = stampBarracks(world, spec, ox, oz, floorY);
+    const wallCount = spec.stamp(world, ox, oz, floorY);
     const b: Building = {
       id: this.nextId++,
       spec,
@@ -228,8 +542,10 @@ export class BuildingManager {
     void units;
     for (const b of this.buildings) {
       if (b.destroyed) continue;
-      // Cheap liveness check every few seconds — count remaining wall voxels.
-      // (Skipped for performance — done lazily on damage.)
+      // Non-producers (power plant, refinery, tech lab) skip the spawn timer entirely
+      // — keeps the tick a no-op for buildings whose only role today is to exist on
+      // the map and be visible.
+      if (b.spec.produces.length === 0 || !isFinite(b.spec.productionInterval)) continue;
 
       b.productionTimer -= dt;
       if (b.productionTimer <= 0) {

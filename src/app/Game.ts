@@ -14,8 +14,9 @@ import { UnitRenderer } from '../render/UnitRenderer';
 import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { worldToVolumeCell, vnavIndex, getBit } from '../path/VolumeNav';
 import { trackDamageFor } from '../voxel/Materials';
-import { BuildingManager, BARRACKS, checkFootprint } from '../sim/Buildings';
+import { BuildingManager, BARRACKS, ALL_BUILDINGS, BuildingSpec, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
+import { BuildingRenderer } from '../render/BuildingRenderer';
 import { PathPreview } from '../render/PathPreview';
 import { TargetMarker } from '../render/TargetMarker';
 
@@ -31,7 +32,10 @@ export class Game {
   readonly units = new UnitManager();
   readonly unitRenderer = new UnitRenderer();
   readonly buildings = new BuildingManager();
+  readonly buildingRenderer = new BuildingRenderer();
   readonly ghost = new BuildingGhost();
+  /** The spec the user will place next while in build mode. Cycled via 1..N keys. */
+  private buildSpec: BuildingSpec = BARRACKS;
   readonly pathPreview = new PathPreview();
   readonly target = new TargetMarker();
   pathClient: PathClient | null = null;
@@ -66,10 +70,11 @@ export class Game {
     this.debris = new DebrisParticles(4096);
     this.renderer.scene.add(this.debris.mesh);
     this.renderer.scene.add(this.unitRenderer.group);
+    this.renderer.scene.add(this.buildingRenderer.group);
     this.renderer.scene.add(this.ghost.group);
     this.renderer.scene.add(this.pathPreview.object);
     this.renderer.scene.add(this.target.group);
-    this.ghost.setSpec(BARRACKS);
+    this.ghost.setSpec(this.buildSpec);
 
     this.buildings.spawner = (kind, x, y, z): Unit | null => this.spawnUnit(kind, x, y, z);
 
@@ -147,6 +152,17 @@ export class Game {
       this.mode = 'play';
       this.ghost.hide();
     }
+    // Cycle building spec via Digit1..Digit{ALL_BUILDINGS.length}. Works in either
+    // mode — pressing a digit also enters build mode so the user doesn't have to
+    // hit B first.
+    for (let i = 0; i < ALL_BUILDINGS.length; i++) {
+      const code = `Digit${i + 1}`;
+      if (this.input.pressed.has(code)) {
+        this.buildSpec = ALL_BUILDINGS[i]!;
+        this.ghost.setSpec(this.buildSpec);
+        this.mode = 'build';
+      }
+    }
     if (this.input.pressed.has('Tab')) this.cycleSelection();
 
     if (this.mode === 'build') {
@@ -165,6 +181,7 @@ export class Game {
       this.paintTankTracks();
     }
     this.unitRenderer.update(this.units);
+    this.buildingRenderer.update(this.buildings.buildings);
 
     // Dashed path preview for the selected unit (if any).
     const sel = this.units.units.find(u => u.selected);
@@ -189,7 +206,10 @@ export class Game {
     if (this.modeEl) {
       const sel = this.units.units.find(u => u.selected);
       const selDesc = sel ? `${sel.kind} #${sel.id}` : 'none';
-      this.modeEl.textContent = `${this.mode === 'build' ? 'MODE: BUILD (LMB place, Esc cancel)' : 'MODE: PLAY'} | selected: ${selDesc}`;
+      const buildDesc = this.mode === 'build'
+        ? `MODE: BUILD ${this.buildSpec.label} (LMB place, 1-${ALL_BUILDINGS.length} cycle, Esc cancel)`
+        : 'MODE: PLAY';
+      this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}`;
     }
   }
 
@@ -218,9 +238,10 @@ export class Game {
     const wx = hit.x * VOXEL_SIZE;
     const wz = hit.z * VOXEL_SIZE;
     const cell = this.pathClient.cellAt(wx, wz);
-    const ox = Math.max(0, Math.min(NAV_W - BARRACKS.cellsW, cell.cx - (BARRACKS.cellsW >> 1)));
-    const oz = Math.max(0, Math.min(NAV_H - BARRACKS.cellsD, cell.cz - (BARRACKS.cellsD >> 1)));
-    const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, BARRACKS, ox, oz);
+    const spec = this.buildSpec;
+    const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
+    const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
+    const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, spec, ox, oz);
     this.ghost.place(ox, oz, fp.floorY >= 0 ? fp.floorY : hit.y, fp.ok);
   }
 
@@ -335,11 +356,12 @@ export class Game {
     const wx = hit.x * VOXEL_SIZE;
     const wz = hit.z * VOXEL_SIZE;
     const cell = this.pathClient.cellAt(wx, wz);
-    const ox = Math.max(0, Math.min(NAV_W - BARRACKS.cellsW, cell.cx - (BARRACKS.cellsW >> 1)));
-    const oz = Math.max(0, Math.min(NAV_H - BARRACKS.cellsD, cell.cz - (BARRACKS.cellsD >> 1)));
-    const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, BARRACKS, ox, oz);
+    const spec = this.buildSpec;
+    const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
+    const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
+    const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, spec, ox, oz);
     if (!fp.ok) return;
-    this.buildings.place(this.world, BARRACKS, ox, oz, fp.floorY);
+    this.buildings.place(this.world, spec, ox, oz, fp.floorY);
     this.requestNavRebuild();
   }
 

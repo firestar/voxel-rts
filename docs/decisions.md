@@ -154,6 +154,25 @@ obstacles make the off-road option costlier, the bias kicks in. Tests cover
 the wiring (nav.road population, on-road paths stay on the road, per-edge
 cost shape) rather than asserting an idealised detour.
 
+## Building stamps live on the spec; animations are separate THREE accessories
+
+Each `BuildingSpec` in `src/sim/Buildings.ts` carries its own `stamp` function.
+The barracks keeps its hollow-box stamp; the new power plant, refinery, and
+tech lab each have their own that produces a more architectural shape (parapet
+crowns, stepped chimneys, domed roofs). Liveness still uses
+`countLivingWalls` over the main hall perimeter — accessory voxels (chimneys,
+domes) don't gate "destroyed", so blowing the chimney off a refinery doesn't
+flip it to ruined.
+
+Animated accessories — the wind-turbine blades on the power plant, smoke puffs
+from the refinery chimney, and the sweeping satellite dish + pulsing core on
+the tech lab — live in `BuildingRenderer` as `InstancedMesh` parts that draw
+on top of the static voxel structure. They are NOT voxel-level animation
+because per-frame voxel writes would dirty chunks and trigger remeshing every
+frame; the THREE.js layer is the right place for cosmetic motion. Accessory
+parts are skipped for destroyed buildings, so they vanish when a building's
+walls fall.
+
 ## Test-driven for sim behaviour
 
 If a behavior isn't covered by an existing test and we want to confirm it,
