@@ -1,5 +1,6 @@
 import { WORLD_X, WORLD_Z } from './types';
 import { VoxelWorld } from './VoxelWorld';
+import { placeTrees } from './Trees';
 
 import WorldgenWorker from '../workers/worldgen.worker?worker';
 
@@ -57,5 +58,9 @@ export async function generateWorld(
 
   await Promise.all(done);
   for (const w of workers) w.terminate();
+  // Trees on the main thread, after the parallel workers — placement walks the
+  // entire world and writes wood + leaf voxels around each candidate. Doing it
+  // here (post-merge) avoids race conditions on canopies that cross worker slabs.
+  placeTrees(world.buffers.voxels, seed);
   world.markAllDirty();
 }
