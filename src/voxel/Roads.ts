@@ -62,6 +62,8 @@ export interface RoadGenStats {
   pathCells: number;
   branchSegments: number;
   branchCells: number;
+  /** 1 byte per voxel column (z * WORLD_X + x). 1 = column was paved. */
+  columnMask: Uint8Array;
 }
 
 interface POI { cx: number; cz: number; }
@@ -78,9 +80,13 @@ interface RoadGrid {
  */
 export function placeRoads(voxels: Uint8Array, seed: number): RoadGenStats {
   const grid = buildRoadGrid(voxels);
+  const columnMask = new Uint8Array(WORLD_X * WORLD_Z);
   const pois = pickPOIs(grid, voxels, seed);
   if (pois.length < 2) {
-    return { poiCount: pois.length, pathSegments: 0, pathCells: 0, branchSegments: 0, branchCells: 0 };
+    return {
+      poiCount: pois.length, pathSegments: 0, pathCells: 0,
+      branchSegments: 0, branchCells: 0, columnMask,
+    };
   }
 
   // Trunk: paved between consecutive POIs.
@@ -91,7 +97,7 @@ export function placeRoads(voxels: Uint8Array, seed: number): RoadGenStats {
     const b = pois[k + 1]!;
     const cellsPath = aStarRoad(grid, a.cx, a.cz, b.cx, b.cz);
     if (cellsPath.length < 2) continue;
-    stampRoadFlat(voxels, grid, cellsPath, M_PATH);
+    stampRoadFlat(voxels, grid, cellsPath, M_PATH, columnMask);
     segments++;
     cells += cellsPath.length;
   }
@@ -106,7 +112,7 @@ export function placeRoads(voxels: Uint8Array, seed: number): RoadGenStats {
       if (!target) continue;
       const cellsPath = aStarRoad(grid, poi.cx, poi.cz, target.cx, target.cz);
       if (cellsPath.length < 2) continue;
-      stampRoadFlat(voxels, grid, cellsPath, M_DIRT_ROAD);
+      stampRoadFlat(voxels, grid, cellsPath, M_DIRT_ROAD, columnMask);
       branchSegs++;
       branchCells += cellsPath.length;
     }
@@ -118,7 +124,35 @@ export function placeRoads(voxels: Uint8Array, seed: number): RoadGenStats {
     pathCells: cells,
     branchSegments: branchSegs,
     branchCells: branchCells,
+    columnMask,
   };
+}
+
+/**
+ * Clear any wood/leaf voxels sitting above road columns. Called after
+ * tree placement so a canopy that drifted across a road gets trimmed
+ * back, leaving the road open to the sky.
+ */
+export function clearAboveRoads(voxels: Uint8Array, columnMask: Uint8Array): void {
+  for (let z = 0; z < WORLD_Z; z++) {
+    for (let x = 0; x < WORLD_X; x++) {
+      if (!columnMask[z * WORLD_X + x]) continue;
+      // Find the road surface y by scanning down past any tree voxels.
+      let surfY = -1;
+      for (let y = WORLD_Y - 1; y >= 1; y--) {
+        const m = voxels[worldIndex(x, y, z)]!;
+        if (m === AIR || m === M_WOOD || m === M_LEAF) continue;
+        surfY = y;
+        break;
+      }
+      if (surfY < 0) continue;
+      for (let y = surfY + 1; y < WORLD_Y; y++) {
+        const idx = worldIndex(x, y, z);
+        const m = voxels[idx]!;
+        if (m === M_WOOD || m === M_LEAF) voxels[idx] = AIR;
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +336,13 @@ function aStarRoad(grid: RoadGrid, sx: number, sz: number, gx: number, gz: numbe
  * width across travel. Any voxels above the surface in the footprint are
  * carved to AIR (cut), any below are filled with `material` (fill).
  */
-function stampRoadFlat(voxels: Uint8Array, grid: RoadGrid, cells: POI[], material: number): void {
+function stampRoadFlat(
+  voxels: Uint8Array,
+  grid: RoadGrid,
+  cells: POI[],
+  material: number,
+  columnMask: Uint8Array,
+): void {
   const n = cells.length;
   if (n < 2) return;
 
@@ -353,7 +393,12 @@ function stampRoadFlat(voxels: Uint8Array, grid: RoadGrid, cells: POI[], materia
     tdx /= tlen; tdz /= tlen;
     // Perpendicular.
     const px = -tdz, pz = tdx;
-    stampFlatSection(voxels, cell, targetY[k]!, tdx, tdz, px, pz, material);
+    stampFlatSection(voxels, cell, targetY[k]!, tdx, tdz, px, pz, material, columnMask);
+    // Disc stamp at the cell centre. The rectangular ribbon above leaves
+    // notches on the inside/outside of sharp turns because consecutive
+    // cells stamp rectangles aligned to different travel directions; the
+    // disc fills those notches and keeps the road continuous.
+    stampDisc(voxels, cell, targetY[k]!, material, columnMask);
   }
 }
 
@@ -364,20 +409,44 @@ function stampFlatSection(
   tdx: number, tdz: number,
   px: number, pz: number,
   material: number,
+  columnMask: Uint8Array,
 ): void {
   const cxw = cell.cx * C + (C >> 1);
   const czw = cell.cz * C + (C >> 1);
   // Sub-sample length and width at voxel resolution. Length covers one cell
   // (8 voxels). Width is 2*ROAD_HALF_VOXELS+1.
   const halfLen = C / 2; // 4 voxels each side of cell centre = 1 m total
-  // Track seen voxel columns this cell to avoid double-writes (cheap dedup
-  // via a set keyed on (x,z)).
   for (let li = -halfLen; li < halfLen; li++) {
     for (let ni = -ROAD_HALF_VOXELS; ni <= ROAD_HALF_VOXELS; ni++) {
       const wx = Math.round(cxw + tdx * (li + 0.5) + px * ni);
       const wz = Math.round(czw + tdz * (li + 0.5) + pz * ni);
       if (wx < 0 || wz < 0 || wx >= WORLD_X || wz >= WORLD_Z) continue;
       paveColumn(voxels, wx, wz, ty, material);
+      columnMask[wz * WORLD_X + wx] = 1;
+    }
+  }
+}
+
+function stampDisc(
+  voxels: Uint8Array,
+  cell: POI,
+  ty: number,
+  material: number,
+  columnMask: Uint8Array,
+): void {
+  const cxw = cell.cx * C + (C >> 1);
+  const czw = cell.cz * C + (C >> 1);
+  const r = ROAD_HALF_VOXELS;
+  const r2 = r * r;
+  for (let dz = -r; dz <= r; dz++) {
+    const wz = czw + dz;
+    if (wz < 0 || wz >= WORLD_Z) continue;
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dz * dz > r2) continue;
+      const wx = cxw + dx;
+      if (wx < 0 || wx >= WORLD_X) continue;
+      paveColumn(voxels, wx, wz, ty, material);
+      columnMask[wz * WORLD_X + wx] = 1;
     }
   }
 }

@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { placeRoads } from '../src/voxel/Roads';
+import { placeRoads, clearAboveRoads } from '../src/voxel/Roads';
 import { VoxelWorld, worldIndex } from '../src/voxel/VoxelWorld';
-import { WORLD_X, WORLD_Z } from '../src/voxel/types';
-import { M_GRASS, M_PATH, M_DIRT, M_DIRT_ROAD } from '../src/voxel/Materials';
+import { WORLD_X, WORLD_Y, WORLD_Z, AIR } from '../src/voxel/types';
+import { M_GRASS, M_PATH, M_DIRT, M_DIRT_ROAD, M_LEAF, M_WOOD } from '../src/voxel/Materials';
 import { allocateNav, buildSurfaceNav, navIndex, NAV_W, NAV_H, NAV_CELL_VOXELS } from '../src/path/SurfaceNav';
 import { findPathSurface, AStarWorkspace } from '../src/path/AStar';
 
@@ -377,5 +377,64 @@ describe('road geometry', () => {
     }
     expect(pavedCells).toBeGreaterThan(0);
     expect(dirtCells).toBeGreaterThan(0);
+  });
+
+  it('every paved column has road material at its surface (no air gaps)', () => {
+    // The stamp fills the road as discs+ribbons. Every voxel column the
+    // generator marked as road must actually have road material on top —
+    // otherwise the visible surface has notches/holes (the original turn-gap
+    // bug stamped only thin rectangles, leaving voxel columns inside the
+    // road footprint with grass on top).
+    const w = buildGrassPlane();
+    const v = w.buffers.voxels;
+    const stats = placeRoads(v, 1234);
+    let mismatches = 0;
+    for (let z = 0; z < WORLD_Z; z++) {
+      for (let x = 0; x < WORLD_X; x++) {
+        if (!stats.columnMask[z * WORLD_X + x]) continue;
+        // Topmost solid voxel must be road.
+        let top = -1;
+        for (let y = WORLD_Y - 1; y >= 1; y--) {
+          if (v[worldIndex(x, y, z)] !== 0) { top = v[worldIndex(x, y, z)]!; break; }
+        }
+        if (top !== M_PATH && top !== M_DIRT_ROAD) mismatches++;
+      }
+    }
+    expect(mismatches).toBe(0);
+  });
+});
+
+describe('clearAboveRoads', () => {
+  it('clears wood/leaf voxels above road columns but leaves the road surface intact', () => {
+    const w = buildGrassPlane();
+    const v = w.buffers.voxels;
+    const stats = placeRoads(v, 4242);
+
+    // Drop a leaf and a wood voxel above a paved column to simulate a tree
+    // canopy that drifted across the road.
+    let chosenX = -1, chosenZ = -1, chosenY = -1;
+    for (let z = 0; z < WORLD_Z && chosenX < 0; z++) {
+      for (let x = 0; x < WORLD_X && chosenX < 0; x++) {
+        if (!stats.columnMask[z * WORLD_X + x]) continue;
+        for (let y = WORLD_Y - 1; y >= 1; y--) {
+          const m = v[worldIndex(x, y, z)]!;
+          if (m === AIR) continue;
+          if (m === M_PATH || m === M_DIRT_ROAD) {
+            chosenX = x; chosenZ = z; chosenY = y;
+          }
+          break;
+        }
+      }
+    }
+    expect(chosenX).toBeGreaterThanOrEqual(0);
+    v[worldIndex(chosenX, chosenY + 3, chosenZ)] = M_LEAF;
+    v[worldIndex(chosenX, chosenY + 5, chosenZ)] = M_WOOD;
+
+    clearAboveRoads(v, stats.columnMask);
+
+    // Surface road voxel still there; tree voxels above are gone.
+    expect(v[worldIndex(chosenX, chosenY, chosenZ)]).toBe(M_PATH);
+    expect(v[worldIndex(chosenX, chosenY + 3, chosenZ)]).toBe(AIR);
+    expect(v[worldIndex(chosenX, chosenY + 5, chosenZ)]).toBe(AIR);
   });
 });
