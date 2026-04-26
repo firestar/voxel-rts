@@ -13,7 +13,7 @@ import { UnitManager, Unit, UnitKind, CarveRequest } from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
 import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { worldToVolumeCell } from '../path/VolumeNav';
-import { M_GRASS, M_DIRT } from '../voxel/Materials';
+import { trackDamageFor } from '../voxel/Materials';
 import { BuildingManager, BARRACKS, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { PathPreview } from '../render/PathPreview';
@@ -424,23 +424,24 @@ export class Game {
   }
 
   /**
-   * For every tank that's traveled at least TANK_TRACK_INTERVAL meters since its last mark,
-   * paint a small patch of grass voxels to dirt under each tread. This is cosmetic — voxel
-   * heights don't change, so we don't need a nav rebuild; the chunk gets remeshed via the
-   * usual dirty-chunk pump.
+   * For every tank that's traveled at least TANK_TRACK_INTERVAL metres since its last
+   * mark, fire a small damageSphere under each tread keyed off the surface material.
+   * Soft ground (mud) accumulates damage fast and the top voxel disappears within a
+   * pass or two, so the tank visibly sinks. Grass takes a few passes before grooves
+   * expose dirt below. Stone/wood/etc. are not affected (peak === 0).
    */
   private paintTankTracks(): void {
     if (!this.pathClient) return;
-    const TANK_TRACK_INTERVAL = 0.4;     // m
-    const TANK_TREAD_OFFSET = 1.20;      // half-spacing between treads, in m (matches model)
-    const TANK_TREAD_HALF_VOXELS = 2;    // tread paints a 4x4 voxel swath
+    const TANK_TRACK_INTERVAL = 0.4;     // m between tread marks
+    const TANK_TREAD_OFFSET = 1.20;      // half-spacing between treads, m (matches model)
     const nav = this.pathClient.nav;
-    const voxels = this.world.buffers.voxels;
+    let anythingDestroyed = false;
+
     for (const u of this.units.units) {
       if (u.kind !== 'tank') continue;
       if (u.distanceWalked - u.lastTrackDistance < TANK_TRACK_INTERVAL) continue;
       u.lastTrackDistance = u.distanceWalked;
-      // Right vector for heading h where forward = (-sin h, -cos h):  right = (cos h, -sin h).
+      // forward = (-sin h, -cos h);  right = (cos h, -sin h).
       const ch = Math.cos(u.heading);
       const sh = Math.sin(u.heading);
       const rx = ch, rz = -sh;
@@ -452,27 +453,41 @@ export class Game {
         if (cx < 0 || cz < 0 || cx >= NAV_W || cz >= NAV_H) continue;
         const top = nav.topY[navIndex(cx, cz)]!;
         if (top < 0) continue;
+
+        // Sample the actual top voxel under the tread (not just cell-average) to pick a
+        // recipe — sloped ground varies across an 8-voxel cell.
         const baseX = Math.floor(wx / VOXEL_SIZE);
         const baseZ = Math.floor(wz / VOXEL_SIZE);
-        for (let dz = -TANK_TREAD_HALF_VOXELS; dz < TANK_TREAD_HALF_VOXELS; dz++) {
-          for (let dx = -TANK_TREAD_HALF_VOXELS; dx < TANK_TREAD_HALF_VOXELS; dx++) {
-            const x = baseX + dx;
-            const z = baseZ + dz;
-            // Per-column topY: scan a few voxels around the cell-level top so sloped ground
-            // gets painted on the right voxel rather than always at the cell's average top.
-            for (let yProbe = top + 2; yProbe >= top - 2 && yProbe >= 0; yProbe--) {
-              const m = this.world.get(x, yProbe, z);
-              if (m === 0) continue;
-              if (m === M_GRASS) {
-                this.world.set(x, yProbe, z, M_DIRT);
-              }
-              break;
-            }
-          }
+        let surfaceY = top;
+        let surfaceMat = 0;
+        for (let yProbe = top + 2; yProbe >= top - 2 && yProbe >= 0; yProbe--) {
+          const m = this.world.get(baseX, yProbe, baseZ);
+          if (m === 0) continue;
+          surfaceY = yProbe;
+          surfaceMat = m;
+          break;
         }
+        if (surfaceMat === 0) continue;
+
+        const recipe = trackDamageFor(surfaceMat);
+        if (recipe.peak <= 0 || recipe.radiusMeters <= 0) continue;
+
+        // damageSphere takes voxel-space coords; centre slightly above the top voxel so
+        // the falloff bites the topmost layer hardest.
+        const cxv = (baseX + 0.5);
+        const cyv = surfaceY + 0.5;
+        const czv = (baseZ + 0.5);
+        const result = this.world.damageSphere(
+          cxv, cyv, czv,
+          recipe.radiusMeters / VOXEL_SIZE,
+          recipe.peak,
+        );
+        if (result.destroyed.length > 0) anythingDestroyed = true;
       }
     }
-    void voxels;
+    // Only request a nav rebuild when track damage actually removed voxels (changed
+    // topY); a no-op pass over compacted grass/dirt just bumps damage counters.
+    if (anythingDestroyed) this.requestNavRebuild(false);
   }
 
   /** World-space Y (meters) of the topY voxel under the given world-space (x, z). */

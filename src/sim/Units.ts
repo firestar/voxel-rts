@@ -1,7 +1,7 @@
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { VOXEL_SIZE, WORLD_X, WORLD_Y, WORLD_Z, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
-import { digSpeedMultiplier } from '../voxel/Materials';
+import { digSpeedMultiplier, groundSpeedMultiplier } from '../voxel/Materials';
 import {
   worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers, VNAV_CELL_METERS,
   VNAV_X, VNAV_Y, VNAV_Z,
@@ -263,7 +263,14 @@ export class UnitManager {
     u.heading += clamp(angDiff, -turnStep, turnStep);
 
     const align = Math.max(0, Math.cos(Math.abs(angDiff)));
-    const step = u.speed * align * dt;
+    // Surface material under the unit modulates speed — mud bogs vehicles down, paths
+    // give a small bonus. Sample the cell-level top material; for soldiers this barely
+    // matters but is consistent with the tank/tunneler.
+    const cx0 = Math.max(0, Math.min(NAV_W - 1, Math.floor(u.x / NAV_CELL_METERS)));
+    const cz0 = Math.max(0, Math.min(NAV_H - 1, Math.floor(u.z / NAV_CELL_METERS)));
+    const groundMat = nav.material[navIndex(cx0, cz0)]!;
+    const groundMult = groundSpeedMultiplier(groundMat);
+    const step = u.speed * align * groundMult * dt;
 
     let moved = 0;
     if (step >= d) {

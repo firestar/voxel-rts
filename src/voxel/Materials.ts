@@ -17,6 +17,9 @@ export const MATERIALS: Material[] = [
   { id: 5, name: 'leaf',   hp: 15,  r: 47,  g: 106, b: 42  },
   { id: 6, name: 'path',   hp: 35,  r: 184, g: 160, b: 106 },
   { id: 7, name: 'bedrock', hp: 0,  r: 40,  g: 40,  b: 50  },
+  // Mud — soft and dark, sucks vehicles in. Hp deliberately low so each tread pass
+  // chews through it quickly.
+  { id: 8, name: 'mud',    hp: 10,  r: 70,  g: 52,  b: 28  },
 ];
 
 export const M_AIR = 0;
@@ -27,6 +30,7 @@ export const M_WOOD = 4;
 export const M_LEAF = 5;
 export const M_PATH = 6;
 export const M_BEDROCK = 7;
+export const M_MUD = 8;
 
 // Flat RGBA palette (length = MATERIALS.length * 4) for fast worker lookup.
 export function materialColors(): Uint8Array {
@@ -55,6 +59,7 @@ export function digSpeedMultiplier(m: MaterialId): number {
   switch (m) {
     case M_AIR:     return 1.0;
     case M_LEAF:    return 1.4;  // very soft
+    case M_MUD:     return 1.3;  // soft, sloppy — easy to push through
     case M_DIRT:    return 1.0;  // baseline
     case M_GRASS:   return 0.95; // grass + topsoil
     case M_PATH:    return 0.85; // compacted dirt
@@ -62,5 +67,45 @@ export function digSpeedMultiplier(m: MaterialId): number {
     case M_STONE:   return 0.30; // hard — really slows the dig
     case M_BEDROCK: return 0;    // can't be cut
     default:        return 0.5;  // unknown = play safe
+  }
+}
+
+/**
+ * Per-material multiplier on a surface unit's movement speed. Soft ground (mud)
+ * bogs vehicles down; paths give a small bonus. Returns 1.0 for materials that
+ * shouldn't matter (air, stone — vehicles aren't on stone surfaces typically).
+ */
+export function groundSpeedMultiplier(m: MaterialId): number {
+  switch (m) {
+    case M_MUD:   return 0.4;   // sinks in mud
+    case M_GRASS: return 1.0;   // baseline
+    case M_DIRT:  return 1.0;
+    case M_PATH:  return 1.15;  // fastest — a beaten road
+    case M_LEAF:  return 0.9;   // soft canopy underfoot
+    case M_STONE: return 0.95;  // bare rock is slightly less grippy
+    default:      return 1.0;
+  }
+}
+
+/**
+ * Per-material recipe for a tank tread mark. `peak` feeds damageSphere; voxels
+ * accumulate damage across passes and are removed once their HP is exceeded, so
+ * a tank rolling over mud actually sinks (top voxel disappears, tank Y drops).
+ * radiusMeters is the carve radius. peak === 0 means the material doesn't take
+ * track marks (stone, bedrock).
+ */
+export interface TrackMark { peak: number; radiusMeters: number; }
+export function trackDamageFor(m: MaterialId): TrackMark {
+  switch (m) {
+    // Mud: each pass kills a swathe of voxels — tank quickly sinks in.
+    case M_MUD:   return { peak: 14, radiusMeters: 0.4 };
+    // Grass: light grooves; takes ~6 passes to expose dirt below.
+    case M_GRASS: return { peak: 6,  radiusMeters: 0.3 };
+    // Dirt: very faint grooves, ~12 passes.
+    case M_DIRT:  return { peak: 3,  radiusMeters: 0.25 };
+    // Path: well-trodden, almost no marks.
+    case M_PATH:  return { peak: 1,  radiusMeters: 0.2 };
+    // Anything else (stone, bedrock, wood, leaf): no track marks.
+    default:      return { peak: 0,  radiusMeters: 0 };
   }
 }

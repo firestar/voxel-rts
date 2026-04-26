@@ -4,7 +4,8 @@ import {
   WORLD_X, WORLD_Y, WORLD_Z, CHUNK_COUNT,
 } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
-import { M_AIR, M_GRASS, M_DIRT, M_STONE, M_BEDROCK } from '../voxel/Materials';
+import { M_AIR, M_GRASS, M_DIRT, M_STONE, M_BEDROCK, M_MUD } from '../voxel/Materials';
+import { fbm2 } from '../util/Noise';
 
 interface GenJob {
   voxels: Uint8Array;        // shared
@@ -60,6 +61,23 @@ function generate(job: GenJob): void {
         else voxels[idx] = M_DIRT;
       }
       voxels[worldIndex(x, grassY, z)] = M_GRASS;
+
+      // Mud patches: low-elevation cells with high "moisture" become mud at the very
+      // top. This swaps the grass voxel out for mud and replaces the next 1–2 dirt
+      // voxels below with more mud, so a tank rolling through can sink several voxels
+      // before it bottoms out on dirt.
+      const elevationT = (h - baseHeight) / heightAmp; // -1 (low) .. +1 (high)
+      const moisture = fbm2(x * (1 / 96), z * (1 / 96), seed + 4099, 3);
+      // Mud iff elevation is below average AND moisture noise is positive enough.
+      if (elevationT < -0.15 && moisture > 0.05) {
+        voxels[worldIndex(x, grassY, z)] = M_MUD;
+        const mudDepth = 1 + Math.floor((moisture - 0.05) * 6); // 1..3 voxels of mud
+        for (let dy = 1; dy <= mudDepth; dy++) {
+          const yy = grassY - dy;
+          if (yy <= stoneTopY) break;
+          voxels[worldIndex(x, yy, z)] = M_MUD;
+        }
+      }
 
       // Above terrain: air (already zero).
 
