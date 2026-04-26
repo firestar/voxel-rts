@@ -36,9 +36,11 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       };
     case 'tank':
       // Big, capable on rough ground, can use existing tunnels but never digs.
+      // Surface pather no longer gates on flatness; climb step is the sole gate.
+      // Bumped climb to 8 (1 m) so tanks don't stall on natural rolling hills.
       return {
         footprintRadius: 2, widthMeters: 2.4,
-        maxStepVoxels: 6, slopePenalty: 0.25,
+        maxStepVoxels: 8, slopePenalty: 0.15,
         canDig: false, requiresGround: true,
         speed: 3.5, speedDigging: 0,
         hp: 220,

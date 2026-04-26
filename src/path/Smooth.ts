@@ -1,18 +1,9 @@
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H } from './SurfaceNav';
 
 /**
- * Effective flatness threshold used when probing intermediate cells. Always one less than
- * the unit's full footprint requirement — A* already proved a footprint-strict path exists,
- * so the smoother is allowed to nibble through "almost flat" cells to straighten it out.
- */
-function smoothingThreshold(footprintRadius: number): number {
-  return Math.max(0, footprintRadius - 1);
-}
-
-/**
  * String-pulling: walk a line between two cells using a 2D Bresenham-style supercover and
- * return false the moment any sampled cell is impassable for a unit with the given footprint
- * and step limit. Uses the relaxed flatness threshold so larger units get longer segments.
+ * return false the moment any sampled cell is impassable for a unit with the given step
+ * limit. Surface pathing relies on climb-step alone; flatness is no longer gated here.
  */
 function navLineClear(
   nav: SurfaceNavBuffers,
@@ -30,11 +21,9 @@ function navLineClear(
   let err = dx - dz;
   const startTopY = nav.topY[navIndex(x0, z0)]!;
   let prevY = startTopY;
-  const flatThresh = smoothingThreshold(footprintRadius);
-  const isAgile = footprintRadius <= 1;
 
-  // Larger units may roll over a slightly bigger ledge between adjacent cells than they'd
-  // accept for a fresh A* expansion — we know the surrounding terrain is path-feasible.
+  // Larger units get a slightly more generous step limit since A* already verified a
+  // climb-feasible cardinal path through the surrounding terrain.
   const stepLimit = maxStepVoxels + (footprintRadius >= 2 ? 2 : 0);
 
   const guard = dx + dz + 2;
@@ -42,7 +31,6 @@ function navLineClear(
     if (x0 < 0 || z0 < 0 || x0 >= NAV_W || z0 >= NAV_H) return false;
     const idx = navIndex(x0, z0);
     if (nav.blocked[idx]) return false;
-    if (!isAgile && nav.flatness[idx]! < flatThresh) return false;
     const y = nav.topY[idx]!;
     if (Math.abs(y - prevY) > stepLimit) return false;
     prevY = y;

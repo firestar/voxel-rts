@@ -65,7 +65,8 @@ export function findPathSurface(
   req: AStarRequest,
 ): AStarResult {
   const gen = ws.resetGeneration();
-  const { startCx, startCz, goalCx, goalCz, footprintRadius, prefersRoads, maxStepVoxels, slopePenalty } = req;
+  const { startCx, startCz, goalCx, goalCz, prefersRoads, maxStepVoxels, slopePenalty } = req;
+  void req.footprintRadius; // currently used only by building placement; surface pathing uses climb-step alone
   const maxExpansions = req.maxExpansions ?? 20000;
 
   const startI = navIndex(startCx, startCz);
@@ -74,18 +75,9 @@ export function findPathSurface(
   if (nav.blocked[startI] || nav.blocked[goalI]) {
     return { cells: [], reached: false, expanded: 0 };
   }
-  // Strict footprint requirement at the goal — but only for vehicle-class units.
-  // Agile units (footprintRadius <= 1) ignore the flatness mechanic entirely; they only
-  // care about `blocked` and the per-step climb limit.
-  const isAgile = footprintRadius <= 1;
-  if (!isAgile && nav.flatness[goalI]! < footprintRadius) {
-    return { cells: [], reached: false, expanded: 0 };
-  }
-
-  // Permissive flatness threshold for intermediate cells. The strict footprint check is
-  // only enforced at the goal — soldiers and tanks are happy to take diagonals through
-  // slightly uneven cells along the way as long as the step-up limit is respected.
-  const passFlat = Math.max(0, footprintRadius - 1);
+  // Flatness was a clearance proxy for vehicles, but maxStepVoxels already gates whether
+  // a unit can physically climb between adjacent cells. Surface pathing relies on the
+  // climb check exclusively now, so the flatness gate is dropped here for everyone.
 
   ws.gScore[startI] = 0;
   ws.gen[startI] = gen;
@@ -113,28 +105,20 @@ export function findPathSurface(
       const ni = navIndex(nx, nz);
       if (ws.closed[ni] === gen) continue;
       if (nav.blocked[ni]) continue;
-      // Vehicle-class units check flatness; agile units (soldiers) only care about climb.
-      if (!isAgile) {
-        const minFlat = ni === goalI ? footprintRadius : passFlat;
-        if (nav.flatness[ni]! < minFlat) continue;
-      }
       // Step-up/down limit: bail on jumps the unit can't physically climb.
       const nyTop = nav.topY[ni]!;
       const dY = Math.abs(nyTop - cy);
       if (dY > maxStepVoxels) continue;
 
-      // Diagonal corner cutting: at least one adjacent cardinal must be passable, and
-      // the dY stays within the unit's climb limit. Agile units only check blocked + climb.
+      // Diagonal corner cutting: at least one adjacent cardinal must be passable
+      // (not blocked) AND within the unit's climb limit. The far diagonal is otherwise
+      // a "squeeze through a wall" move which we still want to forbid.
       if (n >= 4) {
         const a = navIndex(cx + NB_DX[n]!, cz);
         const b = navIndex(cx, cz + NB_DZ[n]!);
         if (nav.blocked[a] && nav.blocked[b]) continue;
-        const aOk = !nav.blocked[a]
-          && (isAgile || nav.flatness[a]! >= passFlat)
-          && Math.abs(nav.topY[a]! - cy) <= maxStepVoxels;
-        const bOk = !nav.blocked[b]
-          && (isAgile || nav.flatness[b]! >= passFlat)
-          && Math.abs(nav.topY[b]! - cy) <= maxStepVoxels;
+        const aOk = !nav.blocked[a] && Math.abs(nav.topY[a]! - cy) <= maxStepVoxels;
+        const bOk = !nav.blocked[b] && Math.abs(nav.topY[b]! - cy) <= maxStepVoxels;
         if (!aOk && !bOk) continue;
       }
 
