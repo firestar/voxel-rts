@@ -50,6 +50,14 @@ function navLineClear(
  * Greedy smoothing: keep the current waypoint, skip ahead while the straight line from it
  * to the next-next waypoint is still passable.
  */
+/**
+ * Greedy smoothing with a bounded lookahead: from each waypoint, only collapse forward
+ * by at most `maxLookaheadCells` cells. That keeps natural curves in the path instead of
+ * folding everything into one straight line, which gives several useful properties:
+ *  - the unit stays close to the A* route through terrain rather than cutting corners
+ *  - paths look more like routes with bends
+ *  - the per-unit A* cost jitter still produces visibly different routes
+ */
 export function smoothPath(
   nav: SurfaceNavBuffers,
   cells: { cx: number; cz: number }[],
@@ -57,12 +65,13 @@ export function smoothPath(
   maxStepVoxels: number,
   bodyHalfCells: number,
   bodyRoughnessVoxels: number,
+  maxLookaheadCells = 12,
 ): { cx: number; cz: number }[] {
   if (cells.length <= 2) return cells;
   const out: { cx: number; cz: number }[] = [cells[0]!];
   let i = 0;
   while (i < cells.length - 1) {
-    let j = cells.length - 1;
+    let j = Math.min(cells.length - 1, i + maxLookaheadCells);
     while (j > i + 1) {
       const a = cells[i]!;
       const b = cells[j]!;

@@ -19,6 +19,12 @@ export interface AStarRequest {
   bodyRoughnessVoxels: number;
   /** If true, road cells are cheaper to traverse. */
   prefersRoads: boolean;
+  /**
+   * Optional 32-bit seed used to perturb per-cell costs by a small amount. Different units
+   * passed different seeds will pick noticeably different routes between the same endpoints.
+   * Zero or undefined disables the jitter.
+   */
+  routeSeed?: number;
   /** Hard cap on expansions before bailing with partial path. */
   maxExpansions?: number;
 }
@@ -36,19 +42,27 @@ const NB_DZ = [ 0, 0, 1,-1,  1,-1, 1,-1];
 const NB_COST = [1, 1, 1, 1, Math.SQRT2, Math.SQRT2, Math.SQRT2, Math.SQRT2];
 
 /**
- * Sample topY across a (2*halfCells+1) x (2*halfCells+1) square centered at (cx, cz)
- * and return whether (max - min) stays within `maxRangeVoxels`. Out-of-bounds or blocked
- * cells in the footprint also fail. Used by the path search and the smoother to keep
- * vehicles off ledges that span their body.
+ * Sample topY across a (2*halfCells+1)² square centered on (cx, cz), fit a least-squares
+ * plane to those samples, and return whether every cell's residual from that plane stays
+ * within `maxResidualVoxels`. Out-of-bounds or blocked cells in the footprint also fail.
+ *
+ * This passes uniform slopes (the unit can sit on a tilted hill) and rejects bumps, steps,
+ * and ridges that span the body — which is the actual physics we want for a vehicle's
+ * chassis. The previous max-min range version was over-eager: every steep slope failed.
  */
 export function bodyRoughnessOk(
   nav: SurfaceNavBuffers,
   cx: number, cz: number,
   halfCells: number,
-  maxRangeVoxels: number,
+  maxResidualVoxels: number,
 ): boolean {
-  let minY = 1 << 30;
-  let maxY = -(1 << 30);
+  // For a centered symmetric square, the cross-term sum(dx*dz) is 0 and sum(dx) = sum(dz) = 0,
+  // so the least-squares plane decouples: y_pred = a*dx + b*dz + c, with c = mean(y),
+  // a = sum(dx*y) / sum(dx²), b = sum(dz*y) / sum(dz²).
+  let sumY = 0;
+  let sumDxY = 0, sumDzY = 0;
+  let sumDx2 = 0, sumDz2 = 0;
+  let n = 0;
   for (let dz = -halfCells; dz <= halfCells; dz++) {
     const z = cz + dz;
     if (z < 0 || z >= NAV_H) return false;
@@ -58,11 +72,29 @@ export function bodyRoughnessOk(
       const i = navIndex(x, z);
       if (nav.blocked[i]) return false;
       const y = nav.topY[i]!;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
+      sumY += y;
+      sumDxY += dx * y;
+      sumDzY += dz * y;
+      sumDx2 += dx * dx;
+      sumDz2 += dz * dz;
+      n++;
     }
   }
-  return (maxY - minY) <= maxRangeVoxels;
+  if (n === 0) return false;
+  const meanY = sumY / n;
+  const a = sumDx2 > 0 ? sumDxY / sumDx2 : 0;
+  const b = sumDz2 > 0 ? sumDzY / sumDz2 : 0;
+
+  // Second pass: check residuals against the fitted plane.
+  for (let dz = -halfCells; dz <= halfCells; dz++) {
+    for (let dx = -halfCells; dx <= halfCells; dx++) {
+      const i = navIndex(cx + dx, cz + dz);
+      const y = nav.topY[i]!;
+      const pred = a * dx + b * dz + meanY;
+      if (Math.abs(y - pred) > maxResidualVoxels) return false;
+    }
+  }
+  return true;
 }
 
 function octileH(ax: number, az: number, bx: number, bz: number): number {
@@ -101,6 +133,7 @@ export function findPathSurface(
   const gen = ws.resetGeneration();
   const { startCx, startCz, goalCx, goalCz, prefersRoads, maxStepVoxels, slopePenalty,
           bodyHalfCells, bodyRoughnessVoxels } = req;
+  const routeSeed = req.routeSeed ?? 0;
   void req.footprintRadius; // currently used only by building placement; surface pathing uses climb-step alone
   const maxExpansions = req.maxExpansions ?? 20000;
 
@@ -172,6 +205,14 @@ export function findPathSurface(
       if (prefersRoads) {
         const rw = nav.road[ni]! / 255;
         stepCost *= 1.0 - 0.6 * rw;
+      }
+      // Per-cell deterministic jitter keyed by routeSeed — different units passed
+      // different seeds explore the map along different routes instead of all funneling
+      // through the single A*-shortest line.
+      if (routeSeed !== 0) {
+        const h = ((Math.imul(ni, 0x9e3779b9) ^ routeSeed) >>> 0);
+        const jitter = ((h & 0xff) / 255 - 0.5) * 0.6; // ±0.3 cost units
+        stepCost += jitter;
       }
 
       const g = (ws.gen[i] === gen ? ws.gScore[i]! : 0) + stepCost;

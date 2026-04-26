@@ -26,6 +26,8 @@ interface UnitConfig {
    * rejects it. Set to a very large number to disable.
    */
   bodyRoughnessVoxels: number;
+  /** How fast the unit can rotate around Y, in radians per second. */
+  turnRateRadPerSec: number;
   canDig: boolean;
   requiresGround: boolean;
   speed: number;
@@ -41,28 +43,31 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         footprintRadius: 1, widthMeters: 0.75,
         maxStepVoxels: 16, slopePenalty: 0.15,
         bodyHalfCells: 0, bodyRoughnessVoxels: 999,
+        turnRateRadPerSec: 6.0,                  // ~340°/s, snappy infantry turn
         canDig: false, requiresGround: true,
         speed: 4.5, speedDigging: 0,
         hp: 80,
       };
     case 'tank':
-      // 3x3 cells (3 m x 3 m) under the body; spread must stay within 0.75 m. Slopes are
-      // fine, ridges or stairs that lift one corner above the rest are not.
+      // 3x3 cells (3 m x 3 m) under the body; max 0.5 m residual from the best-fit plane.
+      // Uniform slopes pass (planar = zero residual); ridges/steps that lift a corner
+      // above the rest fail. Tank can climb steep hills as long as they're smooth.
       return {
         footprintRadius: 2, widthMeters: 2.4,
         maxStepVoxels: 14, slopePenalty: 0.12,
-        bodyHalfCells: 1, bodyRoughnessVoxels: 6,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 4,
+        turnRateRadPerSec: 1.4,                  // ~80°/s — tank pivots are slow
         canDig: false, requiresGround: true,
         speed: 3.5, speedDigging: 0,
         hp: 220,
       };
     case 'tunneler':
-      // 5x5 cells (5 m x 5 m); 1 m spread tolerance — bigger machine, more forgiving
-      // because it carries its own bench when underground.
+      // 5x5 cells (5 m x 5 m); 0.75 m residual tolerance.
       return {
         footprintRadius: 2, widthMeters: 3.6,
         maxStepVoxels: 10, slopePenalty: 0.18,
-        bodyHalfCells: 2, bodyRoughnessVoxels: 8,
+        bodyHalfCells: 2, bodyRoughnessVoxels: 6,
+        turnRateRadPerSec: 0.7,                  // ~40°/s — heavy machine pivots slowly
         canDig: true, requiresGround: false,
         speed: 2.5, speedDigging: 1.8,
         hp: 320,
@@ -79,6 +84,8 @@ export interface Unit {
   slopePenalty: number;
   bodyHalfCells: number;
   bodyRoughnessVoxels: number;
+  /** Max angular velocity in rad/s. */
+  turnRateRadPerSec: number;
   canDig: boolean;
   requiresGround: boolean;
   x: number; y: number; z: number;
@@ -120,6 +127,7 @@ export class UnitManager {
       slopePenalty: cfg.slopePenalty,
       bodyHalfCells: cfg.bodyHalfCells,
       bodyRoughnessVoxels: cfg.bodyRoughnessVoxels,
+      turnRateRadPerSec: cfg.turnRateRadPerSec,
       canDig: cfg.canDig,
       requiresGround: cfg.requiresGround,
       x, y, z,
@@ -212,17 +220,28 @@ export class UnitManager {
     const dx = tgt.x - u.x;
     const dz = tgt.z - u.z;
     const d = Math.hypot(dx, dz);
-    const step = u.speed * dt;
+    if (d < 1e-4) { sampleSurfaceFollow(u, nav, dt); return; }
+
+    // Slew the heading toward the path direction at the unit's turn rate. Until the unit
+    // is roughly facing forward, forward speed is reduced (cosine of misalignment), so a
+    // tank pivots in place before driving and a soldier sweeps around briskly.
+    const targetHeading = Math.atan2(-dx, -dz);
+    const angDiff = wrapAngle(targetHeading - u.heading);
+    const turnStep = u.turnRateRadPerSec * dt;
+    u.heading += clamp(angDiff, -turnStep, turnStep);
+
+    const align = Math.max(0, Math.cos(Math.abs(angDiff)));
+    const step = u.speed * align * dt;
+
     let moved = 0;
-    if (d <= step) {
+    if (step >= d) {
       moved = d;
       u.x = tgt.x; u.z = tgt.z;
       u.path.shift();
-    } else {
+    } else if (step > 0) {
       const inv = 1 / d;
       u.x += dx * inv * step;
       u.z += dz * inv * step;
-      u.heading = Math.atan2(-dx, -dz);
       moved = step;
     }
     u.blockedFrames = 0;
@@ -316,11 +335,31 @@ export class UnitManager {
     u.carveCooldown = 0;
     const inv = 1 / d;
     const fx = dx * inv, fy = dy * inv, fz = dz * inv;
+    // Cutter head — the spinning disc grinds whatever's directly in front.
     carveOut({
       x: u.x + fx * TUNNELER_CUTTER_FORWARD,
       y: u.y + TUNNELER_CUTTER_HEIGHT + fy * TUNNELER_CUTTER_FORWARD,
       z: u.z + fz * TUNNELER_CUTTER_FORWARD,
       radiusMeters: TUNNELER_CUTTER_RADIUS,
+      unit: u,
+    });
+    // Body clearance — second sphere centered on the chassis. Together they leave a
+    // smooth tube along the unit's path, so the body doesn't get hung up on the lip
+    // of a freshly-cut tunnel or a small rise on the ground in front of it.
+    carveOut({
+      x: u.x,
+      y: u.y + TUNNELER_CUTTER_HEIGHT,
+      z: u.z,
+      radiusMeters: TUNNELER_CUTTER_RADIUS * 0.9,
+      unit: u,
+    });
+    // And a follow-through sphere half a step behind the cutter, sweeping the lower
+    // arc the cutter face missed — this is what flattens lumpy tunnel floors.
+    carveOut({
+      x: u.x + fx * TUNNELER_CUTTER_FORWARD * 0.5,
+      y: u.y + TUNNELER_CUTTER_HEIGHT * 0.7 + fy * TUNNELER_CUTTER_FORWARD * 0.5,
+      z: u.z + fz * TUNNELER_CUTTER_FORWARD * 0.5,
+      radiusMeters: TUNNELER_CUTTER_RADIUS * 0.85,
       unit: u,
     });
   }
@@ -355,11 +394,27 @@ function volumePassable(u: Unit, vnav: VolumeNavBuffers, wx: number, wy: number,
 
 function applyPathOrientation(u: Unit, dx: number, dy: number, dz: number, dt: number): void {
   const horiz = Math.hypot(dx, dz);
-  if (horiz > 1e-4) u.heading = Math.atan2(-dx, -dz);
+  if (horiz > 1e-4) {
+    const targetHeading = Math.atan2(-dx, -dz);
+    const angDiff = wrapAngle(targetHeading - u.heading);
+    const turnStep = u.turnRateRadPerSec * dt;
+    u.heading += clamp(angDiff, -turnStep, turnStep);
+  }
   const targetPitch = Math.atan2(-dy, Math.max(horiz, 1e-4));
   const k = Math.min(1, dt * 8);
   u.pitch += (targetPitch - u.pitch) * k;
   u.roll  += (0           - u.roll ) * k;
+}
+
+/** Shortest signed angle in (-π, π]. */
+function wrapAngle(a: number): number {
+  while (a > Math.PI) a -= 2 * Math.PI;
+  while (a < -Math.PI) a += 2 * Math.PI;
+  return a;
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
 }
 
 /** Idle underground / aerial: ease pitch & roll to neutral so the unit doesn't sit askew. */
@@ -382,7 +437,17 @@ function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, dt: number): void 
   const top = nav.topY[navIndex(cx, cz)]!;
   if (top < 0) return;
   const targetY = (top + 1) * VOXEL_SIZE;
-  u.y += (targetY - u.y) * Math.min(1, dt * 12);
+  // Climb is fast (the unit was already gated by maxStepVoxels at path time so we trust
+  // the path here). Descent is capped at a constant rate so walking off a ledge doesn't
+  // snap straight down — the unit falls at a controlled speed and then catches up to
+  // the ground.
+  const dyDesired = targetY - u.y;
+  if (dyDesired >= 0) {
+    u.y += dyDesired * Math.min(1, dt * 12);
+  } else {
+    const maxDescentMPS = 4.0;
+    u.y = Math.max(targetY, u.y - maxDescentMPS * dt);
+  }
 
   const xm1 = nav.topY[navIndex(Math.max(0, cx - 1), cz)]!;
   const xp1 = nav.topY[navIndex(Math.min(NAV_W - 1, cx + 1), cz)]!;

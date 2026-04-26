@@ -407,6 +407,9 @@ export class Game {
       bodyHalfCells: unit.bodyHalfCells,
       bodyRoughnessVoxels: unit.bodyRoughnessVoxels,
       prefersRoads: false,
+      // Per-unit seed so units headed to the same goal don't all share the same A*-optimal
+      // line — they spread out along nearby alternates instead.
+      routeSeed: unit.id * 0x9e3779b9 + 1,
     });
     if (res.cells.length === 0 || !res.reached) return;
     this.units.setPath(unit, this.pathClient.cellsToWaypoints(res.cells));
