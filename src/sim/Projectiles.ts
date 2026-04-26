@@ -219,6 +219,9 @@ export interface Projectile {
  */
 export interface ProjectileImpact {
   kind: ProjectileKind;
+  /** Direct-hit damage from the catalog — what a unit takes when the projectile
+   *  actually struck it (independent of any explosion that follows). */
+  hitDamage: number;
   /** World-space impact point in meters. */
   x: number; y: number; z: number;
   /** True when this was an explosive detonation (vs a bullet pit). */
@@ -229,7 +232,24 @@ export interface ProjectileImpact {
   damagePeak: number;
   /** Hit radius for non-explosive bullets, meters (matches damageSphere call). */
   hitRadiusMeters: number;
+  /** Unit id directly hit by the projectile, or -1 when the impact landed on
+   *  voxel geometry / expired in flight. The Game uses this to apply direct
+   *  projectile damage on top of any explosive splash. */
+  directHitUnitId: number;
 }
+
+/**
+ * Optional callback supplied to `ProjectileManager.tick`. Given the swept
+ * segment of a single projectile's frame motion, returns the closest unit
+ * the segment intersects (skipping the projectile's owner) along with the
+ * distance along the segment, or null if the segment misses every unit.
+ */
+export type UnitHitTest = (
+  fromX: number, fromY: number, fromZ: number,
+  dirX: number, dirY: number, dirZ: number,
+  maxDist: number,
+  ownerId: number,
+) => { tMeters: number; unitId: number } | null;
 
 /** Standard gravity used for ballistic integration — matches Units.ts so unit + projectile drop look consistent. */
 export const PROJECTILE_GRAVITY = 9.81;
@@ -290,7 +310,7 @@ export class ProjectileManager {
    * spawning them needs access to the projectile catalog and the world (for
    * detonation handling), which the manager intentionally doesn't own.
    */
-  tick(dt: number, world: VoxelWorld): void {
+  tick(dt: number, world: VoxelWorld, unitHitTest?: UnitHitTest): void {
     this.pendingImpacts.length = 0;
     for (const p of this.projectiles) {
       if (p.dead) continue;
@@ -312,20 +332,35 @@ export class ProjectileManager {
       let hit = false;
       if (stepLen > 1e-5) {
         const idx = 1 / stepLen;
-        const hitInfo = raycastVoxel(
+        const dirX = stepX * idx, dirY = stepY * idx, dirZ = stepZ * idx;
+        const voxelHit = raycastVoxel(
           world,
           { x: px, y: py, z: pz },
-          { x: stepX * idx, y: stepY * idx, z: stepZ * idx },
+          { x: dirX, y: dirY, z: dirZ },
           stepLen,
         );
-        if (hitInfo) {
-          // tMeters is distance along the ray to the hit voxel face. Snap
-          // the projectile there and emit the impact.
-          const t = hitInfo.tMeters;
-          p.x = px + stepX * idx * t;
-          p.y = py + stepY * idx * t;
-          p.z = pz + stepZ * idx * t;
-          this.emitImpact(p);
+        const unitHit = unitHitTest
+          ? unitHitTest(px, py, pz, dirX, dirY, dirZ, stepLen, p.ownerId)
+          : null;
+        // Pick whichever obstacle the projectile reaches first along the swept
+        // segment. Ties (very rare) fall to the unit since a body is the more
+        // satisfying impact point.
+        let useUnit = false;
+        let hitT = -1;
+        if (voxelHit && unitHit) {
+          if (unitHit.tMeters <= voxelHit.tMeters) { useUnit = true; hitT = unitHit.tMeters; }
+          else { hitT = voxelHit.tMeters; }
+        } else if (unitHit) {
+          useUnit = true;
+          hitT = unitHit.tMeters;
+        } else if (voxelHit) {
+          hitT = voxelHit.tMeters;
+        }
+        if (hitT >= 0) {
+          p.x = px + dirX * hitT;
+          p.y = py + dirY * hitT;
+          p.z = pz + dirZ * hitT;
+          this.emitImpact(p, useUnit && unitHit ? unitHit.unitId : -1);
           p.dead = true;
           hit = true;
         }
@@ -428,15 +463,17 @@ export class ProjectileManager {
     return out;
   }
 
-  private emitImpact(p: Projectile): void {
+  private emitImpact(p: Projectile, directHitUnitId = -1): void {
     const cfg = PROJECTILES[p.kind];
     this.pendingImpacts.push({
       kind: p.kind,
+      hitDamage: cfg.hitDamage,
       x: p.x, y: p.y, z: p.z,
       explosive: cfg.explosive,
       explosionRadiusMeters: cfg.explosionRadiusMeters,
       damagePeak: cfg.explosive ? cfg.explosionPeak : cfg.hitDamage,
       hitRadiusMeters: cfg.hitRadiusMeters,
+      directHitUnitId,
     });
   }
 }

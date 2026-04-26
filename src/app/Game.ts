@@ -29,6 +29,7 @@ import { tickWeapons } from '../sim/WeaponTick';
 import {
   ProjectileRenderer, FlashPool, ImpactRingPool, TrajectoryPreview, ImpactMarker,
 } from '../render/ProjectileRenderer';
+import { HealthBarRenderer } from '../render/HealthBarRenderer';
 
 /**
  * Player UI mode. `build*` modes preview a building footprint; `plant` mode
@@ -63,6 +64,7 @@ export class Game {
   readonly impactRings = new ImpactRingPool(64);
   readonly trajectoryPreview = new TrajectoryPreview();
   readonly impactMarker = new ImpactMarker();
+  readonly healthBars = new HealthBarRenderer();
   pathClient: PathClient | null = null;
   /** Pixels of vertical drag = 1 m of altitude offset for tunneler targets. */
   private readonly altitudeDragSensitivity = 8;
@@ -105,6 +107,7 @@ export class Game {
     this.renderer.scene.add(this.impactRings.group);
     this.renderer.scene.add(this.trajectoryPreview.object);
     this.renderer.scene.add(this.impactMarker.object);
+    this.renderer.scene.add(this.healthBars.group);
     this.ghost.setSpec(this.buildSpec);
 
     this.buildings.spawner = (kind, x, y, z): Unit | null => this.spawnUnit(kind, x, y, z);
@@ -298,10 +301,17 @@ export class Game {
       // Projectile physics + collision detection. Pending impacts drain into
       // the world-edit machinery (damage spheres, debris bursts, impact rings)
       // immediately so a hit is felt the same frame the projectile lands.
-      this.projectiles.tick(dt, this.world);
+      // The unit-hit callback lets the projectile manager intercept rounds
+      // that strike a unit's body sphere, so bullets fired at a soldier in
+      // the open actually deal damage instead of expiring uselessly past them.
+      this.projectiles.tick(dt, this.world, (fx, fy, fz, dx, dy, dz, maxDist, ownerId) => {
+        return this.unitRayHit(fx, fy, fz, dx, dy, dz, maxDist, ownerId);
+      });
       for (const imp of this.projectiles.pendingImpacts) {
         this.handleProjectileImpact(imp);
       }
+      // Sweep out anything that died from the impacts processed this frame.
+      this.removeDeadUnits();
       // Worker automation: drive harvesters / transporters. Routing is
       // delegated back to routePath via the routeWorker callback so the
       // existing path client is reused unchanged.
@@ -319,6 +329,7 @@ export class Game {
       if (grow.matured > 0) this.requestNavRebuild(false);
     }
     this.unitRenderer.update(this.units);
+    this.healthBars.update(this.units.units);
     this.buildingRenderer.update(this.buildings.buildings);
     this.projectileRenderer.update(this.projectiles);
     this.muzzleFlashes.update(dt);
@@ -588,6 +599,22 @@ export class Game {
       this.debris.spawnBurst(wx, wy, wz, burst, sample.material);
       this.requestNavRebuild();
     }
+    // Player-triggered explosion also damages units in the blast radius, with
+    // the same falloff curve we use for projectile splash. Direct projectile
+    // hits still hurt more (no `hitDamage` here — this is pure explosion).
+    const wx = cx * VOXEL_SIZE, wy = cy * VOXEL_SIZE, wz = cz * VOXEL_SIZE;
+    const blastR = this.explosionRadiusBigMeters;
+    for (const u of this.units.units) {
+      const torsoY = u.y + Math.max(0.7, u.widthMeters * 0.6);
+      const dxu = u.x - wx;
+      const dyu = torsoY - wy;
+      const dzu = u.z - wz;
+      const dist = Math.hypot(dxu, dyu, dzu);
+      if (dist >= blastR) continue;
+      const falloff = 1 - dist / blastR;
+      u.hp -= this.explosionPeak * 0.4 * falloff;
+    }
+    this.removeDeadUnits();
   }
 
   /** Single dispatch for every kind of world edit a unit can request. */
@@ -998,12 +1025,84 @@ export class Game {
   }
 
   /**
+   * Ray-vs-unit-sphere hit test for projectile collision. We treat each unit
+   * as a vertical bounding sphere centred on the unit's torso and skip the
+   * projectile's own owner so a soldier doesn't shoot themselves at point-
+   * blank. Returns the closest unit along the swept segment, or null on miss.
+   *
+   * Used as the `unitHitTest` callback wired into ProjectileManager.tick.
+   */
+  private unitRayHit(
+    fx: number, fy: number, fz: number,
+    dx: number, dy: number, dz: number,
+    maxDist: number,
+    ownerId: number,
+  ): { tMeters: number; unitId: number } | null {
+    let bestT = Infinity;
+    let bestId = -1;
+    for (const u of this.units.units) {
+      if (u.id === ownerId) continue;
+      if (u.hp <= 0) continue;
+      // Bounding sphere — body half-width plus a small pad, centred at torso
+      // height (~0.7 m above feet for soldiers, taller for tanks via height
+      // scaling). Picked to feel generous without overlapping neighbours.
+      const radius = u.widthMeters * 0.55 + 0.35;
+      const cx = u.x;
+      const cy = u.y + Math.max(0.7, u.widthMeters * 0.6);
+      const cz = u.z;
+      const ox = fx - cx, oy = fy - cy, oz = fz - cz;
+      // |o + t·d - c|^2 = r^2  →  t² + 2(b)t + c = 0  with b = o·d, c = o·o − r²
+      const b = ox * dx + oy * dy + oz * dz;
+      const cTerm = ox * ox + oy * oy + oz * oz - radius * radius;
+      const disc = b * b - cTerm;
+      if (disc < 0) continue;
+      const sq = Math.sqrt(disc);
+      let t = -b - sq;
+      // Inside the sphere (t < 0 on the near root) — accept the far root so
+      // a projectile spawned partly inside a target's bounding sphere still
+      // registers a hit.
+      if (t < 0) t = -b + sq;
+      if (t < 0 || t > maxDist) continue;
+      if (t < bestT) {
+        bestT = t;
+        bestId = u.id;
+      }
+    }
+    return bestId >= 0 ? { tMeters: bestT, unitId: bestId } : null;
+  }
+
+  /**
+   * Splice any unit whose HP has dropped to zero out of the manager. Called
+   * once per frame after projectile impacts have been applied.
+   */
+  private removeDeadUnits(): void {
+    const arr = this.units.units;
+    let w = 0;
+    for (let r = 0; r < arr.length; r++) {
+      const u = arr[r]!;
+      if (u.hp > 0) {
+        arr[w++] = u;
+      } else {
+        // Death VFX — a small debris burst at the unit's torso so the player
+        // sees a clear loss event tied to the round that killed them.
+        this.debris.spawnBurst(u.x, u.y + 0.6, u.z, 24, M_DIRT);
+      }
+    }
+    arr.length = w;
+  }
+
+  /**
    * Resolve a projectile impact: spawn a damage sphere on the world (so the
    * crater + debris pipeline is identical to a player-placed shift-LMB
    * detonation), spawn a fire-flash sphere at the impact point, and start an
    * expanding ring on the ground tuned to the explosion radius. Cluster
    * detonations also kick out submunitions in random downward-tilted
    * directions.
+   *
+   * Also applies unit damage: a direct projectile hit deals the round's full
+   * `hitDamage`, and explosive impacts splash extra (smaller, falloff)
+   * damage to every unit within the blast radius. Direct hits hurt more
+   * than explosions, by design — landing a clean shot is the decisive play.
    */
   private handleProjectileImpact(imp: ProjectileImpact): void {
     const cfg = PROJECTILES[imp.kind];
@@ -1032,6 +1131,32 @@ export class Game {
     const ringRadius = imp.explosive ? imp.explosionRadiusMeters * 1.4 : 0.6;
     const ringLife = imp.explosive ? 0.7 : 0.25;
     this.impactRings.spawn(imp.x, imp.y, imp.z, ringRadius, ringLife, cfg.colorR, cfg.colorG, cfg.colorB);
+    // Direct projectile hit on a unit. Apply the round's full `hitDamage`
+    // — for non-explosive bullets that's the only damage; explosive rounds
+    // additionally splash blast damage below.
+    if (imp.directHitUnitId >= 0) {
+      const hit = this.units.units.find(u => u.id === imp.directHitUnitId);
+      if (hit) hit.hp -= imp.hitDamage;
+    }
+    // Explosion splash damage to nearby units. Falls off linearly to zero at
+    // the blast edge and is capped well below a direct hit (×0.4) so taking
+    // a round to the chest hurts more than catching the splash from a near-
+    // miss. The directly hit unit, if any, also catches the splash on top of
+    // the impact damage — taking a tank shell to the face is supposed to be
+    // brutal.
+    if (imp.explosive && imp.explosionRadiusMeters > 0) {
+      const blastR = imp.explosionRadiusMeters;
+      for (const u of this.units.units) {
+        const torsoY = u.y + Math.max(0.7, u.widthMeters * 0.6);
+        const dx = u.x - imp.x;
+        const dy = torsoY - imp.y;
+        const dz = u.z - imp.z;
+        const dist = Math.hypot(dx, dy, dz);
+        if (dist >= blastR) continue;
+        const falloff = 1 - dist / blastR;
+        u.hp -= imp.damagePeak * 0.4 * falloff;
+      }
+    }
     // Cluster: spawn submunitions in a random downward cone from the burst
     // point, using the projectile catalog's `cluster_submunition` entry.
     if (cfg.clusterSubmunitions > 0) {
