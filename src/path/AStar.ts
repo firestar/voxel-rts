@@ -74,9 +74,11 @@ export function findPathSurface(
   if (nav.blocked[startI] || nav.blocked[goalI]) {
     return { cells: [], reached: false, expanded: 0 };
   }
-  // Strict footprint requirement at the goal; the start is exempt since the unit may
-  // already be standing on a borderline cell.
-  if (nav.flatness[goalI]! < footprintRadius) {
+  // Strict footprint requirement at the goal — but only for vehicle-class units.
+  // Agile units (footprintRadius <= 1) ignore the flatness mechanic entirely; they only
+  // care about `blocked` and the per-step climb limit.
+  const isAgile = footprintRadius <= 1;
+  if (!isAgile && nav.flatness[goalI]! < footprintRadius) {
     return { cells: [], reached: false, expanded: 0 };
   }
 
@@ -111,24 +113,27 @@ export function findPathSurface(
       const ni = navIndex(nx, nz);
       if (ws.closed[ni] === gen) continue;
       if (nav.blocked[ni]) continue;
-      // Goal must satisfy the full footprint; intermediate cells can be one notch rougher.
-      const minFlat = ni === goalI ? footprintRadius : passFlat;
-      if (nav.flatness[ni]! < minFlat) continue;
+      // Vehicle-class units check flatness; agile units (soldiers) only care about climb.
+      if (!isAgile) {
+        const minFlat = ni === goalI ? footprintRadius : passFlat;
+        if (nav.flatness[ni]! < minFlat) continue;
+      }
       // Step-up/down limit: bail on jumps the unit can't physically climb.
       const nyTop = nav.topY[ni]!;
       const dY = Math.abs(nyTop - cy);
       if (dY > maxStepVoxels) continue;
 
       // Diagonal corner cutting: at least one adjacent cardinal must be passable, and
-      // the dY stays within the unit's climb limit. Soldiers and tanks can therefore
-      // cut across slightly uneven shoulders that strict cardinals-only would forbid.
+      // the dY stays within the unit's climb limit. Agile units only check blocked + climb.
       if (n >= 4) {
         const a = navIndex(cx + NB_DX[n]!, cz);
         const b = navIndex(cx, cz + NB_DZ[n]!);
         if (nav.blocked[a] && nav.blocked[b]) continue;
-        const aOk = !nav.blocked[a] && nav.flatness[a]! >= passFlat
+        const aOk = !nav.blocked[a]
+          && (isAgile || nav.flatness[a]! >= passFlat)
           && Math.abs(nav.topY[a]! - cy) <= maxStepVoxels;
-        const bOk = !nav.blocked[b] && nav.flatness[b]! >= passFlat
+        const bOk = !nav.blocked[b]
+          && (isAgile || nav.flatness[b]! >= passFlat)
           && Math.abs(nav.topY[b]! - cy) <= maxStepVoxels;
         if (!aOk && !bOk) continue;
       }

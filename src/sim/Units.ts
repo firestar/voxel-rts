@@ -24,9 +24,12 @@ interface UnitConfig {
 export function unitConfig(kind: UnitKind): UnitConfig {
   switch (kind) {
     case 'soldier':
+      // Agile (footprintRadius <= 1) so the surface pather skips the flatness gate
+      // entirely — soldiers only care about climb step + blocked cells. Climb step
+      // bumped from 2 (0.25 m) to 6 (0.75 m) so they can traverse rolling hills.
       return {
         footprintRadius: 1, widthMeters: 0.75,
-        maxStepVoxels: 2, slopePenalty: 1.0,
+        maxStepVoxels: 6, slopePenalty: 0.4,
         canDig: false, requiresGround: true,
         speed: 4.5, speedDigging: 0,
         hp: 80,

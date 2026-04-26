@@ -31,6 +31,7 @@ function navLineClear(
   const startTopY = nav.topY[navIndex(x0, z0)]!;
   let prevY = startTopY;
   const flatThresh = smoothingThreshold(footprintRadius);
+  const isAgile = footprintRadius <= 1;
 
   // Larger units may roll over a slightly bigger ledge between adjacent cells than they'd
   // accept for a fresh A* expansion — we know the surrounding terrain is path-feasible.
@@ -41,7 +42,7 @@ function navLineClear(
     if (x0 < 0 || z0 < 0 || x0 >= NAV_W || z0 >= NAV_H) return false;
     const idx = navIndex(x0, z0);
     if (nav.blocked[idx]) return false;
-    if (nav.flatness[idx]! < flatThresh) return false;
+    if (!isAgile && nav.flatness[idx]! < flatThresh) return false;
     const y = nav.topY[idx]!;
     if (Math.abs(y - prevY) > stepLimit) return false;
     prevY = y;
