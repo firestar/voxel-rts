@@ -1210,6 +1210,14 @@ function surfaceWorldY(nav: SurfaceNavBuffers, wx: number, wz: number): number {
  * of the highest voxel under any tread/foot, never inside one. (The path search
  * already guaranteed the cells are climb-feasible.)
  *
+ * `searchRangeVoxels` MUST be at least the unit's `maxStepVoxels` plus a small
+ * margin: a footprint sample sitting in a neighbour cell can be that much taller
+ * than the centre cell's `cellTop`. With too small a window the search starts
+ * INSIDE the neighbour's solid column and records that as the "top", parking the
+ * unit's feet a few voxels below the actual surface — the half-buried look you
+ * see when a soldier climbs a steep step. Soldiers (`maxStepVoxels = 32`) are the
+ * worst offender; workers (24) and worms (16) hit it too.
+ *
  * Returns null if no solid voxel is found in the search range.
  */
 function findFootprintTopVoxel(
@@ -1217,7 +1225,7 @@ function findFootprintTopVoxel(
   nav: SurfaceNavBuffers,
   wx: number, wz: number,
   halfWidthM: number,
-  searchRangeVoxels = 12,
+  searchRangeVoxels: number,
 ): number | null {
   const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(wx / NAV_CELL_METERS)));
   const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(wz / NAV_CELL_METERS)));
@@ -1261,7 +1269,15 @@ function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, voxels: Uint8Array
   // cells are climb-feasible, so we trust it and just keep the unit visually on
   // top of the terrain.
   const halfWidthM = u.widthMeters * 0.5;
-  const topVoxel = findFootprintTopVoxel(voxels, nav, u.x, u.z, halfWidthM);
+  // The search must reach at least one full climb-step above the cell-centre topY,
+  // because A* let the unit straddle a cell boundary where the neighbour cell can be
+  // up to maxStepVoxels taller. The +4 margin covers cases where two adjacent steps
+  // stack up under a wide chassis (e.g. a tank's footprint reaching two cells over).
+  // Without it, soldiers crossing a tall step had their feet snapped into the dirt
+  // a couple voxels below the actual ledge, which the renderer drew as the unit
+  // half-buried in the hillside.
+  const searchRange = Math.max(12, u.maxStepVoxels + 4);
+  const topVoxel = findFootprintTopVoxel(voxels, nav, u.x, u.z, halfWidthM, searchRange);
   if (topVoxel === null) return;
   const targetY = (topVoxel + 1) * VOXEL_SIZE;
   // Climb is fast (the unit was already gated by maxStepVoxels at path time so we trust
@@ -1297,8 +1313,14 @@ function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, voxels: Uint8Array
   const ch = Math.cos(u.heading), sh = Math.sin(u.heading);
   const slopeForward = dydx * sh + dydz * ch;
   const slopeRight   = dydx * ch - dydz * sh;
-  const targetPitch = Math.atan(-slopeForward);
-  const targetRoll  = Math.atan(slopeRight);
+  // Same convention as applyPathOrientation: rendered pitch is clamped to the
+  // unit's maxPitchRad cap so a tank parked on a steep cliff face doesn't tilt
+  // past 30°. Roll is clamped to the same magnitude so a unit straddling a
+  // sharp side-slope also stays within its hull's articulation.
+  const rawPitch = Math.atan(-slopeForward);
+  const rawRoll  = Math.atan(slopeRight);
+  const targetPitch = clamp(rawPitch, -u.maxPitchRad, u.maxPitchRad);
+  const targetRoll  = clamp(rawRoll,  -u.maxPitchRad, u.maxPitchRad);
   const k = Math.min(1, dt * 8);
   u.pitch += (targetPitch - u.pitch) * k;
   u.roll  += (targetRoll  - u.roll)  * k;
