@@ -1,5 +1,8 @@
 import * as THREE from 'three';
 import { Unit, unitConfig } from '../sim/Units';
+import { Building } from '../sim/Buildings';
+import { VOXEL_SIZE } from '../voxel/types';
+import { NAV_CELL_VOXELS } from '../path/SurfaceNav';
 
 /**
  * Per-unit floating HP bar. Each unit gets a screen-aligned Sprite whose
@@ -26,8 +29,9 @@ interface BarEntry {
 export class HealthBarRenderer {
   readonly group = new THREE.Group();
   private entries = new Map<number, BarEntry>();
+  private buildingEntries = new Map<number, BarEntry>();
 
-  update(units: Unit[]): void {
+  update(units: Unit[], buildings?: Building[]): void {
     const seen = new Set<number>();
     for (const u of units) {
       seen.add(u.id);
@@ -62,6 +66,73 @@ export class HealthBarRenderer {
       (entry.sprite.material as THREE.SpriteMaterial).dispose();
       this.entries.delete(id);
     }
+
+    // Building HP bars. Same canvas/sprite shape as units but anchored above
+    // the centre of the footprint at the roof line. Skipped while the
+    // building is at full HP so the screen isn't cluttered with bars on a
+    // freshly-built base.
+    if (buildings) {
+      const seenB = new Set<number>();
+      for (const b of buildings) {
+        if (b.destroyed) continue;
+        const showBar = b.hp < b.maxHp || b.selected;
+        if (!showBar) continue;
+        seenB.add(b.id);
+        let entry = this.buildingEntries.get(b.id);
+        if (!entry) {
+          entry = this.createBuildingEntry(b);
+          this.buildingEntries.set(b.id, entry);
+          this.group.add(entry.sprite);
+        }
+        const cx = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+        const cz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+        const cy = (b.floorY + b.spec.headroomVoxels + 1) * VOXEL_SIZE + entry.yOffset;
+        entry.sprite.position.set(cx, cy, cz);
+        const hpInt = Math.max(0, Math.ceil(b.hp));
+        if (hpInt !== entry.lastHp || b.maxHp !== entry.lastMax) {
+          drawBar(entry.canvas, hpInt, b.maxHp, '');
+          entry.texture.needsUpdate = true;
+          entry.lastHp = hpInt;
+          entry.lastMax = b.maxHp;
+        }
+      }
+      for (const [id, entry] of this.buildingEntries) {
+        if (seenB.has(id)) continue;
+        this.group.remove(entry.sprite);
+        entry.texture.dispose();
+        (entry.sprite.material as THREE.SpriteMaterial).dispose();
+        this.buildingEntries.delete(id);
+      }
+    }
+  }
+
+  private createBuildingEntry(_b: Building): BarEntry {
+    const canvas = document.createElement('canvas');
+    canvas.width = 192;
+    canvas.height = 40;
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    const material = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+    });
+    const sprite = new THREE.Sprite(material);
+    // Wider sprite for buildings — ~3 m wide so the bar reads at typical
+    // RTS zoom while sitting above a medium-size building.
+    sprite.scale.set(3.2, 0.66, 1);
+    sprite.renderOrder = 1000;
+    return {
+      sprite,
+      canvas,
+      texture,
+      lastHp: -1,
+      lastMax: -1,
+      lastCarryKey: -1,
+      yOffset: 1.0, // float ~1 m above the roof
+    };
   }
 
   private createEntry(u: Unit): BarEntry {

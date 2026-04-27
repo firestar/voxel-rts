@@ -18,6 +18,13 @@ export interface VolumeNavBuffers {
   bedrock: Uint8Array;
   /** Per-cell extra cost to enter when solid (1..200). 0 when empty. */
   digCost: Uint8Array;
+  /**
+   * Bit-packed: 1 if this air cell is reachable from the sky via a 6-connected
+   * flood-fill across air cells. Sealed underground voids stay 0 so non-digger
+   * pathfinding can reject them — caves a unit can't physically enter without
+   * a tunneler digging in are useless to consider.
+   */
+  surfaceConnected: Uint8Array;
 }
 
 export function vnavIndex(x: number, y: number, z: number): number {
@@ -43,6 +50,7 @@ export function allocateVolumeNav(useShared: boolean): VolumeNavBuffers {
     solid: new Uint8Array(new Buf(bitBytes)),
     bedrock: new Uint8Array(new Buf(bitBytes)),
     digCost: new Uint8Array(new Buf(VNAV_COUNT)),
+    surfaceConnected: new Uint8Array(new Buf(bitBytes)),
   };
 }
 
@@ -56,6 +64,7 @@ export function buildVolumeNav(voxels: Uint8Array, vnav: VolumeNavBuffers): void
   vnav.solid.fill(0);
   vnav.bedrock.fill(0);
   vnav.digCost.fill(0);
+  vnav.surfaceConnected.fill(0);
   for (let cy = 0; cy < VNAV_Y; cy++) {
     for (let cz = 0; cz < VNAV_Z; cz++) {
       for (let cx = 0; cx < VNAV_X; cx++) {
@@ -91,6 +100,83 @@ export function buildVolumeNav(voxels: Uint8Array, vnav: VolumeNavBuffers): void
           clearBit(vnav.bedrock, i);
           vnav.digCost[i] = 0;
         }
+      }
+    }
+  }
+
+  // Surface-connected flood fill. Seed every air cell at the very top of the
+  // world (cy = VNAV_Y - 1) so anything with sky access is in the open set,
+  // then BFS through 6-connected air cells. Cells that come up unmarked are
+  // sealed underground voids — non-digger pathfinding can ignore them
+  // outright, and even tunnelers benefit because the search no longer drifts
+  // into cavities that can't be reached by walking.
+  const queue = new Int32Array(VNAV_COUNT);
+  let qhead = 0;
+  let qtail = 0;
+  const topY = VNAV_Y - 1;
+  for (let cz = 0; cz < VNAV_Z; cz++) {
+    for (let cx = 0; cx < VNAV_X; cx++) {
+      const i = vnavIndex(cx, topY, cz);
+      if (getBit(vnav.solid, i) === 0) {
+        setBit(vnav.surfaceConnected, i);
+        queue[qtail++] = i;
+      }
+    }
+  }
+  // 6-connected neighbour deltas as flat indices. These are recomputed for
+  // each cell because the world coordinates are needed for bound checks.
+  while (qhead < qtail) {
+    const i = queue[qhead++]!;
+    const cx = i % VNAV_X;
+    const tmp = (i / VNAV_X) | 0;
+    const cz = tmp % VNAV_Z;
+    const cy = (tmp / VNAV_Z) | 0;
+    // +X
+    if (cx + 1 < VNAV_X) {
+      const ni = vnavIndex(cx + 1, cy, cz);
+      if (getBit(vnav.solid, ni) === 0 && getBit(vnav.surfaceConnected, ni) === 0) {
+        setBit(vnav.surfaceConnected, ni);
+        queue[qtail++] = ni;
+      }
+    }
+    // -X
+    if (cx > 0) {
+      const ni = vnavIndex(cx - 1, cy, cz);
+      if (getBit(vnav.solid, ni) === 0 && getBit(vnav.surfaceConnected, ni) === 0) {
+        setBit(vnav.surfaceConnected, ni);
+        queue[qtail++] = ni;
+      }
+    }
+    // +Z
+    if (cz + 1 < VNAV_Z) {
+      const ni = vnavIndex(cx, cy, cz + 1);
+      if (getBit(vnav.solid, ni) === 0 && getBit(vnav.surfaceConnected, ni) === 0) {
+        setBit(vnav.surfaceConnected, ni);
+        queue[qtail++] = ni;
+      }
+    }
+    // -Z
+    if (cz > 0) {
+      const ni = vnavIndex(cx, cy, cz - 1);
+      if (getBit(vnav.solid, ni) === 0 && getBit(vnav.surfaceConnected, ni) === 0) {
+        setBit(vnav.surfaceConnected, ni);
+        queue[qtail++] = ni;
+      }
+    }
+    // +Y
+    if (cy + 1 < VNAV_Y) {
+      const ni = vnavIndex(cx, cy + 1, cz);
+      if (getBit(vnav.solid, ni) === 0 && getBit(vnav.surfaceConnected, ni) === 0) {
+        setBit(vnav.surfaceConnected, ni);
+        queue[qtail++] = ni;
+      }
+    }
+    // -Y
+    if (cy > 0) {
+      const ni = vnavIndex(cx, cy - 1, cz);
+      if (getBit(vnav.solid, ni) === 0 && getBit(vnav.surfaceConnected, ni) === 0) {
+        setBit(vnav.surfaceConnected, ni);
+        queue[qtail++] = ni;
       }
     }
   }

@@ -9,6 +9,7 @@ import { ProjectileManager, muzzleOrigin, PROJECTILES, PROJECTILE_GRAVITY, Proje
 
 export type BuildingKind =
   | 'barracks'
+  | 'vehicle_depot'
   | 'farm'
   | 'storage'
   | 'power_plant'
@@ -93,11 +94,29 @@ export const BARRACKS: BuildingSpec = {
   wall: M_WOOD,
   maxHp: 600,
   productionInterval: 6.0,
-  // Cycle through every kind the barracks can produce so a single building
-  // visibly outputs a balanced mix. Order is roughly "infantry → vehicles
-  // → diggers → economy" so the early ticks favour combat units.
-  produces: ['soldier', 'tank', 'tunneler', 'worm', 'dozer', 'worker'],
+  // Infantry only — vehicles come out of the dedicated VEHICLE_DEPOT now so a
+  // barracks reads as the personnel facility (soldier + worker bunks).
+  produces: ['soldier', 'worker'],
   stamp: stampBarracks,
+};
+
+/**
+ * Vehicle depot — heavy assembly hangar for tanks, dozers, worms, tunnelers,
+ * and rocket trucks. Larger footprint than a barracks (5x4) so the rolling
+ * door fits at the front. Same metal/stone aesthetic but with a wide hangar
+ * mouth; the renderer parks an in-progress chassis silhouette inside.
+ */
+export const VEHICLE_DEPOT: BuildingSpec = {
+  kind: 'vehicle_depot',
+  label: 'Vehicle Depot',
+  cellsW: 5,
+  cellsD: 4,
+  headroomVoxels: 28, // 3.5 m clearance for tank turret
+  wall: M_METAL,
+  maxHp: 900,
+  productionInterval: 9.0,
+  produces: ['tank', 'dozer', 'tunneler', 'worm', 'rocket_truck'],
+  stamp: stampVehicleDepot,
 };
 
 /**
@@ -141,9 +160,11 @@ export const STORAGE: BuildingSpec = {
 export const POWER_PLANT: BuildingSpec = {
   kind: 'power_plant',
   label: 'Power Plant',
-  cellsW: 5,
-  cellsD: 5,
-  headroomVoxels: 24, // 3 m main hall — wind turbine pylon sits above
+  // 4-cell footprint for the substation pad. A tall windmill on top makes the
+  // building tower above neighbours rather than spread horizontally.
+  cellsW: 4,
+  cellsD: 4,
+  headroomVoxels: 18, // 2.25 m machine room — tall windmill rises above
   wall: M_STONE,
   maxHp: 800,
   productionInterval: Infinity,
@@ -242,9 +263,12 @@ export const AA_TURRET: BuildingSpec = {
 export const SILO: BuildingSpec = {
   kind: 'silo',
   label: 'Silo Launcher',
-  cellsW: 5,
-  cellsD: 5,
-  headroomVoxels: 36,           // ~4.5 m main hall + missile tubes above
+  // Compact 3x3 footprint so the silo reads as a tight missile bunker rather
+  // than a sprawling fortress; the missile cluster on top is rebalanced
+  // around the smaller footprint in `stampSilo`.
+  cellsW: 3,
+  cellsD: 3,
+  headroomVoxels: 32,           // ~4 m main hall + missile tubes above
   wall: M_STONE,
   maxHp: 1000,
   productionInterval: Infinity,
@@ -253,11 +277,11 @@ export const SILO: BuildingSpec = {
   weapon: 'silo_launcher',
   launcherMaxStrength: 220,
   // Top of the missile cluster sits ~6 voxels above the parapet.
-  weaponMuzzleHeight: (36 + 6) * VOXEL_SIZE,
+  weaponMuzzleHeight: (32 + 6) * VOXEL_SIZE,
 };
 
 /** All building specs in the order they appear on the build-mode hotkeys (1..N). */
-export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, FARM, STORAGE, POWER_PLANT, REFINERY, TECH_LAB, TURRET, AA_TURRET, SILO];
+export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, VEHICLE_DEPOT, FARM, STORAGE, POWER_PLANT, REFINERY, TECH_LAB, TURRET, AA_TURRET, SILO];
 
 export interface FootprintHit {
   ok: boolean;
@@ -479,7 +503,160 @@ export function stampBarracks(
   ox: number, oz: number,
   floorY: number,
 ): number {
-  return stampHollowBox(world, BARRACKS, ox, oz, floorY);
+  let count = stampHollowBox(world, BARRACKS, ox, oz, floorY);
+  // Detail pass: window cuts on the side walls, a stone foundation strip at
+  // the base, and a stout flag pole over the door so the building reads as a
+  // garrison, not just a wood box.
+  const wxStart = ox * NAV_CELL_VOXELS;
+  const wzStart = oz * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + BARRACKS.cellsW * NAV_CELL_VOXELS;
+  const wzEnd = wzStart + BARRACKS.cellsD * NAV_CELL_VOXELS;
+  const yFloor = floorY + 1;
+  const yRoof = floorY + BARRACKS.headroomVoxels;
+  // Stone foundation: re-stamp the bottom 2 voxels of every perimeter column
+  // as M_STONE for a darker base — purely cosmetic, doesn't change wallCount
+  // (those voxels were wood already, we're replacing them).
+  const baseH = 2;
+  for (let y = yFloor + 1; y <= yFloor + baseH && y <= yRoof - 1; y++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      const onZSide = true;
+      void onZSide;
+      // -Z face
+      world.set(x, y, wzStart, M_STONE);
+      // +Z face
+      world.set(x, y, wzEnd - 1, M_STONE);
+    }
+    for (let z = wzStart; z < wzEnd; z++) {
+      // -X face
+      world.set(wxStart, y, z, M_STONE);
+    }
+  }
+  // Window cuts on the -Z and +Z faces — pairs of single-voxel air gaps at
+  // mid-height. The countLivingWalls liveness check tolerates them (it just
+  // counts perimeter voxels; we'll lose a handful but stay above the 25%
+  // threshold by a wide margin).
+  const winY = yFloor + 8;
+  if (winY < yRoof) {
+    const winXs = [wxStart + 6, wxStart + 14, wxStart + 22];
+    for (const wx of winXs) {
+      if (wx >= wxEnd - 1) continue;
+      world.set(wx, winY, wzStart, AIR);
+      world.set(wx + 1, winY, wzStart, AIR);
+      world.set(wx, winY, wzEnd - 1, AIR);
+      world.set(wx + 1, winY, wzEnd - 1, AIR);
+      count -= 4;
+    }
+  }
+  // Flag pole at the front-right corner — stone column + metal flag.
+  const poleX = wxEnd - 2;
+  const poleZ = wzEnd - 2;
+  for (let dy = 1; dy <= 8; dy++) {
+    const py = yRoof + dy;
+    if (py >= WORLD_Y) break;
+    world.set(poleX, py, poleZ, M_WOOD);
+    count++;
+  }
+  // Flag triangle (3 voxels of metal pointing in +X).
+  const flagBaseY = yRoof + 6;
+  for (let i = 0; i < 3; i++) {
+    if (poleX + 1 + i >= WORLD_X) break;
+    if (flagBaseY + i >= WORLD_Y) break;
+    world.set(poleX + 1, flagBaseY + i, poleZ, M_METAL);
+    count++;
+  }
+  return count;
+}
+
+/**
+ * Vehicle depot — wide hangar with a rolling-door cutout on the +X face,
+ * angled metal roof trusses, and a maintenance crane spine running down the
+ * inside. Larger than the barracks so a tank can drive out cleanly.
+ */
+export function stampVehicleDepot(
+  world: VoxelWorld,
+  ox: number, oz: number,
+  floorY: number,
+): number {
+  const spec = VEHICLE_DEPOT;
+  const wxStart = ox * NAV_CELL_VOXELS;
+  const wzStart = oz * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const yFloor = floorY + 1;
+  const yRoof = floorY + spec.headroomVoxels;
+  // Wide hangar door — 6 voxels wide, 14 tall — centred on the +X face.
+  const doorWz0 = ((wzStart + wzEnd) >> 1) - 3;
+  const doorWz1 = doorWz0 + 5;
+  const doorYTop = yFloor + 14;
+
+  let wallCount = 0;
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      // Concrete-stone floor (vehicles roll on stone, not wood).
+      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
+        world.set(x, yFloor, z, M_STONE);
+        wallCount++;
+      }
+      for (let y = yFloor + 1; y <= yRoof; y++) {
+        if (y >= WORLD_Y) break;
+        const onPerimeter =
+          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+        if (y === yRoof) {
+          // Corrugated metal roof.
+          world.set(x, y, z, M_METAL);
+          wallCount++;
+        } else if (onPerimeter) {
+          const isDoor = (x === wxEnd - 1 && z >= doorWz0 && z <= doorWz1 && y < doorYTop);
+          if (!isDoor) {
+            world.set(x, y, z, spec.wall);
+            wallCount++;
+          } else {
+            world.set(x, y, z, AIR);
+          }
+        } else {
+          world.set(x, y, z, AIR);
+        }
+      }
+    }
+  }
+  // Concrete pad strip just outside the door so the chassis rolls onto a
+  // levelled apron. Two voxels of M_PATH for visual continuity with roads.
+  for (let s = 0; s < 4; s++) {
+    const px = wxEnd + s;
+    if (px >= WORLD_X) break;
+    for (let z = doorWz0; z <= doorWz1; z++) {
+      if (z < 0 || z >= WORLD_Z) continue;
+      world.set(px, yFloor, z, M_PATH);
+    }
+  }
+  // Roof trusses — 3 metal beams running across the hangar at the ridges.
+  const ridgeXs = [wxStart + 6, wxStart + 18, wxStart + 30];
+  for (const rx of ridgeXs) {
+    if (rx <= wxStart || rx >= wxEnd - 1) continue;
+    for (let z = wzStart + 1; z < wzEnd - 1; z++) {
+      const py = yRoof + 1;
+      if (py >= WORLD_Y) break;
+      world.set(rx, py, z, M_METAL);
+      wallCount++;
+    }
+  }
+  // Vent stacks above the roof (two short metal columns) so the silhouette
+  // reads as industrial, not just a flat box.
+  const ventBases: [number, number][] = [
+    [wxStart + 8, wzStart + 6],
+    [wxStart + 24, wzStart + 18],
+  ];
+  for (const [vx, vz] of ventBases) {
+    if (vx <= wxStart || vx >= wxEnd - 1) continue;
+    if (vz <= wzStart || vz >= wzEnd - 1) continue;
+    for (let dy = 1; dy <= 5; dy++) {
+      const py = yRoof + dy;
+      if (py >= WORLD_Y) break;
+      world.set(vx, py, vz, M_METAL);
+      wallCount++;
+    }
+  }
+  return wallCount;
 }
 
 export function stampStorage(
@@ -487,7 +664,33 @@ export function stampStorage(
   ox: number, oz: number,
   floorY: number,
 ): number {
-  return stampHollowBox(world, STORAGE, ox, oz, floorY);
+  let count = stampHollowBox(world, STORAGE, ox, oz, floorY);
+  // Detail pass — storage gets stacked-crate accents on the roof and a sign
+  // strip above the door so it doesn't read as a plain box.
+  const wxStart = ox * NAV_CELL_VOXELS;
+  const wzStart = oz * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + STORAGE.cellsW * NAV_CELL_VOXELS;
+  const wzEnd = wzStart + STORAGE.cellsD * NAV_CELL_VOXELS;
+  const yRoof = floorY + STORAGE.headroomVoxels;
+  // Two crate stacks on the roof — tight 2x2 wood blocks at opposite corners.
+  const crateOffsets: [number, number][] = [
+    [wxStart + 3, wzStart + 3],
+    [wxEnd - 5, wzEnd - 5],
+  ];
+  for (const [bx, bz] of crateOffsets) {
+    for (let dy = 1; dy <= 3; dy++) {
+      const py = yRoof + dy;
+      if (py >= WORLD_Y) break;
+      for (let xo = 0; xo < 2; xo++) {
+        for (let zo = 0; zo < 2; zo++) {
+          if (bx + xo >= WORLD_X || bz + zo >= WORLD_Z) continue;
+          world.set(bx + xo, py, bz + zo, M_WOOD);
+          count++;
+        }
+      }
+    }
+  }
+  return count;
 }
 
 /**
@@ -533,9 +736,16 @@ export function stampFarm(
 }
 
 /**
- * Power plant: stone perimeter walls, M_DIRT_ROAD tiled floor, a recessed second-tier
- * crown around the parapet, and a stout wood pylon column stub at the centre of the
- * roof. The pylon stub is what the renderer's wind-turbine accessory bolts to.
+ * Height of the windmill mast above the substation roof, in voxels. Exposed
+ * so the renderer can mount the turbine head at the top without re-deriving
+ * the geometry.
+ */
+export const POWER_PLANT_MAST_VOXELS = 30;
+
+/**
+ * Power plant: small substation hut with a tall windmill mast rising from the
+ * centre. The mast is a 2x2 metal column that climbs much higher than the
+ * hut itself; the renderer mounts the rotating turbine at the top.
  */
 export function stampPowerPlant(
   world: VoxelWorld,
@@ -603,20 +813,35 @@ export function stampPowerPlant(
     }
   }
 
-  // Wood turbine pylon stub at the centre — a 2x2 column of M_WOOD, 6 voxels tall,
-  // mounted on top of the roof. The animated turbine head sits above it.
+  // Tall windmill mast at the centre — a 2x2 column climbing well above the
+  // hut so the turbine reads as a real wind tower at distance. Bottom half is
+  // M_STONE (lattice base), upper half M_METAL (slim mast). The renderer's
+  // turbine head bolts onto the top.
   const cxv = (wxStart + wxEnd) >> 1;
   const czv = (wzStart + wzEnd) >> 1;
-  const pylonH = 6;
-  for (let dy = 1; dy <= pylonH; dy++) {
+  const mastH = POWER_PLANT_MAST_VOXELS;
+  for (let dy = 1; dy <= mastH; dy++) {
     const py = yRoof + dy;
     if (py >= WORLD_Y) break;
+    const mat = dy <= 4 ? M_STONE : M_METAL;
     for (let xo = -1; xo <= 0; xo++) {
       for (let zo = -1; zo <= 0; zo++) {
-        world.set(cxv + xo, py, czv + zo, M_WOOD);
+        world.set(cxv + xo, py, czv + zo, mat);
         wallCount++;
       }
     }
+  }
+  // Cabling: thin wood lattice (single-voxel bracing) at four height bands so
+  // the mast doesn't read as a featureless column from afar. Each brace is a
+  // single voxel offset diagonally from the mast core.
+  for (const dy of [6, 12, 18, 24]) {
+    if (dy > mastH) break;
+    const py = yRoof + dy;
+    if (py >= WORLD_Y) break;
+    world.set(cxv - 2, py, czv - 1, M_WOOD); wallCount++;
+    world.set(cxv + 1, py, czv - 1, M_WOOD); wallCount++;
+    world.set(cxv - 1, py, czv - 2, M_WOOD); wallCount++;
+    world.set(cxv - 1, py, czv + 1, M_WOOD); wallCount++;
   }
   return wallCount;
 }
@@ -708,6 +933,27 @@ export function stampRefinery(
       }
     }
   }
+  // Window strip — pairs of single-voxel cuts on each long side wall at
+  // mid-height so the hall reads less like a featureless box. We deliberately
+  // re-cut these AFTER stamping the perimeter so they punch through the
+  // existing stone walls.
+  const winY = yFloor + 12;
+  if (winY < yRoof) {
+    for (let wx = wxStart + 4; wx < wxEnd - 3; wx += 6) {
+      world.set(wx, winY, wzStart, AIR);
+      world.set(wx, winY, wzEnd - 1, AIR);
+      wallCount -= 2;
+    }
+  }
+  // Pipe accent — a metal pipe running from the chimney base out across the
+  // roof to a small stub on the +X side. Reads as plumbing at a glance.
+  const pipeY = yRoof + 1;
+  if (pipeY < WORLD_Y) {
+    for (let x = chimX0 + 2; x < wxEnd - 1; x++) {
+      world.set(x, pipeY, chimZ0 + 1, M_METAL);
+      wallCount++;
+    }
+  }
   return wallCount;
 }
 
@@ -797,6 +1043,19 @@ export function stampTechLab(
     world.set(cxv, py, czv, M_WOOD);
     wallCount++;
   }
+  // Tall narrow window cuts on each side of the lab — single-voxel slits at
+  // mid-height. Reads as a research building, not a featureless box.
+  const slitYBase = yFloor + 8;
+  for (let dy = 0; dy < 4; dy++) {
+    const py = slitYBase + dy;
+    if (py >= yRoof) break;
+    for (const wx of [wxStart + 6, wxStart + 14, wxStart + 22]) {
+      if (wx >= wxEnd - 1) continue;
+      world.set(wx, py, wzStart, AIR);
+      world.set(wx, py, wzEnd - 1, AIR);
+      wallCount -= 2;
+    }
+  }
   return wallCount;
 }
 
@@ -855,14 +1114,27 @@ export function stampTurret(
       }
     }
   }
+  // Sandbag-style accent — a single ring of M_DIRT_ROAD voxels around the
+  // base perimeter so the emplacement reads as fortified, not just a stone
+  // box. We re-write the bottom voxel of the perimeter columns.
+  const accentY = yFloor + 1;
+  if (accentY < yRoof) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      world.set(x, accentY, wzStart, M_DIRT_ROAD);
+      world.set(x, accentY, wzEnd - 1, M_DIRT_ROAD);
+    }
+    for (let z = wzStart; z < wzEnd; z++) {
+      world.set(wxStart, accentY, z, M_DIRT_ROAD);
+      world.set(wxEnd - 1, accentY, z, M_DIRT_ROAD);
+    }
+  }
   return wallCount;
 }
 
 /**
- * Heavy silo launcher: a 5x5 stone fortress with a tall parapet and a 3x3
- * missile-tube cluster on the roof (six metal columns capped with red warhead
- * voxels). The renderer doesn't add any animated accessories — the missile
- * tubes are part of the static stamp.
+ * Heavy silo launcher: a 3x3 stone fortress with a tall parapet and a tight
+ * cluster of three missile tubes on the roof. The renderer doesn't add any
+ * animated accessories — the missile tubes are part of the static stamp.
  */
 export function stampSilo(
   world: VoxelWorld,
@@ -925,32 +1197,30 @@ export function stampSilo(
       }
     }
   }
-  // Missile tube cluster — 6 vertical tubes arranged in a 3x2 grid on the
-  // roof. Each tube is a 2x2 metal column 5 voxels tall capped with a single
-  // red-tinted M_METAL warhead voxel (we just use M_METAL throughout; the
-  // renderer's voxel-meshes pick the colour from the material catalog).
+  // Missile tubes — 3 single-column launchers in a tight triangular cluster
+  // on the roof. The 3x3 footprint (24 voxels per side) only fits a small
+  // cluster, so we place a 2x2 metal column at three offsets centred on the
+  // roof. Each tube is 6 voxels tall capped with a red-tinted M_METAL
+  // warhead voxel.
   const tubeBaseY = yRoof + 3; // sits above the parapet
-  const tubeHeight = 5;
-  // Layout: 3 tubes along X × 2 tubes along Z, centred. Tube footprint is 2
-  // voxels each side, gap of 1 between → 3*2+2*1 = 8 voxels along X (fits the
-  // 5-cell × 8-voxel = 40-voxel building width with margin).
-  const tubeStride = 3; // 2-wide tube + 1 gap
+  const tubeHeight = 6;
   const cxv = (wxStart + wxEnd) >> 1;
   const czv = (wzStart + wzEnd) >> 1;
-  const xStartTube = cxv - tubeStride - 1; // covers tube columns at -4..-3, -1..0, +2..+3
-  const zStartTube = czv - 2;
-  for (let tx = 0; tx < 3; tx++) {
-    for (let tz = 0; tz < 2; tz++) {
-      const baseX = xStartTube + tx * tubeStride;
-      const baseZ = zStartTube + tz * tubeStride;
-      for (let dy = 0; dy < tubeHeight; dy++) {
-        const py = tubeBaseY + dy;
-        if (py >= WORLD_Y) break;
-        for (let xo = 0; xo < 2; xo++) {
-          for (let zo = 0; zo < 2; zo++) {
-            world.set(baseX + xo, py, baseZ + zo, M_METAL);
-            wallCount++;
-          }
+  const tubeOffsets: [number, number][] = [
+    [cxv - 4, czv - 4],
+    [cxv + 2, czv - 4],
+    [cxv - 1, czv + 2],
+  ];
+  for (const [baseX, baseZ] of tubeOffsets) {
+    for (let dy = 0; dy < tubeHeight; dy++) {
+      const py = tubeBaseY + dy;
+      if (py >= WORLD_Y) break;
+      for (let xo = 0; xo < 2; xo++) {
+        for (let zo = 0; zo < 2; zo++) {
+          if (baseX + xo < 0 || baseX + xo >= WORLD_X) continue;
+          if (baseZ + zo < 0 || baseZ + zo >= WORLD_Z) continue;
+          world.set(baseX + xo, py, baseZ + zo, M_METAL);
+          wallCount++;
         }
       }
     }

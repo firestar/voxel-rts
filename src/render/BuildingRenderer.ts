@@ -12,6 +12,8 @@ import {
   buildCornStalkGeometry, buildWheatStalkGeometry,
   FARM_CORN_PER_FARM, FARM_WHEAT_PER_FARM,
   buildTurretHeadGeometry, TURRET_HEAD_Y_M,
+  buildDepotCraneGeometry, VEHICLE_DEPOT_CRANE_Y_M, VEHICLE_DEPOT_CRANE_SLIDE_M,
+  buildSolarPanelGeometry, POWER_PLANT_SOLAR_Y_M, POWER_PLANT_SOLAR_COUNT,
 } from './BuildingModels';
 
 /**
@@ -36,6 +38,8 @@ export class BuildingRenderer {
   private cornStalk: THREE.InstancedMesh;
   private wheatStalk: THREE.InstancedMesh;
   private turretHead: THREE.InstancedMesh;
+  private depotCrane: THREE.InstancedMesh;
+  private solarPanel: THREE.InstancedMesh;
 
   private capacity: number;
   private tmpM = new THREE.Matrix4();
@@ -62,6 +66,8 @@ export class BuildingRenderer {
     this.cornStalk = makeIM(buildCornStalkGeometry(), lit, capacity * FARM_CORN_PER_FARM);
     this.wheatStalk = makeIM(buildWheatStalkGeometry(), lit, capacity * FARM_WHEAT_PER_FARM);
     this.turretHead = makeIM(buildTurretHeadGeometry(), lit, capacity);
+    this.depotCrane = makeIM(buildDepotCraneGeometry(), lit, capacity);
+    this.solarPanel = makeIM(buildSolarPanelGeometry(), lit, capacity * POWER_PLANT_SOLAR_COUNT);
 
     this.group.add(
       this.turbineHub, this.turbineBlade,
@@ -69,11 +75,13 @@ export class BuildingRenderer {
       this.satDish, this.pulseCore,
       this.cornStalk, this.wheatStalk,
       this.turretHead,
+      this.depotCrane, this.solarPanel,
     );
   }
 
   update(buildings: Building[]): void {
     let nHub = 0, nBlade = 0, nSmoke = 0, nDish = 0, nCore = 0, nCorn = 0, nWheat = 0, nTurret = 0;
+    let nCrane = 0, nSolar = 0;
     const t = performance.now() / 1000;
 
     // Pulse colour modulation for the tech-lab core (shared across all labs).
@@ -95,6 +103,8 @@ export class BuildingRenderer {
           this.placePowerPlantTurbine(b.id, cx, cz, floorTopY, t + phase, nHub, nBlade);
           nHub++;
           nBlade += TURBINE_BLADE_COUNT;
+          this.placePowerPlantSolar(b, cx, cz, floorTopY, nSolar);
+          nSolar += POWER_PLANT_SOLAR_COUNT;
           break;
         case 'refinery':
           this.placeRefinerySmoke(cx, cz, floorTopY, t + phase, nSmoke);
@@ -116,6 +126,11 @@ export class BuildingRenderer {
           this.placeTurretHead(b, cx, cz, floorTopY, nTurret);
           nTurret++;
           break;
+        case 'vehicle_depot':
+          if (nCrane >= this.capacity) break;
+          this.placeDepotCrane(b, cx, cz, floorTopY, t + phase, nCrane);
+          nCrane++;
+          break;
         default:
           // Barracks / storage / silo: no rotating accessories. The silo's
           // missile cluster is part of the static voxel stamp.
@@ -131,15 +146,64 @@ export class BuildingRenderer {
     this.cornStalk.count = nCorn;
     this.wheatStalk.count = nWheat;
     this.turretHead.count = nTurret;
+    this.depotCrane.count = nCrane;
+    this.solarPanel.count = nSolar;
     for (const m of [
       this.turbineHub, this.turbineBlade,
       this.smoke,
       this.satDish, this.pulseCore,
       this.cornStalk, this.wheatStalk,
       this.turretHead,
+      this.depotCrane, this.solarPanel,
     ]) {
       m.instanceMatrix.needsUpdate = true;
     }
+  }
+
+  /**
+   * Slide a gantry crane back and forth above the depot floor. The crane runs
+   * along the building's X axis (long edge) and bobs slightly in Z so the
+   * shuttle reads as actively positioning a chassis.
+   */
+  private placeDepotCrane(
+    b: Building,
+    cx: number, cz: number, floorTopY: number,
+    t: number,
+    slot: number,
+  ): void {
+    const slide = Math.sin(t * 0.4) * VEHICLE_DEPOT_CRANE_SLIDE_M;
+    const wobble = Math.sin(t * 1.2) * 0.05;
+    this.tmpEuler.set(0, 0, 0, 'YXZ');
+    this.tmpQ.setFromEuler(this.tmpEuler);
+    this.tmpV.set(cx + slide, floorTopY + VEHICLE_DEPOT_CRANE_Y_M + wobble, cz);
+    this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+    this.depotCrane.setMatrixAt(slot, this.tmpM);
+  }
+
+  /**
+   * Lay out the solar panel bank around the windmill mast on the power plant
+   * roof. Panels are placed at fixed offsets and tilted toward the south so
+   * the silhouette reads as a hybrid generator.
+   */
+  private placePowerPlantSolar(
+    b: Building,
+    cx: number, cz: number, floorTopY: number,
+    solarStart: number,
+  ): void {
+    const offsets: [number, number][] = [
+      [-1.2, -1.2], [ 1.2, -1.2],
+      [-1.2,  1.2], [ 1.2,  1.2],
+    ];
+    const tilt = -0.5; // tilt panel face toward the sky (~30°)
+    for (let i = 0; i < POWER_PLANT_SOLAR_COUNT; i++) {
+      const [ox, oz] = offsets[i] ?? [0, 0];
+      this.tmpEuler.set(tilt, 0, 0, 'YXZ');
+      this.tmpQ.setFromEuler(this.tmpEuler);
+      this.tmpV.set(cx + ox, floorTopY + POWER_PLANT_SOLAR_Y_M, cz + oz);
+      this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+      this.solarPanel.setMatrixAt(solarStart + i, this.tmpM);
+    }
+    void b;
   }
 
   /**
