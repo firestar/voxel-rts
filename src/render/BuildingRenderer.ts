@@ -146,14 +146,16 @@ export class BuildingRenderer {
    * Position + yaw the rotating cannon head on top of a turret. Pivot sits at
    * the top of the building's pintle column (TURRET_HEAD_Y_M above the floor
    * top) and yaws to `weaponTurretYaw` so the visible barrel points at the
-   * current target.
+   * current target. The AA flak turret also drives `weaponTurretPitch` to
+   * tilt the barrel down while reloading; non-AA buildings leave pitch at 0
+   * so this is a no-op for them.
    */
   private placeTurretHead(
     b: Building,
     cx: number, cz: number, floorTopY: number,
     slot: number,
   ): void {
-    this.tmpEuler.set(0, b.weaponTurretYaw, 0, 'YXZ');
+    this.tmpEuler.set(b.weaponTurretPitch, b.weaponTurretYaw, 0, 'YXZ');
     this.tmpQ.setFromEuler(this.tmpEuler);
     this.tmpV.set(cx, floorTopY + TURRET_HEAD_Y_M, cz);
     this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
