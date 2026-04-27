@@ -412,7 +412,7 @@ describe('clearAboveRoads', () => {
 
     // Drop a leaf and a wood voxel above a paved column to simulate a tree
     // canopy that drifted across the road.
-    let chosenX = -1, chosenZ = -1, chosenY = -1;
+    let chosenX = -1, chosenZ = -1, chosenY = -1, chosenMat = 0;
     for (let z = 0; z < WORLD_Z && chosenX < 0; z++) {
       for (let x = 0; x < WORLD_X && chosenX < 0; x++) {
         if (!stats.columnMask[z * WORLD_X + x]) continue;
@@ -420,7 +420,7 @@ describe('clearAboveRoads', () => {
           const m = v[worldIndex(x, y, z)]!;
           if (m === AIR) continue;
           if (m === M_PATH || m === M_DIRT_ROAD) {
-            chosenX = x; chosenZ = z; chosenY = y;
+            chosenX = x; chosenZ = z; chosenY = y; chosenMat = m;
           }
           break;
         }
@@ -432,8 +432,9 @@ describe('clearAboveRoads', () => {
 
     clearAboveRoads(v, stats.columnMask);
 
-    // Surface road voxel still there; tree voxels above are gone.
-    expect(v[worldIndex(chosenX, chosenY, chosenZ)]).toBe(M_PATH);
+    // Surface road voxel still there (whichever flavor the column had); tree
+    // voxels above are gone.
+    expect(v[worldIndex(chosenX, chosenY, chosenZ)]).toBe(chosenMat);
     expect(v[worldIndex(chosenX, chosenY + 3, chosenZ)]).toBe(AIR);
     expect(v[worldIndex(chosenX, chosenY + 5, chosenZ)]).toBe(AIR);
   });
