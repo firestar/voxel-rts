@@ -5,6 +5,7 @@ import { PileManager } from '../src/sim/Piles';
 import { SaplingManager } from '../src/sim/Saplings';
 import { BuildingManager, STORAGE, checkFootprint } from '../src/sim/Buildings';
 import { tickWorkers, WORKER_CARRY_CAP } from '../src/sim/Workers';
+import { WorkerTaskBoard } from '../src/sim/WorkerTasks';
 import { VoxelWorld, worldIndex } from '../src/voxel/VoxelWorld';
 import { WORLD_X, WORLD_Z, VOXEL_SIZE, AIR } from '../src/voxel/types';
 import { M_GRASS, M_DIRT, M_WOOD, M_METAL } from '../src/voxel/Materials';
@@ -31,6 +32,7 @@ interface Deps {
   piles: PileManager;
   saplings: SaplingManager;
   resources: Resources;
+  taskBoard: WorkerTaskBoard;
   routeCalls: number;
 }
 
@@ -43,6 +45,7 @@ function makeDeps(): Deps {
     piles: new PileManager(),
     saplings: new SaplingManager(),
     resources: new Resources(),
+    taskBoard: new WorkerTaskBoard(),
     routeCalls: 0,
   };
 }
@@ -55,6 +58,7 @@ function tick(deps: Deps, dt: number): void {
     piles: deps.piles,
     saplings: deps.saplings,
     resources: deps.resources,
+    taskBoard: deps.taskBoard,
     routeWorker: (): void => { deps.routeCalls++; },
     onVoxelEdit: (): void => {},
   });
@@ -157,8 +161,13 @@ describe('transporter worker — picks up pile and delivers to storage', () => {
       { workerRole: 'transporter' },
     );
 
-    // First tick: transporter empty + at the pile → claims and picks up.
-    tick(deps, 0.1);
+    // Pickup is now gated on a weight-scaled load timer. For 3 wood + 2
+    // metal that's ~1.6 seconds, so we need to step the tick repeatedly
+    // before the carrying buffer fills. We grant a generous budget and bail
+    // out once the pickup completes.
+    for (let i = 0; i < 40 && deps.piles.piles.length > 0; i++) {
+      tick(deps, 0.1);
+    }
     expect(t.carrying.wood + t.carrying.metals).toBeGreaterThan(0);
     expect(deps.piles.piles.length).toBe(0);
 

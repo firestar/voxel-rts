@@ -7,6 +7,7 @@ import { Pile, PileManager } from './Piles';
 import { BuildingManager, Building, doorWorldPos } from './Buildings';
 import { SaplingManager } from './Saplings';
 import { NAV_CELL_VOXELS } from '../path/SurfaceNav';
+import { WorkerTaskBoard, WorkOrder } from './WorkerTasks';
 
 /**
  * Capacity each worker can carry before they MUST drop / deliver. Mining is
@@ -25,11 +26,7 @@ const WORK_REACH_M = 1.4;
 const INTERACT_REACH_M = 1.6;
 
 /**
- * Damage applied per second when a worker chops or mines. Per-frame we apply
- * `WORK_DPS * dt`, scaled to integer peak via the existing damageSphere
- * machinery (which clamps to [1, 255]). 60 dps means a wood voxel (hp 60)
- * breaks in ~1 s and a metal voxel (hp 80) in ~1.3 s — fast enough to feel
- * responsive without trivialising harvesting.
+ * Damage applied per second when a worker chops or mines.
  */
 const WORK_DPS = 60;
 /** Voxel-space radius of each chop/mine swing; small so we hit the target. */
@@ -40,14 +37,39 @@ const SCAN_RADIUS_M = 60;
 const SCAN_R2 = SCAN_RADIUS_M * SCAN_RADIUS_M;
 
 /**
+ * Seconds a worker can spend on a non-idle task without any progress signal
+ * (no path step, no carry change, no voxel chip) before the stall recovery
+ * kicks in: the task is dropped to idle, any TaskBoard claim is released,
+ * and the worker re-scans next tick. Generous enough that a pathfinder
+ * waiting on a long surface route doesn't trip it, but small enough that a
+ * truly stuck unit doesn't sit on a job indefinitely.
+ */
+const TASK_STALL_SECONDS = 8;
+
+/**
+ * Per-resource "weight" used to compute transporter load time. Each unit of
+ * wood adds `LOAD_SECONDS_PER_WOOD` seconds; each unit of metal adds
+ * `LOAD_SECONDS_PER_METAL`. Metals are heavier so a transporter needs to
+ * spend visibly longer hoisting an ore pile than a wood pile, even at the
+ * same item count. Tuned so a full-cap pure-wood pile loads in roughly a
+ * second while a full-cap metal pile takes ~2.5 s.
+ */
+const LOAD_SECONDS_PER_WOOD = 0.2;
+const LOAD_SECONDS_PER_METAL = 0.5;
+
+/**
  * Per-frame automation for every worker unit. Drives the harvester /
- * transporter task state machines. Movement to targets is delegated back to
- * the caller via `routeWorker`, which the Game wires to its `routePath`.
+ * transporter task state machines through the global `WorkerTaskBoard`:
  *
- * The Worker tick does NOT modify the path itself, only the task field and
- * the carrying buffer. When a task assignment requires routing, we call
- * `routeWorker(u, x, y, z)` and let the existing pathfinding pipeline handle
- * the move; the next tick polls arrival.
+ *   - Pile drops, ripe farms, etc. become `WorkOrder` entries on the board.
+ *   - Idle workers `claim()` an order matching their role.
+ *   - Local progress (voxel chip, carry change, path advance) keeps the
+ *     stall timer at zero. If a worker can't make progress for
+ *     `TASK_STALL_SECONDS`, the task is reset and the order is released.
+ *
+ * Movement is delegated back to the caller via `routeWorker`, which the
+ * Game wires to its `routePath`. A* still runs asynchronously, so we
+ * tolerate the path being empty for a frame after the call.
  */
 export interface WorkerDeps {
   units: UnitManager;
@@ -56,33 +78,86 @@ export interface WorkerDeps {
   piles: PileManager;
   saplings: SaplingManager;
   resources: Resources;
-  /**
-   * Called when the worker needs to set a path to a world-space target.
-   * Implementation lives in Game.ts (uses the existing path client). The
-   * tick just supplies the destination — A* still runs asynchronously, so
-   * we tolerate the path being empty for a frame after the call.
-   */
+  taskBoard: WorkerTaskBoard;
   routeWorker: (u: Unit, wx: number, wy: number, wz: number) => void;
-  /**
-   * Called when a worker action mutated the voxel grid (chop / mine), so
-   * the Game can request a nav rebuild in the same throttled way the
-   * tunneler carve does.
-   */
   onVoxelEdit: () => void;
 }
 
 export function tickWorkers(dt: number, deps: WorkerDeps): void {
+  // Refresh auto-published orders (new piles, newly-ripe farms, removed
+  // entries whose target despawned) before any worker reads from the board.
+  deps.taskBoard.syncAutoOrders(deps.piles, deps.buildings);
+
   const { units } = deps;
   for (const u of units.units) {
     if (u.kind !== 'worker') continue;
+    // Stall accounting: if a worker on a non-idle task has made no progress
+    // since the last tick, age the stall timer; on progress, reset it.
+    if (u.task.kind === 'idle') {
+      u.taskStallTimer = 0;
+      u.taskProgressKey = 0;
+    } else {
+      const key = workerProgressKey(u);
+      if (key !== u.taskProgressKey) {
+        u.taskProgressKey = key;
+        u.taskStallTimer = 0;
+      } else {
+        u.taskStallTimer += dt;
+        if (u.taskStallTimer >= TASK_STALL_SECONDS) {
+          // Stall recovery: drop to idle, release any board claim and any
+          // pile claim, kill the path so the next tick gets a fresh route.
+          // Do NOT drop carried resources — the worker keeps what they
+          // already have so they can still go deliver.
+          if (u.claimedOrderId !== 0) {
+            const o = deps.taskBoard.byId(u.claimedOrderId);
+            if (o && o.claimedBy === u.id) o.claimedBy = 0;
+            u.claimedOrderId = 0;
+          }
+          deps.piles.releaseClaimsBy(u.id);
+          // If the worker was claimed as a farmer/harvester on a building,
+          // release that too so the building doesn't think we're still on it.
+          for (const b of deps.buildings.buildings) {
+            if (b.farmerId === u.id) b.farmerId = null;
+            if (b.harvesterClaimId === u.id) b.harvesterClaimId = null;
+          }
+          u.task = { kind: 'idle' };
+          u.path = [];
+          u.loadTimer = 0;
+          u.taskStallTimer = 0;
+          u.taskProgressKey = 0;
+          continue;
+        }
+      }
+    }
+
     if (u.workerRole === 'harvester') tickHarvester(u, dt, deps);
     else tickTransporter(u, dt, deps);
   }
 }
 
+/**
+ * Cheap signal of whether `u` has made tangible progress on its task since
+ * the last tick: packs path length, carry totals, and pickup-timer integer
+ * milliseconds into a single number. Any real change rotates the key, which
+ * is enough for stall detection.
+ */
+function workerProgressKey(u: Unit): number {
+  const carry = u.carrying.wood * 31 + u.carrying.metals;
+  const path = u.path.length;
+  const load = Math.round(u.loadTimer * 100);
+  return ((carry & 0xffff) << 16) ^ ((path & 0xff) << 8) ^ (load & 0xff);
+}
+
 // ----------------------------- Harvester -------------------------------------
 
 function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
+  // External cancel (e.g. the player hit X) leaves the worker idle but with
+  // a stale `claimedOrderId`. Release the claim back to the board so a
+  // different worker can pick the order up — we don't `remove()` it because
+  // the player only cancelled this worker, not the order itself.
+  if (u.task.kind === 'idle' && u.claimedOrderId !== 0) {
+    releaseClaimedOrder(u, deps);
+  }
   const total = u.carrying.wood + u.carrying.metals;
   // Cap reached → drop a pile right where we stand and clear carrying. The
   // dropped pile sits at the worker's feet; a transporter will pick it up.
@@ -105,8 +180,6 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
       const tx = u.task.wx, ty = u.task.wy, tz = u.task.wz;
       const dx = tx - u.x, dz = tz - u.z;
       const horiz2 = dx * dx + dz * dz;
-      // Verify the target voxel is still the resource we expected. Trees can
-      // be chopped down by another worker; ore can be cleared by tunnelers.
       const vx = Math.floor(tx / VOXEL_SIZE);
       const vy = Math.floor(ty / VOXEL_SIZE);
       const vz = Math.floor(tz / VOXEL_SIZE);
@@ -117,16 +190,10 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
       }
 
       if (horiz2 > WORK_REACH_M * WORK_REACH_M) {
-        // Out of reach — we expect the path to bring us closer; if no path
-        // is set (or we somehow drifted), kick a route.
         if (u.path.length === 0) deps.routeWorker(u, tx, ty, tz);
         return;
       }
 
-      // In range. Apply per-frame damage to the target voxel via the same
-      // damageSphere primitive the tunneler uses. peak is dps * dt clamped
-      // to a sensible per-tick bite so the voxel doesn't shred in one frame
-      // unless dt is unusually large.
       const peak = Math.max(1, Math.min(255, Math.round(WORK_DPS * dt)));
       const result = deps.world.damageSphere(
         vx + 0.5, vy + 0.5, vz + 0.5,
@@ -134,18 +201,11 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
         peak,
       );
       if (result.destroyed.length > 0) {
-        // Each destroyed voxel of the targeted material adds 1 to carrying;
-        // collateral leaf / dirt / etc. counts for nothing (workers don't
-        // bag dirt, only the resource they came for).
         for (const d of result.destroyed) {
           if (d.material === M_WOOD) u.carrying.wood++;
           else if (d.material === M_METAL) u.carrying.metals++;
         }
         deps.onVoxelEdit();
-        // If the target voxel itself is now air, we're done with it; pick
-        // another adjacent voxel of the same kind next frame. The "pick
-        // another" lookup happens by going back to idle; the harvester will
-        // re-scan and most often pick the same tree's next voxel.
         const after = readVoxel(deps.world.buffers.voxels, vx, vy, vz);
         if (after !== targetMat) u.task = { kind: 'idle' };
       }
@@ -157,31 +217,26 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
       const dx = tx - u.x, dz = tz - u.z;
       if (dx * dx + dz * dz > INTERACT_REACH_M * INTERACT_REACH_M) {
         if (u.path.length === 0) {
-          // Plant target is a 2D xz; route via surface Y at that column.
           deps.routeWorker(u, tx, u.y, tz);
         }
         return;
       }
       const seed = (u.id * 0x9e3779b9 + Math.floor(performance.now())) >>> 0;
       const res = deps.saplings.plant(deps.world, tx, tz, seed);
-      // Whether or not the plant succeeded, drop the task — failure modes
-      // (no grass, too close to existing) shouldn't loop the worker forever.
       if (res.ok) deps.onVoxelEdit();
+      // Plant orders complete win-or-lose; remove the board entry.
+      completeClaimedOrder(u, deps);
       u.task = { kind: 'idle' };
       return;
     }
 
     case 'farm': {
-      // Player-assigned farmer. Walk to the farm centre, then linger inside
-      // the farm rectangle so BuildingManager.tickFarm sees the worker as
-      // "active tender" and accelerates crop growth.
       const farm = deps.buildings.byId(u.task.buildingId);
       if (!farm || farm.destroyed || farm.spec.kind !== 'farm') {
+        completeClaimedOrder(u, deps);
         u.task = { kind: 'idle' };
         return;
       }
-      // Register as the farm's farmer so the building sim treats us as
-      // active. Subsequent ticks reaffirm this — no harm if we lose it.
       farm.farmerId = u.id;
       const cxw = farmCenterX(farm);
       const czw = farmCenterZ(farm);
@@ -190,11 +245,6 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
         deps.routeWorker(u, cxw, u.y, czw);
         return;
       }
-      // Standing inside the field. If the crop is ripe and no other harvester
-      // has claimed it, the farmer collects directly so a single-worker setup
-      // doesn't stall waiting for a separate harvester to arrive. The farmer
-      // then keeps the 'farm' task and immediately resumes tending the now-
-      // empty field.
       if (inside && farm.cropReady && (farm.harvesterClaimId === null || farm.harvesterClaimId === u.id)) {
         deps.buildings.collectFarm(farm, u.id);
       }
@@ -204,8 +254,8 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
     case 'harvestFarm': {
       const farm = deps.buildings.byId(u.task.buildingId);
       if (!farm || farm.destroyed || farm.spec.kind !== 'farm' || !farm.cropReady) {
-        // Crop got harvested by someone else / farm gone — drop and rescan.
         if (farm && farm.harvesterClaimId === u.id) farm.harvesterClaimId = null;
+        completeClaimedOrder(u, deps);
         u.task = { kind: 'idle' };
         return;
       }
@@ -216,9 +266,8 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
         if (u.path.length === 0) deps.routeWorker(u, cxw, u.y, czw);
         return;
       }
-      // Arrived. Deliver food directly via the BuildingManager helper, which
-      // resets the farm and pushes through `foodSink` to the player counter.
       deps.buildings.collectFarm(farm, u.id);
+      completeClaimedOrder(u, deps);
       u.task = { kind: 'idle' };
       return;
     }
@@ -226,29 +275,27 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
     case 'deliver':
     case 'fetchPile':
       // Harvesters don't deliver / fetch — those are transporter tasks.
-      // Reset to idle so the harvester picks up its real job.
       u.task = { kind: 'idle' };
       return;
   }
 }
 
 /**
- * Pick the next harvest task for an idle harvester. Priority:
- *   1. Nearest ripe, unclaimed farm — food is the rarest resource pre-economy
- *      and a ready field rots if nobody collects, so harvesters drop tree /
- *      ore work to grab it first.
- *   2. Nearest exposed metal voxel within SCAN_RADIUS_M.
- *   3. Nearest tree voxel within SCAN_RADIUS_M.
- * If none of those is available the worker stays idle this frame.
+ * Pick the next harvest task for an idle harvester. The board is checked
+ * first so player-issued plant orders and ripe farms (auto-published) get
+ * picked up before any local scan-for-trees work. If the board has nothing
+ * for us, fall back to scanning for the nearest exposed metal or wood
+ * voxel within `SCAN_RADIUS_M`.
  */
 function assignNextHarvestTask(u: Unit, deps: WorkerDeps): void {
-  const farm = deps.buildings.nearestReadyFarm(u.x, u.z);
-  if (farm) {
-    farm.harvesterClaimId = u.id;
-    u.task = { kind: 'harvestFarm', buildingId: farm.id };
-    deps.routeWorker(u, farmCenterX(farm), u.y, farmCenterZ(farm));
+  const order = deps.taskBoard.claim(u.id, isHarvesterOrder);
+  if (order) {
+    u.claimedOrderId = order.id;
+    applyOrderToHarvester(u, order, deps);
     return;
   }
+  // No board work — fall back to the local voxel scan. Ore beats wood
+  // because metal is the rarer resource in the early economy.
   const ore = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_METAL);
   if (ore) {
     u.task = {
@@ -260,7 +307,6 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps): void {
     deps.routeWorker(u, u.task.wx, u.task.wy, u.task.wz);
     return;
   }
-
   const wood = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_WOOD);
   if (wood) {
     u.task = {
@@ -271,22 +317,83 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps): void {
     };
     deps.routeWorker(u, u.task.wx, u.task.wy, u.task.wz);
   }
-  // No work in range — stay idle this tick.
+}
+
+/** Order kinds a harvester is willing to take from the board. */
+function isHarvesterOrder(o: WorkOrder): boolean {
+  return o.kind === 'plant' || o.kind === 'farmTend' || o.kind === 'harvestFarm';
+}
+
+/** Order kinds a transporter is willing to take from the board. */
+function isTransporterOrder(o: WorkOrder): boolean {
+  return o.kind === 'fetchPile';
+}
+
+/**
+ * Translate a freshly-claimed `WorkOrder` into the matching per-worker
+ * task and kick a route. Keeps the harvester switch happy with the same
+ * task shape the rest of the file already understands.
+ */
+function applyOrderToHarvester(u: Unit, order: WorkOrder, deps: WorkerDeps): void {
+  switch (order.kind) {
+    case 'plant':
+      u.task = { kind: 'plant', wx: order.wx!, wz: order.wz! };
+      deps.routeWorker(u, order.wx!, u.y, order.wz!);
+      return;
+    case 'farmTend': {
+      const farm = deps.buildings.byId(order.buildingId!);
+      if (!farm) { completeClaimedOrder(u, deps); u.task = { kind: 'idle' }; return; }
+      u.task = { kind: 'farm', buildingId: order.buildingId! };
+      deps.routeWorker(u, farmCenterX(farm), u.y, farmCenterZ(farm));
+      return;
+    }
+    case 'harvestFarm': {
+      const farm = deps.buildings.byId(order.buildingId!);
+      if (!farm) { completeClaimedOrder(u, deps); u.task = { kind: 'idle' }; return; }
+      farm.harvesterClaimId = u.id;
+      u.task = { kind: 'harvestFarm', buildingId: order.buildingId! };
+      deps.routeWorker(u, farmCenterX(farm), u.y, farmCenterZ(farm));
+      return;
+    }
+    case 'fetchPile':
+      // Should never reach here — harvesters skip pile orders.
+      completeClaimedOrder(u, deps);
+      u.task = { kind: 'idle' };
+      return;
+  }
+}
+
+/** Drop the unit's claimed order from the board (if any). */
+function completeClaimedOrder(u: Unit, deps: WorkerDeps): void {
+  if (u.claimedOrderId === 0) return;
+  deps.taskBoard.remove(u.claimedOrderId);
+  u.claimedOrderId = 0;
+}
+
+/** Release the unit's claim on its order back to the pool, but leave the
+ *  order on the board so another worker can pick it up. */
+function releaseClaimedOrder(u: Unit, deps: WorkerDeps): void {
+  if (u.claimedOrderId === 0) return;
+  const o = deps.taskBoard.byId(u.claimedOrderId);
+  if (o && o.claimedBy === u.id) o.claimedBy = 0;
+  u.claimedOrderId = 0;
 }
 
 // ----------------------------- Transporter -----------------------------------
 
 function tickTransporter(u: Unit, dt: number, deps: WorkerDeps): void {
-  void dt;
+  // Mirror the harvester's external-cancel cleanup: a worker dropped to
+  // idle from outside the tick must release any board claim so another
+  // transporter can pick the order up.
+  if (u.task.kind === 'idle' && u.claimedOrderId !== 0) {
+    releaseClaimedOrder(u, deps);
+  }
   // Already carrying something → take it to the nearest storage building.
   const carryTotal = u.carrying.wood + u.carrying.metals;
   if (carryTotal > 0) {
     if (u.task.kind !== 'deliver') u.task = { kind: 'deliver' };
     const storage = deps.buildings.nearestStorage(u.x, u.z);
-    if (!storage) {
-      // No storage exists; idle in place but keep the load.
-      return;
-    }
+    if (!storage) return;
     const dpos = doorWorldPos(storage);
     const dx = dpos.x - u.x, dz = dpos.z - u.z;
     if (dx * dx + dz * dz <= INTERACT_REACH_M * INTERACT_REACH_M) {
@@ -301,23 +408,30 @@ function tickTransporter(u: Unit, dt: number, deps: WorkerDeps): void {
     return;
   }
 
-  // Empty-handed → pursue (or claim) a pile. We may transition idle→fetchPile
-  // and then immediately pick up in the same tick when the transporter
-  // already sits on the pile (e.g. an idle transporter standing where a
-  // harvester just dropped). The idle branch falls through into fetchPile
-  // by reassigning u.task and re-entering the same logic.
+  // Empty-handed: claim a fetchPile order from the board if not already on one.
   if (u.task.kind === 'idle') {
-    const pile = deps.piles.nearest(u.x, u.z, u.id);
-    if (!pile) return;
-    pile.claimedBy = u.id;
-    u.task = { kind: 'fetchPile', pileId: pile.id };
-    deps.routeWorker(u, pile.x, pile.y, pile.z);
+    const order = deps.taskBoard.claim(u.id, isTransporterOrder);
+    if (!order) return;
+    u.claimedOrderId = order.id;
+    const p = lookupPile(deps.piles, order.pileId!);
+    if (!p) {
+      completeClaimedOrder(u, deps);
+      return;
+    }
+    p.claimedBy = u.id;
+    u.task = { kind: 'fetchPile', pileId: order.pileId! };
+    u.loadTimer = 0;
+    deps.routeWorker(u, p.x, p.y, p.z);
     // fall through into the fetchPile handler below.
   }
 
   if (u.task.kind === 'fetchPile') {
     const p = lookupPile(deps.piles, u.task.pileId);
     if (!p) {
+      // Pile vanished mid-haul (another transporter beat us, or harvester
+      // collected). Drop the claim and idle so the next tick re-picks.
+      completeClaimedOrder(u, deps);
+      u.loadTimer = 0;
       u.task = { kind: 'idle' };
       return;
     }
@@ -326,16 +440,36 @@ function tickTransporter(u: Unit, dt: number, deps: WorkerDeps): void {
       if (u.path.length === 0) deps.routeWorker(u, p.x, p.y, p.z);
       return;
     }
+    // In range. Start the pickup animation if it isn't already running, then
+    // tick it down. The transfer doesn't actually happen until the timer
+    // hits zero — heavier piles take longer to load.
+    if (u.loadTimer === 0) {
+      u.loadTimer = pileLoadSeconds(p);
+      // Seed at least one frame so a perfectly-instant tick (dt big) still
+      // shows the loading state visibly to the player.
+      if (u.loadTimer === 0) u.loadTimer = LOAD_SECONDS_PER_WOOD;
+    }
+    u.loadTimer = Math.max(0, u.loadTimer - dt);
+    if (u.loadTimer > 0) return;
     u.carrying.wood += p.wood;
     u.carrying.metals += p.metals;
     deps.piles.remove(p.id);
+    completeClaimedOrder(u, deps);
     u.task = { kind: 'deliver' };
     return;
   }
 
-  // chop / mine / plant / deliver-with-empty-hands → reset to idle so the
-  // next tick re-picks the right work.
+  // Any other state → reset to idle so the next tick re-picks the right work.
   u.task = { kind: 'idle' };
+}
+
+/**
+ * Total seconds a transporter must spend hoisting `p` before the contents
+ * transfer to its carry buffer. Wood is light, metals are heavier — see
+ * `LOAD_SECONDS_PER_WOOD` / `LOAD_SECONDS_PER_METAL`.
+ */
+export function pileLoadSeconds(p: Pile): number {
+  return p.wood * LOAD_SECONDS_PER_WOOD + p.metals * LOAD_SECONDS_PER_METAL;
 }
 
 function lookupPile(pm: PileManager, id: number): Pile | null {
@@ -347,17 +481,6 @@ function lookupPile(pm: PileManager, id: number): Pile | null {
 
 interface VoxelHit { vx: number; vy: number; vz: number; }
 
-/**
- * Find the nearest "exposed" voxel of `targetMat` to the worker. Exposed =
- * has at least one orthogonal neighbour that is air. Search is a simple
- * brute-force scan over a bounding box around the worker out to
- * SCAN_RADIUS_M, keeping the closest hit by squared distance.
- *
- * Brute-force is fine for the voxel scale and current map size: at most
- * ~480k cells in the box, and we early-out via a coarse grid stride — we
- * sample every 2nd voxel in each axis, then refine. In practice for the
- * 768³ voxel world a typical scan touches a few thousand cells.
- */
 function findNearestExposed(
   voxels: Uint8Array,
   wx: number, wy: number, wz: number,
@@ -376,9 +499,6 @@ function findNearestExposed(
 
   let best: VoxelHit | null = null;
   let bestD2 = Infinity;
-  // Coarse stride first: only inspect every 2nd voxel. If we find a target,
-  // we still verify its exposure on a fine scan, but the coarse stride keeps
-  // the per-frame cost bounded.
   const STRIDE = 2;
   const reachM2 = SCAN_R2 / (VOXEL_SIZE * VOXEL_SIZE);
 
@@ -416,20 +536,15 @@ function readVoxel(voxels: Uint8Array, vx: number, vy: number, vz: number): numb
   return voxels[worldIndex(vx, vy, vz)]!;
 }
 
-// Re-export for test convenience.
 export { findNearestExposed, isExposed };
-// Re-export Building too so callers that build deps don't need a separate import.
 export type { Building };
 
-/** World-meters X of the centre of a building's footprint. */
 function farmCenterX(b: Building): number {
   return (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
 }
-/** World-meters Z of the centre of a building's footprint. */
 function farmCenterZ(b: Building): number {
   return (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
 }
-/** True when world-meters (x, z) lies inside the farm's stamped rectangle. */
 function pointInFarm(b: Building, x: number, z: number): boolean {
   const wxStart = b.ox * NAV_CELL_VOXELS * VOXEL_SIZE;
   const wzStart = b.oz * NAV_CELL_VOXELS * VOXEL_SIZE;

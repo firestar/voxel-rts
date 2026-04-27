@@ -431,6 +431,33 @@ export interface Unit {
    */
   carrying: { wood: number; metals: number };
   /**
+   * Seconds the worker has been on the current non-idle task without making
+   * forward progress (no carry change, no path advance, no voxel chip).
+   * Reset to 0 on any progress; when it crosses the stall threshold the
+   * worker drops the task and releases any TaskBoard claim.
+   */
+  taskStallTimer: number;
+  /**
+   * Cached previous progress signal — `path.length`, `carrying.wood`,
+   * `carrying.metals` packed into a single key. Used by stall detection to
+   * tell when something tangible advanced.
+   */
+  taskProgressKey: number;
+  /**
+   * Seconds remaining on a transporter's pickup animation. Set when the
+   * transporter reaches a pile; ticks down each frame; the actual transfer
+   * doesn't fire until it hits 0. Scaled by the pile's material weight so
+   * a heavy metal pile takes meaningfully longer to load than a wood pile.
+   * 0 means "no load in progress".
+   */
+  loadTimer: number;
+  /**
+   * TaskBoard order id this worker has claimed, or 0 when none. Cleared on
+   * task completion, on stall, and when the worker dies — `releaseDead`
+   * sweeps both the unit list and the board through this id.
+   */
+  claimedOrderId: number;
+  /**
    * Trailing body segments for chain-bodied diggers (worm). Empty for everyone else.
    * Element 0 is the segment closest to the head; each subsequent segment trails
    * further back. Each segment is placed at an exact arc-length offset along the
@@ -692,6 +719,10 @@ export class UnitManager {
       workerRole: opts?.workerRole ?? 'harvester',
       task: { kind: 'idle' },
       carrying: { wood: 0, metals: 0 },
+      taskStallTimer: 0,
+      taskProgressKey: 0,
+      loadTimer: 0,
+      claimedOrderId: 0,
       segments,
       pathHistory,
       spoilLoad: 0,

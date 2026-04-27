@@ -23,6 +23,7 @@ import { Resources } from '../sim/Resources';
 import { PileManager } from '../sim/Piles';
 import { SaplingManager } from '../sim/Saplings';
 import { tickWorkers } from '../sim/Workers';
+import { WorkerTaskBoard, describeOrder } from '../sim/WorkerTasks';
 import { ProjectileManager, PROJECTILES, muzzleOrigin, ProjectileImpact } from '../sim/Projectiles';
 import { WEAPONS } from '../sim/Weapons';
 import { tickWeapons } from '../sim/WeaponTick';
@@ -62,6 +63,7 @@ export class Game {
   readonly resources = new Resources();
   readonly piles = new PileManager();
   readonly saplings = new SaplingManager();
+  readonly taskBoard = new WorkerTaskBoard();
   readonly projectiles = new ProjectileManager();
   readonly projectileRenderer = new ProjectileRenderer();
   readonly muzzleFlashes = new FlashPool(256);
@@ -88,6 +90,9 @@ export class Game {
   private actionsEl: HTMLElement | null = null;
   /** Last rendered panel signature. Used to skip DOM rebuilds when nothing changed. */
   private actionsRenderedKey = '';
+  private tasksEl: HTMLElement | null = null;
+  /** Last rendered task-panel signature. Same purpose as `actionsRenderedKey`. */
+  private tasksRenderedKey = '';
   private mode: Mode = 'play';
   private rebuildPending = false;
   private rebuildQueued = false;
@@ -138,6 +143,7 @@ export class Game {
     this.modeEl = document.getElementById('mode');
     this.selBoxEl = document.getElementById('selbox');
     this.actionsEl = document.getElementById('actions');
+    this.tasksEl = document.getElementById('tasks');
 
     this.onResize();
     window.addEventListener('resize', this.onResize);
@@ -382,6 +388,7 @@ export class Game {
         piles: this.piles,
         saplings: this.saplings,
         resources: this.resources,
+        taskBoard: this.taskBoard,
         routeWorker: (u, wx, wy, wz): void => { void this.routePath(u, wx, wy, wz); },
         onVoxelEdit: (): void => { this.requestNavRebuild(false); },
       });
@@ -439,6 +446,7 @@ export class Game {
       this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}${weaponDesc}`;
     }
     this.renderActionPanel();
+    this.renderTaskPanel();
   }
 
   /**
@@ -775,15 +783,15 @@ export class Game {
     }
 
     if (this.mode === 'plant') {
-      // Plant mode: only meaningful with a harvester worker selected. Click
-      // anywhere on terrain — we drop the plant task at the click voxel xz
-      // and let tickWorkers route the worker to it.
+      // Plant mode: a harvester needs to be selected, but the actual
+      // assignment runs through the global task board so the same plant
+      // order survives if the chosen worker dies / is reassigned. Any free
+      // harvester will pick it up next tick.
       const selected = this.units.units.find(u => u.selected);
       const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
       if (!r || !selected || selected.kind !== 'worker' || selected.workerRole !== 'harvester') return;
       const wx = r.target.x, wz = r.target.z;
-      selected.task = { kind: 'plant', wx, wz };
-      void this.routePath(selected, wx, selected.y, wz);
+      this.taskBoard.addPlant(wx, wz);
       return;
     }
 
@@ -1430,12 +1438,24 @@ export class Game {
       // Detach any existing farmer from this farm so the latest assignment
       // wins, then route the new farmer to the field. tickFarm validates the
       // assignment each tick; the worker will start tending on arrival.
+      // Also publish a farmTend order on the global board pre-claimed for
+      // this worker so the right-side panel reflects the assignment and a
+      // stall recovery later releases it cleanly.
       if (b.farmerId !== null && b.farmerId !== worker.id) {
         const prev = this.units.units.find(u => u.id === b.farmerId);
-        if (prev && prev.task.kind === 'farm') prev.task = { kind: 'idle' };
+        if (prev && prev.task.kind === 'farm') {
+          prev.task = { kind: 'idle' };
+          if (prev.claimedOrderId !== 0) {
+            this.taskBoard.remove(prev.claimedOrderId);
+            prev.claimedOrderId = 0;
+          }
+        }
       }
       b.farmerId = worker.id;
       worker.task = { kind: 'farm', buildingId: b.id };
+      const order = this.taskBoard.addFarmTend(b.id);
+      order.claimedBy = worker.id;
+      worker.claimedOrderId = order.id;
       const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
       const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
       void this.routePath(worker, cxw, worker.y, czw);
@@ -1832,6 +1852,51 @@ export class Game {
       row.appendChild(lbl);
       row.addEventListener('click', () => r.run());
       this.actionsEl.appendChild(row);
+    }
+  }
+
+  /**
+   * Rebuild the right-side task panel from the live `WorkerTaskBoard`. Lists
+   * orders in execution order (claimed first, then by priority + FIFO seq).
+   * Keyed on a string signature so we only re-render the DOM when the
+   * displayed order set actually changes.
+   */
+  private renderTaskPanel(): void {
+    if (!this.tasksEl) return;
+    const orders = this.taskBoard.snapshot();
+    const key = orders
+      .map(o => `${o.id}:${o.kind}:${o.claimedBy}:${o.pileId ?? ''}:${o.buildingId ?? ''}:${o.wx ?? ''}:${o.wz ?? ''}`)
+      .join('|');
+    if (key === this.tasksRenderedKey) return;
+    this.tasksRenderedKey = key;
+    this.tasksEl.innerHTML = '';
+    const t = document.createElement('div');
+    t.className = 'tasks-title';
+    t.textContent = `Worker tasks (${orders.length})`;
+    this.tasksEl.appendChild(t);
+    if (orders.length === 0) {
+      const e = document.createElement('div');
+      e.className = 'tasks-empty';
+      e.textContent = '(none — workers idle)';
+      this.tasksEl.appendChild(e);
+      return;
+    }
+    for (const o of orders) {
+      const row = document.createElement('div');
+      row.className = `task-row ${o.claimedBy !== 0 ? 'claimed' : 'pending'}`;
+      const k = document.createElement('span');
+      k.className = 'task-kind';
+      k.textContent = o.kind;
+      const d = document.createElement('span');
+      d.className = 'task-detail';
+      d.textContent = describeOrder(o, this.piles, this.buildings);
+      const c = document.createElement('span');
+      c.className = 'task-claim';
+      c.textContent = o.claimedBy !== 0 ? `→ #${o.claimedBy}` : 'queued';
+      row.appendChild(k);
+      row.appendChild(d);
+      row.appendChild(c);
+      this.tasksEl.appendChild(row);
     }
   }
 
