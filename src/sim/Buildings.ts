@@ -5,7 +5,7 @@ import { M_WOOD, M_FARM, M_STONE, M_PATH, M_DIRT_ROAD, M_METAL } from '../voxel/
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_VOXELS, FLAT_TOLERANCE_VOXELS } from '../path/SurfaceNav';
 import { UnitManager, UnitKind, Unit } from './Units';
 import { WeaponKind, WEAPONS } from './Weapons';
-import { ProjectileManager, muzzleOrigin, PROJECTILES } from './Projectiles';
+import { ProjectileManager, muzzleOrigin, PROJECTILES, PROJECTILE_GRAVITY, Projectile, solveBallisticDirection } from './Projectiles';
 
 export type BuildingKind =
   | 'barracks'
@@ -169,6 +169,30 @@ export const TURRET: BuildingSpec = {
 };
 
 /**
+ * Anti-air flak turret. Same chassis as the regular turret but its weapon
+ * targets airborne projectiles instead of ground units. The firing pipeline
+ * leads the target so the flak shell detonates just below the projectile on
+ * its way through — `tickAntiAir` in BuildingManager owns that logic.
+ *
+ * Reuses `stampTurret` for the visible model (small stone emplacement). The
+ * AA-specific behaviour is keyed off the spec's `weapon === 'aa_turret'`.
+ */
+export const AA_TURRET: BuildingSpec = {
+  kind: 'turret',
+  label: 'Anti-air Turret',
+  cellsW: 2,
+  cellsD: 2,
+  headroomVoxels: 12,
+  wall: M_STONE,
+  productionInterval: Infinity,
+  produces: [],
+  stamp: stampTurret,
+  weapon: 'aa_turret',
+  launcherMaxStrength: 130,
+  weaponMuzzleHeight: (12 + 4) * VOXEL_SIZE,
+};
+
+/**
  * Heavy silo launcher. A large fortified emplacement with a missile cluster
  * on the roof. Auto-fires `silo_missile` rounds at the nearest enemy in a
  * very long range (320 m). Long cooldown — the missile is devastating but
@@ -191,7 +215,7 @@ export const SILO: BuildingSpec = {
 };
 
 /** All building specs in the order they appear on the build-mode hotkeys (1..N). */
-export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, FARM, STORAGE, POWER_PLANT, REFINERY, TECH_LAB, TURRET, SILO];
+export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, FARM, STORAGE, POWER_PLANT, REFINERY, TECH_LAB, TURRET, AA_TURRET, SILO];
 
 export interface FootprintHit {
   ok: boolean;
@@ -942,11 +966,12 @@ export class BuildingManager {
     for (const b of this.buildings) {
       if (b.destroyed) continue;
 
-      // Weapon-bearing buildings (turret, silo): auto-target the nearest
-      // enemy unit in range and fire on cooldown. Runs in addition to any
-      // other behaviour the spec carries; for turret/silo there's nothing
-      // else to do, so the firing logic IS the building's tick.
-      if (b.spec.weapon) {
+      // Weapon-bearing buildings (turret, silo, AA): auto-target and fire on
+      // cooldown. Anti-air uses a different targeting pipeline (incoming
+      // projectiles, not enemy units) so it gets its own tick.
+      if (b.spec.weapon === 'aa_turret') {
+        this.tickAntiAir(b, dt, units);
+      } else if (b.spec.weapon) {
         this.tickBuildingWeapon(b, dt, units, world);
       }
 
@@ -1046,14 +1071,16 @@ export class BuildingManager {
       const d2 = dx * dx + dz * dz;
       if (d2 > muzzleXZRange2) continue;
       if (d2 < bestD2) { bestD2 = d2; bestU = u; }
-      // Hittability scan: aim from the muzzle directly at the torso and ask
-      // the projectile predictor whether the round actually reaches them.
+      // Hittability scan: solve the proper ballistic launch direction so the
+      // arc actually lands at the target instead of plowing flat into the
+      // ground short of it. Slow projectiles like the turret shell drop a
+      // lot before reaching even mid-range targets, so a flat aim-at-torso
+      // gives a false negative on every shot — the round visibly falls
+      // short of the target every time.
       const targetTY = u.y + Math.max(0.7, u.widthMeters * 0.6);
-      const ddx = u.x - cxw;
-      const ddy = targetTY - muzzleY;
-      const ddz = u.z - czw;
-      const dl = Math.hypot(ddx, ddy, ddz) || 1;
-      const dirX = ddx / dl, dirY = ddy / dl, dirZ = ddz / dl;
+      const launchSpeed = Math.min(PROJECTILES[w.projectile].muzzleVelocity * w.velocityScale, launcherCap);
+      const ballistic = solveBallisticDirection(cxw, muzzleY, czw, u.x, targetTY, u.z, launchSpeed, PROJECTILE_GRAVITY);
+      const dirX = ballistic.x, dirY = ballistic.y, dirZ = ballistic.z;
       const boost = boostMeters > 0
         ? { meters: boostMeters, targetX: u.x, targetY: targetTY, targetZ: u.z }
         : undefined;
@@ -1079,25 +1106,17 @@ export class BuildingManager {
     if (b.weaponFireCooldown > 0) return;
     if (!this.projectiles) return;
 
-    // Pitch toward the target's torso so a shot fired downhill doesn't sail
-    // past the unit.
+    // Solve the launch direction as a real ballistic arc. With the slow
+    // catalog projectiles a flat aim-at-torso shot drops well below the
+    // target before it gets there; the proper arc clears the gap. The
+    // solver returns a unit-length direction so we use it directly without
+    // re-normalising.
     const targetTorsoY = bestU.y + Math.max(0.7, bestU.widthMeters * 0.6);
-    const ddx = bestU.x - cxw;
-    const ddz = bestU.z - czw;
-    const ddy = targetTorsoY - muzzleY;
-    const horiz = Math.hypot(ddx, ddz);
-    const pitchY = horiz > 1e-3 ? ddy / horiz : 0;
-
-    // Forward unit-vector from the (now-aligned) turret yaw. Same convention
-    // as units (yaw=0 → forward = -Z).
-    const fx = -Math.sin(b.weaponTurretYaw);
-    const fz = -Math.cos(b.weaponTurretYaw);
-
-    let dirX = fx;
-    let dirZ = fz;
-    let dirY = pitchY;
-    const dl = Math.hypot(dirX, dirY, dirZ) || 1;
-    dirX /= dl; dirY /= dl; dirZ /= dl;
+    const launchSpeed = Math.min(PROJECTILES[w.projectile].muzzleVelocity * w.velocityScale, b.spec.launcherMaxStrength ?? Infinity);
+    const ballistic = solveBallisticDirection(cxw, muzzleY, czw, bestU.x, targetTorsoY, bestU.z, launchSpeed, PROJECTILE_GRAVITY);
+    const dirX = ballistic.x;
+    const dirY = ballistic.y;
+    const dirZ = ballistic.z;
 
     // Building's "owner id" for the projectile — negative numbers can't
     // collide with any real unit id, so the friendly-skip logic in the
@@ -1131,6 +1150,130 @@ export class BuildingManager {
       w.velocityScale,
       b.spec.launcherMaxStrength ?? Infinity,
       boost,
+    );
+    b.weaponFireCooldown = w.fireInterval;
+
+    if (this.onBuildingMuzzleFlash) {
+      const pcfg = PROJECTILES[w.projectile];
+      this.onBuildingMuzzleFlash(
+        muzzle.x, muzzle.y, muzzle.z,
+        w.muzzleFlashRadius, w.muzzleFlashSeconds,
+        { r: pcfg.colorR, g: pcfg.colorG, b: pcfg.colorB },
+      );
+    }
+  }
+
+  /**
+   * Anti-air firing pipeline. Each frame:
+   *   1. Decay cooldown.
+   *   2. Pick the nearest in-range projectile NOT fired by an AA building.
+   *   3. Solve a lead point — where the projectile will be when the flak
+   *      shell arrives — and aim slightly below it so the upward-biased
+   *      shrapnel cone goes off underneath the round.
+   *   4. Slew the visible turret toward the lead point and fire when within
+   *      the weapon's aim tolerance and the cooldown is ready.
+   *
+   * The actual interception (chance to disrupt the target round) is owned by
+   * the projectile manager: when a flak shell detonates, any projectile
+   * inside its blast gets a 90% disruption roll. This keeps the targeting
+   * logic here purely about delivering the burst.
+   */
+  private tickAntiAir(b: Building, dt: number, units: UnitManager): void {
+    if (b.weaponFireCooldown > 0) {
+      b.weaponFireCooldown = Math.max(0, b.weaponFireCooldown - dt);
+    }
+    const wKind = b.spec.weapon!;
+    const w = WEAPONS[wKind];
+    const pm = this.projectiles;
+    if (!pm) return;
+    const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+    const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+    const floorTopMeters = (b.floorY + 1) * VOXEL_SIZE;
+    const muzzleY = floorTopMeters + (b.spec.weaponMuzzleHeight ?? 1.0);
+    const range2 = w.rangeMeters * w.rangeMeters;
+    const flakSpeed = Math.min(
+      PROJECTILES[w.projectile].muzzleVelocity * w.velocityScale,
+      b.spec.launcherMaxStrength ?? Infinity,
+    );
+
+    // Pick the closest live projectile inside the AA dome that the AA didn't
+    // fire itself. Skipping the AA's own shells stops a turret from chasing
+    // the shell it just lobbed.
+    let bestP: Projectile | null = null;
+    let bestD2 = range2;
+    for (const p of pm.projectiles) {
+      if (p.dead) continue;
+      // Skip our own kind — AA never chases friendly flak shells.
+      if (p.kind === 'flak_shell') continue;
+      // Skip rounds owned by friendly units / buildings. Buildings carry a
+      // negative owner id (we can't easily resolve their team here, but the
+      // player owns every building today) so treat negative ids as friendly.
+      // Positive ids are units; check the unit's team to decide.
+      if (p.ownerId >= 0) {
+        const owner = lookupUnit(units, p.ownerId);
+        if (owner && owner.team !== 'enemy') continue;
+      } else if (p.ownerId !== -1) {
+        // -1 is anonymous (e.g. cluster submunition). Anything else negative
+        // is a friendly building — skip.
+        continue;
+      }
+      const dx = p.x - cxw, dy = p.y - muzzleY, dz = p.z - czw;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 > range2) continue;
+      // Prefer the round closest to the AA so we always engage the most
+      // immediate threat.
+      if (d2 < bestD2) { bestD2 = d2; bestP = p; }
+    }
+    if (!bestP) return;
+
+    // Lead solve: time-of-flight ≈ distance / flak muzzle speed (ignoring drag
+    // and gravity to keep the lead computation stable when the target is fast
+    // and close). Predict where the target will be after that delay using its
+    // current velocity + simple gravity falloff.
+    const dxNow = bestP.x - cxw;
+    const dyNow = bestP.y - muzzleY;
+    const dzNow = bestP.z - czw;
+    const distNow = Math.hypot(dxNow, dyNow, dzNow);
+    const tof = Math.max(0.05, distNow / Math.max(20, flakSpeed));
+    let leadX = bestP.x + bestP.vx * tof;
+    let leadY = bestP.y + bestP.vy * tof - 0.5 * PROJECTILE_GRAVITY * tof * tof;
+    let leadZ = bestP.z + bestP.vz * tof;
+    // Aim slightly below the lead point so the upward-biased flak burst goes
+    // off just under the round on its way through. ~1 m below puts the
+    // explosion sphere centred where the cone has the best chance to hit.
+    leadY = Math.max(0.5, leadY - 1.0);
+
+    // Slew the visible turret toward the lead point.
+    const tdx = leadX - cxw;
+    const tdz = leadZ - czw;
+    const targetYaw = Math.atan2(-tdx, -tdz);
+    const diff = wrapAngle(targetYaw - b.weaponTurretYaw);
+    const step = w.aimSlewRadPerSec * dt;
+    b.weaponTurretYaw += diff < -step ? -step : diff > step ? step : diff;
+
+    const remaining = wrapAngle(targetYaw - b.weaponTurretYaw);
+    if (Math.abs(remaining) > w.aimToleranceRad) return;
+    if (b.weaponFireCooldown > 0) return;
+
+    // Fire toward the lead point at the chosen muzzle direction. AA turrets
+    // are allowed to point sharply up — the flak shell's trajectory is what
+    // we use, not the turret's slew.
+    const ddx = leadX - cxw;
+    const ddy = leadY - muzzleY;
+    const ddz = leadZ - czw;
+    const dl = Math.hypot(ddx, ddy, ddz) || 1;
+    const dirX = ddx / dl;
+    const dirY = ddy / dl;
+    const dirZ = ddz / dl;
+    const ownerId = -2000 - b.id;
+    const muzzle = muzzleOrigin(cxw, muzzleY - 1.2, czw, dirX, dirY, dirZ, 0.5, 1.2);
+    pm.spawn(
+      w.projectile,
+      muzzle.x, muzzle.y, muzzle.z,
+      dirX, dirY, dirZ,
+      ownerId,
+      w.velocityScale,
+      b.spec.launcherMaxStrength ?? Infinity,
     );
     b.weaponFireCooldown = w.fireInterval;
 

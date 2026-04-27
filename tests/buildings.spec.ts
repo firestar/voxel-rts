@@ -27,9 +27,13 @@ function buildFlatWorld(surfaceY = 32): VoxelWorld {
 
 describe('building specs', () => {
   it('exposes all kinds via ALL_BUILDINGS in registry order', () => {
+    // Two 'turret' specs in a row — the regular building_turret and the
+    // anti-air flak turret. Both share `kind: 'turret'` because they reuse
+    // the same renderer head; the AA-vs-ground behaviour is keyed off the
+    // spec's `weapon` field, not `kind`.
     expect(ALL_BUILDINGS.map(s => s.kind)).toEqual([
       'barracks', 'farm', 'storage', 'power_plant', 'refinery', 'tech_lab',
-      'turret', 'silo',
+      'turret', 'turret', 'silo',
     ]);
   });
 
