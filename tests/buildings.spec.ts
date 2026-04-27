@@ -228,6 +228,12 @@ describe('BuildingManager — turret + silo weapon firing', () => {
     }
     expect(pm.projectiles.length).toBeGreaterThan(0);
     const p = pm.projectiles[0]!;
+    // Silo missiles spawn with a vertical-ascent boost phase first, then
+    // tip over to the catalog speed (~90 m/s). Tick until the missile exits
+    // the boost so the speed assertion sees the real launch speed.
+    for (let i = 0; i < 60 && p.boostMetersRemaining > 0; i++) {
+      pm.tick(1 / 60, world);
+    }
     // Silo launcher cap (220 m/s) is comfortably above the silo missile's
     // catalog speed (90 m/s), so the actual launch speed is the catalog
     // value. Confirm the spawn used min(catalog, cap) = catalog and the

@@ -327,6 +327,80 @@ export class TrajectoryPreview {
 }
 
 /**
+ * Pool of dashed arcs that follow live projectiles in flight. The Game
+ * predicts each projectile's remaining trajectory once per frame and pushes
+ * them in here; the pool reuses up to `capacity` Line objects, hiding any
+ * trailing slot when the projectile count drops. Each line shares the same
+ * `LineDashedMaterial` instance — three.js renders them as dashed strokes
+ * regardless of the number of segments.
+ */
+export class ProjectileArcPool {
+  readonly group = new THREE.Group();
+  private lines: THREE.Line[] = [];
+  private buffers: Float32Array[] = [];
+  private capacity: number;
+  private maxSamples: number;
+
+  constructor(capacity = 64, maxSamples = 96) {
+    this.capacity = capacity;
+    this.maxSamples = maxSamples;
+    const mat = new THREE.LineDashedMaterial({
+      color: 0xffaa55,
+      dashSize: 0.5,
+      gapSize: 0.35,
+      depthTest: false,
+      transparent: true,
+      opacity: 0.55,
+    });
+    for (let i = 0; i < capacity; i++) {
+      const buf = new Float32Array(maxSamples * 3);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(buf, 3));
+      geo.setDrawRange(0, 0);
+      const line = new THREE.Line(geo, mat);
+      line.frustumCulled = false;
+      line.renderOrder = 1090;
+      line.visible = false;
+      this.lines.push(line);
+      this.buffers.push(buf);
+      this.group.add(line);
+    }
+  }
+
+  /**
+   * Push the trajectories. Each entry is a sampled list of points; lines
+   * past the supplied list are hidden, lines past `capacity` are dropped.
+   */
+  update(arcs: { points: { x: number; y: number; z: number }[] }[]): void {
+    const n = Math.min(arcs.length, this.capacity);
+    for (let i = 0; i < n; i++) {
+      const pts = arcs[i]!.points;
+      const line = this.lines[i]!;
+      const buf = this.buffers[i]!;
+      if (pts.length < 2) {
+        line.visible = false;
+        continue;
+      }
+      const count = Math.min(pts.length, this.maxSamples);
+      for (let j = 0; j < count; j++) {
+        const p = pts[j]!;
+        buf[j * 3 + 0] = p.x;
+        buf[j * 3 + 1] = p.y;
+        buf[j * 3 + 2] = p.z;
+      }
+      const attr = line.geometry.getAttribute('position') as THREE.BufferAttribute;
+      attr.needsUpdate = true;
+      line.geometry.setDrawRange(0, count);
+      line.computeLineDistances();
+      line.visible = true;
+    }
+    for (let i = n; i < this.capacity; i++) {
+      this.lines[i]!.visible = false;
+    }
+  }
+}
+
+/**
  * Tiny marker placed at the predicted impact point of the trajectory preview
  * arc. A flat disc on the ground so the player can see exactly where the
  * round will land if they release RMB now.

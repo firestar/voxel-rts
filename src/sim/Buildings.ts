@@ -211,6 +211,14 @@ export interface Building {
   productionTimer: number;
   wallVoxelsAtBuild: number;
   destroyed: boolean;
+  /** True when this building is the player's currently selected building. */
+  selected: boolean;
+  /**
+   * Player-queued unit kinds for buildings that produce units (e.g. barracks).
+   * The next production tick consumes the front entry instead of cycling
+   * through `spec.produces`. Empty queue → fall back to the default cycle.
+   */
+  trainQueue: UnitKind[];
   /** Index into spec.produces for the next spawn. */
   nextProduceIdx: number;
   /**
@@ -919,6 +927,8 @@ export class BuildingManager {
       productionTimer: spec.productionInterval,
       wallVoxelsAtBuild: wallCount,
       destroyed: false,
+      selected: false,
+      trainQueue: [],
       nextProduceIdx: 0,
       cropProgress: 0,
       cropReady: false,
@@ -940,7 +950,7 @@ export class BuildingManager {
       // other behaviour the spec carries; for turret/silo there's nothing
       // else to do, so the firing logic IS the building's tick.
       if (b.spec.weapon) {
-        this.tickBuildingWeapon(b, dt, units);
+        this.tickBuildingWeapon(b, dt, units, world);
       }
 
       // Farm crop growth runs every tick (continuous), independent of the
@@ -968,11 +978,18 @@ export class BuildingManager {
         continue;
       }
 
-      // Barracks: cycle through `produces`, spawning a unit at the door.
+      // Barracks: prefer the player-queued kind from `trainQueue`, otherwise
+      // cycle through `produces`. Either way we spawn one unit at the door
+      // each tick.
       if (b.spec.produces.length > 0 && this.spawner) {
         const door = doorWorldPos(b);
-        const kind = b.spec.produces[b.nextProduceIdx % b.spec.produces.length]!;
-        b.nextProduceIdx++;
+        let kind: UnitKind;
+        if (b.trainQueue.length > 0) {
+          kind = b.trainQueue.shift()!;
+        } else {
+          kind = b.spec.produces[b.nextProduceIdx % b.spec.produces.length]!;
+          b.nextProduceIdx++;
+        }
         this.spawner(kind, door.x, door.y, door.z);
       }
     }
@@ -994,7 +1011,7 @@ export class BuildingManager {
    * skipped for now: a player turret will happily shoot through their own
    * units. Real turret-line awareness can be layered on later.
    */
-  private tickBuildingWeapon(b: Building, dt: number, units: UnitManager): void {
+  private tickBuildingWeapon(b: Building, dt: number, units: UnitManager, world: VoxelWorld): void {
     if (b.weaponFireCooldown > 0) {
       b.weaponFireCooldown = Math.max(0, b.weaponFireCooldown - dt);
     }
@@ -1007,22 +1024,47 @@ export class BuildingManager {
     const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
     const floorTopMeters = (b.floorY + 1) * VOXEL_SIZE;
     const muzzleY = floorTopMeters + (b.spec.weaponMuzzleHeight ?? 1.0);
+    const muzzleXZRange2 = w.rangeMeters * w.rangeMeters;
+    const pcfgScan = PROJECTILES[w.projectile];
+    const boostMeters = pcfgScan.boostMetersDefault ?? 0;
+    const launcherCap = b.spec.launcherMaxStrength ?? Infinity;
+    // Hittability scan needs the manager to predict trajectories; when it's
+    // missing (test sandbox), skip the filter and just pick the nearest.
+    const pmForScan = this.projectiles;
 
-    // Find the closest LIVING enemy in horizontal range. We use 2D distance
-    // because the weapon's `rangeMeters` is meant as an engagement radius on
-    // the ground, not a 3D sphere.
+    // Find the closest LIVING enemy in horizontal range whose body the round
+    // can actually reach with this weapon. If nobody is hittable we still
+    // pick the closest enemy as a tracking target (the turret slews to face
+    // them) but skip the fire — better than freezing at the last yaw.
     let bestU: Unit | null = null;
-    let bestD2 = w.rangeMeters * w.rangeMeters;
+    let bestD2 = muzzleXZRange2;
+    let bestUHittable: Unit | null = null;
+    let bestD2Hittable = muzzleXZRange2;
     for (const u of units.units) {
       if (u.hp <= 0) continue;
       if (u.team !== 'enemy') continue;
       const dx = u.x - cxw, dz = u.z - czw;
       const d2 = dx * dx + dz * dz;
-      if (d2 > bestD2) continue;
-      bestD2 = d2;
-      bestU = u;
+      if (d2 > muzzleXZRange2) continue;
+      if (d2 < bestD2) { bestD2 = d2; bestU = u; }
+      // Hittability scan: aim from the muzzle directly at the torso and ask
+      // the projectile predictor whether the round actually reaches them.
+      const targetTY = u.y + Math.max(0.7, u.widthMeters * 0.6);
+      const ddx = u.x - cxw;
+      const ddy = targetTY - muzzleY;
+      const ddz = u.z - czw;
+      const dl = Math.hypot(ddx, ddy, ddz) || 1;
+      const dirX = ddx / dl, dirY = ddy / dl, dirZ = ddz / dl;
+      const boost = boostMeters > 0
+        ? { meters: boostMeters, targetX: u.x, targetY: targetTY, targetZ: u.z }
+        : undefined;
+      const reachable = pmForScan
+        ? projectileWillReach(pmForScan, w.projectile, cxw, muzzleY, czw, dirX, dirY, dirZ, w.velocityScale, launcherCap, u, boost, world)
+        : true;
+      if (reachable && d2 < bestD2Hittable) { bestD2Hittable = d2; bestUHittable = u; }
     }
-
+    // Prefer a hittable target; fall back to the closest enemy in range.
+    bestU = bestUHittable ?? bestU;
     if (!bestU) return;
 
     // Slew the visible turret toward the target.
@@ -1064,6 +1106,24 @@ export class BuildingManager {
     // want; the building itself isn't a unit).
     const ownerId = -1000 - b.id;
     const muzzle = muzzleOrigin(cxw, muzzleY - 1.2, czw, dirX, dirY, dirZ, 0.5, 1.2);
+    // Hittability gate — predict the trajectory before pulling the trigger
+    // and bail when the predicted impact won't actually affect the target.
+    // Stops a turret from shelling a hill the enemy is hiding behind, and
+    // stops a silo from gambling missiles that will bury themselves into
+    // the parapet. Cooldown is preserved on a no-fire so the building keeps
+    // re-evaluating each tick.
+    const pcfg = PROJECTILES[w.projectile];
+    const boost = pcfg.boostMetersDefault && pcfg.boostMetersDefault > 0
+      ? {
+          meters: pcfg.boostMetersDefault,
+          targetX: bestU.x,
+          targetY: targetTorsoY,
+          targetZ: bestU.z,
+        }
+      : undefined;
+    if (!projectileWillReach(this.projectiles, w.projectile, muzzle.x, muzzle.y, muzzle.z, dirX, dirY, dirZ, w.velocityScale, b.spec.launcherMaxStrength ?? Infinity, bestU, boost, world)) {
+      return;
+    }
     this.projectiles.spawn(
       w.projectile,
       muzzle.x, muzzle.y, muzzle.z,
@@ -1071,6 +1131,7 @@ export class BuildingManager {
       ownerId,
       w.velocityScale,
       b.spec.launcherMaxStrength ?? Infinity,
+      boost,
     );
     b.weaponFireCooldown = w.fireInterval;
 
@@ -1193,6 +1254,22 @@ export class BuildingManager {
     return null;
   }
 
+  /** Clear `selected` on every building. Used when the player picks a unit. */
+  deselectAll(): void {
+    for (const b of this.buildings) b.selected = false;
+  }
+
+  /** The single currently-selected building, or null when none/multiple. */
+  getSelected(): Building | null {
+    let found: Building | null = null;
+    for (const b of this.buildings) {
+      if (!b.selected || b.destroyed) continue;
+      if (found) return null;
+      found = b;
+    }
+    return found;
+  }
+
   /** Lookup the nearest live storage building (in XZ). Returns null if there are none. */
   nearestStorage(x: number, z: number): Building | null {
     let best: Building | null = null;
@@ -1219,4 +1296,74 @@ function wrapAngle(a: number): number {
   while (a > Math.PI) a -= 2 * Math.PI;
   while (a < -Math.PI) a += 2 * Math.PI;
   return a;
+}
+
+/**
+ * Predict whether a projectile fired from `(fx,fy,fz)` along `(dx,dy,dz)` will
+ * actually affect `target` — either landing within the projectile's
+ * `explosionRadiusMeters` of the target's torso (for explosives) or sweeping
+ * through the target's body bounding sphere along the predicted line (for
+ * direct-fire rounds). Used by buildings to avoid wasting shots on a target
+ * tucked behind cover. Pure read of the manager's predictTrajectory.
+ */
+function projectileWillReach(
+  pm: ProjectileManager,
+  kind: import('./Projectiles').ProjectileKind,
+  fx: number, fy: number, fz: number,
+  dx: number, dy: number, dz: number,
+  velocityScale: number,
+  maxStrength: number,
+  target: Unit,
+  boost: { meters: number; targetX: number; targetY: number; targetZ: number } | undefined,
+  world: VoxelWorld | null,
+): boolean {
+  const cfg = PROJECTILES[kind];
+  // Target torso point — same offset the unit-ray-hit logic uses.
+  const targetX = target.x;
+  const targetY = target.y + Math.max(0.7, target.widthMeters * 0.6);
+  const targetZ = target.z;
+  const points = pm.predictTrajectory(
+    kind,
+    fx, fy, fz,
+    dx, dy, dz,
+    world,                // world raycast → trajectory ends at first wall
+    0,
+    96, 0.06,
+    velocityScale, maxStrength,
+    boost,
+  );
+  // For explosives, the warhead's blast covers a sphere — landing within the
+  // explosion radius of the target counts as a hit.
+  if (cfg.explosive) {
+    const last = points[points.length - 1];
+    if (!last) return false;
+    const r = cfg.explosionRadiusMeters + (target.widthMeters * 0.55 + 0.35);
+    const d = Math.hypot(last.x - targetX, last.y - targetY, last.z - targetZ);
+    if (d <= r) return true;
+    // Even if the final sample isn't at the target, check every sample —
+    // a long rocket can pass directly over the target on its way past, and
+    // we still want to count that as "blast clears the cover".
+    for (const p of points) {
+      const dd = Math.hypot(p.x - targetX, p.y - targetY, p.z - targetZ);
+      if (dd <= r) return true;
+    }
+    return false;
+  }
+  // Direct-fire: check if any segment of the predicted line passes inside
+  // the target's bounding sphere.
+  const bodyR = target.widthMeters * 0.55 + 0.35;
+  const bodyR2 = bodyR * bodyR;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1]!, b = points[i]!;
+    const sx = b.x - a.x, sy = b.y - a.y, sz = b.z - a.z;
+    const ssq = sx * sx + sy * sy + sz * sz;
+    if (ssq < 1e-8) continue;
+    const tx = targetX - a.x, ty = targetY - a.y, tz = targetZ - a.z;
+    let t = (tx * sx + ty * sy + tz * sz) / ssq;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    const cx = a.x + sx * t, cy = a.y + sy * t, cz = a.z + sz * t;
+    const dxs = cx - targetX, dys = cy - targetY, dzs = cz - targetZ;
+    if (dxs * dxs + dys * dys + dzs * dzs <= bodyR2) return true;
+  }
+  return false;
 }

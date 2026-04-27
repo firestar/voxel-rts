@@ -23,6 +23,14 @@ export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'do
 export type Team = 'player' | 'enemy';
 
 /**
+ * Combat behaviour. `defensive` (default) sits and waits for orders — the
+ * unit only fires when the player issues a firingTarget. `aggressive` lets
+ * the unit auto-engage the nearest enemy in weapon range; if its predicted
+ * trajectory is blocked it routes toward the target until the line clears.
+ */
+export type CombatStance = 'aggressive' | 'defensive';
+
+/**
  * Worker role. Harvesters auto-find resources (trees, exposed metal ore) and
  * mine them, dropping piles when full. Transporters watch piles and ferry
  * them to storage buildings. Both share the same UnitKind, geometry, and
@@ -495,6 +503,20 @@ export interface Unit {
    * skips them, but the field is still set for uniform read paths).
    */
   launcherMaxStrength: number;
+  /**
+   * Combat stance. Aggressive units auto-acquire enemies in range; defensive
+   * units wait for the player to assign a firingTarget. Default is
+   * 'defensive' so existing players' habits stay unchanged. Workers /
+   * diggers / unarmed kinds carry the field but it has no effect on them.
+   */
+  stance: CombatStance;
+  /**
+   * Auto-engage retry timer. The aggressive-stance pipeline checks for a
+   * target on this cadence (rather than every frame) so a unit whose nearest
+   * enemy is unreachable doesn't hammer the predictor. Decremented in the
+   * tick; set to a positive value when an attempt fails.
+   */
+  autoEngageCooldown: number;
 }
 
 /**
@@ -598,7 +620,7 @@ export class UnitManager {
   spawn(
     kind: UnitKind,
     x: number, y: number, z: number,
-    opts?: { workerRole?: WorkerRole; weapon?: WeaponKind | null; team?: Team },
+    opts?: { workerRole?: WorkerRole; weapon?: WeaponKind | null; team?: Team; stance?: CombatStance },
   ): Unit {
     const cfg = unitConfig(kind);
     const segments: WormSegment[] = [];
@@ -681,6 +703,8 @@ export class UnitManager {
       burstShotTimer: 0,
       team: opts?.team ?? 'player',
       launcherMaxStrength: cfg.launcherMaxStrength,
+      stance: opts?.stance ?? 'defensive',
+      autoEngageCooldown: 0,
     };
     this.units.push(u);
     return u;
