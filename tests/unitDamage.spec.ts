@@ -38,7 +38,11 @@ describe('projectile direct-hit damage', () => {
   it('a bullet aimed at a soldier reports a direct hit on the impact', () => {
     const world = VoxelWorld.create(false);  // empty world — no voxel geometry
     const um = new UnitManager();
-    const target = um.spawn('soldier', 30, 1, 0);
+    // Stand the target close enough that the catalog-tuned bullet drop (with
+    // the deliberately-low muzzle velocities + bumped projectile gravity)
+    // still puts the round inside the soldier's body sphere by the time it
+    // arrives. The tunable here is the test fixture, not the catalog.
+    const target = um.spawn('soldier', 8, 1, 0);
     const startHp = target.hp;
     const pm = new ProjectileManager();
     // Fire a 5.56 mm bullet from x=0 along +X straight at the target's torso

@@ -25,7 +25,9 @@ export type ProjectileKind =
   | 'heavy_rocket'
   | 'cluster_rocket'
   | 'cluster_submunition'
-  | 'tank_shell';
+  | 'tank_shell'
+  | 'turret_shell'
+  | 'silo_missile';
 
 export interface ProjectileConfig {
   kind: ProjectileKind;
@@ -83,7 +85,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   bullet_9mm: {
     kind: 'bullet_9mm',
     massKg: 0.0075,
-    muzzleVelocity: 90,
+    muzzleVelocity: 55,
     dragPerSecond: 0.10,
     hitDamage: 18, hitRadiusMeters: 0.12,
     explosive: false, explosionPeak: 0, explosionRadiusMeters: 0,
@@ -96,7 +98,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   bullet_5_56mm: {
     kind: 'bullet_5_56mm',
     massKg: 0.004,
-    muzzleVelocity: 130,
+    muzzleVelocity: 75,
     dragPerSecond: 0.06,
     hitDamage: 28, hitRadiusMeters: 0.15,
     explosive: false, explosionPeak: 0, explosionRadiusMeters: 0,
@@ -109,7 +111,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   bullet_7_62mm: {
     kind: 'bullet_7_62mm',
     massKg: 0.0095,
-    muzzleVelocity: 160,
+    muzzleVelocity: 95,
     dragPerSecond: 0.04,
     hitDamage: 55, hitRadiusMeters: 0.20,
     explosive: false, explosionPeak: 0, explosionRadiusMeters: 0,
@@ -122,7 +124,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   rpg: {
     kind: 'rpg',
     massKg: 2.25,
-    muzzleVelocity: 55,
+    muzzleVelocity: 45,
     dragPerSecond: 0.08,
     hitDamage: 60, hitRadiusMeters: 0.4,
     explosive: true, explosionPeak: 180, explosionRadiusMeters: 2.4,
@@ -135,7 +137,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   heavy_rocket: {
     kind: 'heavy_rocket',
     massKg: 65,
-    muzzleVelocity: 70,
+    muzzleVelocity: 50,
     dragPerSecond: 0.05,
     hitDamage: 80, hitRadiusMeters: 0.5,
     explosive: true, explosionPeak: 220, explosionRadiusMeters: 4.0,
@@ -148,7 +150,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   cluster_rocket: {
     kind: 'cluster_rocket',
     massKg: 80,
-    muzzleVelocity: 65,
+    muzzleVelocity: 48,
     dragPerSecond: 0.06,
     hitDamage: 30, hitRadiusMeters: 0.4,
     explosive: true, explosionPeak: 100, explosionRadiusMeters: 1.6,
@@ -167,7 +169,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   cluster_submunition: {
     kind: 'cluster_submunition',
     massKg: 6,
-    muzzleVelocity: 30,
+    muzzleVelocity: 22,
     dragPerSecond: 0.10,
     hitDamage: 30, hitRadiusMeters: 0.3,
     explosive: true, explosionPeak: 90, explosionRadiusMeters: 1.4,
@@ -180,7 +182,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   tank_shell: {
     kind: 'tank_shell',
     massKg: 18,
-    muzzleVelocity: 180,
+    muzzleVelocity: 110,
     dragPerSecond: 0.03,
     hitDamage: 80, hitRadiusMeters: 0.5,
     explosive: true, explosionPeak: 240, explosionRadiusMeters: 2.8,
@@ -188,6 +190,43 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     maxLifeSeconds: 4.0,
     colorR: 1.00, colorG: 0.80, colorB: 0.45,
     visualLengthMeters: 0.55, visualRadiusMeters: 0.07,
+    hasTrail: true,
+  },
+  /**
+   * Building-turret round — heavier than a tank shell but with a smaller blast.
+   * Designed for the static defensive turret: lobs in a pronounced arc thanks
+   * to its sub-tank-shell muzzle velocity.
+   */
+  turret_shell: {
+    kind: 'turret_shell',
+    massKg: 14,
+    muzzleVelocity: 95,
+    dragPerSecond: 0.04,
+    hitDamage: 70, hitRadiusMeters: 0.45,
+    explosive: true, explosionPeak: 200, explosionRadiusMeters: 2.4,
+    clusterSubmunitions: 0,
+    maxLifeSeconds: 5.0,
+    colorR: 0.95, colorG: 0.75, colorB: 0.40,
+    visualLengthMeters: 0.55, visualRadiusMeters: 0.07,
+    hasTrail: true,
+  },
+  /**
+   * Silo missile — the heaviest in the catalog. Slow off the launch rails but
+   * carries a punishing warhead with a wide blast. The silo's high
+   * launcherMaxStrength lets the missile reach across the map; with the
+   * doubled gravity it visibly arcs hundreds of meters before terminal dive.
+   */
+  silo_missile: {
+    kind: 'silo_missile',
+    massKg: 350,
+    muzzleVelocity: 90,
+    dragPerSecond: 0.025,
+    hitDamage: 140, hitRadiusMeters: 0.7,
+    explosive: true, explosionPeak: 380, explosionRadiusMeters: 6.0,
+    clusterSubmunitions: 0,
+    maxLifeSeconds: 18.0,
+    colorR: 1.00, colorG: 0.40, colorB: 0.20,
+    visualLengthMeters: 2.4, visualRadiusMeters: 0.32,
     hasTrail: true,
   },
 };
@@ -251,8 +290,14 @@ export type UnitHitTest = (
   ownerId: number,
 ) => { tMeters: number; unitId: number } | null;
 
-/** Standard gravity used for ballistic integration — matches Units.ts so unit + projectile drop look consistent. */
-export const PROJECTILE_GRAVITY = 9.81;
+/**
+ * Gravity used for ballistic integration. Pumped to roughly 2× real-world
+ * gravity so projectiles arc more visibly over the deliberately-slow muzzle
+ * velocities in this catalog — players see a clear lob, not a flat ray. The
+ * value is decoupled from the unit-physics gravity in `Units.ts` so we can
+ * tune projectile arcs without making units feel different to drive.
+ */
+export const PROJECTILE_GRAVITY = 18.0;
 
 export class ProjectileManager {
   readonly projectiles: Projectile[] = [];
@@ -263,7 +308,11 @@ export class ProjectileManager {
   /**
    * Launch a projectile from `(x,y,z)` along the unit-vector `(dx,dy,dz)` at the
    * configured muzzle velocity. `velocityScale` lets a weapon dial the speed
-   * (e.g. a sub-charge load) without editing the projectile catalog.
+   * (e.g. a sub-charge load) without editing the projectile catalog. When
+   * `maxStrength` is supplied, it caps the resulting muzzle velocity in m/s —
+   * each launcher (soldier, tank, turret building, silo, …) carries its own
+   * max-strength rating so a 7.62 mm round fired from a soldier doesn't fly
+   * the same distance as the same round fired from a battleship cannon.
    */
   spawn(
     kind: ProjectileKind,
@@ -271,10 +320,11 @@ export class ProjectileManager {
     dx: number, dy: number, dz: number,
     ownerId: number,
     velocityScale = 1,
+    maxStrength = Infinity,
   ): Projectile {
     const cfg = PROJECTILES[kind];
     const dl = Math.hypot(dx, dy, dz) || 1;
-    const speed = cfg.muzzleVelocity * velocityScale;
+    const speed = Math.min(cfg.muzzleVelocity * velocityScale, maxStrength);
     const p: Projectile = {
       id: this.nextId++,
       kind,
@@ -420,10 +470,11 @@ export class ProjectileManager {
     samples = 80,
     sampleDt = 0.06,
     velocityScale = 1,
+    maxStrength = Infinity,
   ): { x: number; y: number; z: number }[] {
     const cfg = PROJECTILES[kind];
     const dl = Math.hypot(dx, dy, dz) || 1;
-    const speed = cfg.muzzleVelocity * velocityScale;
+    const speed = Math.min(cfg.muzzleVelocity * velocityScale, maxStrength);
     let vx = (dx / dl) * speed;
     let vy = (dy / dl) * speed;
     let vz = (dz / dl) * speed;

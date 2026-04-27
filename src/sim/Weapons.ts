@@ -23,7 +23,9 @@ export type WeaponKind =
   | 'rpg_launcher'
   | 'tank_cannon'
   | 'rocket_pod'
-  | 'cluster_pod';
+  | 'cluster_pod'
+  | 'building_turret'
+  | 'silo_launcher';
 
 export type WeaponMount = 'hull' | 'turret';
 
@@ -150,6 +152,36 @@ export const WEAPONS: Record<WeaponKind, WeaponConfig> = {
     shotsPerBurst: 1, burstInterval: 0,
     velocityScale: 1.0,
     muzzleFlashRadius: 0.9, muzzleFlashSeconds: 0.25,
+  },
+  /**
+   * Building-mounted defensive turret. Auto-fires at the nearest enemy in
+   * range; fires a turret_shell with a noticeable arc (gravity bites hard at
+   * the slow projectile catalog). Aim is 'turret' so the visible head yaws to
+   * the target while the building stays put.
+   */
+  building_turret: {
+    kind: 'building_turret', label: 'Defensive turret',
+    projectile: 'turret_shell', aimedBy: 'turret',
+    aimToleranceRad: 0.05, aimSlewRadPerSec: 1.6,
+    fireInterval: 2.5, rangeMeters: 90, spreadRad: 0.01,
+    shotsPerBurst: 1, burstInterval: 0,
+    velocityScale: 1.0,
+    muzzleFlashRadius: 0.9, muzzleFlashSeconds: 0.20,
+  },
+  /**
+   * Silo launcher. The heaviest weapon in the catalog — long cooldown, huge
+   * blast, and a long range backed by the silo's high launcherMaxStrength. Aim
+   * is 'turret' but the silo's "turret" is the missile cluster on top; the
+   * model just picks an aim yaw without visible motion.
+   */
+  silo_launcher: {
+    kind: 'silo_launcher', label: 'Heavy silo launcher',
+    projectile: 'silo_missile', aimedBy: 'turret',
+    aimToleranceRad: 0.10, aimSlewRadPerSec: 0.8,
+    fireInterval: 14.0, rangeMeters: 320, spreadRad: 0.02,
+    shotsPerBurst: 1, burstInterval: 0,
+    velocityScale: 1.0,
+    muzzleFlashRadius: 1.6, muzzleFlashSeconds: 0.40,
   },
 };
 

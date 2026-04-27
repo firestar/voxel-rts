@@ -116,6 +116,13 @@ export class Game {
     // Farms feed the resource counter via the manager's foodSink hook so the
     // sim doesn't have to know about Resources directly.
     this.buildings.foodSink = (amount): void => { this.resources.food += amount; };
+    // Buildings with weapons (turret, silo) drop their projectiles into the
+    // shared manager and route their muzzle flashes into the same FlashPool
+    // unit shots use, so the visual feels uniform.
+    this.buildings.projectiles = this.projectiles;
+    this.buildings.onBuildingMuzzleFlash = (x, y, z, radius, life, color): void => {
+      this.muzzleFlashes.spawn(x, y, z, radius, life, color.r, color.g, color.b);
+    };
 
     this.fpsEl = statsEl;
     this.modeEl = document.getElementById('mode');
@@ -1290,6 +1297,7 @@ export class Game {
       0,
       120, 0.05,
       wcfg.velocityScale,
+      sel.launcherMaxStrength,
     );
     this.trajectoryPreview.update(points);
     const last = points[points.length - 1];
