@@ -480,7 +480,7 @@ export class Game {
       if (grow.matured > 0) this.requestNavRebuild(false);
     }
     this.unitRenderer.update(this.units);
-    this.healthBars.update(this.units.units);
+    this.healthBars.update(this.units.units, this.buildings.buildings);
     this.buildingRenderer.update(this.buildings.buildings);
     this.buildingRange.show(this.buildings.getSelected());
     this.unitRange.show(this.units.units);
@@ -2124,7 +2124,7 @@ export class Game {
 
   private tickAggressiveStance(dt: number): void {
     const liveUnits = this.units.units.filter(u => u.hp > 0);
-    if (liveUnits.length === 0) return;
+    const liveBuildings = this.buildings.buildings.filter(b => !b.destroyed);
     for (const u of this.units.units) {
       if (u.weapon === null) continue;
       if (u.stance !== 'aggressive') continue;
@@ -2136,30 +2136,67 @@ export class Game {
       }
       const w = WEAPONS[u.weapon];
       const range2 = w.rangeMeters * w.rangeMeters;
-      // Closest cross-team unit in horizontal range. Aggressive stance is now
-      // team-agnostic — enemy-team aggressors fire back at player units the
-      // same way player-team aggressors target enemies.
-      let target: Unit | null = null;
-      let bestD2 = range2;
+
+      // Priority targeting: enemy turrets first (highest threat), then
+      // cross-team units, then other enemy buildings. We pick the best
+      // candidate from each tier and only fall through if the tier is empty.
+      // Distance is the tiebreaker inside a tier.
+      let bestUnit: Unit | null = null;
+      let bestUnitD2 = range2;
       for (const e of liveUnits) {
         if (e.team === u.team) continue;
         const dx = e.x - u.x, dz = e.z - u.z;
         const d2 = dx * dx + dz * dz;
-        if (d2 < bestD2) { bestD2 = d2; target = e; }
+        if (d2 < bestUnitD2) { bestUnitD2 = d2; bestUnit = e; }
       }
-      if (!target) continue;
+      let bestTurret: Building | null = null;
+      let bestTurretD2 = range2;
+      let bestBuilding: Building | null = null;
+      let bestBuildingD2 = range2;
+      for (const b of liveBuildings) {
+        if (b.team === u.team) continue;
+        const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_METERS;
+        const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_METERS;
+        const dx = cxw - u.x, dz = czw - u.z;
+        const d2 = dx * dx + dz * dz;
+        if (b.spec.kind === 'turret') {
+          if (d2 < bestTurretD2) { bestTurretD2 = d2; bestTurret = b; }
+        } else {
+          if (d2 < bestBuildingD2) { bestBuildingD2 = d2; bestBuilding = b; }
+        }
+      }
 
-      const targetTorsoY = target.y + Math.max(0.7, target.widthMeters * 0.6);
-      // Predict the trajectory along a direct muzzle-to-torso line.
+      const targetUnit = bestTurret ? null : bestUnit;
+      const targetBuilding = bestTurret ?? (bestUnit ? null : bestBuilding);
+      if (!targetUnit && !targetBuilding) continue;
+
+      // Pick a torso point to aim at. For unit targets that's the torso
+      // sphere centre; for buildings we aim slightly above the floor centre
+      // so the round lands on the wall, not the roof.
+      let tx: number, ty: number, tz: number;
+      let buildingBodyR = 0;
+      if (targetUnit) {
+        tx = targetUnit.x;
+        ty = targetUnit.y + Math.max(0.7, targetUnit.widthMeters * 0.6);
+        tz = targetUnit.z;
+      } else {
+        const b = targetBuilding!;
+        tx = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+        tz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+        ty = (b.floorY + Math.min(b.spec.headroomVoxels - 2, 8)) * VOXEL_SIZE;
+        buildingBodyR = Math.max(b.spec.cellsW, b.spec.cellsD) * NAV_CELL_METERS * 0.5;
+      }
+      const cfg = PROJECTILES[w.projectile];
+      const explosionR = cfg.explosive ? cfg.explosionRadiusMeters : 0;
+
       const muzzleX = u.x;
       const muzzleY = u.y + 1.2;
       const muzzleZ = u.z;
-      const ddx = target.x - muzzleX;
-      const ddy = targetTorsoY - muzzleY;
-      const ddz = target.z - muzzleZ;
+      const ddx = tx - muzzleX;
+      const ddy = ty - muzzleY;
+      const ddz = tz - muzzleZ;
       const dl = Math.hypot(ddx, ddy, ddz) || 1;
       const dirX = ddx / dl, dirY = ddy / dl, dirZ = ddz / dl;
-      const cfg = PROJECTILES[w.projectile];
       const points = this.projectiles.predictTrajectory(
         w.projectile,
         muzzleX, muzzleY, muzzleZ,
@@ -2170,32 +2207,28 @@ export class Game {
         w.velocityScale,
         u.launcherMaxStrength,
       );
-      const willHit = arcCoversTarget(points, target, cfg.explosive ? cfg.explosionRadiusMeters : 0);
+      const willHit = targetUnit
+        ? arcCoversTarget(points, targetUnit, explosionR)
+        : arcCoversPoint(points, tx, ty, tz, buildingBodyR + explosionR);
       if (willHit) {
-        u.firingTarget = { x: target.x, y: targetTorsoY, z: target.z };
-        // Tiny cooldown after a successful target lock so we don't fight the
-        // weapon-tick if it clears `firingTarget` at the moment of fire.
+        u.firingTarget = { x: tx, y: ty, z: tz };
         u.autoEngageCooldown = 0.25;
         continue;
       }
-      // Trajectory blocked. Route toward the target so the unit walks into
-      // line-of-sight, but stop short of the enemy at a preferred firing
-      // distance — without this clamp the unit would walk right up to the
-      // target and end up nose-to-nose. Throttle re-route attempts so we
-      // don't spam path requests on every frame.
+      // Trajectory blocked — walk closer.
       u.autoEngageCooldown = 0.6;
       if (u.path.length > 0) continue;
       const stopRange = w.rangeMeters * AUTO_ENGAGE_STOP_FRACTION;
-      const dxBack = u.x - target.x;
-      const dzBack = u.z - target.z;
+      const dxBack = u.x - tx;
+      const dzBack = u.z - tz;
       const distBack = Math.hypot(dxBack, dzBack);
-      let goalX = target.x;
-      let goalZ = target.z;
+      let goalX = tx;
+      let goalZ = tz;
       if (distBack > 1e-3 && distBack > stopRange) {
-        goalX = target.x + (dxBack / distBack) * stopRange;
-        goalZ = target.z + (dzBack / distBack) * stopRange;
+        goalX = tx + (dxBack / distBack) * stopRange;
+        goalZ = tz + (dzBack / distBack) * stopRange;
       }
-      void this.routePath(u, goalX, target.y, goalZ);
+      void this.routePath(u, goalX, ty, goalZ);
     }
   }
 
@@ -2319,6 +2352,33 @@ function arcCoversTarget(
     }
     return false;
   }
+  const r2 = bodyR * bodyR;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1]!, b = points[i]!;
+    const sx = b.x - a.x, sy = b.y - a.y, sz = b.z - a.z;
+    const ssq = sx * sx + sy * sy + sz * sz;
+    if (ssq < 1e-8) continue;
+    const txa = tx - a.x, tya = ty - a.y, tza = tz - a.z;
+    let t = (txa * sx + tya * sy + tza * sz) / ssq;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    const cx = a.x + sx * t, cy = a.y + sy * t, cz = a.z + sz * t;
+    const dxs = cx - tx, dys = cy - ty, dzs = cz - tz;
+    if (dxs * dxs + dys * dys + dzs * dzs <= r2) return true;
+  }
+  return false;
+}
+
+/**
+ * Variant of `arcCoversTarget` for non-unit targets: takes a point and a
+ * sphere radius. Used by the aggressive-stance pipeline when the target is a
+ * building (no Unit struct available).
+ */
+function arcCoversPoint(
+  points: { x: number; y: number; z: number }[],
+  tx: number, ty: number, tz: number,
+  bodyR: number,
+): boolean {
+  if (points.length < 2) return false;
   const r2 = bodyR * bodyR;
   for (let i = 1; i < points.length; i++) {
     const a = points[i - 1]!, b = points[i]!;

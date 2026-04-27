@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { buildVoxelModel, VoxelBlock } from './UnitModels';
-import { POWER_PLANT, REFINERY, TECH_LAB, TURRET } from '../sim/Buildings';
+import { POWER_PLANT, REFINERY, TECH_LAB, TURRET, VEHICLE_DEPOT, POWER_PLANT_MAST_VOXELS } from '../sim/Buildings';
 import { VOXEL_SIZE } from '../voxel/types';
 import { NAV_CELL_VOXELS } from '../path/SurfaceNav';
 
@@ -120,9 +120,9 @@ export function buildPulseCoreGeometry(): THREE.BufferGeometry {
 // Each constant below describes the local-space pivot of an animated accessory, in
 // the building's own frame (no rotation — buildings don't rotate).
 
-/** Top of the wind-turbine pylon (in metres above the building floor). */
+/** Top of the wind-turbine mast (in metres above the building floor). */
 export const POWER_PLANT_TURBINE_Y_M =
-  (POWER_PLANT.headroomVoxels + 2 /* parapet */ + 6 /* pylon */) * VOXEL_SIZE;
+  (POWER_PLANT.headroomVoxels + POWER_PLANT_MAST_VOXELS) * VOXEL_SIZE;
 /** Length (metres) of one turbine blade — used for the tip-circle radius. */
 export const POWER_PLANT_BLADE_LENGTH_M = 1.7;
 
@@ -235,3 +235,60 @@ export function buildTurretHeadGeometry(): THREE.BufferGeometry {
  */
 export const TURRET_HEAD_Y_M =
   (TURRET.headroomVoxels + 4 /* pintle height */) * VOXEL_SIZE;
+
+// ---------- Vehicle depot — gantry crane sliding overhead ---------------------
+// Sits above the hangar floor on rails along the +X/-X length of the
+// building. The crane shuttle slides back and forth so a player can see the
+// depot is "working" even though all production is invisible (queued in
+// trainQueue).
+
+const CRANE_FRAME = { r: 0.62, g: 0.62, b: 0.66 };
+const CRANE_FRAME_DARK = { r: 0.32, g: 0.32, b: 0.36 };
+const CRANE_HOOK = { r: 0.85, g: 0.32, b: 0.20 };
+
+export function buildDepotCraneGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [
+    // Cross-beam — runs perpendicular to the building's long axis, riding on
+    // the ceiling rails. Origin at beam centre.
+    { x: 0, y: 0, z: 0, sx: 0.40, sy: 0.30, sz: 4.40, ...CRANE_FRAME },
+    { x: 0, y: 0.20, z: 0, sx: 0.30, sy: 0.10, sz: 4.20, ...CRANE_FRAME_DARK },
+    // Trolley housing.
+    { x: 0, y: -0.10, z: 0, sx: 0.50, sy: 0.30, sz: 0.60, ...CRANE_FRAME_DARK },
+    // Hook hanging below the trolley.
+    { x: 0, y: -0.65, z: 0, sx: 0.10, sy: 0.40, sz: 0.10, ...CRANE_FRAME_DARK },
+    { x: 0, y: -0.95, z: 0, sx: 0.18, sy: 0.16, sz: 0.18, ...CRANE_HOOK },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+/** Crane Y above the hangar floor — just below the roof. */
+export const VEHICLE_DEPOT_CRANE_Y_M =
+  (VEHICLE_DEPOT.headroomVoxels - 3) * VOXEL_SIZE;
+/** Half-extent (metres) of the crane's slide motion along the building's X axis. */
+export const VEHICLE_DEPOT_CRANE_SLIDE_M =
+  (VEHICLE_DEPOT.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE) * 0.30;
+
+// ---------- Power plant — solar panels on the substation roof ---------------
+// Even though the spec calls for a tall windmill (which we already render),
+// a small solar bank flanks the mast on the roof so the building reads as a
+// hybrid generator at distance. Each panel is a flat slab tilted toward the
+// south. Two panels are placed per power plant.
+
+const SOLAR_FRAME = { r: 0.32, g: 0.32, b: 0.34 };
+const SOLAR_GLASS = { r: 0.10, g: 0.18, b: 0.42 };
+
+export function buildSolarPanelGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [
+    // Mounting post.
+    { x: 0, y: 0.10, z: 0, sx: 0.10, sy: 0.20, sz: 0.10, ...SOLAR_FRAME },
+    // Panel face — tilted slab. The renderer applies a small pitch so the
+    // panel reads as facing the sky, not flat horizontal.
+    { x: 0, y: 0.30, z: 0, sx: 0.90, sy: 0.06, sz: 0.60, ...SOLAR_FRAME },
+    { x: 0, y: 0.34, z: 0, sx: 0.84, sy: 0.04, sz: 0.54, ...SOLAR_GLASS },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+/** Solar panel mount Y above the substation floor (just above the roof). */
+export const POWER_PLANT_SOLAR_Y_M = (POWER_PLANT.headroomVoxels + 1) * VOXEL_SIZE;
+export const POWER_PLANT_SOLAR_COUNT = 4;

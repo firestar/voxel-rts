@@ -32,7 +32,7 @@ describe('building specs', () => {
     // the same renderer head; the AA-vs-ground behaviour is keyed off the
     // spec's `weapon` field, not `kind`.
     expect(ALL_BUILDINGS.map(s => s.kind)).toEqual([
-      'barracks', 'farm', 'storage', 'power_plant', 'refinery', 'tech_lab',
+      'barracks', 'vehicle_depot', 'farm', 'storage', 'power_plant', 'refinery', 'tech_lab',
       'turret', 'turret', 'silo',
     ]);
   });

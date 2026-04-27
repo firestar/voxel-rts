@@ -92,6 +92,7 @@ function cellPassable(
   canDig: boolean,
   requiresGround: boolean,
   isStartOrGoal: boolean,
+  gateSealedCaves: boolean,
 ): boolean {
   if (cx < 0 || cy < 0 || cz < 0 || cx >= VNAV_X || cy >= VNAV_Y || cz >= VNAV_Z) return false;
   const i = vnavIndex(cx, cy, cz);
@@ -103,6 +104,12 @@ function cellPassable(
     if (cy === 0) return false;
     if (getBit(vnav.solid, vnavIndex(cx, cy - 1, cz)) !== 1) return false;
   }
+  // Sealed-cave gate. Only consider air cells reachable from the sky via the
+  // volume-nav flood fill — sealed underground voids are pruned so the
+  // search doesn't drift into pockets a unit can't physically enter without
+  // a digger carving in. The gate is suppressed (caller-controlled) when the
+  // unit is already inside a sealed pocket so it can still leave.
+  if (gateSealedCaves && !solid && !isStartOrGoal && getBit(vnav.surfaceConnected, i) === 0) return false;
   return true;
 }
 
@@ -114,14 +121,15 @@ function footprintPassable(
   requiresGround: boolean,
   footprintRadius: number,
   isStartOrGoal: boolean,
+  gateSealedCaves: boolean,
 ): boolean {
   if (footprintRadius <= 1) {
-    return cellPassable(vnav, cx, cy, cz, canDig, requiresGround, isStartOrGoal);
+    return cellPassable(vnav, cx, cy, cz, canDig, requiresGround, isStartOrGoal, gateSealedCaves);
   }
   const r = footprintRadius - 1;
   for (let dz = -r; dz <= r; dz++) {
     for (let dx = -r; dx <= r; dx++) {
-      if (!cellPassable(vnav, cx + dx, cy, cz + dz, canDig, requiresGround, isStartOrGoal)) return false;
+      if (!cellPassable(vnav, cx + dx, cy, cz + dz, canDig, requiresGround, isStartOrGoal, gateSealedCaves)) return false;
     }
   }
   return true;
@@ -156,9 +164,22 @@ export function findPathVolume(
   const startI = vnavIndex(startCx, startCy, startCz);
   const goalI = vnavIndex(goalCx, goalCy, goalCz);
 
+  // Sealed-cave gate. We only prune unreachable underground pockets when the
+  // start cell is itself surface-connected — units that begin inside a
+  // sealed pocket (e.g. mid-carve) need to be able to walk out within it.
+  // Likewise, if the goal sits inside a sealed pocket the search must let
+  // the round arrive at it, otherwise diggers couldn't carve into a void.
+  const startSurface = getBit(vnav.solid, startI) === 0
+    ? getBit(vnav.surfaceConnected, startI) === 1
+    : true;
+  const goalSurface = getBit(vnav.solid, goalI) === 0
+    ? getBit(vnav.surfaceConnected, goalI) === 1
+    : true;
+  const gateSealedCaves = startSurface && goalSurface;
+
   // Goal must be enterable (allow start/goal to skip the requiresGround check so units can
   // be on stairs / doorway thresholds).
-  if (!footprintPassable(vnav, goalCx, goalCy, goalCz, canDig, requiresGround, footprintRadius, true)) {
+  if (!footprintPassable(vnav, goalCx, goalCy, goalCz, canDig, requiresGround, footprintRadius, true, gateSealedCaves)) {
     return { cells: [], reached: false, expanded: 0 };
   }
 
@@ -218,7 +239,7 @@ export function findPathVolume(
         const h2 = NB26_HORIZ2[n]!;
         if (h2 === 0 || dy * dy > h2 * maxTanPitchSq) continue;
       }
-      if (!footprintPassable(vnav, nx, ny, nz, canDig, requiresGround, footprintRadius, ni === goalI)) continue;
+      if (!footprintPassable(vnav, nx, ny, nz, canDig, requiresGround, footprintRadius, ni === goalI, gateSealedCaves)) continue;
 
       let stepCost = NB26_COST[n]!;
       const isSolid = (vnavSolid[ni >> 3]! >> (ni & 7)) & 1;
@@ -272,7 +293,9 @@ function lineClearVolume(
   requiresGround: boolean,
   footprintRadius: number,
 ): boolean {
-  // Step in unit-cell steps, checking the closest cell at each.
+  // Step in unit-cell steps, checking the closest cell at each. Smoother runs
+  // after A* on cells we already proved passable, so we don't re-apply the
+  // sealed-cave gate here — the original A* expansion has already filtered.
   const dx = bx - ax, dy = by - ay, dz = bz - az;
   const steps = Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz));
   if (steps === 0) return true;
@@ -281,7 +304,7 @@ function lineClearVolume(
     const cx = Math.round(ax + dx * t);
     const cy = Math.round(ay + dy * t);
     const cz = Math.round(az + dz * t);
-    if (!footprintPassable(vnav, cx, cy, cz, canDig, requiresGround, footprintRadius, false)) return false;
+    if (!footprintPassable(vnav, cx, cy, cz, canDig, requiresGround, footprintRadius, false, false)) return false;
   }
   return true;
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { allocateVolumeNav, buildVolumeNav, VNAV_Y } from '../src/path/VolumeNav';
+import { allocateVolumeNav, buildVolumeNav, VNAV_Y, vnavIndex, getBit } from '../src/path/VolumeNav';
 import { findPathVolume, AStar3DWorkspace } from '../src/path/AStar3D';
 import { VoxelWorld, worldIndex } from '../src/voxel/VoxelWorld';
 import { WORLD_X, WORLD_Z } from '../src/voxel/types';
@@ -88,6 +88,55 @@ describe('volume A*', () => {
       const dy = Math.abs(b.cy - a.cy);
       const horiz = Math.hypot(b.cx - a.cx, b.cz - a.cz);
       if (dy > 0) expect(horiz).toBeGreaterThan(0);
+    }
+  });
+
+  it('rejects sealed-cave detours: a non-digger searching across surface air ignores buried voids', () => {
+    // Build a flat surface world with a sealed cavity buried inside the
+    // stone. The cavity contains zero air voxels reachable from the sky, so
+    // the surfaceConnected flood fill marks it 0 — pathfinding must skip it.
+    const world = VoxelWorld.create(false);
+    const v = world.buffers.voxels;
+    for (let z = 0; z < WORLD_Z; z++) {
+      for (let x = 0; x < WORLD_X; x++) {
+        v[worldIndex(x, 0, z)] = M_BEDROCK;
+        for (let y = 1; y < 80; y++) v[worldIndex(x, y, z)] = M_STONE;
+      }
+    }
+    // Carve a sealed 8x8x8 air pocket centred at cell (40, 5, 40) — voxel
+    // bounds y=40..47, x=320..327, z=320..327. Surrounded by stone on every
+    // side, no opening to the sky.
+    for (let y = 40; y <= 47; y++) {
+      for (let z = 320; z < 328; z++) {
+        for (let x = 320; x < 328; x++) {
+          v[worldIndex(x, y, z)] = 0;
+        }
+      }
+    }
+    const vnav = allocateVolumeNav(false);
+    buildVolumeNav(v, vnav);
+    const sealedI = vnavIndex(40, 5, 40);
+    // The sealed pocket cell itself must read as solid=0 but
+    // surfaceConnected=0 — that's the whole point of the flood fill.
+    expect(getBit(vnav.solid, sealedI)).toBe(0);
+    expect(getBit(vnav.surfaceConnected, sealedI)).toBe(0);
+    // A neighbouring open-sky air cell must be marked surface-connected.
+    const skyI = vnavIndex(40, 12, 40);
+    expect(getBit(vnav.solid, skyI)).toBe(0);
+    expect(getBit(vnav.surfaceConnected, skyI)).toBe(1);
+
+    // A non-digger walking from (10,12,10) to (60,12,60) via the surface
+    // air layer must succeed and never expand into the sealed pocket.
+    const ws = new AStar3DWorkspace();
+    const r = findPathVolume(vnav, ws, {
+      startCx: 10, startCy: 12, startCz: 10,
+      goalCx:  60, goalCy: 12, goalCz: 60,
+      canDig: false, requiresGround: false, footprintRadius: 1,
+    });
+    expect(r.reached).toBe(true);
+    for (const c of r.cells) {
+      const inSealed = c.cx === 40 && c.cz === 40 && c.cy === 5;
+      expect(inSealed, 'path must skip sealed cave cells').toBe(false);
     }
   });
 
