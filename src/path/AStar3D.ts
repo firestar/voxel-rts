@@ -113,6 +113,19 @@ function footprintPassable(
   return true;
 }
 
+/**
+ * Heuristic weight for the volume A*. Inflating the heuristic above 1 makes the
+ * search inadmissible (paths may be slightly suboptimal) but cone-shaped, which
+ * is what we need for tunnelers — every step into solid stone costs `1 +
+ * digCost` (≈18 for stone), so a weight-1 chebyshev3 heuristic is dwarfed by
+ * the g-score and the search degenerates to a uniform-cost ball that hits the
+ * expansion cap before reaching even modest goals. A weight of 8 lands a
+ * 100-cell dig in ~7 k expansions instead of 170 k+, well inside the cap. The
+ * trade-off is acceptable for RTS use — tunnelers prioritise getting there
+ * over following the absolute cheapest dig.
+ */
+const HEURISTIC_WEIGHT = 8;
+
 export function findPathVolume(
   vnav: VolumeNavBuffers,
   ws: AStar3DWorkspace,
@@ -121,7 +134,7 @@ export function findPathVolume(
   const gen = ws.resetGeneration();
   const { startCx, startCy, startCz, goalCx, goalCy, goalCz, canDig, requiresGround, footprintRadius } = req;
   const maxTanPitch = req.maxPitchRad === undefined ? Infinity : Math.tan(req.maxPitchRad);
-  const maxExpansions = req.maxExpansions ?? 8000;
+  const maxExpansions = req.maxExpansions ?? 20000;
 
   const startI = vnavIndex(startCx, startCy, startCz);
   const goalI = vnavIndex(goalCx, goalCy, goalCz);
@@ -135,7 +148,7 @@ export function findPathVolume(
   ws.gScore[startI] = 0;
   ws.gen[startI] = gen;
   ws.cameFrom[startI] = -1;
-  ws.open.push(startI, chebyshev3(startCx, startCy, startCz, goalCx, goalCy, goalCz));
+  ws.open.push(startI, HEURISTIC_WEIGHT * chebyshev3(startCx, startCy, startCz, goalCx, goalCy, goalCz));
 
   let expanded = 0;
   let reached = false;
@@ -180,7 +193,7 @@ export function findPathVolume(
         ws.gen[ni] = gen;
         ws.gScore[ni] = g;
         ws.cameFrom[ni] = i;
-        const f = g + chebyshev3(nx, ny, nz, goalCx, goalCy, goalCz);
+        const f = g + HEURISTIC_WEIGHT * chebyshev3(nx, ny, nz, goalCx, goalCy, goalCz);
         ws.open.push(ni, f);
       }
     }
