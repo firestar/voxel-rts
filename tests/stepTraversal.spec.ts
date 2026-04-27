@@ -30,12 +30,12 @@ function buildStepWorld(boundaryCx: number, lowTopY: number, highTopY: number): 
 
 describe('surface-follow Y on tall steps', () => {
   it('soldier whose footprint straddles a 3 m step rests on the upper voxel, not buried inside it', () => {
-    // Step = 24 voxels = 3 m. Larger than the old 1.5 m search range that
-    // findFootprintTopVoxel used, but well inside the soldier's 32-voxel
-    // (4 m) climb cap, so this is a position the path search would happily
-    // place a soldier in. The bug used to snap the soldier's feet to a
-    // voxel ~1.5 m below the actual ledge — drawn by the renderer as the
-    // unit half-buried in the hillside.
+    // Step = 24 voxels = 3 m. The path search would no longer place a soldier
+    // here (climb cap is 6 voxels), but the surface-follow snap still has to
+    // do the right thing if a unit ends up on this terrain (spawned, knocked
+    // there, etc). The bug used to snap the soldier's feet to a voxel ~1.5 m
+    // below the actual ledge — drawn by the renderer as the unit half-buried
+    // in the hillside.
     const boundaryCx = 50;
     const lowTopY = 32;
     const highTopY = 56;
@@ -71,9 +71,10 @@ describe('surface-follow Y on tall steps', () => {
   });
 
   it('worker whose footprint straddles a 2.5 m step rests on the upper voxel', () => {
-    // Workers have maxStepVoxels=24 (3 m), so a 20-voxel (2.5 m) step is in range.
-    // Same regression as the soldier — the worker's halfWidth (0.325 m) is
-    // narrower so the bug is borderline, but the principle is identical.
+    // The path search wouldn't route a worker over a 20-voxel (2.5 m) step
+    // any more, but the surface-follow snap still needs to handle the case
+    // (e.g. spawned next to a ledge). The worker's halfWidth (0.325 m) is
+    // narrow so the regression is borderline, but the principle is identical.
     const boundaryCx = 40;
     const lowTopY = 28;
     const highTopY = 48; // 20-voxel step = 2.5 m
@@ -101,14 +102,14 @@ describe('surface-follow Y on tall steps', () => {
   });
 
   it('tank whose wide footprint straddles a step rests on top of the highest voxel under any tread', () => {
-    // Tank's bodyHalfCells=1 + bodyRoughnessVoxels=5 means the path search
-    // would never put it on a true 5-voxel step at the cell boundary — but
-    // the half-width (1.2 m = 9.6 voxels) reaches into adjacent cells, so
-    // the search still has to scan a meaningful range. We use a 4-voxel
-    // (0.5 m) step which is exactly the tank's max climb.
+    // Tank's bodyHalfCells=1 + bodyRoughnessVoxels=4 still rejects true ridges
+    // at the cell boundary, but the half-width (1.2 m = 9.6 voxels) reaches
+    // into adjacent cells, so the surface-follow snap still has to scan a
+    // meaningful range. 3-voxel (0.375 m) step is the tank's tightened climb
+    // cap.
     const boundaryCx = 45;
     const lowTopY = 36;
-    const highTopY = 40; // 4-voxel step = 0.5 m, the tank's exact climb cap
+    const highTopY = 39; // 3-voxel step = 0.375 m, the tank's climb cap
     const world = buildStepWorld(boundaryCx, lowTopY, highTopY);
     const nav = allocateNav(false);
     buildSurfaceNav(world.buffers.voxels, nav);

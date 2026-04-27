@@ -23,6 +23,7 @@ import { BuildingManager, BARRACKS, STORAGE, ALL_BUILDINGS, BuildingSpec, Buildi
 import { BuildingGhost } from '../render/BuildingGhost';
 import { BuildingRenderer } from '../render/BuildingRenderer';
 import { BuildingRangeIndicator } from '../render/BuildingRangeIndicator';
+import { UnitRangeIndicator } from '../render/UnitRangeIndicator';
 import { PathPreview } from '../render/PathPreview';
 import { TargetMarker } from '../render/TargetMarker';
 import { Resources } from '../sim/Resources';
@@ -83,6 +84,7 @@ export class Game {
   readonly buildings = new BuildingManager();
   readonly buildingRenderer = new BuildingRenderer();
   readonly buildingRange = new BuildingRangeIndicator();
+  readonly unitRange = new UnitRangeIndicator();
   readonly ghost = new BuildingGhost();
   /** The spec the user will place next while in build mode. Cycled via 1..N keys. */
   private buildSpec: BuildingSpec = BARRACKS;
@@ -161,6 +163,7 @@ export class Game {
     this.renderer.scene.add(this.unitRenderer.group);
     this.renderer.scene.add(this.buildingRenderer.group);
     this.renderer.scene.add(this.buildingRange.group);
+    this.renderer.scene.add(this.unitRange.group);
     this.renderer.scene.add(this.ghost.group);
     this.renderer.scene.add(this.pathPreview.object);
     this.renderer.scene.add(this.target.group);
@@ -429,6 +432,11 @@ export class Game {
       // Runs before tickWeapons so any new firingTarget assignments slew the
       // turret this same frame.
       this.tickAggressiveStance(dt);
+      // Evasion pass: any unit with an inbound enemy round about to land near
+      // it side-steps perpendicular to the projectile direction. Runs after
+      // aggressive stance so the new target lock survives the dodge — we
+      // don't re-route units that already have a firingTarget.
+      this.tickEvade(dt);
       // Weapon firing pipeline. Slews turret/hull toward each unit's
       // firingTarget, fires when aligned, drops projectiles into the
       // ProjectileManager, and emits muzzle flashes for the renderer.
@@ -471,6 +479,7 @@ export class Game {
     this.healthBars.update(this.units.units);
     this.buildingRenderer.update(this.buildings.buildings);
     this.buildingRange.show(this.buildings.getSelected());
+    this.unitRange.show(this.units.units);
     this.projectileRenderer.update(this.projectiles);
     this.updateProjectileArcs();
     this.muzzleFlashes.update(dt);
@@ -528,14 +537,18 @@ export class Game {
    * Sandbox helper: spawn an enemy unit at the surface voxel under the
    * cursor. Picks soldier by default, tank when shift is held. The new unit
    * is given the standard weapon for its kind so it shows up red AND armed,
-   * so the friendly-fire gate has something meaningful to gate on.
+   * and starts in aggressive stance so it auto-fires at player units in
+   * range — the friendly-fire gate has something meaningful to gate on, and
+   * the player has someone shooting back to react to.
    */
   private spawnEnemyAtCursor(w: number, h: number, shift: boolean): void {
     if (this.input.mouseX < 0) return;
     const r = this.resolveTarget(this.input.mouseX, this.input.mouseY, w, h, 0);
     if (!r) return;
     const kind: UnitKind = shift ? 'tank' : 'soldier';
-    this.units.spawn(kind, r.surface.x, r.surface.y, r.surface.z, { team: 'enemy' });
+    this.units.spawn(kind, r.surface.x, r.surface.y, r.surface.z, {
+      team: 'enemy', stance: 'aggressive',
+    });
   }
 
   /**
@@ -2015,11 +2028,84 @@ export class Game {
    * Defensive-stance units are left alone — the player issues their orders
    * via RMB-fire as before.
    */
-  private tickAggressiveStance(dt: number): void {
-    const enemies = this.units.units.filter(u => u.team === 'enemy' && u.hp > 0);
-    if (enemies.length === 0) return;
+  /**
+   * Evasion pass — when a projectile is closing on a non-firing unit and
+   * predicted to land within `EVADE_DANGER_METERS`, snap a perpendicular
+   * sidestep path onto the unit so it juke-walks clear. Sidesteps are gated
+   * by `evadeCooldown` so the unit doesn't shimmy every frame, and skipped
+   * for units that are actively engaging a target (we don't want a tank to
+   * abandon its line-up just because a stray bullet flies past).
+   */
+  private tickEvade(dt: number): void {
+    if (!this.pathClient) return;
+    const projectiles = this.projectiles.projectiles;
+    if (projectiles.length === 0) return;
+    const nav = this.pathClient.nav;
     for (const u of this.units.units) {
-      if (u.team !== 'player') continue;
+      if (u.hp <= 0) continue;
+      if (u.evadeCooldown > 0) {
+        u.evadeCooldown = Math.max(0, u.evadeCooldown - dt);
+        continue;
+      }
+      // Dodging makes no sense for diggers / dozers / non-mobile units.
+      if (u.kind === 'tunneler' || u.kind === 'worm' || u.kind === 'dozer') continue;
+      // Don't break a worker out of a job or a unit that's holding an aim.
+      if (u.task.kind !== 'idle') continue;
+      if (u.firingTarget) continue;
+
+      const torsoY = u.y + Math.max(0.7, u.widthMeters * 0.6);
+      for (const p of projectiles) {
+        if (p.dead) continue;
+        if (p.ownerId === u.id) continue;
+        const dx = u.x - p.x;
+        const dy = torsoY - p.y;
+        const dz = u.z - p.z;
+        const v2 = p.vx * p.vx + p.vy * p.vy + p.vz * p.vz;
+        if (v2 < 1e-3) continue;
+        const dot = dx * p.vx + dy * p.vy + dz * p.vz;
+        if (dot <= 0) continue; // moving away
+        const t = dot / v2;
+        if (t > EVADE_LOOKAHEAD_SECONDS) continue;
+        const cx = p.x + p.vx * t;
+        const cy = p.y + p.vy * t;
+        const cz = p.z + p.vz * t;
+        const miss2 = (cx - u.x) ** 2 + (cy - torsoY) ** 2 + (cz - u.z) ** 2;
+        if (miss2 > EVADE_DANGER_METERS * EVADE_DANGER_METERS) continue;
+
+        // Build a perpendicular sidestep target. Use the projectile's XZ
+        // direction; perp = (-vz, vx) / |vxz|.
+        const horiz = Math.hypot(p.vx, p.vz) || 1;
+        const perpX = -p.vz / horiz;
+        const perpZ =  p.vx / horiz;
+        const dist = EVADE_DISTANCE_METERS;
+        // Bias the sidestep to whichever side is already further from the
+        // projectile's forecast path so we don't dive INTO the round.
+        const offX = u.x - cx;
+        const offZ = u.z - cz;
+        const sideSign = (offX * perpX + offZ * perpZ) >= 0 ? 1 : -1;
+        const tx = u.x + perpX * dist * sideSign;
+        const tz = u.z + perpZ * dist * sideSign;
+        const cell = this.pathClient.cellAt(tx, tz);
+        if (!cell.ok) continue;
+        const i = navIndex(cell.cx, cell.cz);
+        if (nav.headroom[i]! < u.heightVoxels) continue;
+        // Surface Y at the sidestep target.
+        const top = nav.topY[i]!;
+        if (top < 0) continue;
+        const ty = (top + 1) * VOXEL_SIZE;
+        u.path = [{ x: tx, y: ty, z: tz }];
+        u.blockedFrames = 0;
+        u.needsRepath = false;
+        u.evadeCooldown = EVADE_REARM_SECONDS;
+        break;
+      }
+    }
+  }
+
+  private tickAggressiveStance(dt: number): void {
+    const liveUnits = this.units.units.filter(u => u.hp > 0);
+    if (liveUnits.length === 0) return;
+    for (const u of this.units.units) {
       if (u.weapon === null) continue;
       if (u.stance !== 'aggressive') continue;
       if (u.firingTarget) continue;
@@ -2030,10 +2116,13 @@ export class Game {
       }
       const w = WEAPONS[u.weapon];
       const range2 = w.rangeMeters * w.rangeMeters;
-      // Closest enemy in horizontal range.
+      // Closest cross-team unit in horizontal range. Aggressive stance is now
+      // team-agnostic — enemy-team aggressors fire back at player units the
+      // same way player-team aggressors target enemies.
       let target: Unit | null = null;
       let bestD2 = range2;
-      for (const e of enemies) {
+      for (const e of liveUnits) {
+        if (e.team === u.team) continue;
         const dx = e.x - u.x, dz = e.z - u.z;
         const d2 = dx * dx + dz * dz;
         if (d2 < bestD2) { bestD2 = d2; target = e; }
@@ -2167,6 +2256,19 @@ const TERRAIN_DAMAGE_GLOBAL_SCALE = 0.2;
  * unit at a useful firing distance instead of parking on the enemy's feet.
  */
 const AUTO_ENGAGE_STOP_FRACTION = 0.7;
+
+/**
+ * Evasion tuning. We project each live projectile to its closest approach to
+ * each non-engaged unit; if the predicted miss distance is within
+ * `EVADE_DANGER_METERS` and the time-to-closest-approach is shorter than
+ * `EVADE_LOOKAHEAD_SECONDS`, the unit kicks a perpendicular sidestep of
+ * `EVADE_DISTANCE_METERS`. After dodging, `EVADE_REARM_SECONDS` of cooldown
+ * stops the same unit from juking on every frame while it's still under fire.
+ */
+const EVADE_DANGER_METERS = 3.0;
+const EVADE_LOOKAHEAD_SECONDS = 1.4;
+const EVADE_DISTANCE_METERS = 2.5;
+const EVADE_REARM_SECONDS = 1.2;
 
 /**
  * Decide whether a sampled trajectory `points` would actually affect `target`.

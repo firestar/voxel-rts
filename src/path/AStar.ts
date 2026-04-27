@@ -93,6 +93,30 @@ export function bodyRoughnessOk(
   return true;
 }
 
+/**
+ * Memoised `bodyRoughnessOk`. The plane-fit predicate is expensive and called
+ * repeatedly for the same cell during a single A* run (every neighbour edge
+ * that lands on it triggers a recheck). The cache keys on the workspace
+ * generation tick so it auto-invalidates between queries without an explicit
+ * clear.
+ */
+function cachedBodyRoughnessOk(
+  nav: SurfaceNavBuffers,
+  ws: AStarWorkspace,
+  gen: number,
+  cellIdx: number,
+  cx: number, cz: number,
+  halfCells: number, maxResidualVoxels: number,
+): boolean {
+  if (ws.roughnessGen[cellIdx] === gen) {
+    return ws.roughnessCache[cellIdx] === 1;
+  }
+  const ok = bodyRoughnessOk(nav, cx, cz, halfCells, maxResidualVoxels);
+  ws.roughnessGen[cellIdx] = gen;
+  ws.roughnessCache[cellIdx] = ok ? 1 : 2;
+  return ok;
+}
+
 function octileH(ax: number, az: number, bx: number, bz: number): number {
   const dx = Math.abs(ax - bx), dz = Math.abs(az - bz);
   const m = Math.min(dx, dz), M = Math.max(dx, dz);
@@ -124,6 +148,16 @@ export class AStarWorkspace {
    * buffer so post-pass shortcuts don't slice through a blocking peer.
    */
   readonly unitBlock = new Uint8Array(NAV_COUNT);
+  /**
+   * Memoised `bodyRoughnessOk` results for the current request. 0 = not yet
+   * computed for this query, 1 = ok, 2 = rejected. Reset on every `resetGeneration`
+   * by piggy-backing on the generation tick stored in `roughnessGen`. The roughness
+   * test does a 2-pass plane fit over a (2k+1)² window of cells and is the
+   * single most expensive predicate inside the inner loop; caching it cuts vehicle
+   * pathfinding latency dramatically without changing routes.
+   */
+  readonly roughnessCache = new Uint8Array(NAV_COUNT);
+  readonly roughnessGen = new Int32Array(NAV_COUNT);
   private unitBlockMarks: number[] = [];
   private genTick = 0;
 
@@ -216,7 +250,11 @@ function edgeCost(
  */
 // Heuristic multiplier — values >1 narrow the search into cone shape. 1.0 is
 // admissible A* (broad fan); 2.5 is a tight cone that may miss long detours.
-const HEURISTIC_WEIGHT = 1.5;
+// 2.0 trades a small amount of route optimality for noticeably fewer expanded
+// cells per query — the visual difference between 1.5 and 2.0 paths on the
+// production maps is minor, and the latency win matters when several units
+// repath at once.
+const HEURISTIC_WEIGHT = 2.0;
 export function findPathSurface(
   nav: SurfaceNavBuffers,
   ws: AStarWorkspace,
@@ -309,7 +347,7 @@ export function findPathSurface(
       const nyTop = nav.topY[ni]!;
       const dY = Math.abs(nyTop - cy);
       if (dY > maxStepVoxels) continue;
-      if (bodyHalfCells > 0 && !bodyRoughnessOk(nav, nx, nz, bodyHalfCells, bodyRoughnessVoxels)) continue;
+      if (bodyHalfCells > 0 && !cachedBodyRoughnessOk(nav, ws, gen, ni, nx, nz, bodyHalfCells, bodyRoughnessVoxels)) continue;
       if (headroomVoxels > 0 && nav.headroom[ni]! < headroomVoxels) continue;
       if (n >= 4) {
         const a = navIndex(cx + NB_DX[n]!, cz);
