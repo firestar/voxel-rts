@@ -31,7 +31,7 @@ import { SaplingManager } from '../sim/Saplings';
 import { tickWorkers } from '../sim/Workers';
 import { WorkerTaskBoard, describeOrder } from '../sim/WorkerTasks';
 import { ProjectileManager, PROJECTILES, muzzleOrigin, ProjectileImpact } from '../sim/Projectiles';
-import { WEAPONS } from '../sim/Weapons';
+import { WEAPONS, WeaponKind } from '../sim/Weapons';
 import { tickWeapons } from '../sim/WeaponTick';
 import {
   ProjectileRenderer, FlashPool, ImpactRingPool, TrajectoryPreview, ImpactMarker,
@@ -380,13 +380,17 @@ export class Game {
     this.dispatchActionKeys();
 
     // Sandbox helper: 'E' spawns an enemy unit at the cursor's terrain xz.
-    //   E         → enemy soldier (rifle)
-    //   Shift+E   → enemy tank (cannon)
+    //   E             → enemy soldier (rifle)
+    //   Shift+E       → enemy tank (cannon)
+    //   Alt+E         → enemy rocket truck (cluster pod)
+    //   Shift+Alt+E   → enemy rocket truck (heavy rocket pod)
     // Used to test friendly-fire gating + selection rules without needing an
     // AI opponent. The new unit appears immediately at the picked surface
     // voxel and idles in place.
     if (this.input.pressed.has('KeyE')) {
-      this.spawnEnemyAtCursor(w, h, this.input.keys.has('ShiftLeft') || this.input.keys.has('ShiftRight'));
+      const shift = this.input.keys.has('ShiftLeft') || this.input.keys.has('ShiftRight');
+      const alt = this.input.keys.has('AltLeft') || this.input.keys.has('AltRight');
+      this.spawnEnemyAtCursor(w, h, shift, alt);
     }
 
     if (isBuildMode(this.mode)) {
@@ -535,16 +539,26 @@ export class Game {
 
   /**
    * Sandbox helper: spawn an enemy unit at the surface voxel under the
-   * cursor. Picks soldier by default, tank when shift is held. The new unit
-   * is given the standard weapon for its kind so it shows up red AND armed,
+   * cursor. Picks soldier by default; shift swaps to a tank, alt swaps to a
+   * rocket truck (shift+alt = heavy rocket pod variant). The new unit is
+   * given the standard weapon for its kind so it shows up red AND armed,
    * and starts in aggressive stance so it auto-fires at player units in
    * range — the friendly-fire gate has something meaningful to gate on, and
    * the player has someone shooting back to react to.
    */
-  private spawnEnemyAtCursor(w: number, h: number, shift: boolean): void {
+  private spawnEnemyAtCursor(w: number, h: number, shift: boolean, alt: boolean): void {
     if (this.input.mouseX < 0) return;
     const r = this.resolveTarget(this.input.mouseX, this.input.mouseY, w, h, 0);
     if (!r) return;
+    if (alt) {
+      // Heavy single-warhead pod when shift is also held; cluster pod (the
+      // rocket_truck default) otherwise.
+      const weapon: WeaponKind = shift ? 'rocket_pod' : 'cluster_pod';
+      this.units.spawn('rocket_truck', r.surface.x, r.surface.y, r.surface.z, {
+        team: 'enemy', stance: 'aggressive', weapon,
+      });
+      return;
+    }
     const kind: UnitKind = shift ? 'tank' : 'soldier';
     this.units.spawn(kind, r.surface.x, r.surface.y, r.surface.z, {
       team: 'enemy', stance: 'aggressive',
