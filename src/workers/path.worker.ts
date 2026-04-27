@@ -63,6 +63,9 @@ self.onmessage = (ev: MessageEvent<Message>) => {
       const r = findPathSurface(nav, ws2, msg.req);
       // Pass the workspace's unit-obstacle mask into the smoother so post-pass
       // shortcuts don't slice straight through a peer that A* routed around.
+      // Also pass the workspace itself so the smoother shares the roughness
+      // cache the search just populated — those plane-fit verdicts are still
+      // valid until the next `resetGeneration` bumps the tick.
       const smoothed = r.cells.length > 2
         ? smoothPath(
             nav, r.cells,
@@ -70,6 +73,8 @@ self.onmessage = (ev: MessageEvent<Message>) => {
             msg.req.bodyHalfCells, msg.req.bodyRoughnessVoxels,
             msg.req.headroomVoxels,
             ws2.unitBlock,
+            12,
+            ws2,
           )
         : r.cells;
       (self as unknown as Worker).postMessage({
