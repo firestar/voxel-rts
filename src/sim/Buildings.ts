@@ -69,6 +69,19 @@ export interface BuildingSpec {
    * the top of the turret head / silo cluster, not from inside the wall.
    */
   weaponMuzzleHeight?: number;
+  /**
+   * Optional magazine capacity. When set, the weapon fires this many rounds
+   * before forcing a reload of `weaponReloadSeconds`. Undefined = unlimited
+   * ammo (regular turrets / silos). Used by the AA flak turret so a wave of
+   * incoming fire can saturate the dome before it goes offline to reload.
+   */
+  weaponMagazineSize?: number;
+  /**
+   * Seconds the weapon stays offline after the magazine is emptied. During
+   * this window the building cannot target or fire, and the renderer drops
+   * the turret head to a stowed pose so the reload is visually obvious.
+   */
+  weaponReloadSeconds?: number;
 }
 
 export const BARRACKS: BuildingSpec = {
@@ -213,6 +226,11 @@ export const AA_TURRET: BuildingSpec = {
   weapon: 'aa_turret',
   launcherMaxStrength: 130,
   weaponMuzzleHeight: (12 + 4) * VOXEL_SIZE,
+  // 12-round magazine, 30 s reload. While reloading the turret tilts its
+  // barrel down (see BuildingRenderer) and refuses to engage — a saturation
+  // attack can punch a hole in the AA umbrella by emptying the magazine.
+  weaponMagazineSize: 12,
+  weaponReloadSeconds: 30,
 };
 
 /**
@@ -320,6 +338,28 @@ export interface Building {
    * the value stays at 0.
    */
   weaponTurretYaw: number;
+  /**
+   * Visible turret-head pitch (radians, X-axis, YXZ Euler order). 0 = barrel
+   * level, negative = tilted down. Only the AA turret currently moves this
+   * value — it slews to a steep down-tilt while reloading and back to 0 when
+   * the magazine is fresh, so the renderer reads "offline" at a glance. All
+   * other buildings leave it at 0.
+   */
+  weaponTurretPitch: number;
+  /**
+   * Rounds remaining in the magazine for buildings whose spec sets
+   * `weaponMagazineSize`. Decremented on each shot; when it hits 0 the
+   * building enters a reload cycle (`weaponReloadTimer`). Buildings without
+   * a magazine spec leave this at 0 and ignore it.
+   */
+  weaponAmmo: number;
+  /**
+   * Seconds remaining on the current reload, or 0 when the weapon is ready.
+   * While > 0 the building's weapon tick refuses to target/fire and the
+   * renderer shows the stowed pose. Decays each tick; when it crosses 0 the
+   * magazine refills to `weaponMagazineSize` and the turret comes back online.
+   */
+  weaponReloadTimer: number;
 }
 
 /**
@@ -1008,6 +1048,9 @@ export class BuildingManager {
       harvesterClaimId: null,
       weaponFireCooldown: 0,
       weaponTurretYaw: 0,
+      weaponTurretPitch: 0,
+      weaponAmmo: spec.weaponMagazineSize ?? 0,
+      weaponReloadTimer: 0,
     };
     this.buildings.push(b);
     return b;
@@ -1254,12 +1297,16 @@ export class BuildingManager {
   /**
    * Anti-air firing pipeline. Each frame:
    *   1. Decay cooldown.
-   *   2. Pick the nearest in-range projectile NOT fired by an AA building.
-   *   3. Solve a lead point — where the projectile will be when the flak
+   *   2. If the magazine is empty, decay the reload timer instead of firing
+   *      and slew the turret head down to a stowed pose so the building
+   *      reads as offline. When the timer hits 0 the magazine refills.
+   *   3. Pick the nearest in-range projectile NOT fired by an AA building.
+   *   4. Solve a lead point — where the projectile will be when the flak
    *      shell arrives — and aim slightly below it so the upward-biased
    *      shrapnel cone goes off underneath the round.
-   *   4. Slew the visible turret toward the lead point and fire when within
-   *      the weapon's aim tolerance and the cooldown is ready.
+   *   5. Slew the visible turret toward the lead point and fire when within
+   *      the weapon's aim tolerance and the cooldown is ready. Each shot
+   *      drains a round; emptying the magazine triggers the reload cycle.
    *
    * The actual interception (chance to disrupt the target round) is owned by
    * the projectile manager: when a flak shell detonates, any projectile
@@ -1274,6 +1321,32 @@ export class BuildingManager {
     const w = WEAPONS[wKind];
     const pm = this.projectiles;
     if (!pm) return;
+
+    // Reload cycle. While the timer is positive the turret is offline: no
+    // targeting, no firing, and the head pitches down toward the stowed pose
+    // so the renderer reads "reloading" without any extra HUD plumbing.
+    // AIM_PITCH_RAD_PER_SEC controls how quickly the head drops / rises;
+    // STOWED_PITCH is how far down the barrel parks (~70° below horizontal).
+    const STOWED_PITCH = -1.2;
+    const AIM_PITCH_RAD_PER_SEC = 1.4;
+    if (b.weaponReloadTimer > 0) {
+      b.weaponReloadTimer = Math.max(0, b.weaponReloadTimer - dt);
+      const pitchStep = AIM_PITCH_RAD_PER_SEC * dt;
+      const pitchDiff = STOWED_PITCH - b.weaponTurretPitch;
+      b.weaponTurretPitch +=
+        pitchDiff < -pitchStep ? -pitchStep : pitchDiff > pitchStep ? pitchStep : pitchDiff;
+      if (b.weaponReloadTimer === 0 && b.spec.weaponMagazineSize !== undefined) {
+        b.weaponAmmo = b.spec.weaponMagazineSize;
+      }
+      return;
+    }
+    // Not reloading: ease the barrel back to level any time it sits below 0.
+    if (b.weaponTurretPitch !== 0) {
+      const pitchStep = AIM_PITCH_RAD_PER_SEC * dt;
+      const pitchDiff = 0 - b.weaponTurretPitch;
+      b.weaponTurretPitch +=
+        pitchDiff < -pitchStep ? -pitchStep : pitchDiff > pitchStep ? pitchStep : pitchDiff;
+    }
     const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
     const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
     const floorTopMeters = (b.floorY + 1) * VOXEL_SIZE;
@@ -1364,6 +1437,12 @@ export class BuildingManager {
       b.spec.launcherMaxStrength ?? Infinity,
     );
     b.weaponFireCooldown = w.fireInterval;
+    if (b.spec.weaponMagazineSize !== undefined) {
+      b.weaponAmmo = Math.max(0, b.weaponAmmo - 1);
+      if (b.weaponAmmo === 0) {
+        b.weaponReloadTimer = b.spec.weaponReloadSeconds ?? 0;
+      }
+    }
 
     if (this.onBuildingMuzzleFlash) {
       const pcfg = PROJECTILES[w.projectile];
