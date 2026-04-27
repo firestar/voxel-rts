@@ -1743,6 +1743,12 @@ export class Game {
       const hit = this.units.units.find(u => u.id === imp.directHitUnitId);
       if (hit) hit.hp -= imp.hitDamage;
     }
+    // Building damage. Direct-hit (impact lands inside a footprint AABB)
+    // takes hitDamage; explosive splash applies falloff to every building
+    // whose AABB sits within the blast. Once a building's HP hits zero it
+    // flips to `destroyed` — that single source of truth replaces having
+    // to wait for the wall-count tick to notice the structure is gone.
+    this.buildings.applyImpactDamage(imp);
     // Explosion splash damage to nearby units. Falls off linearly to zero at
     // the blast edge and is capped well below a direct hit (×0.4) so taking
     // a round to the chest hurts more than catching the splash from a near-
