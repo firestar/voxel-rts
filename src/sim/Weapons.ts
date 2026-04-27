@@ -25,6 +25,7 @@ export type WeaponKind =
   | 'rocket_pod'
   | 'cluster_pod'
   | 'building_turret'
+  | 'aa_turret'
   | 'silo_launcher';
 
 export type WeaponMount = 'hull' | 'turret';
@@ -167,6 +168,21 @@ export const WEAPONS: Record<WeaponKind, WeaponConfig> = {
     shotsPerBurst: 1, burstInterval: 0,
     velocityScale: 1.0,
     muzzleFlashRadius: 0.9, muzzleFlashSeconds: 0.20,
+  },
+  /**
+   * Anti-air turret. Auto-fires upward-tilted flak shells at enemy projectiles
+   * inside its dome, leading the target so the burst goes off just below the
+   * round on its way through. Snappy slew + short cooldown — interception is
+   * a per-projectile race against the clock.
+   */
+  aa_turret: {
+    kind: 'aa_turret', label: 'AA flak turret',
+    projectile: 'flak_shell', aimedBy: 'turret',
+    aimToleranceRad: 0.18, aimSlewRadPerSec: 6.0,
+    fireInterval: 0.55, rangeMeters: 110, spreadRad: 0.02,
+    shotsPerBurst: 1, burstInterval: 0,
+    velocityScale: 1.0,
+    muzzleFlashRadius: 0.45, muzzleFlashSeconds: 0.10,
   },
   /**
    * Silo launcher. The heaviest weapon in the catalog — long cooldown, huge

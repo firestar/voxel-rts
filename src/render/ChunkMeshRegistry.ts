@@ -27,13 +27,20 @@ export class ChunkMeshRegistry {
 
   // Material reused across chunks.
   private material: THREE.Material;
+  /**
+   * Shared with the chunk material's onBeforeCompile shader so the underground
+   * overlay (`Game.hideAboveY`) can render any fragment whose world-space Y is
+   * at or above this value at 5% opacity. A very large default (~1e9) keeps
+   * the cutoff disabled until the player toggles it on.
+   */
+  readonly hideAboveYUniform = { value: 1e9 };
 
   constructor(
     public readonly scene: THREE.Scene,
     public readonly world: VoxelWorld,
   ) {
     this.worldVersion = world.buffers.version;
-    this.material = makeChunkMaterial();
+    this.material = makeChunkMaterial(this.hideAboveYUniform);
     const cores = Math.max(2, Math.min((navigator.hardwareConcurrency ?? 4) - 1, 8));
     for (let i = 0; i < cores; i++) {
       const w = new MesherWorker();
@@ -131,20 +138,68 @@ export class ChunkMeshRegistry {
 
   getMeshCount(): number { return this.meshes.size; }
   getInflight(): number { return this.inflight.size; }
+
+  /**
+   * Set the Y cutoff (in meters). Anything above this Y is rendered at 5%
+   * opacity by the chunk material's shader patch. Pass a very large value
+   * (or `Infinity`) to disable the cutoff and restore solid terrain. The
+   * material's `transparent` flag is toggled with the cutoff so the engine
+   * isn't paying for alpha sorting when the cutoff is off.
+   */
+  setHideAboveY(meters: number): void {
+    const enabled = isFinite(meters) && meters < 1e8;
+    this.hideAboveYUniform.value = enabled ? meters : 1e9;
+    const m = this.material as THREE.MeshLambertMaterial;
+    if (m.transparent !== enabled) {
+      m.transparent = enabled;
+      m.depthWrite = !enabled;
+      m.needsUpdate = true;
+    }
+  }
 }
 
-function makeChunkMaterial(): THREE.Material {
+function makeChunkMaterial(hideUniform: { value: number }): THREE.Material {
   // Per-vertex color carries (r,g,b, ao). We pipe AO through a tiny onBeforeCompile patch
   // so it multiplies the diffuse term, giving cheap baked AO without a custom ShaderMaterial.
+  // The same patch wires `uHideAboveY` so the Y-axis cutoff overlay can render any fragment
+  // above the cutoff at 5% opacity (so the player can see underground tunnels through it).
   const m = new THREE.MeshLambertMaterial({ vertexColors: true });
   m.onBeforeCompile = (shader) => {
-    shader.fragmentShader = shader.fragmentShader.replace(
-      '#include <color_fragment>',
-      `
-      #include <color_fragment>
-      diffuseColor.rgb *= vColor.a;
-      `,
-    );
+    shader.uniforms.uHideAboveY = hideUniform;
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        `
+        #include <common>
+        varying vec3 vWorldPosForCutoff;
+        `,
+      )
+      .replace(
+        '#include <worldpos_vertex>',
+        `
+        #include <worldpos_vertex>
+        vWorldPosForCutoff = (modelMatrix * vec4(transformed, 1.0)).xyz;
+        `,
+      );
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `
+        #include <common>
+        uniform float uHideAboveY;
+        varying vec3 vWorldPosForCutoff;
+        `,
+      )
+      .replace(
+        '#include <color_fragment>',
+        `
+        #include <color_fragment>
+        diffuseColor.rgb *= vColor.a;
+        if (vWorldPosForCutoff.y >= uHideAboveY) {
+          diffuseColor.a *= 0.05;
+        }
+        `,
+      );
   };
   return m;
 }

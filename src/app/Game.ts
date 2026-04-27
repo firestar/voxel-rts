@@ -12,7 +12,7 @@ import { PathClient } from '../path/PathClient';
 import { UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest, ScoopRequest, DumpRequest, unitCollisionRadius } from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
 import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS, NAV_CELL_VOXELS } from '../path/SurfaceNav';
-import { worldToVolumeCell, vnavIndex, getBit } from '../path/VolumeNav';
+import { worldToVolumeCell, vnavIndex, getBit, VNAV_Y } from '../path/VolumeNav';
 import { trackDamageFor, M_DIRT, M_WOOD, M_METAL } from '../voxel/Materials';
 import { BuildingManager, BARRACKS, STORAGE, ALL_BUILDINGS, BuildingSpec, Building, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
@@ -94,6 +94,17 @@ export class Game {
   /** Last rendered task-panel signature. Same purpose as `actionsRenderedKey`. */
   private tasksRenderedKey = '';
   private mode: Mode = 'play';
+  /**
+   * Y-axis cutoff (in meters). Anything at or above this Y is rendered at 5%
+   * opacity so the player can see underground tunnels through it. Raycasts —
+   * including the LMB target picker — also ignore voxels above the cutoff,
+   * so a click pierces the see-through overlay and lands on whatever is
+   * actually visible underneath. `Infinity` disables the cutoff entirely.
+   *
+   * Hotkeys: `[` lower the cutoff one meter, `]` raise it, `\` reset it
+   * (back to disabled, i.e. show everything).
+   */
+  private hideAboveY = Infinity;
   private rebuildPending = false;
   private rebuildQueued = false;
   private rebuildShouldReplan = false;
@@ -110,6 +121,10 @@ export class Game {
     const sharedAvailable = typeof SharedArrayBuffer !== 'undefined' && (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
     this.world = VoxelWorld.create(sharedAvailable);
     this.meshes = new ChunkMeshRegistry(this.renderer.scene, this.world);
+    // Wire the world into the projectile manager so newly spawned rounds
+    // pre-compute their full visible arc (used by the dashed-line renderer
+    // so the arc stays visible from spawn through impact).
+    this.projectiles.worldForPrediction = this.world;
     this.debris = new DebrisParticles(4096);
     this.renderer.scene.add(this.debris.mesh);
     this.renderer.scene.add(this.unitRenderer.group);
@@ -298,6 +313,13 @@ export class Game {
     }
     if (this.input.pressed.has('Tab')) this.cycleSelection();
 
+    // Y-axis cutoff overlay. `[` lowers the cutoff (showing more underground),
+    // `]` raises it. `\` resets to disabled. Holding shift quadruples the step
+    // so the player can sweep through several layers quickly.
+    if (this.input.pressed.has('BracketLeft') || this.input.pressed.has('BracketRight') || this.input.pressed.has('Backslash')) {
+      this.adjustHideAboveY();
+    }
+
     // Per-selection action keybinds (e.g. Q on a barracks queues a soldier;
     // H on selected units stops them). Runs after the global hotkeys (B/P/
     // Esc/digit cycle) so their bindings always win for the global mode.
@@ -470,7 +492,7 @@ export class Game {
    */
   private pickBuildingAt(px: number, py: number, w: number, h: number): Building | null {
     const { origin, dir } = this.rayFromScreen(px, py, w, h);
-    const hit = raycastVoxel(this.world, origin, dir, 200);
+    const hit = raycastVoxel(this.world, origin, dir, 200, this.raycastMaxVoxelY());
     if (!hit) return null;
     for (const b of this.buildings.buildings) {
       if (b.destroyed) continue;
@@ -508,7 +530,7 @@ export class Game {
     if (!spec) { this.ghost.hide(); return; }
     if (this.input.mouseX < 0) { this.ghost.hide(); return; }
     const { origin, dir } = this.rayFromScreen(this.input.mouseX, this.input.mouseY, w, h);
-    const hit = raycastVoxel(this.world, origin, dir, 200);
+    const hit = raycastVoxel(this.world, origin, dir, 200, this.raycastMaxVoxelY());
     if (!hit) { this.ghost.hide(); return; }
     const wx = hit.x * VOXEL_SIZE;
     const wz = hit.z * VOXEL_SIZE;
@@ -541,10 +563,17 @@ export class Game {
     voxelXYZ: { x: number; y: number; z: number; nx: number; ny: number; nz: number };
   } | null {
     const { origin, dir } = this.rayFromScreen(px, py, w, h);
-    const hit = raycastVoxel(this.world, origin, dir, 400);
+    const hit = raycastVoxel(this.world, origin, dir, 400, this.raycastMaxVoxelY());
     if (!hit) return null;
     const wx = (hit.x + 0.5) * VOXEL_SIZE;
-    const wy = (hit.y + 0.5) * VOXEL_SIZE;
+    // When the click resolves to the top face of a solid voxel (the common
+    // "click on the ground" case), report the click as being one voxel
+    // ABOVE that voxel — i.e. on the standing surface — so worldToVolumeCell
+    // lands in the air cell where the unit will actually stand instead of
+    // inside the floor voxel itself. Without this, an LMB click on a tunnel
+    // floor through the Y-cutoff overlay would resolve into a solid volume
+    // cell and the volume A* would refuse the goal.
+    const wy = hit.ny > 0 ? (hit.y + 1.0) * VOXEL_SIZE + 1e-3 : (hit.y + 0.5) * VOXEL_SIZE;
     const wz = (hit.z + 0.5) * VOXEL_SIZE;
     const dragMeters = verticalDragPx / this.altitudeDragSensitivity; // down = +meters depth
     // Default base height is the click's voxel y. Callers pass `baseY` to override —
@@ -1135,6 +1164,20 @@ export class Game {
       }
       const startCell = worldToVolumeCell(unit.x, unit.y, unit.z);
       const goalCell = worldToVolumeCell(wx, wy, wz);
+      // The click landed on a solid surface (e.g. tunnel floor through the
+      // Y-cutoff overlay) so its volume cell is solid. A non-digger can't
+      // enter solid cells, so walk up until we find the air cell where the
+      // unit will actually stand. Diggers don't need this — they'll carve
+      // into the cell on arrival.
+      if (!unit.canDig) {
+        const vnav = this.pathClient.vnav;
+        while (
+          goalCell.cy < VNAV_Y - 1 &&
+          getBit(vnav.solid, vnavIndex(goalCell.cx, goalCell.cy, goalCell.cz)) === 1
+        ) {
+          goalCell.cy++;
+        }
+      }
       const res = await this.pathClient.requestVolumePath({
         startCx: startCell.cx, startCy: startCell.cy, startCz: startCell.cz,
         goalCx: goalCell.cx, goalCy: goalCell.cy, goalCz: goalCell.cz,
@@ -1990,10 +2033,51 @@ export class Game {
     }
   }
 
+  /**
+   * Hotkey handler for the Y-cutoff overlay. `[` and `]` step the cutoff up /
+   * down; `\` disables it. Holding shift quadruples the step. The cutoff is
+   * clamped against the world's vertical extent (in meters) so the player
+   * can't push it negative or past the sky.
+   */
+  private adjustHideAboveY(): void {
+    const shift = this.input.keys.has('ShiftLeft') || this.input.keys.has('ShiftRight');
+    const step = shift ? 4 : 1;
+    const minY = 0.5;
+    // Default seed when the cutoff is currently disabled but the user wants
+    // to start cutting in: drop to roughly the ground we're focused on.
+    let v = isFinite(this.hideAboveY) ? this.hideAboveY : 24;
+    if (this.input.pressed.has('Backslash')) {
+      this.hideAboveY = Infinity;
+    } else if (this.input.pressed.has('BracketLeft')) {
+      v = Math.max(minY, v - step);
+      this.hideAboveY = v;
+    } else if (this.input.pressed.has('BracketRight')) {
+      v = v + step;
+      this.hideAboveY = v;
+    }
+    this.meshes.setHideAboveY(this.hideAboveY);
+  }
+
+  /**
+   * Voxel-y ceiling for `raycastVoxel`. Returns the integer voxel index at
+   * or above which a column reads as AIR for the picker — i.e. the floor
+   * `(hideAboveY / VOXEL_SIZE)`. When the cutoff is disabled, returns
+   * `undefined` so the raycast keeps its normal behavior.
+   */
+  private raycastMaxVoxelY(): number | undefined {
+    if (!isFinite(this.hideAboveY)) return undefined;
+    return Math.max(0, Math.floor(this.hideAboveY / VOXEL_SIZE));
+  }
+
   private updateProjectileArcs(): void {
     const arcs: { points: { x: number; y: number; z: number }[] }[] = [];
     for (const p of this.projectiles.projectiles) {
-      const points = this.projectiles.predictRemaining(p, this.world, 0, 96, 0.06);
+      // Prefer the arc captured at spawn (full path, mouth-to-impact). Falls
+      // back to a live re-predict for projectiles that were spawned without
+      // a world reference (e.g. cluster submunitions deflected mid-flight).
+      const points = p.arcPoints.length >= 2
+        ? p.arcPoints
+        : this.projectiles.predictRemaining(p, this.world, 0, 96, 0.06);
       if (points.length >= 2) arcs.push({ points });
     }
     this.projectileArcs.update(arcs);

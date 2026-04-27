@@ -16,12 +16,18 @@ export interface VoxelHit {
  * `maxMeters` caps the traversal distance.
  *
  * Internally we work in voxel units so cell stepping is unit-cost.
+ *
+ * `maxVoxelY` (optional) is an exclusive ceiling in voxel coords: any solid
+ * voxel at y >= maxVoxelY reads as AIR. Used by the Y-axis cutoff overlay
+ * so clicks pierce the (visually 5%-opacity) terrain above the cutoff and
+ * land on the underground ground that's still rendered solid.
  */
 export function raycastVoxel(
   world: VoxelWorld,
   origin: { x: number; y: number; z: number },
   dir: { x: number; y: number; z: number },
   maxMeters: number,
+  maxVoxelY?: number,
 ): VoxelHit | null {
   const inv = 1 / VOXEL_SIZE;
   // Convert origin to voxel-space (continuous coords; floor() = cell index).
@@ -54,9 +60,14 @@ export function raycastVoxel(
   const maxSteps = (maxVoxelDist | 0) * 4 + 16;
   for (let i = 0; i < maxSteps; i++) {
     if (x >= 0 && y >= 0 && z >= 0 && x < WORLD_X && y < WORLD_Y && z < WORLD_Z) {
-      const m = world.get(x, y, z);
-      if (m !== AIR) {
-        return { x, y, z, tMeters, nx, ny, nz };
+      // When a Y-cutoff is active, voxels at or above the cutoff are treated
+      // as AIR by this raycast so the click can pierce the see-through
+      // overlay and land on the actual underground geometry below.
+      if (maxVoxelY === undefined || y < maxVoxelY) {
+        const m = world.get(x, y, z);
+        if (m !== AIR) {
+          return { x, y, z, tMeters, nx, ny, nz };
+        }
       }
     }
     // Step on whichever axis crosses the next cell boundary first. Compare

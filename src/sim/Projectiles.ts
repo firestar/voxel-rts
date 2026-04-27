@@ -27,6 +27,7 @@ export type ProjectileKind =
   | 'cluster_submunition'
   | 'tank_shell'
   | 'turret_shell'
+  | 'flak_shell'
   | 'silo_missile';
 
 export interface ProjectileConfig {
@@ -230,6 +231,30 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     hasTrail: true,
   },
   /**
+   * Flak shell — the AA turret's payload. Fast off the muzzle, light drag, low
+   * direct damage; on detonation it sprays an upward-biased cone of shrapnel
+   * that disrupts any enemy projectile inside `explosionRadiusMeters`. The
+   * disruption itself is handled by the anti-air intercept logic in the
+   * projectile manager (so the shell is just the carrier — its blast against
+   * units is small).
+   */
+  flak_shell: {
+    kind: 'flak_shell',
+    massKg: 4,
+    muzzleVelocity: 95,
+    dragPerSecond: 0.04,
+    hitDamage: 12, hitRadiusMeters: 0.25,
+    explosive: true, explosionPeak: 60, explosionRadiusMeters: 4.0,
+    // Defensive shell, fired near our own buildings — keep terrain damage low
+    // so a busy AA salvo doesn't grind craters into the base.
+    terrainDamageScale: 0.05,
+    clusterSubmunitions: 0,
+    maxLifeSeconds: 4.0,
+    colorR: 1.00, colorG: 0.95, colorB: 0.55,
+    visualLengthMeters: 0.45, visualRadiusMeters: 0.06,
+    hasTrail: true,
+  },
+  /**
    * Silo missile — the heaviest in the catalog. Slow off the launch rails but
    * carries a punishing warhead with a wide blast. The silo's high
    * launcherMaxStrength lets the missile reach across the map; with the
@@ -287,6 +312,20 @@ export interface Projectile {
   boostTargetY: number;
   boostTargetZ: number;
   postBoostSpeed: number;
+  /**
+   * Sampled trajectory captured at spawn time — the predicted full flight
+   * path from the muzzle until the projectile hits voxel geometry, drops
+   * below the world floor, or runs out of `maxLifeSeconds`. Used by the
+   * `ProjectileArcPool` renderer so the dashed arc the player sees on screen
+   * stays visible from spawn through impact instead of shrinking each frame
+   * as a re-prediction would.
+   *
+   * Empty until `attachPredictedArc` is called by the manager — the spawn
+   * site (Game / WeaponTick) wires the world reference at fire time so the
+   * arc reflects real terrain. When empty, the renderer falls back to the
+   * live-state predict.
+   */
+  arcPoints: { x: number; y: number; z: number }[];
 }
 
 /**
@@ -396,6 +435,13 @@ export class ProjectileManager {
   /** Impacts that occurred this tick — drained by Game after each `tick`. */
   readonly pendingImpacts: ProjectileImpact[] = [];
   private nextId = 1;
+  /**
+   * World ref used when `spawn` should automatically pre-compute the visible
+   * trajectory arc. Wired by Game on init; tests that don't care about the
+   * renderer can leave it unset and the projectile's `arcPoints` stays empty
+   * (the live tick is unaffected).
+   */
+  worldForPrediction: VoxelWorld | null = null;
 
   /**
    * Launch a projectile from `(x,y,z)` along the unit-vector `(dx,dy,dz)` at the
@@ -454,9 +500,25 @@ export class ProjectileManager {
       boostMetersRemaining,
       boostTargetX, boostTargetY, boostTargetZ,
       postBoostSpeed: speed,
+      arcPoints: [],
     };
     this.projectiles.push(p);
+    if (this.worldForPrediction) this.attachPredictedArc(p, this.worldForPrediction);
     return p;
+  }
+
+  /**
+   * Compute and cache the projectile's predicted full flight arc (from the
+   * spawn position, with the spawn velocity, until impact / floor / max
+   * life). Stored on the projectile so the renderer can draw a dashed line
+   * that stays put as the projectile flies, instead of recomputing the
+   * remaining flight every frame (which makes the visible arc shrink).
+   *
+   * Safe to call on a freshly-spawned projectile that still carries its
+   * launch velocity. Pure read of the world.
+   */
+  attachPredictedArc(p: Projectile, world: VoxelWorld | null): void {
+    p.arcPoints = this.predictRemaining(p, world, 0, 96, 0.06);
   }
 
   /**
@@ -592,6 +654,20 @@ export class ProjectileManager {
         }
       }
     }
+    // Anti-air intercept pass. Each flak-shell impact emitted this tick
+    // disrupts any other live projectile inside its blast radius. The total
+    // chance of disruption is 90%; the outcome rolls between three flavors:
+    //
+    //   - silent kill (fall from the sky)
+    //   - off-course divert (random horizontal perturbation, lose lift)
+    //   - blow up where hit (immediate detonation; explosive rounds emit
+    //     an impact at their current position)
+    //
+    // Non-flak impacts pass through unchanged.
+    for (const imp of this.pendingImpacts) {
+      if (imp.kind !== 'flak_shell') continue;
+      this.applyAaIntercept(imp.x, imp.y, imp.z, imp.explosionRadiusMeters);
+    }
     // Sweep dead.
     let w = 0;
     for (let r = 0; r < this.projectiles.length; r++) {
@@ -599,6 +675,57 @@ export class ProjectileManager {
       if (!p.dead) this.projectiles[w++] = p;
     }
     this.projectiles.length = w;
+  }
+
+  /**
+   * Apply the AA intercept rolls against all live (non-flak, non-AA-owned)
+   * projectiles inside `(x,y,z)`'s `radiusMeters` sphere. 90% disruption
+   * total; outcomes split evenly across silent kill, off-course divert, and
+   * detonate-where-hit.
+   *
+   * Pulled out as a method (rather than inlined into `tick`) so tests can
+   * deterministically exercise the intercept logic by passing a fixed
+   * (x,y,z,r). The randomness is local — the caller seeds a Math.random()
+   * roll per affected projectile.
+   */
+  applyAaIntercept(x: number, y: number, z: number, radiusMeters: number): number {
+    const r2 = radiusMeters * radiusMeters;
+    let affected = 0;
+    for (const q of this.projectiles) {
+      if (q.dead) continue;
+      if (q.kind === 'flak_shell') continue;
+      const dxq = q.x - x, dyq = q.y - y, dzq = q.z - z;
+      if (dxq * dxq + dyq * dyq + dzq * dzq > r2) continue;
+      affected++;
+      const roll = Math.random();
+      // 0..0.30 silent kill; 0.30..0.60 divert; 0.60..0.90 detonate; 0.90+ miss.
+      if (roll < 0.30) {
+        q.dead = true;
+      } else if (roll < 0.60) {
+        // Divert: rotate the velocity by a sharp random yaw and shed half the
+        // lift so the round veers off and falls.
+        const speed = Math.hypot(q.vx, q.vy, q.vz) || 1;
+        const yawJitter = (Math.random() - 0.5) * 1.6;
+        const cosA = Math.cos(yawJitter), sinA = Math.sin(yawJitter);
+        const nvx = q.vx * cosA - q.vz * sinA;
+        const nvz = q.vx * sinA + q.vz * cosA;
+        q.vx = nvx;
+        q.vz = nvz;
+        q.vy = Math.min(q.vy, 0) - speed * 0.15;
+        // Boosted rounds (silo missile mid-ascent) lose their boost so
+        // gravity takes them.
+        q.boostMetersRemaining = 0;
+      } else if (roll < 0.90) {
+        // Detonate-where-hit: explosive rounds emit their impact at the
+        // current position; non-explosives just die. Either way the round
+        // is gone.
+        const cfg = PROJECTILES[q.kind];
+        if (cfg.explosive) this.emitImpact(q);
+        q.dead = true;
+      }
+      // else: 10% miss — projectile flies on undisturbed.
+    }
+    return affected;
   }
 
   /**
