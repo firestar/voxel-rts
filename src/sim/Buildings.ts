@@ -136,6 +136,27 @@ export interface Building {
   destroyed: boolean;
   /** Index into spec.produces for the next spawn. */
   nextProduceIdx: number;
+  /**
+   * Farm-only: 0..1 crop progress. Advances each tick at the slow ambient
+   * rate, or at 4× when a worker-farmer (`farmerId`) is at the farm with a
+   * `farm` task. When it reaches 1, `cropReady` flips true and the renderer
+   * draws ripe (slightly amber) stalks until a harvester collects.
+   */
+  cropProgress: number;
+  /** Farm-only: true once `cropProgress` hit 1; reset by harvester collection. */
+  cropReady: boolean;
+  /**
+   * Farm-only: id of the worker currently dedicated as farmer here, or null
+   * if unassigned. Set by RMB-on-farm with a worker selected; cleared when
+   * the worker drops the task or dies.
+   */
+  farmerId: number | null;
+  /**
+   * Farm-only: id of the harvester that has claimed the ripe crop, so
+   * multiple harvesters don't all converge on the same field. Cleared when
+   * the harvester delivers / dies / drops task.
+   */
+  harvesterClaimId: number | null;
 }
 
 /**
@@ -636,15 +657,28 @@ export class BuildingManager {
       wallVoxelsAtBuild: wallCount,
       destroyed: false,
       nextProduceIdx: 0,
+      cropProgress: 0,
+      cropReady: false,
+      farmerId: null,
+      harvesterClaimId: null,
     };
     this.buildings.push(b);
     return b;
   }
 
   tick(dt: number, world: VoxelWorld, units: UnitManager): void {
-    void units;
     for (const b of this.buildings) {
       if (b.destroyed) continue;
+
+      // Farm crop growth runs every tick (continuous), independent of the
+      // production-timer cycle the barracks uses. Slow ambient growth lets
+      // an unattended farm eventually ripen; an assigned + co-located
+      // farmer multiplies the rate so dedicating a worker is worthwhile.
+      if (b.spec.kind === 'farm') {
+        this.tickFarm(b, dt, world, units);
+        continue;
+      }
+
       // Storage has no timer; non-producers (power plant / refinery / tech lab)
       // carry an Infinity interval so the spawn loop never fires for them.
       if (b.spec.kind === 'storage' || b.spec.productionInterval <= 0 || !isFinite(b.spec.productionInterval)) continue;
@@ -660,14 +694,6 @@ export class BuildingManager {
         continue;
       }
 
-      if (b.spec.kind === 'farm') {
-        // Each tick generates a fixed food bundle. We don't model crop growth
-        // per-voxel — the farm is treated as a passive +5 food / interval
-        // generator. Tweak the per-tick amount here when balance demands it.
-        if (this.foodSink) this.foodSink(5, b);
-        continue;
-      }
-
       // Barracks: cycle through `produces`, spawning a unit at the door.
       if (b.spec.produces.length > 0 && this.spawner) {
         const door = doorWorldPos(b);
@@ -676,6 +702,115 @@ export class BuildingManager {
         this.spawner(kind, door.x, door.y, door.z);
       }
     }
+  }
+
+  /**
+   * Per-frame farm tick. Crops grow on a 0..1 progress meter; ambient growth
+   * is slow (so you see something happen even without a farmer), and an
+   * assigned farmer who is actually standing in the field accelerates it ~4x.
+   * On reaching 1, `cropReady` flips and growth pauses until a harvester
+   * collects (which clears it back to 0).
+   *
+   * Liveness check is folded into this tick on a coarse interval so a farm
+   * whose fence has been levelled goes inert.
+   */
+  private tickFarm(b: Building, dt: number, world: VoxelWorld, units: UnitManager): void {
+    // Coarse liveness check, throttled to once per spec interval like other
+    // buildings — counting voxels every frame is overkill.
+    b.productionTimer -= dt;
+    if (b.productionTimer <= 0) {
+      b.productionTimer += b.spec.productionInterval;
+      const alive = countLivingWalls(world, b);
+      if (alive < b.wallVoxelsAtBuild * 0.25) {
+        b.destroyed = true;
+        return;
+      }
+    }
+    if (b.cropReady) return;
+    // Validate the assigned farmer still exists, is alive, and is at the farm
+    // with the farm task. If any of those fails, drop the assignment so a new
+    // worker can be tasked without a stale slot.
+    let farmerActive = false;
+    if (b.farmerId !== null) {
+      const farmer = lookupUnit(units, b.farmerId);
+      if (!farmer || farmer.hp <= 0) {
+        b.farmerId = null;
+      } else if (farmer.task.kind === 'farm' && farmer.task.buildingId === b.id) {
+        // Farmer must be standing in the farm rectangle to count as tending.
+        const wxStart = b.ox * NAV_CELL_VOXELS * VOXEL_SIZE;
+        const wzStart = b.oz * NAV_CELL_VOXELS * VOXEL_SIZE;
+        const wxEnd = wxStart + b.spec.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE;
+        const wzEnd = wzStart + b.spec.cellsD * NAV_CELL_VOXELS * VOXEL_SIZE;
+        if (farmer.x >= wxStart && farmer.x < wxEnd && farmer.z >= wzStart && farmer.z < wzEnd) {
+          farmerActive = true;
+        }
+      } else {
+        // Worker quit the task (player overrode with a move/chop command).
+        b.farmerId = null;
+      }
+    }
+    // Validate harvester claim — clear it if the claimant is gone or no longer
+    // headed here, so a new harvester can pick up where they left off.
+    if (b.harvesterClaimId !== null) {
+      const h = lookupUnit(units, b.harvesterClaimId);
+      if (!h || h.hp <= 0 || (h.task.kind !== 'harvestFarm' || h.task.buildingId !== b.id)) {
+        b.harvesterClaimId = null;
+      }
+    }
+    // Growth: slow ambient rate without a farmer, ×4 with a tending farmer. The
+    // numbers are tuned so farmer-tended fields ripen in ~productionInterval
+    // seconds; ambient growth still gets there but takes 4× longer.
+    const ambientRatePerSec = 0.25 / b.spec.productionInterval;
+    const tendedRatePerSec = 1.0 / b.spec.productionInterval;
+    const rate = farmerActive ? tendedRatePerSec : ambientRatePerSec;
+    b.cropProgress = Math.min(1, b.cropProgress + rate * dt);
+    if (b.cropProgress >= 1) {
+      b.cropReady = true;
+    }
+  }
+
+  /**
+   * Called by tickWorkers when a harvester reaches a ripe farm. Drops the
+   * crop into the player's food counter, resets the farm, and clears the
+   * claim so the same field can ripen again.
+   */
+  collectFarm(b: Building, harvesterId: number): { foodGained: number } {
+    if (!b.cropReady) return { foodGained: 0 };
+    if (b.harvesterClaimId !== null && b.harvesterClaimId !== harvesterId) return { foodGained: 0 };
+    const food = 5;
+    b.cropReady = false;
+    b.cropProgress = 0;
+    b.harvesterClaimId = null;
+    if (this.foodSink) this.foodSink(food, b);
+    return { foodGained: food };
+  }
+
+  /**
+   * Iterate ripe, unclaimed farms in ascending squared XZ distance from
+   * (x, z). Used by the harvester scan to pick up the nearest available
+   * field without each harvester running its own scan.
+   */
+  nearestReadyFarm(x: number, z: number): Building | null {
+    let best: Building | null = null;
+    let bestD2 = Infinity;
+    for (const b of this.buildings) {
+      if (b.destroyed) continue;
+      if (b.spec.kind !== 'farm') continue;
+      if (!b.cropReady) continue;
+      if (b.harvesterClaimId !== null) continue;
+      const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const dx = cxw - x, dz = czw - z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < bestD2) { bestD2 = d2; best = b; }
+    }
+    return best;
+  }
+
+  /** Lookup helper — returns the building with the given id, or null. */
+  byId(id: number): Building | null {
+    for (const b of this.buildings) if (b.id === id) return b;
+    return null;
   }
 
   /** Lookup the nearest live storage building (in XZ). Returns null if there are none. */
@@ -692,4 +827,10 @@ export class BuildingManager {
     }
     return best;
   }
+}
+
+/** Find a unit by id without exposing UnitManager internals to the manager file. */
+function lookupUnit(units: UnitManager, id: number): Unit | null {
+  for (const u of units.units) if (u.id === id) return u;
+  return null;
 }

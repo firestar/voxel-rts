@@ -144,3 +144,59 @@ export const REFINERY_CHIMNEY_TOP_Y_M =
 /** Top of the tech-lab antenna mast. */
 export const TECH_LAB_MAST_TOP_Y_M =
   (TECH_LAB.headroomVoxels + 3 /* dome tiers */ * 2 + 6 /* mast height */) * VOXEL_SIZE;
+
+// ---------- Farm — corn + wheat stalks --------------------------------------
+// Each stalk is a thin column geometry, origin at the base. The renderer
+// scales stalks vertically by `cropProgress` so newly-planted fields show
+// short shoots while ripe fields show full-height plants. We provide two
+// stalk variants — corn (taller, thicker, with a small head at the top) and
+// wheat (shorter, slimmer, tapered tip) — and alternate between them inside
+// each farm so a field reads as a mixed crop.
+//
+// All stalks are kept green per the user spec ("have the crops be green
+// (corn and wheat)"); the head/tip uses a slightly lighter / yellow-tinged
+// green to suggest seed-bearing material without going outright golden.
+
+const STALK_STEM = { r: 0.18, g: 0.55, b: 0.15 };
+const STALK_STEM_DARK = { r: 0.10, g: 0.40, b: 0.10 };
+const STALK_HEAD = { r: 0.62, g: 0.78, b: 0.20 };
+const STALK_TIP = { r: 0.55, g: 0.80, b: 0.24 };
+
+/**
+ * Corn stalk — taller column with a small "ear" near the top. Origin at the
+ * base; full height ~0.9 m, so a stalk with `cropProgress == 1` matches the
+ * farm fence height without looming above it.
+ */
+export function buildCornStalkGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [
+    { x: 0, y: 0.30, z: 0, sx: 0.07, sy: 0.60, sz: 0.07, ...STALK_STEM_DARK },
+    { x: 0, y: 0.65, z: 0, sx: 0.05, sy: 0.30, sz: 0.05, ...STALK_STEM },
+    // Two leaves angled out (just rectangular slabs - reads as foliage at distance).
+    { x:  0.10, y: 0.45, z: 0.00, sx: 0.18, sy: 0.04, sz: 0.05, ...STALK_STEM },
+    { x: -0.10, y: 0.55, z: 0.00, sx: 0.18, sy: 0.04, sz: 0.05, ...STALK_STEM },
+    // Ear / cob near the top — small fat block in muted yellow-green.
+    { x: 0, y: 0.78, z: 0.05, sx: 0.08, sy: 0.18, sz: 0.06, ...STALK_HEAD },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+/**
+ * Wheat stalk — slimmer, shorter column tapering to a single seed-head spike.
+ * Same origin convention; full height ~0.7 m so wheat tiles are noticeably
+ * shorter than corn tiles at full ripeness.
+ */
+export function buildWheatStalkGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [
+    { x: 0, y: 0.25, z: 0, sx: 0.04, sy: 0.50, sz: 0.04, ...STALK_STEM },
+    { x: 0, y: 0.55, z: 0, sx: 0.03, sy: 0.16, sz: 0.03, ...STALK_STEM_DARK },
+    // Spiky head — three small blocks stacked tightly to suggest the husk.
+    { x: 0, y: 0.65, z: 0, sx: 0.05, sy: 0.06, sz: 0.05, ...STALK_TIP },
+    { x: 0, y: 0.70, z: 0, sx: 0.04, sy: 0.06, sz: 0.04, ...STALK_TIP },
+    { x: 0, y: 0.74, z: 0, sx: 0.03, sy: 0.04, sz: 0.03, ...STALK_TIP },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+/** Per-farm count of each stalk variant. */
+export const FARM_CORN_PER_FARM = 8;
+export const FARM_WHEAT_PER_FARM = 8;

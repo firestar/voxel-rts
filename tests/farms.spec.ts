@@ -44,7 +44,7 @@ describe('Farm building', () => {
     expect(v[worldIndex(fenceX, fp.floorY + 1, fenceZ)]).toBe(M_DIRT_ROAD);
   });
 
-  it('foodSink fires every productionInterval', () => {
+  it('crops grow over time and harvester-collection drives foodSink', () => {
     const world = buildGrassPlane();
     const nav = allocateNav(false);
     buildSurfaceNav(world.buffers.voxels, nav);
@@ -52,13 +52,50 @@ describe('Farm building', () => {
     const mgr = new BuildingManager();
     let foodAdded = 0;
     mgr.foodSink = (amount): void => { foodAdded += amount; };
-    mgr.place(world, FARM, fp.ox, fp.oz, fp.floorY);
+    const farm = mgr.place(world, FARM, fp.ox, fp.oz, fp.floorY);
+    expect(farm.cropProgress).toBe(0);
+    expect(farm.cropReady).toBe(false);
 
-    // Tick across 3 intervals — should fire 3 times.
-    for (let i = 0; i < 3; i++) {
-      mgr.tick(FARM.productionInterval + 0.01, world, new UnitManager());
+    // Tick a long stretch without any farmer/harvester. Ambient growth alone
+    // should advance progress meaningfully, but no food enters the counter
+    // until something actually collects.
+    const um = new UnitManager();
+    for (let i = 0; i < 30; i++) {
+      mgr.tick(FARM.productionInterval + 0.01, world, um);
     }
-    expect(foodAdded).toBe(15); // 3 ticks × +5 each
+    expect(foodAdded).toBe(0);
+    expect(farm.cropReady).toBe(true);
+
+    // collectFarm grants the configured 5-food bundle, resets the field,
+    // and pushes through the foodSink hook the player wires up.
+    const r = mgr.collectFarm(farm, /* harvesterId */ 999);
+    expect(r.foodGained).toBe(5);
+    expect(foodAdded).toBe(5);
+    expect(farm.cropReady).toBe(false);
+    expect(farm.cropProgress).toBe(0);
+  });
+
+  it('a tending farmer accelerates growth (~4×) vs ambient', () => {
+    const world = buildGrassPlane();
+    const nav = allocateNav(false);
+    buildSurfaceNav(world.buffers.voxels, nav);
+    const fp = checkFootprint(world.buffers.voxels, nav, FARM, 70, 70);
+    const mgr = new BuildingManager();
+    const farm = mgr.place(world, FARM, fp.ox, fp.oz, fp.floorY);
+
+    // Spawn a worker at the farm centre and assign them as the farmer.
+    const um = new UnitManager();
+    const cxw = (farm.ox + farm.spec.cellsW * 0.5) * 8 * 0.125; // NAV_CELL_VOXELS=8, VOXEL_SIZE=0.125
+    const czw = (farm.oz + farm.spec.cellsD * 0.5) * 8 * 0.125;
+    const worker = um.spawn('worker', cxw, (fp.floorY + 1) * 0.125, czw);
+    worker.task = { kind: 'farm', buildingId: farm.id };
+    farm.farmerId = worker.id;
+
+    // 1.0 × productionInterval at the tended rate (1/interval per second)
+    // should bring cropProgress to ~1.0. Ambient alone (rate 0.25/interval
+    // per second) would only reach ~0.25 in the same window.
+    mgr.tick(FARM.productionInterval, world, um);
+    expect(farm.cropProgress).toBeGreaterThan(0.9);
   });
 });
 

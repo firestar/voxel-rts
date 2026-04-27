@@ -306,3 +306,47 @@ function wrapAngle(a: number): number {
 }
 
 void AIR;
+
+describe('WeaponTick — friendly-fire gating', () => {
+  it('holds the trigger when a same-team peer is on the line of fire', () => {
+    const world = VoxelWorld.create(false); // no terrain blocking the shot
+    const um = new UnitManager();
+    const shooter = um.spawn('soldier', 100, 100, 100);
+    // Friendly directly between shooter and target (at +X 5m).
+    um.spawn('soldier', 105, 100, 100);
+    // Order shooter to fire at +X 20m — lane is blocked by the friendly.
+    shooter.firingTarget = { x: 120, y: 100, z: 100 };
+
+    const pm = new ProjectileManager();
+    const flashes: number[] = [];
+    // Run a few seconds — plenty of time for the rifle's 0.3s cooldown to
+    // expire repeatedly. With friendly fire on, no shot should fire.
+    for (let i = 0; i < 240; i++) {
+      tickWeapons(1 / 60, um, pm, {
+        onMuzzleFlash: (): void => { flashes.push(0); },
+      });
+    }
+    expect(pm.projectiles.length).toBe(0);
+    expect(flashes.length).toBe(0);
+    // The firingTarget should still be queued — the shooter is waiting for
+    // the lane to clear, not silently giving up.
+    expect(shooter.firingTarget).not.toBeNull();
+  });
+
+  it('still fires when only an enemy-team unit is in the line of fire', () => {
+    const world = VoxelWorld.create(false);
+    const um = new UnitManager();
+    const shooter = um.spawn('soldier', 100, 100, 100);
+    // Enemy directly between — friendly-fire gate should NOT block this.
+    um.spawn('soldier', 105, 100, 100, { team: 'enemy' });
+    shooter.firingTarget = { x: 120, y: 100, z: 100 };
+
+    const pm = new ProjectileManager();
+    // Seed the heading so the shooter is already aligned (skip slew time).
+    shooter.heading = Math.atan2(-(120 - 100), -(100 - 100));
+    for (let i = 0; i < 60; i++) {
+      tickWeapons(1 / 60, um, pm, { onMuzzleFlash: (): void => {} });
+    }
+    expect(pm.projectiles.length).toBeGreaterThan(0);
+  });
+});

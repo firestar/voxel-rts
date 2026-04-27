@@ -27,9 +27,12 @@ export const MATERIALS: Material[] = [
   // mine exposed voxels (any metal voxel adjacent to air). Visually a cool
   // gray-blue so it stands out from stone when a tunnel cuts into a vein.
   { id: 10, name: 'metal',    hp: 80,  r: 140, g: 152, b: 178 },
-  // Farm crops — purely cosmetic golden-wheat tiles laid down by stampFarm.
-  // No special speed/dig behaviour; default-cased in the helpers below.
-  { id: 11, name: 'farm',     hp: 15,  r: 212, g: 182, b: 90  },
+  // Farm crops — tilled green soil laid down by stampFarm. The renderer
+  // overlays animated stalks on top whose height + colour shift with the
+  // farm's `cropProgress`, but the base tile is a deep green so the field
+  // reads as cropland even at distance / before stalks are tall enough to
+  // be visible.
+  { id: 11, name: 'farm',     hp: 15,  r: 78,  g: 142, b: 56  },
 ];
 
 export const M_AIR = 0;

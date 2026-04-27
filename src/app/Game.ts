@@ -11,10 +11,10 @@ import { DebrisParticles } from '../render/DebrisParticles';
 import { PathClient } from '../path/PathClient';
 import { UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest, ScoopRequest, DumpRequest } from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
-import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS } from '../path/SurfaceNav';
+import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS, NAV_CELL_VOXELS } from '../path/SurfaceNav';
 import { worldToVolumeCell, vnavIndex, getBit } from '../path/VolumeNav';
 import { trackDamageFor, M_DIRT, M_WOOD, M_METAL } from '../voxel/Materials';
-import { BuildingManager, BARRACKS, STORAGE, ALL_BUILDINGS, BuildingSpec, checkFootprint } from '../sim/Buildings';
+import { BuildingManager, BARRACKS, STORAGE, ALL_BUILDINGS, BuildingSpec, Building, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { BuildingRenderer } from '../render/BuildingRenderer';
 import { PathPreview } from '../render/PathPreview';
@@ -271,6 +271,16 @@ export class Game {
     }
     if (this.input.pressed.has('Tab')) this.cycleSelection();
 
+    // Sandbox helper: 'E' spawns an enemy unit at the cursor's terrain xz.
+    //   E         → enemy soldier (rifle)
+    //   Shift+E   → enemy tank (cannon)
+    // Used to test friendly-fire gating + selection rules without needing an
+    // AI opponent. The new unit appears immediately at the picked surface
+    // voxel and idles in place.
+    if (this.input.pressed.has('KeyE')) {
+      this.spawnEnemyAtCursor(w, h, this.input.keys.has('ShiftLeft') || this.input.keys.has('ShiftRight'));
+    }
+
     if (isBuildMode(this.mode)) {
       this.updateGhost(w, h);
     }
@@ -378,6 +388,42 @@ export class Game {
           : 'MODE: PLAY';
       this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}${weaponDesc}`;
     }
+  }
+
+  /**
+   * Sandbox helper: spawn an enemy unit at the surface voxel under the
+   * cursor. Picks soldier by default, tank when shift is held. The new unit
+   * is given the standard weapon for its kind so it shows up red AND armed,
+   * so the friendly-fire gate has something meaningful to gate on.
+   */
+  private spawnEnemyAtCursor(w: number, h: number, shift: boolean): void {
+    if (this.input.mouseX < 0) return;
+    const r = this.resolveTarget(this.input.mouseX, this.input.mouseY, w, h, 0);
+    if (!r) return;
+    const kind: UnitKind = shift ? 'tank' : 'soldier';
+    this.units.spawn(kind, r.surface.x, r.surface.y, r.surface.z, { team: 'enemy' });
+  }
+
+  /**
+   * Pick the building under the cursor by ray-casting voxels and matching the
+   * hit voxel's XZ to a building footprint. Returns null when the ray misses
+   * geometry or lands outside any live building.
+   */
+  private pickBuildingAt(px: number, py: number, w: number, h: number): Building | null {
+    const { origin, dir } = this.rayFromScreen(px, py, w, h);
+    const hit = raycastVoxel(this.world, origin, dir, 200);
+    if (!hit) return null;
+    for (const b of this.buildings.buildings) {
+      if (b.destroyed) continue;
+      const wxStart = b.ox * NAV_CELL_VOXELS;
+      const wxEnd = wxStart + b.spec.cellsW * NAV_CELL_VOXELS;
+      const wzStart = b.oz * NAV_CELL_VOXELS;
+      const wzEnd = wzStart + b.spec.cellsD * NAV_CELL_VOXELS;
+      if (hit.x >= wxStart && hit.x < wxEnd && hit.z >= wzStart && hit.z < wzEnd) {
+        return b;
+      }
+    }
+    return null;
   }
 
   private cycleSelection(): void {
@@ -530,7 +576,8 @@ export class Game {
 
   /**
    * Pick the unit nearest the cursor along the camera ray. Returns null when
-   * no unit's bounding sphere is hit. Used by single-click LMB to select.
+   * no unit's bounding sphere is hit. Only player-team units are clickable —
+   * enemy units render but can't be selected (they're commanded by no one).
    */
   private pickUnitAt(px: number, py: number, w: number, h: number): Unit | null {
     const { origin, dir } = this.rayFromScreen(px, py, w, h);
@@ -538,6 +585,7 @@ export class Game {
     let best: Unit | null = null;
     for (const u of this.units.units) {
       if (u.hp <= 0) continue;
+      if (u.team !== 'player') continue;
       const radius = u.widthMeters * 0.55 + 0.35;
       const cx = u.x;
       const cy = u.y + Math.max(0.7, u.widthMeters * 0.6);
@@ -562,14 +610,24 @@ export class Game {
    * cursor positions. With `additive`, existing selection is preserved and
    * units in the box are added; without it, the existing selection is
    * replaced.
+   *
+   * "Military prefer" rule: if the box contains any armed unit (soldier,
+   * tank, rocket truck — anything with a weapon), only those armed units are
+   * selected. Workers / earthmovers / diggers are dropped from the resulting
+   * selection so a player who drag-selects across a mixed clump picks a pure
+   * combat group instead of accidentally pulling support units into a fight.
+   * Boxes that contain only support units still select all of them.
+   *
+   * Enemy-team units never enter the selection regardless of the box.
    */
   private boxSelect(sx: number, sy: number, ex: number, ey: number, w: number, h: number, additive: boolean): void {
     const x0 = Math.min(sx, ex), x1 = Math.max(sx, ex);
     const y0 = Math.min(sy, ey), y1 = Math.max(sy, ey);
-    if (!additive) for (const u of this.units.units) u.selected = false;
     const v = new THREE.Vector3();
+    const inBox: Unit[] = [];
     for (const u of this.units.units) {
       if (u.hp <= 0) continue;
+      if (u.team !== 'player') continue;
       v.set(u.x, u.y + Math.max(0.5, u.widthMeters * 0.5), u.z);
       v.project(this.camera.cam);
       // project() returns NDC (−1..+1) in x/y and a z that is < −1 / > +1
@@ -578,8 +636,12 @@ export class Game {
       if (v.z < -1 || v.z > 1) continue;
       const px = (v.x * 0.5 + 0.5) * w;
       const py = (-v.y * 0.5 + 0.5) * h;
-      if (px >= x0 && px <= x1 && py >= y0 && py <= y1) u.selected = true;
+      if (px >= x0 && px <= x1 && py >= y0 && py <= y1) inBox.push(u);
     }
+    const hasArmed = inBox.some(u => u.weapon !== null);
+    const finalSel = hasArmed ? inBox.filter(u => u.weapon !== null) : inBox;
+    if (!additive) for (const u of this.units.units) u.selected = false;
+    for (const u of finalSel) u.selected = true;
   }
 
   /**
@@ -1215,13 +1277,41 @@ export class Game {
    * slew the turret / hull toward the target, then fire when within tolerance.
    * Burst weapons (rifle, MG) consume the target on the first shot and then
    * spray follow-up rounds along the same heading without needing re-aim.
+   *
+   * For unarmed selections we instead try to interpret the click as a worker
+   * command — currently just "RMB on a farm with a worker selected" → assign
+   * the worker as the farm's farmer. Anything that isn't a recognised
+   * unarmed-RMB gesture falls through silently.
    */
   private handleFireRelease(release: { startX: number; startY: number; endX: number; endY: number; shift: boolean }, w: number, h: number): void {
     this.trajectoryPreview.update([]);
     this.impactMarker.hide();
     if (this.mode !== 'play') return;
     const armed = this.units.units.filter(u => u.selected && u.weapon !== null);
-    if (armed.length === 0) return;
+    if (armed.length === 0) {
+      // Worker → farm gesture only fires on a short click (no drag), so the
+      // existing camera-yaw drag still works for unarmed selections.
+      if (this.isDragging(release.startX, release.startY, release.endX, release.endY)) return;
+      // Only harvesters tend farms — transporters' tick state machine doesn't
+      // know how to handle the 'farm' task and would just reset it to idle.
+      const worker = this.units.units.find(u => u.selected && u.kind === 'worker' && u.workerRole === 'harvester');
+      if (!worker) return;
+      const b = this.pickBuildingAt(release.startX, release.startY, w, h);
+      if (!b || b.spec.kind !== 'farm') return;
+      // Detach any existing farmer from this farm so the latest assignment
+      // wins, then route the new farmer to the field. tickFarm validates the
+      // assignment each tick; the worker will start tending on arrival.
+      if (b.farmerId !== null && b.farmerId !== worker.id) {
+        const prev = this.units.units.find(u => u.id === b.farmerId);
+        if (prev && prev.task.kind === 'farm') prev.task = { kind: 'idle' };
+      }
+      b.farmerId = worker.id;
+      worker.task = { kind: 'farm', buildingId: b.id };
+      const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      void this.routePath(worker, cxw, worker.y, czw);
+      return;
+    }
     const verticalDrag = release.endY - release.startY;
     const r = this.resolveTarget(release.startX, release.startY, w, h, verticalDrag);
     if (!r) return;

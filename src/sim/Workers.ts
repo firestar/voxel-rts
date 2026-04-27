@@ -6,6 +6,7 @@ import { Resources } from './Resources';
 import { Pile, PileManager } from './Piles';
 import { BuildingManager, Building, doorWorldPos } from './Buildings';
 import { SaplingManager } from './Saplings';
+import { NAV_CELL_VOXELS } from '../path/SurfaceNav';
 
 /**
  * Capacity each worker can carry before they MUST drop / deliver. Mining is
@@ -170,6 +171,58 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
       return;
     }
 
+    case 'farm': {
+      // Player-assigned farmer. Walk to the farm centre, then linger inside
+      // the farm rectangle so BuildingManager.tickFarm sees the worker as
+      // "active tender" and accelerates crop growth.
+      const farm = deps.buildings.byId(u.task.buildingId);
+      if (!farm || farm.destroyed || farm.spec.kind !== 'farm') {
+        u.task = { kind: 'idle' };
+        return;
+      }
+      // Register as the farm's farmer so the building sim treats us as
+      // active. Subsequent ticks reaffirm this — no harm if we lose it.
+      farm.farmerId = u.id;
+      const cxw = farmCenterX(farm);
+      const czw = farmCenterZ(farm);
+      const inside = pointInFarm(farm, u.x, u.z);
+      if (!inside && u.path.length === 0) {
+        deps.routeWorker(u, cxw, u.y, czw);
+        return;
+      }
+      // Standing inside the field. If the crop is ripe and no other harvester
+      // has claimed it, the farmer collects directly so a single-worker setup
+      // doesn't stall waiting for a separate harvester to arrive. The farmer
+      // then keeps the 'farm' task and immediately resumes tending the now-
+      // empty field.
+      if (inside && farm.cropReady && (farm.harvesterClaimId === null || farm.harvesterClaimId === u.id)) {
+        deps.buildings.collectFarm(farm, u.id);
+      }
+      return;
+    }
+
+    case 'harvestFarm': {
+      const farm = deps.buildings.byId(u.task.buildingId);
+      if (!farm || farm.destroyed || farm.spec.kind !== 'farm' || !farm.cropReady) {
+        // Crop got harvested by someone else / farm gone — drop and rescan.
+        if (farm && farm.harvesterClaimId === u.id) farm.harvesterClaimId = null;
+        u.task = { kind: 'idle' };
+        return;
+      }
+      const cxw = farmCenterX(farm);
+      const czw = farmCenterZ(farm);
+      const dx = cxw - u.x, dz = czw - u.z;
+      if (dx * dx + dz * dz > INTERACT_REACH_M * INTERACT_REACH_M) {
+        if (u.path.length === 0) deps.routeWorker(u, cxw, u.y, czw);
+        return;
+      }
+      // Arrived. Deliver food directly via the BuildingManager helper, which
+      // resets the farm and pushes through `foodSink` to the player counter.
+      deps.buildings.collectFarm(farm, u.id);
+      u.task = { kind: 'idle' };
+      return;
+    }
+
     case 'deliver':
     case 'fetchPile':
       // Harvesters don't deliver / fetch — those are transporter tasks.
@@ -181,11 +234,21 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
 
 /**
  * Pick the next harvest task for an idle harvester. Priority:
- *   1. Nearest exposed metal voxel within SCAN_RADIUS_M.
- *   2. Nearest tree voxel within SCAN_RADIUS_M.
- * If neither is available the worker stays idle this frame.
+ *   1. Nearest ripe, unclaimed farm — food is the rarest resource pre-economy
+ *      and a ready field rots if nobody collects, so harvesters drop tree /
+ *      ore work to grab it first.
+ *   2. Nearest exposed metal voxel within SCAN_RADIUS_M.
+ *   3. Nearest tree voxel within SCAN_RADIUS_M.
+ * If none of those is available the worker stays idle this frame.
  */
 function assignNextHarvestTask(u: Unit, deps: WorkerDeps): void {
+  const farm = deps.buildings.nearestReadyFarm(u.x, u.z);
+  if (farm) {
+    farm.harvesterClaimId = u.id;
+    u.task = { kind: 'harvestFarm', buildingId: farm.id };
+    deps.routeWorker(u, farmCenterX(farm), u.y, farmCenterZ(farm));
+    return;
+  }
   const ore = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_METAL);
   if (ore) {
     u.task = {
@@ -357,3 +420,20 @@ function readVoxel(voxels: Uint8Array, vx: number, vy: number, vz: number): numb
 export { findNearestExposed, isExposed };
 // Re-export Building too so callers that build deps don't need a separate import.
 export type { Building };
+
+/** World-meters X of the centre of a building's footprint. */
+function farmCenterX(b: Building): number {
+  return (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+}
+/** World-meters Z of the centre of a building's footprint. */
+function farmCenterZ(b: Building): number {
+  return (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+}
+/** True when world-meters (x, z) lies inside the farm's stamped rectangle. */
+function pointInFarm(b: Building, x: number, z: number): boolean {
+  const wxStart = b.ox * NAV_CELL_VOXELS * VOXEL_SIZE;
+  const wzStart = b.oz * NAV_CELL_VOXELS * VOXEL_SIZE;
+  const wxEnd = wxStart + b.spec.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE;
+  const wzEnd = wzStart + b.spec.cellsD * NAV_CELL_VOXELS * VOXEL_SIZE;
+  return x >= wxStart && x < wxEnd && z >= wzStart && z < wzEnd;
+}

@@ -9,6 +9,8 @@ import {
   REFINERY_CHIMNEY_X_M, REFINERY_CHIMNEY_Z_M, REFINERY_CHIMNEY_TOP_Y_M,
   buildSatDishGeometry, buildPulseCoreGeometry,
   TECH_LAB_MAST_TOP_Y_M,
+  buildCornStalkGeometry, buildWheatStalkGeometry,
+  FARM_CORN_PER_FARM, FARM_WHEAT_PER_FARM,
 } from './BuildingModels';
 
 /**
@@ -30,6 +32,8 @@ export class BuildingRenderer {
   private smoke: THREE.InstancedMesh;
   private satDish: THREE.InstancedMesh;
   private pulseCore: THREE.InstancedMesh;
+  private cornStalk: THREE.InstancedMesh;
+  private wheatStalk: THREE.InstancedMesh;
 
   private capacity: number;
   private tmpM = new THREE.Matrix4();
@@ -50,16 +54,22 @@ export class BuildingRenderer {
     this.smoke = makeIM(buildSmokePuffGeometry(), lit, capacity * SMOKE_PUFF_COUNT);
     this.satDish = makeIM(buildSatDishGeometry(), lit, capacity);
     this.pulseCore = makeIM(buildPulseCoreGeometry(), emissive, capacity);
+    // Farm crops — one corn + one wheat instance per stalk slot per farm.
+    // Stalk-instance count is bounded by `capacity * FARM_*_PER_FARM` so a
+    // map-full of farms doesn't run out of slots.
+    this.cornStalk = makeIM(buildCornStalkGeometry(), lit, capacity * FARM_CORN_PER_FARM);
+    this.wheatStalk = makeIM(buildWheatStalkGeometry(), lit, capacity * FARM_WHEAT_PER_FARM);
 
     this.group.add(
       this.turbineHub, this.turbineBlade,
       this.smoke,
       this.satDish, this.pulseCore,
+      this.cornStalk, this.wheatStalk,
     );
   }
 
   update(buildings: Building[]): void {
-    let nHub = 0, nBlade = 0, nSmoke = 0, nDish = 0, nCore = 0;
+    let nHub = 0, nBlade = 0, nSmoke = 0, nDish = 0, nCore = 0, nCorn = 0, nWheat = 0;
     const t = performance.now() / 1000;
 
     // Pulse colour modulation for the tech-lab core (shared across all labs).
@@ -92,6 +102,11 @@ export class BuildingRenderer {
           nDish++;
           nCore++;
           break;
+        case 'farm':
+          this.placeFarmCrops(b, cx, cz, floorTopY, t, nCorn, nWheat);
+          nCorn += FARM_CORN_PER_FARM;
+          nWheat += FARM_WHEAT_PER_FARM;
+          break;
         default:
           // Barracks has no animated accessories.
           break;
@@ -103,7 +118,14 @@ export class BuildingRenderer {
     this.smoke.count = nSmoke;
     this.satDish.count = nDish;
     this.pulseCore.count = nCore;
-    for (const m of [this.turbineHub, this.turbineBlade, this.smoke, this.satDish, this.pulseCore]) {
+    this.cornStalk.count = nCorn;
+    this.wheatStalk.count = nWheat;
+    for (const m of [
+      this.turbineHub, this.turbineBlade,
+      this.smoke,
+      this.satDish, this.pulseCore,
+      this.cornStalk, this.wheatStalk,
+    ]) {
       m.instanceMatrix.needsUpdate = true;
     }
   }
@@ -166,6 +188,77 @@ export class BuildingRenderer {
       this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
       this.smoke.setMatrixAt(smokeStart + i, this.tmpM);
     }
+    this.tmpScale.set(1, 1, 1); // restore for other branches
+  }
+
+  /**
+   * Lay out the corn + wheat stalks for a single farm. Stalks are placed on a
+   * deterministic interior grid so they don't move between frames; only their
+   * vertical scale (cropProgress) and a small wind-sway yaw oscillation
+   * change per frame. Stalks shorter than ~0.05× full height are clamped so
+   * an empty field doesn't show flat polygons at the soil line.
+   */
+  private placeFarmCrops(
+    b: Building,
+    cx: number, cz: number, floorTopY: number,
+    t: number,
+    cornStart: number, wheatStart: number,
+  ): void {
+    // Per-farm stable phase so different farms sway out of sync.
+    const phase = b.id * 0.713;
+    // Interior rectangle (skip the perimeter fence cells). Farm is 3x3 nav
+    // cells; interior is the inner 1x1, ~1m square. We pack stalks in a 4x4
+    // grid biased toward the centre to keep them inside the fence.
+    const interiorHalfMeters = (b.spec.cellsW - 2) * NAV_CELL_VOXELS * VOXEL_SIZE * 0.5;
+    const stalkProg = Math.max(0.05, b.cropProgress);
+    const baseScaleY = b.cropReady ? 1.05 : stalkProg;
+    const totalCorn = FARM_CORN_PER_FARM;
+    const totalWheat = FARM_WHEAT_PER_FARM;
+    // Lay stalks on a roughly-square grid covering totalCorn + totalWheat
+    // slots. We index across the grid sequentially, alternating corn and
+    // wheat so a field reads as a mixed crop.
+    const total = totalCorn + totalWheat;
+    const cols = Math.ceil(Math.sqrt(total));
+    const rows = Math.ceil(total / cols);
+    const spacingX = (interiorHalfMeters * 1.6) / cols;
+    const spacingZ = (interiorHalfMeters * 1.6) / rows;
+    const x0 = cx - spacingX * (cols - 1) * 0.5;
+    const z0 = cz - spacingZ * (rows - 1) * 0.5;
+
+    let cornI = 0, wheatI = 0;
+    for (let i = 0; i < total; i++) {
+      const row = Math.floor(i / cols);
+      const col = i % cols;
+      const sx = x0 + col * spacingX;
+      const sz = z0 + row * spacingZ;
+      // Wind sway — small yaw oscillation so the field looks alive when ripe.
+      const sway = Math.sin(t * 1.4 + phase + i * 0.31) * 0.12;
+      this.tmpEuler.set(0, sway, 0, 'YXZ');
+      this.tmpQ.setFromEuler(this.tmpEuler);
+      this.tmpV.set(sx, floorTopY, sz);
+      // Alternate corn / wheat by index parity.
+      const isCorn = (i & 1) === 0 && cornI < totalCorn;
+      if (isCorn) {
+        this.tmpScale.set(1, baseScaleY, 1);
+        this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+        this.cornStalk.setMatrixAt(cornStart + cornI, this.tmpM);
+        cornI++;
+      } else if (wheatI < totalWheat) {
+        this.tmpScale.set(1, baseScaleY * 0.9, 1);
+        this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+        this.wheatStalk.setMatrixAt(wheatStart + wheatI, this.tmpM);
+        wheatI++;
+      }
+    }
+    // Pad any leftover slots with degenerate (zero-scale) matrices so stale
+    // instances from a previous farm don't render as floating relics.
+    this.tmpEuler.set(0, 0, 0, 'YXZ');
+    this.tmpQ.setFromEuler(this.tmpEuler);
+    this.tmpScale.set(0, 0, 0);
+    this.tmpV.set(0, 0, 0);
+    this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+    for (; cornI < totalCorn; cornI++) this.cornStalk.setMatrixAt(cornStart + cornI, this.tmpM);
+    for (; wheatI < totalWheat; wheatI++) this.wheatStalk.setMatrixAt(wheatStart + wheatI, this.tmpM);
     this.tmpScale.set(1, 1, 1); // restore for other branches
   }
 
