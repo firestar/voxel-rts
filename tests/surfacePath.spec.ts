@@ -175,7 +175,7 @@ describe('surface A* + smoother on flat ground', () => {
     const nav = allocateNav(false);
     buildSurfaceNav(v, nav);
     // Sanity: the carved cell really is blocked.
-    expect(nav.blocked[40 * 96 + 40]).toBe(1); // cz=40, cx=40
+    expect(nav.blocked[40 * NAV_W + 40]).toBe(1); // cz=40, cx=40
 
     const ws = new AStarWorkspace();
     const r = findPathSurface(nav, ws, {

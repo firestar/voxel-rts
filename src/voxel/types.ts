@@ -1,18 +1,18 @@
 // World is in voxel units; voxel size in meters is VOXEL_SIZE.
 export const VOXEL_SIZE = 0.125;
 
-// Bounded map dimensions in voxels. 96 m x 24 m x 96 m at 0.125 m.
-export const WORLD_X = 768;
+// Bounded map dimensions in voxels. 128 m x 24 m x 128 m at 0.125 m.
+export const WORLD_X = 1024;
 export const WORLD_Y = 192;
-export const WORLD_Z = 768;
+export const WORLD_Z = 1024;
 
 export const CHUNK = 32;
 export const CHUNK_VOL = CHUNK * CHUNK * CHUNK;
 
-export const CHUNKS_X = WORLD_X / CHUNK; // 24
+export const CHUNKS_X = WORLD_X / CHUNK; // 32
 export const CHUNKS_Y = WORLD_Y / CHUNK; // 6
-export const CHUNKS_Z = WORLD_Z / CHUNK; // 24
-export const CHUNK_COUNT = CHUNKS_X * CHUNKS_Y * CHUNKS_Z; // 3456
+export const CHUNKS_Z = WORLD_Z / CHUNK; // 32
+export const CHUNK_COUNT = CHUNKS_X * CHUNKS_Y * CHUNKS_Z; // 6144
 
 export type MaterialId = number; // 0 = air
 
