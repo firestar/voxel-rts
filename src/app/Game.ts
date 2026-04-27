@@ -95,13 +95,6 @@ export class Game {
 
   private readonly explosionRadiusBigMeters = 3.0;
   private readonly explosionPeak = 90;
-  /**
-   * Scale applied to a projectile-impact `damagePeak` before it is fed to
-   * `damageSphere` for voxel destruction. Unit splash damage uses the
-   * unscaled peak — only the terrain dig-out is dampened, so explosions
-   * still hurt anything they hit but leave noticeably smaller craters.
-   */
-  private readonly explosionTerrainDamageScale = 0.35;
 
   constructor(canvas: HTMLCanvasElement, statsEl: HTMLElement | null) {
     this.renderer = new Renderer(canvas);
@@ -924,7 +917,7 @@ export class Game {
     const cx = hit.x + 0.5 - hit.nx * 0.5;
     const cy = hit.y + 0.5 - hit.ny * 0.5;
     const cz = hit.z + 0.5 - hit.nz * 0.5;
-    const result = this.world.damageSphere(cx, cy, cz, radiusVoxels, this.explosionPeak);
+    const result = this.world.damageSphere(cx, cy, cz, radiusVoxels, this.explosionPeak * TERRAIN_DAMAGE_GLOBAL_SCALE);
     if (result.destroyed.length > 0) {
       const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
       const wx = cx * VOXEL_SIZE, wy = cy * VOXEL_SIZE, wz = cz * VOXEL_SIZE;
@@ -1584,8 +1577,9 @@ export class Game {
     const radiusMeters = imp.explosive ? imp.explosionRadiusMeters : imp.hitRadiusMeters;
     // Terrain damage uses a per-projectile multiplier so a turret round can
     // still hurt enemies at full peak without carving up the surrounding
-    // base. Unit damage below ignores this scale.
-    const terrainPeak = imp.damagePeak * imp.terrainDamageScale;
+    // base, plus a global TERRAIN_DAMAGE_GLOBAL_SCALE that softens craters
+    // across the board. Unit damage below ignores both scales.
+    const terrainPeak = imp.damagePeak * imp.terrainDamageScale * TERRAIN_DAMAGE_GLOBAL_SCALE;
     const result = this.world.damageSphere(cx, cy, cz, radiusMeters / VOXEL_SIZE, terrainPeak);
     if (result.destroyed.length > 0) {
       const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
@@ -1911,11 +1905,23 @@ export class Game {
         continue;
       }
       // Trajectory blocked. Route toward the target so the unit walks into
-      // line-of-sight. Throttle re-route attempts so we don't spam path
-      // requests on every frame.
+      // line-of-sight, but stop short of the enemy at a preferred firing
+      // distance — without this clamp the unit would walk right up to the
+      // target and end up nose-to-nose. Throttle re-route attempts so we
+      // don't spam path requests on every frame.
       u.autoEngageCooldown = 0.6;
       if (u.path.length > 0) continue;
-      void this.routePath(u, target.x, target.y, target.z);
+      const stopRange = w.rangeMeters * AUTO_ENGAGE_STOP_FRACTION;
+      const dxBack = u.x - target.x;
+      const dzBack = u.z - target.z;
+      const distBack = Math.hypot(dxBack, dzBack);
+      let goalX = target.x;
+      let goalZ = target.z;
+      if (distBack > 1e-3 && distBack > stopRange) {
+        goalX = target.x + (dxBack / distBack) * stopRange;
+        goalZ = target.z + (dzBack / distBack) * stopRange;
+      }
+      void this.routePath(u, goalX, target.y, goalZ);
     }
   }
 
@@ -1938,6 +1944,23 @@ export class Game {
 function isBuildMode(m: Mode): boolean {
   return m === 'build';
 }
+
+/**
+ * Global multiplier folded into every terrain `damageSphere` peak that comes
+ * from a projectile impact or a player-triggered explosion. Scales the crater
+ * down 5× from the historical level so explosions still kill units at full
+ * peak (unit damage doesn't read this) but stop chewing huge holes in the
+ * map. Per-projectile `terrainDamageScale` is applied on top of this.
+ */
+const TERRAIN_DAMAGE_GLOBAL_SCALE = 0.2;
+
+/**
+ * When an aggressive-stance unit decides to walk closer to its target (because
+ * the trajectory is blocked), we route to a point this fraction of the unit's
+ * weapon range away from the enemy rather than to the enemy itself. Keeps the
+ * unit at a useful firing distance instead of parking on the enemy's feet.
+ */
+const AUTO_ENGAGE_STOP_FRACTION = 0.7;
 
 /**
  * Decide whether a sampled trajectory `points` would actually affect `target`.

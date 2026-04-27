@@ -215,12 +215,10 @@ export interface Building {
   selected: boolean;
   /**
    * Player-queued unit kinds for buildings that produce units (e.g. barracks).
-   * The next production tick consumes the front entry instead of cycling
-   * through `spec.produces`. Empty queue → fall back to the default cycle.
+   * Producer buildings only train when this queue is non-empty — there is no
+   * auto-cycle fallback, so an empty queue means the building sits idle.
    */
   trainQueue: UnitKind[];
-  /** Index into spec.produces for the next spawn. */
-  nextProduceIdx: number;
   /**
    * Farm-only: 0..1 crop progress. Advances each tick at the slow ambient
    * rate, or at 4× when a worker-farmer (`farmerId`) is at the farm with a
@@ -929,7 +927,6 @@ export class BuildingManager {
       destroyed: false,
       selected: false,
       trainQueue: [],
-      nextProduceIdx: 0,
       cropProgress: 0,
       cropReady: false,
       farmerId: null,
@@ -966,6 +963,14 @@ export class BuildingManager {
       // turret, silo) carry an Infinity interval so the spawn loop never fires
       // for them.
       if (b.spec.kind === 'storage' || b.spec.productionInterval <= 0 || !isFinite(b.spec.productionInterval)) continue;
+      // Producer buildings (barracks) only train units the player has
+      // explicitly queued. With nothing queued, the timer is held at the full
+      // interval so a freshly-queued kind still takes the configured time to
+      // come out — but the building never auto-spawns a default cycle.
+      if (b.spec.produces.length > 0 && b.trainQueue.length === 0) {
+        b.productionTimer = b.spec.productionInterval;
+        continue;
+      }
       b.productionTimer -= dt;
       if (b.productionTimer > 0) continue;
       b.productionTimer += b.spec.productionInterval;
@@ -978,18 +983,12 @@ export class BuildingManager {
         continue;
       }
 
-      // Barracks: prefer the player-queued kind from `trainQueue`, otherwise
-      // cycle through `produces`. Either way we spawn one unit at the door
-      // each tick.
-      if (b.spec.produces.length > 0 && this.spawner) {
+      // Barracks: spawn the next queued unit at the door. We've already
+      // gated on `trainQueue.length > 0` above, so the queue can't be empty
+      // here for a producer building.
+      if (b.spec.produces.length > 0 && this.spawner && b.trainQueue.length > 0) {
         const door = doorWorldPos(b);
-        let kind: UnitKind;
-        if (b.trainQueue.length > 0) {
-          kind = b.trainQueue.shift()!;
-        } else {
-          kind = b.spec.produces[b.nextProduceIdx % b.spec.produces.length]!;
-          b.nextProduceIdx++;
-        }
+        const kind = b.trainQueue.shift()!;
         this.spawner(kind, door.x, door.y, door.z);
       }
     }

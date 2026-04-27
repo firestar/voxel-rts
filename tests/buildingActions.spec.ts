@@ -109,7 +109,7 @@ describe('Building "Train X" action queue', () => {
     expect(acts.length).toBe(0);
   });
 
-  it('a queued train kind is consumed before the default cycle on the next production tick', () => {
+  it('a barracks only spawns queued kinds — empty queue means no auto-cycle', () => {
     const world = buildFlatWorld();
     const nav = allocateNav(false);
     buildSurfaceNav(world.buffers.voxels, nav);
@@ -124,14 +124,31 @@ describe('Building "Train X" action queue', () => {
     };
     const fp = checkFootprint(world.buffers.voxels, nav, BARRACKS, 8, 8);
     const b = bm.place(world, BARRACKS, 8, 8, fp.floorY);
-    // Queue a tank ahead of the default cycle (which would start with soldier).
+    // Queue exactly one tank.
     b.trainQueue.push('tank');
-    // Advance enough seconds for two production ticks to fire — barracks
-    // interval is 6 s so we step ~14 seconds to comfortably catch ticks 1+2.
-    for (let i = 0; i < 140; i++) bm.tick(0.1, world, um);
-    expect(spawned[0]).toBe('tank');
-    // Subsequent ticks fall back to the default cycle (which starts at soldier).
-    expect(spawned[1]).toBe('soldier');
+    // Advance enough seconds for several production intervals to roll past —
+    // barracks interval is 6 s so 30 seconds covers five ticks. Only the
+    // queued tank should ever leave the door; nothing else auto-spawns.
+    for (let i = 0; i < 300; i++) bm.tick(0.1, world, um);
+    expect(spawned).toEqual(['tank']);
+  });
+
+  it('an empty trainQueue holds the production timer at the full interval', () => {
+    const world = buildFlatWorld();
+    const nav = allocateNav(false);
+    buildSurfaceNav(world.buffers.voxels, nav);
+    const um = new UnitManager();
+    const bm = new BuildingManager();
+    let spawned = 0;
+    bm.spawner = () => { spawned++; return null; };
+    const fp = checkFootprint(world.buffers.voxels, nav, BARRACKS, 8, 8);
+    const b = bm.place(world, BARRACKS, 8, 8, fp.floorY);
+    // Run with no queue for many intervals — nothing must spawn, and the
+    // timer must stay parked at the full interval so a later queue still
+    // takes the configured wait time to produce.
+    for (let i = 0; i < 200; i++) bm.tick(0.1, world, um);
+    expect(spawned).toBe(0);
+    expect(b.productionTimer).toBe(BARRACKS.productionInterval);
   });
 });
 
