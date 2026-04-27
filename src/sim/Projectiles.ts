@@ -34,6 +34,20 @@ export interface ProjectileConfig {
   /** Real-ish projectile mass in kilograms (small for bullets, big for rockets). */
   massKg: number;
   /**
+   * Multiplier applied to the per-impact `damagePeak` when calling
+   * `damageSphere` on the world. 1.0 means terrain damage matches the
+   * unit-damage peak; lower values (e.g. 0.2 for the turret shell) keep the
+   * round lethal to enemies while sparing the surrounding map. Defaults to 1
+   * when omitted in the catalog.
+   */
+  terrainDamageScale?: number;
+  /**
+   * Optional vertical-boost phase. Used by the silo missile: launch climbs
+   * straight up for `boostMetersDefault` before tipping over toward the
+   * target with full ballistic flight. Carriers can override at spawn time.
+   */
+  boostMetersDefault?: number;
+  /**
    * Initial speed in m/s, taken at the muzzle / launcher. Deliberately slow
    * (sub-200 m/s for bullets, sub-100 m/s for rockets) so the player can
    * actually see the trajectory; bullet drop becomes very visible at this
@@ -204,6 +218,11 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     dragPerSecond: 0.04,
     hitDamage: 70, hitRadiusMeters: 0.45,
     explosive: true, explosionPeak: 200, explosionRadiusMeters: 2.4,
+    // Defensive turrets are positioned among friendly buildings — letting
+    // them carve craters at full peak chews up the base wall every salvo.
+    // Scale the terrain damage to a fifth of the unit damage so the round
+    // still stings enemies but spares the surrounding voxel structure.
+    terrainDamageScale: 0.2,
     clusterSubmunitions: 0,
     maxLifeSeconds: 5.0,
     colorR: 0.95, colorG: 0.75, colorB: 0.40,
@@ -221,8 +240,15 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     massKg: 350,
     muzzleVelocity: 90,
     dragPerSecond: 0.025,
-    hitDamage: 140, hitRadiusMeters: 0.7,
-    explosive: true, explosionPeak: 380, explosionRadiusMeters: 6.0,
+    // Damage tuned down from a previous high-peak revision: silos are still
+    // the heaviest single shot on the map, but a hit is no longer instant
+    // map deletion. Both direct and explosion damage are scaled together.
+    hitDamage: 47, hitRadiusMeters: 0.7,
+    explosive: true, explosionPeak: 127, explosionRadiusMeters: 6.0,
+    // Vertical liftoff: the silo cluster fires straight up for 10 m before
+    // tipping over toward the target. Reads visually as a launch silo, and
+    // gives nearby friendlies a beat to clear the muzzle wash.
+    boostMetersDefault: 10,
     clusterSubmunitions: 0,
     maxLifeSeconds: 18.0,
     colorR: 1.00, colorG: 0.40, colorB: 0.20,
@@ -249,7 +275,27 @@ export interface Projectile {
   /** Set true the moment a collision is resolved or the projectile expires; the manager
    *  sweeps these out at the end of each tick. */
   dead: boolean;
+  /**
+   * Vertical-boost flight phase. While > 0, the projectile climbs straight up
+   * at `BOOST_ASCEND_SPEED` instead of running ballistic physics. When the
+   * meter counter reaches 0, the velocity is recomputed toward
+   * (boostTargetX/Y/Z) at `postBoostSpeed` and normal physics resumes. Used
+   * by silo missiles to fire vertical first then arc.
+   */
+  boostMetersRemaining: number;
+  boostTargetX: number;
+  boostTargetY: number;
+  boostTargetZ: number;
+  postBoostSpeed: number;
 }
+
+/**
+ * Vertical-ascent speed used during the boost phase. Constant across all
+ * boosted munitions for now — the only consumer is the silo missile, but
+ * pulling it out as a named constant keeps the predict / tick branches
+ * obviously matched.
+ */
+export const BOOST_ASCEND_SPEED = 30;
 
 /**
  * Detonation event yielded by the projectile tick. The Game wires this to the
@@ -275,6 +321,10 @@ export interface ProjectileImpact {
    *  voxel geometry / expired in flight. The Game uses this to apply direct
    *  projectile damage on top of any explosive splash. */
   directHitUnitId: number;
+  /** Multiplier from the projectile config; applied to the world `damageSphere`
+   *  peak so a round can hurt enemies more than it hurts the map (e.g. turret
+   *  shells). Defaults to 1 when the catalog entry omits the field. */
+  terrainDamageScale: number;
 }
 
 /**
@@ -299,6 +349,48 @@ export type UnitHitTest = (
  */
 export const PROJECTILE_GRAVITY = 18.0;
 
+/**
+ * Solve the ballistic-arc launch direction needed to hit (toX, toY, toZ) from
+ * (fromX, fromY, fromZ) with the given launch `speed` against constant
+ * downward `gravity`. Returns the unit-length launch direction; chooses the
+ * lower (flatter) of the two valid elevation angles so the missile arches
+ * but doesn't lob nearly straight up.
+ *
+ * If the target is out of range (no real solution), returns a direct-line
+ * unit vector — the projectile will fall short, and any hittability gate
+ * upstream will catch the unreachable case via predictTrajectory.
+ *
+ * Used by boosted projectiles (silo) at the moment they exit the boost
+ * phase: from the apex altitude, the missile arches toward the target.
+ */
+export function solveBallisticDirection(
+  fromX: number, fromY: number, fromZ: number,
+  toX: number, toY: number, toZ: number,
+  speed: number,
+  gravity: number,
+): { x: number; y: number; z: number } {
+  const dx = toX - fromX, dy = toY - fromY, dz = toZ - fromZ;
+  const horiz = Math.hypot(dx, dz);
+  if (horiz < 1e-3) {
+    const sgn = dy >= 0 ? 1 : -1;
+    return { x: 0, y: sgn, z: 0 };
+  }
+  const v2 = speed * speed;
+  const disc = v2 * v2 - gravity * (gravity * horiz * horiz + 2 * dy * v2);
+  if (disc < 0) {
+    const dl = Math.hypot(dx, dy, dz) || 1;
+    return { x: dx / dl, y: dy / dl, z: dz / dl };
+  }
+  const tanLow = (v2 - Math.sqrt(disc)) / (gravity * horiz);
+  const fx = dx / horiz, fz = dz / horiz;
+  const dirLen = Math.sqrt(1 + tanLow * tanLow);
+  return {
+    x: fx / dirLen,
+    y: tanLow / dirLen,
+    z: fz / dirLen,
+  };
+}
+
 export class ProjectileManager {
   readonly projectiles: Projectile[] = [];
   /** Impacts that occurred this tick — drained by Game after each `tick`. */
@@ -321,23 +413,47 @@ export class ProjectileManager {
     ownerId: number,
     velocityScale = 1,
     maxStrength = Infinity,
+    /**
+     * Optional vertical-boost phase. When present, the projectile spawns
+     * climbing straight up (`vy = BOOST_ASCEND_SPEED`) for `meters` of
+     * altitude, ignoring the supplied direction; on completion its velocity
+     * is recomputed toward `target` at the same launch speed used for a
+     * direct shot. The silo missile uses this to fire vertical first.
+     */
+    boost?: { meters: number; targetX: number; targetY: number; targetZ: number },
   ): Projectile {
     const cfg = PROJECTILES[kind];
     const dl = Math.hypot(dx, dy, dz) || 1;
     const speed = Math.min(cfg.muzzleVelocity * velocityScale, maxStrength);
+    // Direct-flight initial velocity. Overwritten below for boosted shots.
+    let vx = (dx / dl) * speed;
+    let vy = (dy / dl) * speed;
+    let vz = (dz / dl) * speed;
+    let boostMetersRemaining = 0;
+    let boostTargetX = 0, boostTargetY = 0, boostTargetZ = 0;
+    if (boost && boost.meters > 0) {
+      vx = 0;
+      vy = BOOST_ASCEND_SPEED;
+      vz = 0;
+      boostMetersRemaining = boost.meters;
+      boostTargetX = boost.targetX;
+      boostTargetY = boost.targetY;
+      boostTargetZ = boost.targetZ;
+    }
     const p: Projectile = {
       id: this.nextId++,
       kind,
       x, y, z,
-      vx: (dx / dl) * speed,
-      vy: (dy / dl) * speed,
-      vz: (dz / dl) * speed,
+      vx, vy, vz,
       dragPerSecond: cfg.dragPerSecond,
       massKg: cfg.massKg,
       age: 0,
       maxLifeSeconds: cfg.maxLifeSeconds,
       ownerId,
       dead: false,
+      boostMetersRemaining,
+      boostTargetX, boostTargetY, boostTargetZ,
+      postBoostSpeed: speed,
     };
     this.projectiles.push(p);
     return p;
@@ -364,6 +480,40 @@ export class ProjectileManager {
     this.pendingImpacts.length = 0;
     for (const p of this.projectiles) {
       if (p.dead) continue;
+
+      // Vertical-boost phase: pure ascent at BOOST_ASCEND_SPEED, no gravity
+      // / drag, until the meter counter is consumed. Once exhausted we
+      // reseed velocity toward the stored boostTarget at postBoostSpeed and
+      // fall through to normal physics on the next tick.
+      if (p.boostMetersRemaining > 0) {
+        const ds = BOOST_ASCEND_SPEED * dt;
+        const consumed = Math.min(p.boostMetersRemaining, ds);
+        p.y += consumed;
+        p.boostMetersRemaining -= consumed;
+        p.vx = 0; p.vy = BOOST_ASCEND_SPEED; p.vz = 0;
+        if (p.boostMetersRemaining <= 0) {
+          // Ballistic-arc solve: aim for the chosen target point with the
+          // launch speed and current gravity. Lobs over distance instead of
+          // diving directly at the target like a flat-fire round, which is
+          // why the silo missile reads as a real artillery shot.
+          const dir = solveBallisticDirection(
+            p.x, p.y, p.z,
+            p.boostTargetX, p.boostTargetY, p.boostTargetZ,
+            p.postBoostSpeed,
+            PROJECTILE_GRAVITY,
+          );
+          p.vx = dir.x * p.postBoostSpeed;
+          p.vy = dir.y * p.postBoostSpeed;
+          p.vz = dir.z * p.postBoostSpeed;
+        }
+        p.age += dt;
+        if (p.age >= p.maxLifeSeconds) {
+          if (PROJECTILES[p.kind].explosive) this.emitImpact(p);
+          p.dead = true;
+        }
+        continue;
+      }
+
       // Cache previous position so we can ray-cast the swept segment.
       const px = p.x, py = p.y, pz = p.z;
 
@@ -471,6 +621,13 @@ export class ProjectileManager {
     sampleDt = 0.06,
     velocityScale = 1,
     maxStrength = Infinity,
+    /**
+     * Mirror of `spawn`'s `boost` parameter: when present, the prediction
+     * starts with a vertical-ascent phase (samples step up at
+     * `BOOST_ASCEND_SPEED` ignoring gravity / drag) for `meters`, then
+     * tips over toward `target` at the spawn speed.
+     */
+    boost?: { meters: number; targetX: number; targetY: number; targetZ: number },
   ): { x: number; y: number; z: number }[] {
     const cfg = PROJECTILES[kind];
     const dl = Math.hypot(dx, dy, dz) || 1;
@@ -478,14 +635,113 @@ export class ProjectileManager {
     let vx = (dx / dl) * speed;
     let vy = (dy / dl) * speed;
     let vz = (dz / dl) * speed;
+    let boostRemaining = 0;
+    let bTx = 0, bTy = 0, bTz = 0;
+    if (boost && boost.meters > 0) {
+      vx = 0; vy = BOOST_ASCEND_SPEED; vz = 0;
+      boostRemaining = boost.meters;
+      bTx = boost.targetX; bTy = boost.targetY; bTz = boost.targetZ;
+    }
     const drag = cfg.dragPerSecond;
     const out: { x: number; y: number; z: number }[] = [{ x, y, z }];
     let cx = x, cy = y, cz = z;
     for (let i = 0; i < samples; i++) {
-      vy -= PROJECTILE_GRAVITY * sampleDt;
-      const dragScale = Math.exp(-drag * sampleDt);
-      vx *= dragScale; vy *= dragScale; vz *= dragScale;
-      const sx = vx * sampleDt, sy = vy * sampleDt, sz = vz * sampleDt;
+      let sx: number, sy: number, sz: number;
+      if (boostRemaining > 0) {
+        const ds = BOOST_ASCEND_SPEED * sampleDt;
+        const consumed = Math.min(boostRemaining, ds);
+        sx = 0; sy = consumed; sz = 0;
+        boostRemaining -= consumed;
+        if (boostRemaining <= 0) {
+          const px = cx + sx, py = cy + sy, pz = cz + sz;
+          const dir = solveBallisticDirection(
+            px, py, pz,
+            bTx, bTy, bTz,
+            speed,
+            PROJECTILE_GRAVITY,
+          );
+          vx = dir.x * speed;
+          vy = dir.y * speed;
+          vz = dir.z * speed;
+        }
+      } else {
+        vy -= PROJECTILE_GRAVITY * sampleDt;
+        const dragScale = Math.exp(-drag * sampleDt);
+        vx *= dragScale; vy *= dragScale; vz *= dragScale;
+        sx = vx * sampleDt; sy = vy * sampleDt; sz = vz * sampleDt;
+      }
+      const sl = Math.hypot(sx, sy, sz);
+      if (world && sl > 1e-5) {
+        const idx = 1 / sl;
+        const hit = raycastVoxel(
+          world,
+          { x: cx, y: cy, z: cz },
+          { x: sx * idx, y: sy * idx, z: sz * idx },
+          sl,
+        );
+        if (hit) {
+          out.push({
+            x: cx + sx * idx * hit.tMeters,
+            y: cy + sy * idx * hit.tMeters,
+            z: cz + sz * idx * hit.tMeters,
+          });
+          break;
+        }
+      }
+      cx += sx; cy += sy; cz += sz;
+      if (cy < floorY) {
+        out.push({ x: cx, y: floorY, z: cz });
+        break;
+      }
+      out.push({ x: cx, y: cy, z: cz });
+    }
+    return out;
+  }
+
+  /**
+   * Predict the remaining flight path of a live projectile from its current
+   * state, including any boost phase still in progress. Used by the in-flight
+   * arc renderer so the dashed line tracks the same physics the live tick
+   * applies. Pure read of the projectile — no mutation.
+   */
+  predictRemaining(
+    p: Projectile,
+    world: VoxelWorld | null,
+    floorY = 0,
+    samples = 80,
+    sampleDt = 0.06,
+  ): { x: number; y: number; z: number }[] {
+    const cfg = PROJECTILES[p.kind];
+    let vx = p.vx, vy = p.vy, vz = p.vz;
+    let boostRemaining = p.boostMetersRemaining;
+    const drag = cfg.dragPerSecond;
+    const out: { x: number; y: number; z: number }[] = [{ x: p.x, y: p.y, z: p.z }];
+    let cx = p.x, cy = p.y, cz = p.z;
+    for (let i = 0; i < samples; i++) {
+      let sx: number, sy: number, sz: number;
+      if (boostRemaining > 0) {
+        const ds = BOOST_ASCEND_SPEED * sampleDt;
+        const consumed = Math.min(boostRemaining, ds);
+        sx = 0; sy = consumed; sz = 0;
+        boostRemaining -= consumed;
+        if (boostRemaining <= 0) {
+          const px = cx + sx, py = cy + sy, pz = cz + sz;
+          const dir = solveBallisticDirection(
+            px, py, pz,
+            p.boostTargetX, p.boostTargetY, p.boostTargetZ,
+            p.postBoostSpeed,
+            PROJECTILE_GRAVITY,
+          );
+          vx = dir.x * p.postBoostSpeed;
+          vy = dir.y * p.postBoostSpeed;
+          vz = dir.z * p.postBoostSpeed;
+        }
+      } else {
+        vy -= PROJECTILE_GRAVITY * sampleDt;
+        const dragScale = Math.exp(-drag * sampleDt);
+        vx *= dragScale; vy *= dragScale; vz *= dragScale;
+        sx = vx * sampleDt; sy = vy * sampleDt; sz = vz * sampleDt;
+      }
       const sl = Math.hypot(sx, sy, sz);
       if (world && sl > 1e-5) {
         const idx = 1 / sl;
@@ -525,6 +781,7 @@ export class ProjectileManager {
       damagePeak: cfg.explosive ? cfg.explosionPeak : cfg.hitDamage,
       hitRadiusMeters: cfg.hitRadiusMeters,
       directHitUnitId,
+      terrainDamageScale: cfg.terrainDamageScale ?? 1,
     });
   }
 }

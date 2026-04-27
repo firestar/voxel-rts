@@ -25,6 +25,10 @@ export interface SurfaceNavBuffers {
    *  the path search to keep units out of cells where their head would clip a tree
    *  canopy / overhang / building roof. */
   headroom: Uint8Array;
+  /** 1 when the cell contains a tree trunk or low-canopy voxel (M_WOOD / M_LEAF)
+   *  inside the trunk-base layer above topY. Folded into `blocked` after the
+   *  scan, but kept exposed for renderers / diagnostics. */
+  treeBlocked: Uint8Array;
 }
 
 export function navIndex(x: number, z: number): number { return z * NAV_W + x; }
@@ -39,8 +43,16 @@ export function allocateNav(useShared: boolean): SurfaceNavBuffers {
     road: new Uint8Array(new Buf(NAV_COUNT)),
     blocked: new Uint8Array(new Buf(NAV_COUNT)),
     headroom: new Uint8Array(new Buf(NAV_COUNT)),
+    treeBlocked: new Uint8Array(new Buf(NAV_COUNT)),
   };
 }
+
+/**
+ * Voxels above topY scanned for tree obstructions. Trunks rise straight from
+ * the ground voxel at topY+1; we check the first few voxels of the column to
+ * catch trunk presence without reading every column-voxel.
+ */
+const TREE_TRUNK_PROBE_VOXELS = 4;
 
 /**
  * Build the surface nav grid from the voxel buffer.
@@ -74,7 +86,32 @@ export function buildSurfaceNav(voxels: Uint8Array, nav: SurfaceNavBuffers): voi
       const i = navIndex(cx, cz);
       nav.topY[i] = top;
       nav.material[i] = mat;
-      nav.blocked[i] = top < 0 ? 1 : 0;
+      // Tree-trunk scan: walk every voxel column inside this cell and check
+      // the first TREE_TRUNK_PROBE_VOXELS voxels above topY for wood / leaf.
+      // Catches trunks no matter where they jitter inside the cell, so the
+      // entire cell goes blocked even when the trunk hugs an edge.
+      let treeBlocked = 0;
+      if (top >= 0) {
+        const x0 = cx * NAV_CELL_VOXELS;
+        const z0 = cz * NAV_CELL_VOXELS;
+        outer: for (let dz = 0; dz < NAV_CELL_VOXELS; dz++) {
+          for (let dx = 0; dx < NAV_CELL_VOXELS; dx++) {
+            const ax = x0 + dx, az = z0 + dz;
+            if (ax >= WORLD_X || az >= WORLD_Z) continue;
+            for (let h = 1; h <= TREE_TRUNK_PROBE_VOXELS; h++) {
+              const yy = top + h;
+              if (yy >= WORLD_Y) break;
+              const m = voxels[worldIndex(ax, yy, az)]!;
+              if (m === M_WOOD || m === M_LEAF) { treeBlocked = 1; break outer; }
+            }
+          }
+        }
+      }
+      nav.treeBlocked[i] = treeBlocked;
+      // OR tree blocking into the main `blocked` flag so every A* user
+      // (surface + headroom checks) routes around the tree without each
+      // having to consult `treeBlocked` separately.
+      nav.blocked[i] = (top < 0 || treeBlocked) ? 1 : 0;
       // Road weight: paved (M_PATH) gets a strong discount in A* edge cost,
       // dirt roads (M_DIRT_ROAD) a milder one. See edgeCost in AStar.ts:
       // 200/255 ≈ 0.78 → ~0.47x cost on paved, 120/255 ≈ 0.47 → ~0.72x on dirt.

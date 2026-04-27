@@ -28,8 +28,13 @@ import { WEAPONS } from '../sim/Weapons';
 import { tickWeapons } from '../sim/WeaponTick';
 import {
   ProjectileRenderer, FlashPool, ImpactRingPool, TrajectoryPreview, ImpactMarker,
+  ProjectileArcPool,
 } from '../render/ProjectileRenderer';
 import { HealthBarRenderer } from '../render/HealthBarRenderer';
+import {
+  ActionContext, BuildingAction, UnitAction,
+  buildingActionsFor, unitActionsFor,
+} from './Actions';
 
 /**
  * Player UI mode. `build*` modes preview a building footprint; `plant` mode
@@ -63,6 +68,7 @@ export class Game {
   readonly impactFlashes = new FlashPool(128);
   readonly impactRings = new ImpactRingPool(64);
   readonly trajectoryPreview = new TrajectoryPreview();
+  readonly projectileArcs = new ProjectileArcPool(64, 96);
   readonly impactMarker = new ImpactMarker();
   readonly healthBars = new HealthBarRenderer();
   pathClient: PathClient | null = null;
@@ -79,6 +85,9 @@ export class Game {
   private fpsTimer = 0;
   private fpsEl: HTMLElement | null;
   private modeEl: HTMLElement | null = null;
+  private actionsEl: HTMLElement | null = null;
+  /** Last rendered panel signature. Used to skip DOM rebuilds when nothing changed. */
+  private actionsRenderedKey = '';
   private mode: Mode = 'play';
   private rebuildPending = false;
   private rebuildQueued = false;
@@ -115,6 +124,7 @@ export class Game {
     this.renderer.scene.add(this.impactFlashes.mesh);
     this.renderer.scene.add(this.impactRings.group);
     this.renderer.scene.add(this.trajectoryPreview.object);
+    this.renderer.scene.add(this.projectileArcs.group);
     this.renderer.scene.add(this.impactMarker.object);
     this.renderer.scene.add(this.healthBars.group);
     this.ghost.setSpec(this.buildSpec);
@@ -134,6 +144,7 @@ export class Game {
     this.fpsEl = statsEl;
     this.modeEl = document.getElementById('mode');
     this.selBoxEl = document.getElementById('selbox');
+    this.actionsEl = document.getElementById('actions');
 
     this.onResize();
     window.addEventListener('resize', this.onResize);
@@ -288,6 +299,11 @@ export class Game {
     }
     if (this.input.pressed.has('Tab')) this.cycleSelection();
 
+    // Per-selection action keybinds (e.g. Q on a barracks queues a soldier;
+    // H on selected units stops them). Runs after the global hotkeys (B/P/
+    // Esc/digit cycle) so their bindings always win for the global mode.
+    this.dispatchActionKeys();
+
     // Sandbox helper: 'E' spawns an enemy unit at the cursor's terrain xz.
     //   E         → enemy soldier (rifle)
     //   Shift+E   → enemy tank (cannon)
@@ -336,6 +352,11 @@ export class Game {
       this.servicePendingRepaths();
       this.buildings.tick(dt, this.world, this.units);
       this.paintTankTracks();
+      // Aggressive-stance auto-engage: armed units in 'aggressive' mode pick
+      // their own target and reposition when the trajectory is blocked.
+      // Runs before tickWeapons so any new firingTarget assignments slew the
+      // turret this same frame.
+      this.tickAggressiveStance(dt);
       // Weapon firing pipeline. Slews turret/hull toward each unit's
       // firingTarget, fires when aligned, drops projectiles into the
       // ProjectileManager, and emits muzzle flashes for the renderer.
@@ -378,6 +399,7 @@ export class Game {
     this.healthBars.update(this.units.units);
     this.buildingRenderer.update(this.buildings.buildings);
     this.projectileRenderer.update(this.projectiles);
+    this.updateProjectileArcs();
     this.muzzleFlashes.update(dt);
     this.impactFlashes.update(dt);
     this.impactRings.update(dt);
@@ -423,6 +445,7 @@ export class Game {
           : 'MODE: PLAY';
       this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}${weaponDesc}`;
     }
+    this.renderActionPanel();
   }
 
   /**
@@ -468,6 +491,7 @@ export class Game {
     arr.forEach(u => u.selected = false);
     const next = (idx + 1) % arr.length;
     arr[next]!.selected = true;
+    this.buildings.deselectAll();
   }
 
   private rayFromScreen(px: number, py: number, w: number, h: number): { origin: THREE.Vector3; dir: THREE.Vector3 } {
@@ -668,6 +692,7 @@ export class Game {
     const finalSel = hasArmed ? inBox.filter(u => u.weapon !== null) : inBox;
     if (!additive) for (const u of this.units.units) u.selected = false;
     for (const u of finalSel) u.selected = true;
+    if (finalSel.length > 0) this.buildings.deselectAll();
   }
 
   /**
@@ -780,6 +805,18 @@ export class Game {
         for (const u of this.units.units) u.selected = false;
         picked.selected = true;
       }
+      this.buildings.deselectAll();
+      return;
+    }
+
+    // Next, check if the cursor landed on a building — selecting a
+    // building lets the player issue per-building actions (e.g. queue a
+    // training run) and clears any unit selection.
+    const pickedBuilding = this.pickBuildingAt(release.startX, release.startY, w, h);
+    if (pickedBuilding) {
+      this.buildings.deselectAll();
+      pickedBuilding.selected = true;
+      for (const u of this.units.units) u.selected = false;
       return;
     }
 
@@ -790,7 +827,12 @@ export class Game {
     // on RMB now (see handleDigRelease). Tunnelers/worms commanded via LMB
     // surface-walk to the click instead of digging down.
     const selected = this.units.units.filter(u => u.selected);
-    if (selected.length === 0) return;
+    if (selected.length === 0) {
+      // Bare-terrain click with no units selected → drop any building
+      // selection so the action panel goes away.
+      this.buildings.deselectAll();
+      return;
+    }
     const lead = selected[0]!;
     const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
     if (!r) return;
@@ -1540,9 +1582,10 @@ export class Game {
     const cy = imp.y / VOXEL_SIZE;
     const cz = imp.z / VOXEL_SIZE;
     const radiusMeters = imp.explosive ? imp.explosionRadiusMeters : imp.hitRadiusMeters;
-    const terrainPeak = imp.explosive
-      ? imp.damagePeak * this.explosionTerrainDamageScale
-      : imp.damagePeak;
+    // Terrain damage uses a per-projectile multiplier so a turret round can
+    // still hurt enemies at full peak without carving up the surrounding
+    // base. Unit damage below ignores this scale.
+    const terrainPeak = imp.damagePeak * imp.terrainDamageScale;
     const result = this.world.damageSphere(cx, cy, cz, radiusMeters / VOXEL_SIZE, terrainPeak);
     if (result.destroyed.length > 0) {
       const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
@@ -1618,6 +1661,273 @@ export class Game {
     return top < 0 ? 0 : (top + 1) * VOXEL_SIZE;
   }
 
+  /**
+   * The hooks actions are allowed to call back into Game with. Kept tiny —
+   * actions mutate units / buildings directly; the context is for things
+   * that need Game-level mode state (build / plant / play).
+   */
+  private actionCtx(): ActionContext {
+    return {
+      enterBuildMode: (): void => {
+        this.mode = 'build';
+        this.buildSpec = ALL_BUILDINGS[0]!;
+        this.ghost.setSpec(this.buildSpec);
+      },
+      enterPlantMode: (): void => {
+        this.mode = 'plant';
+        this.ghost.hide();
+      },
+      cancelMode: (): void => {
+        this.mode = 'play';
+        this.ghost.hide();
+      },
+    };
+  }
+
+  /** Run a unit action against the currently-selected units. */
+  private runUnitAction(action: UnitAction): void {
+    const sel = this.units.units.filter(u => u.selected && action.applicable(u));
+    if (sel.length === 0) return;
+    action.run(sel, this.actionCtx());
+  }
+
+  /** Run a building action against the currently-selected building. */
+  private runBuildingAction(action: BuildingAction): void {
+    const b = this.buildings.getSelected();
+    if (!b || !action.applicable(b)) return;
+    action.run(b, this.actionCtx());
+  }
+
+  /**
+   * Read each action's keybind off the current selection's action list and
+   * fire any whose key was pressed this frame. Buildings take priority over
+   * units when both somehow have selection state — in practice the click
+   * handlers keep them mutually exclusive, but we still dispatch only one
+   * source per frame to avoid double-fires on a shared key.
+   */
+  private dispatchActionKeys(): void {
+    if (this.input.pressed.size === 0) return;
+    const selBuilding = this.buildings.getSelected();
+    if (selBuilding) {
+      for (const a of buildingActionsFor(selBuilding)) {
+        if (this.input.pressed.has(a.key)) this.runBuildingAction(a);
+      }
+      return;
+    }
+    const selUnits = this.units.units.filter(u => u.selected);
+    if (selUnits.length === 0) return;
+    for (const a of unitActionsFor(selUnits)) {
+      if (this.input.pressed.has(a.key)) this.runUnitAction(a);
+    }
+  }
+
+  /**
+   * Rebuild the action panel DOM when the selection's actions changed; refresh
+   * the live subtitle (e.g. queue length) every frame regardless. The render
+   * is keyed on a string signature so we skip DOM work when nothing
+   * structural has changed — that keeps existing click handlers attached.
+   */
+  private renderActionPanel(): void {
+    if (!this.actionsEl) return;
+    const selBuilding = this.buildings.getSelected();
+    const selUnits = this.units.units.filter(u => u.selected);
+
+    if (selBuilding) {
+      const acts = buildingActionsFor(selBuilding);
+      const key = `b:${selBuilding.id}:${selBuilding.spec.kind}:${acts.map(a => a.id).join(',')}`;
+      if (key !== this.actionsRenderedKey) {
+        this.buildActionsDom(
+          `${selBuilding.spec.label} (#${selBuilding.id})`,
+          'Building',
+          acts.map(a => ({
+            id: a.id, label: a.label, keyLabel: a.keyLabel,
+            run: (): void => this.runBuildingAction(a),
+          })),
+        );
+        this.actionsRenderedKey = key;
+      }
+      const sub = this.actionsEl.querySelector('.actions-sub');
+      if (sub) {
+        const q = selBuilding.trainQueue;
+        sub.textContent = q.length > 0
+          ? `Building · queue: ${q.join(', ')}`
+          : 'Building';
+      }
+      this.actionsEl.style.display = 'block';
+      return;
+    }
+
+    if (selUnits.length > 0) {
+      const acts = unitActionsFor(selUnits);
+      const lead = selUnits[0]!;
+      const key = `u:${selUnits.length}:${lead.id}:${lead.kind}:${acts.map(a => a.id).join(',')}`;
+      if (key !== this.actionsRenderedKey) {
+        const title = selUnits.length > 1
+          ? `${selUnits.length} units selected`
+          : lead.kind === 'worker'
+            ? `Worker (${lead.workerRole}) #${lead.id}`
+            : `${lead.kind} #${lead.id}`;
+        this.buildActionsDom(
+          title,
+          'Unit',
+          acts.map(a => ({
+            id: a.id, label: a.label, keyLabel: a.keyLabel,
+            run: (): void => this.runUnitAction(a),
+          })),
+        );
+        this.actionsRenderedKey = key;
+      }
+      // Live subtitle: stance summary so the player can see the current
+      // mode without checking the panel twice.
+      const sub = this.actionsEl.querySelector('.actions-sub');
+      if (sub) {
+        const armed = selUnits.filter(u => u.weapon !== null);
+        if (armed.length === 0) {
+          sub.textContent = 'Unit';
+        } else {
+          const all = armed.every(u => u.stance === armed[0]!.stance);
+          sub.textContent = all
+            ? `Unit · stance: ${armed[0]!.stance}`
+            : 'Unit · stance: mixed';
+        }
+      }
+      this.actionsEl.style.display = 'block';
+      return;
+    }
+
+    if (this.actionsRenderedKey !== '') {
+      this.actionsEl.innerHTML = '';
+      this.actionsRenderedKey = '';
+    }
+    this.actionsEl.style.display = 'none';
+  }
+
+  /** Construct the DOM rows for the actions panel from a list of entries. */
+  private buildActionsDom(
+    title: string,
+    subtitle: string,
+    rows: { id: string; label: string; keyLabel: string; run: () => void }[],
+  ): void {
+    if (!this.actionsEl) return;
+    this.actionsEl.innerHTML = '';
+    const t = document.createElement('div');
+    t.className = 'actions-title';
+    t.textContent = title;
+    this.actionsEl.appendChild(t);
+    const s = document.createElement('div');
+    s.className = 'actions-sub';
+    s.textContent = subtitle;
+    this.actionsEl.appendChild(s);
+    if (rows.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'action-row';
+      empty.textContent = '(no actions available)';
+      this.actionsEl.appendChild(empty);
+      return;
+    }
+    for (const r of rows) {
+      const row = document.createElement('div');
+      row.className = 'action-row';
+      const k = document.createElement('span');
+      k.className = 'action-key';
+      k.textContent = r.keyLabel;
+      const lbl = document.createElement('span');
+      lbl.className = 'action-label';
+      lbl.textContent = r.label;
+      row.appendChild(k);
+      row.appendChild(lbl);
+      row.addEventListener('click', () => r.run());
+      this.actionsEl.appendChild(row);
+    }
+  }
+
+  /**
+   * Predict the remaining flight path for every live projectile and push the
+   * sample arrays into the dashed-arc renderer. Called once per frame from
+   * the tick — the arcs are visualisation only, no game state changes.
+   */
+  /**
+   * Aggressive-stance pipeline. For every armed friendly unit in
+   * 'aggressive' mode that isn't already firing, find the nearest enemy in
+   * weapon range and either (a) drop a `firingTarget` on it when the
+   * trajectory clears, or (b) route the unit toward the enemy when the
+   * arc is blocked, so they get into a position they can shoot from.
+   *
+   * Defensive-stance units are left alone — the player issues their orders
+   * via RMB-fire as before.
+   */
+  private tickAggressiveStance(dt: number): void {
+    const enemies = this.units.units.filter(u => u.team === 'enemy' && u.hp > 0);
+    if (enemies.length === 0) return;
+    for (const u of this.units.units) {
+      if (u.team !== 'player') continue;
+      if (u.weapon === null) continue;
+      if (u.stance !== 'aggressive') continue;
+      if (u.firingTarget) continue;
+      if (u.burstShotsRemaining > 0) continue;
+      if (u.autoEngageCooldown > 0) {
+        u.autoEngageCooldown = Math.max(0, u.autoEngageCooldown - dt);
+        continue;
+      }
+      const w = WEAPONS[u.weapon];
+      const range2 = w.rangeMeters * w.rangeMeters;
+      // Closest enemy in horizontal range.
+      let target: Unit | null = null;
+      let bestD2 = range2;
+      for (const e of enemies) {
+        const dx = e.x - u.x, dz = e.z - u.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) { bestD2 = d2; target = e; }
+      }
+      if (!target) continue;
+
+      const targetTorsoY = target.y + Math.max(0.7, target.widthMeters * 0.6);
+      // Predict the trajectory along a direct muzzle-to-torso line.
+      const muzzleX = u.x;
+      const muzzleY = u.y + 1.2;
+      const muzzleZ = u.z;
+      const ddx = target.x - muzzleX;
+      const ddy = targetTorsoY - muzzleY;
+      const ddz = target.z - muzzleZ;
+      const dl = Math.hypot(ddx, ddy, ddz) || 1;
+      const dirX = ddx / dl, dirY = ddy / dl, dirZ = ddz / dl;
+      const cfg = PROJECTILES[w.projectile];
+      const points = this.projectiles.predictTrajectory(
+        w.projectile,
+        muzzleX, muzzleY, muzzleZ,
+        dirX, dirY, dirZ,
+        this.world,
+        0,
+        96, 0.06,
+        w.velocityScale,
+        u.launcherMaxStrength,
+      );
+      const willHit = arcCoversTarget(points, target, cfg.explosive ? cfg.explosionRadiusMeters : 0);
+      if (willHit) {
+        u.firingTarget = { x: target.x, y: targetTorsoY, z: target.z };
+        // Tiny cooldown after a successful target lock so we don't fight the
+        // weapon-tick if it clears `firingTarget` at the moment of fire.
+        u.autoEngageCooldown = 0.25;
+        continue;
+      }
+      // Trajectory blocked. Route toward the target so the unit walks into
+      // line-of-sight. Throttle re-route attempts so we don't spam path
+      // requests on every frame.
+      u.autoEngageCooldown = 0.6;
+      if (u.path.length > 0) continue;
+      void this.routePath(u, target.x, target.y, target.z);
+    }
+  }
+
+  private updateProjectileArcs(): void {
+    const arcs: { points: { x: number; y: number; z: number }[] }[] = [];
+    for (const p of this.projectiles.projectiles) {
+      const points = this.projectiles.predictRemaining(p, this.world, 0, 96, 0.06);
+      if (points.length >= 2) arcs.push({ points });
+    }
+    this.projectileArcs.update(arcs);
+  }
+
   private onResize = (): void => {
     const w = window.innerWidth, h = window.innerHeight;
     this.renderer.resize(w, h);
@@ -1627,4 +1937,49 @@ export class Game {
 
 function isBuildMode(m: Mode): boolean {
   return m === 'build';
+}
+
+/**
+ * Decide whether a sampled trajectory `points` would actually affect `target`.
+ * For explosive rounds we treat the last sample (impact location) as the
+ * blast centre and check the target sits inside an extended explosion radius
+ * (target body + explosion). For direct-fire rounds we walk every segment
+ * and accept the line if it passes through the target's body sphere.
+ *
+ * Used by both the unit aggressive-stance pipeline and (in spirit) the
+ * building turret hittability gate — they share the same shape because the
+ * gameplay intent is identical: don't waste shots that won't reach.
+ */
+function arcCoversTarget(
+  points: { x: number; y: number; z: number }[],
+  target: Unit,
+  explosionRadiusMeters: number,
+): boolean {
+  if (points.length < 2) return false;
+  const tx = target.x;
+  const ty = target.y + Math.max(0.7, target.widthMeters * 0.6);
+  const tz = target.z;
+  const bodyR = target.widthMeters * 0.55 + 0.35;
+  if (explosionRadiusMeters > 0) {
+    const r = explosionRadiusMeters + bodyR;
+    for (const p of points) {
+      const d = Math.hypot(p.x - tx, p.y - ty, p.z - tz);
+      if (d <= r) return true;
+    }
+    return false;
+  }
+  const r2 = bodyR * bodyR;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1]!, b = points[i]!;
+    const sx = b.x - a.x, sy = b.y - a.y, sz = b.z - a.z;
+    const ssq = sx * sx + sy * sy + sz * sz;
+    if (ssq < 1e-8) continue;
+    const txa = tx - a.x, tya = ty - a.y, tza = tz - a.z;
+    let t = (txa * sx + tya * sy + tza * sz) / ssq;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    const cx = a.x + sx * t, cy = a.y + sy * t, cz = a.z + sz * t;
+    const dxs = cx - tx, dys = cy - ty, dzs = cz - tz;
+    if (dxs * dxs + dys * dys + dzs * dzs <= r2) return true;
+  }
+  return false;
 }
