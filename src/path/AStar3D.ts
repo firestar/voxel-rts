@@ -29,20 +29,34 @@ export interface AStar3DResult {
   expanded: number;
 }
 
-const NB26: { dx: number; dy: number; dz: number; cost: number }[] = (() => {
-  const out: { dx: number; dy: number; dz: number; cost: number }[] = [];
+// 26-neighbor offsets and step costs. Stored as flat typed arrays so the inner
+// loop reads them as monomorphic indexed loads instead of object property reads.
+const NB26_DX = new Int8Array(26);
+const NB26_DY = new Int8Array(26);
+const NB26_DZ = new Int8Array(26);
+const NB26_COST = new Float32Array(26);
+// Squared horizontal step (dx² + dz²) — used by the squared-pitch comparison
+// so we never call Math.hypot inside the inner loop.
+const NB26_HORIZ2 = new Float32Array(26);
+{
+  let k = 0;
   for (let dz = -1; dz <= 1; dz++) {
     for (let dy = -1; dy <= 1; dy++) {
       for (let dx = -1; dx <= 1; dx++) {
         if (dx === 0 && dy === 0 && dz === 0) continue;
-        const k = (dx !== 0 ? 1 : 0) + (dy !== 0 ? 1 : 0) + (dz !== 0 ? 1 : 0);
-        const cost = k === 1 ? 1 : k === 2 ? Math.SQRT2 : Math.sqrt(3);
-        out.push({ dx, dy, dz, cost });
+        const dim = (dx !== 0 ? 1 : 0) + (dy !== 0 ? 1 : 0) + (dz !== 0 ? 1 : 0);
+        const cost = dim === 1 ? 1 : dim === 2 ? Math.SQRT2 : Math.sqrt(3);
+        NB26_DX[k] = dx;
+        NB26_DY[k] = dy;
+        NB26_DZ[k] = dz;
+        NB26_COST[k] = cost;
+        NB26_HORIZ2[k] = dx * dx + dz * dz;
+        k++;
       }
     }
   }
-  return out;
-})();
+}
+const NB26_LEN = 26;
 
 function chebyshev3(ax: number, ay: number, az: number, bx: number, by: number, bz: number): number {
   const dx = Math.abs(ax - bx), dy = Math.abs(ay - by), dz = Math.abs(az - bz);
@@ -134,6 +148,9 @@ export function findPathVolume(
   const gen = ws.resetGeneration();
   const { startCx, startCy, startCz, goalCx, goalCy, goalCz, canDig, requiresGround, footprintRadius } = req;
   const maxTanPitch = req.maxPitchRad === undefined ? Infinity : Math.tan(req.maxPitchRad);
+  // Squared form so the inner pitch test is `dy² > horiz² * tan²` — no sqrt.
+  const maxTanPitchSq = maxTanPitch === Infinity ? Infinity : maxTanPitch * maxTanPitch;
+  const havePitch = maxTanPitch !== Infinity;
   const maxExpansions = req.maxExpansions ?? 20000;
 
   const startI = vnavIndex(startCx, startCy, startCz);
@@ -150,69 +167,81 @@ export function findPathVolume(
   ws.cameFrom[startI] = -1;
   ws.open.push(startI, HEURISTIC_WEIGHT * chebyshev3(startCx, startCy, startCz, goalCx, goalCy, goalCz));
 
+  // Track the closed cell with the smallest heuristic-to-goal so partial paths
+  // don't require an O(VNAV_COUNT) scan after a cap-out.
+  let bestPartialNode = startI;
+  let bestPartialH = chebyshev3(startCx, startCy, startCz, goalCx, goalCy, goalCz);
+
   let expanded = 0;
   let reached = false;
-  while (ws.open.length > 0) {
-    const i = ws.open.pop();
-    if (ws.closed[i] === gen) continue;
-    ws.closed[i] = gen;
+  // Hoist into locals to avoid property loads in the inner loop.
+  const vnavSolid = vnav.solid;
+  const vnavDigCost = vnav.digCost;
+  const closedArr = ws.closed;
+  const genArr = ws.gen;
+  const gArr = ws.gScore;
+  const cameFromArr = ws.cameFrom;
+  const open = ws.open;
+  while (open.length > 0) {
+    const i = open.pop();
+    if (closedArr[i] === gen) continue;
+    closedArr[i] = gen;
     expanded++;
     if (i === goalI) { reached = true; break; }
-    if (expanded >= maxExpansions) break;
 
     const cx = i % VNAV_X;
     const tmp = (i / VNAV_X) | 0;
     const cz = tmp % VNAV_Z;
     const cy = (tmp / VNAV_Z) | 0;
+    const gI = gArr[i]!;
 
-    for (let n = 0; n < NB26.length; n++) {
-      const off = NB26[n]!;
-      const nx = cx + off.dx;
-      const ny = cy + off.dy;
-      const nz = cz + off.dz;
+    // Track best partial as we settle each cell. Done before the expansion-cap
+    // break so the very last cell we close is still a candidate (matches the
+    // pre-optimisation behaviour of scanning every closed cell post-hoc).
+    const hI = chebyshev3(cx, cy, cz, goalCx, goalCy, goalCz);
+    if (hI < bestPartialH) { bestPartialH = hI; bestPartialNode = i; }
+    if (expanded >= maxExpansions) break;
+
+    for (let n = 0; n < NB26_LEN; n++) {
+      const dx = NB26_DX[n]!;
+      const dy = NB26_DY[n]!;
+      const dz = NB26_DZ[n]!;
+      const nx = cx + dx;
+      const ny = cy + dy;
+      const nz = cz + dz;
       if (nx < 0 || ny < 0 || nz < 0 || nx >= VNAV_X || ny >= VNAV_Y || nz >= VNAV_Z) continue;
-      const ni = vnavIndex(nx, ny, nz);
-      if (ws.closed[ni] === gen) continue;
+      const ni = (ny * VNAV_Z + nz) * VNAV_X + nx;
+      if (closedArr[ni] === gen) continue;
+      // Pitch gate: |dy|/horiz <= tan(pitch). Squared form avoids hypot/sqrt.
+      // Pure-vertical edges (horiz==0) are rejected when pitch is set.
+      if (havePitch && dy !== 0) {
+        const h2 = NB26_HORIZ2[n]!;
+        if (h2 === 0 || dy * dy > h2 * maxTanPitchSq) continue;
+      }
       if (!footprintPassable(vnav, nx, ny, nz, canDig, requiresGround, footprintRadius, ni === goalI)) continue;
-      // Pitch gate: |dy| / horizontal_distance must stay within tan(maxPitchRad).
-      // Pure-vertical edges (horiz == 0) are blocked the moment the pitch limit is set.
-      if (off.dy !== 0 && maxTanPitch !== Infinity) {
-        const horiz = Math.hypot(off.dx, off.dz);
-        if (horiz === 0 || Math.abs(off.dy) > horiz * maxTanPitch) continue;
-      }
 
-      let stepCost = off.cost;
-      const isSolid = getBit(vnav.solid, ni);
+      let stepCost = NB26_COST[n]!;
+      const isSolid = (vnavSolid[ni >> 3]! >> (ni & 7)) & 1;
       if (isSolid) {
-        stepCost += vnav.digCost[ni]!;
+        stepCost += vnavDigCost[ni]!;
       }
 
-      const g = ws.gScore[i]! + stepCost;
-      const seen = ws.gen[ni] === gen;
-      if (!seen || g < ws.gScore[ni]!) {
-        ws.gen[ni] = gen;
-        ws.gScore[ni] = g;
-        ws.cameFrom[ni] = i;
+      const g = gI + stepCost;
+      const seen = genArr[ni] === gen;
+      if (!seen || g < gArr[ni]!) {
+        genArr[ni] = gen;
+        gArr[ni] = g;
+        cameFromArr[ni] = i;
         const f = g + HEURISTIC_WEIGHT * chebyshev3(nx, ny, nz, goalCx, goalCy, goalCz);
-        ws.open.push(ni, f);
+        open.push(ni, f);
       }
     }
   }
 
   let endI = goalI;
   if (!reached) {
-    let bestH = Infinity, best = -1;
-    for (let i = 0; i < VNAV_COUNT; i++) {
-      if (ws.closed[i] !== gen) continue;
-      const cx = i % VNAV_X;
-      const tmp = (i / VNAV_X) | 0;
-      const cz = tmp % VNAV_Z;
-      const cy = (tmp / VNAV_Z) | 0;
-      const h = chebyshev3(cx, cy, cz, goalCx, goalCy, goalCz);
-      if (h < bestH) { bestH = h; best = i; }
-    }
-    if (best < 0) return { cells: [], reached: false, expanded };
-    endI = best;
+    if (bestPartialNode < 0) return { cells: [], reached: false, expanded };
+    endI = bestPartialNode;
   }
 
   const out: { cx: number; cy: number; cz: number }[] = [];

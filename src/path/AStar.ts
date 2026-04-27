@@ -46,10 +46,11 @@ export interface AStarResult {
   expanded: number;
 }
 
-// Diagonal+cardinal neighbor offsets and unit costs (octile).
-const NB_DX = [ 1,-1, 0, 0,  1, 1,-1,-1];
-const NB_DZ = [ 0, 0, 1,-1,  1,-1, 1,-1];
-const NB_COST = [1, 1, 1, 1, Math.SQRT2, Math.SQRT2, Math.SQRT2, Math.SQRT2];
+// Diagonal+cardinal neighbor offsets and unit costs (octile). Stored as flat
+// typed arrays so the inner A* loop reads them as monomorphic indexed loads.
+const NB_DX = new Int8Array([ 1,-1, 0, 0,  1, 1,-1,-1]);
+const NB_DZ = new Int8Array([ 0, 0, 1,-1,  1,-1, 1,-1]);
+const NB_COST = new Float32Array([1, 1, 1, 1, Math.SQRT2, Math.SQRT2, Math.SQRT2, Math.SQRT2]);
 
 export function bodyRoughnessOk(
   nav: SurfaceNavBuffers,
@@ -98,9 +99,10 @@ export function bodyRoughnessOk(
  * repeatedly for the same cell during a single A* run (every neighbour edge
  * that lands on it triggers a recheck). The cache keys on the workspace
  * generation tick so it auto-invalidates between queries without an explicit
- * clear.
+ * clear. Exported so the post-A* smoother can reuse the same cache (the
+ * generation tick is still valid until the next `findPathSurface` call).
  */
-function cachedBodyRoughnessOk(
+export function cachedBodyRoughnessOk(
   nav: SurfaceNavBuffers,
   ws: AStarWorkspace,
   gen: number,
@@ -173,6 +175,10 @@ export class AStarWorkspace {
     return this.genTick;
   }
 
+  /** Latest generation tick from the most recent `resetGeneration`. The smoother
+   *  uses this to share the roughness-cache from the just-finished A* search. */
+  currentGen(): number { return this.genTick; }
+
   markUnitObstacles(indices: readonly number[] | undefined, exemptStart: number, exemptGoal: number): void {
     this.clearUnitObstacles();
     if (!indices) return;
@@ -195,41 +201,6 @@ export class AStarWorkspace {
   }
 }
 
-/**
- * Symmetric edge cost between cells idxA and idxB. The two endpoints are passed
- * symmetrically (we deliberately avoid using "destination" anywhere) so the cost
- * forward(a→b) === backward(b→a). That's a hard requirement for bidirectional
- * A*: if the two searches saw different costs for the same edge, the meeting
- * point cost wouldn't equal the actual shortest-path cost.
- */
-function edgeCost(
-  nav: SurfaceNavBuffers,
-  idxA: number, idxB: number,
-  baseCost: number,
-  slopePenalty: number,
-  prefersRoads: boolean,
-  routeSeed: number,
-): number {
-  const dY = Math.abs(nav.topY[idxA]! - nav.topY[idxB]!);
-  let cost = baseCost + dY * slopePenalty;
-  if (prefersRoads) {
-    // Use the maximum road weight on either endpoint — symmetric and treats either
-    // cell being a road as enough to grant the discount.
-    const rwA = nav.road[idxA]!;
-    const rwB = nav.road[idxB]!;
-    const rw = Math.max(rwA, rwB) / 255;
-    cost *= 1.0 - 0.6 * rw;
-  }
-  if (routeSeed !== 0) {
-    // Hash keyed by min/max so the edge has the same jitter regardless of direction.
-    const lo = idxA < idxB ? idxA : idxB;
-    const hi = idxA < idxB ? idxB : idxA;
-    const h = ((Math.imul(lo, 0x9e3779b9) ^ Math.imul(hi, 0x85ebca6b) ^ routeSeed) >>> 0);
-    const jitter = ((h & 0xff) / 255 - 0.5) * 0.6; // ±0.3 cost units
-    cost += jitter;
-  }
-  return cost;
-}
 
 /**
  * Bidirectional, weighted-A* "cone" search. Forward and backward fronts each grow
@@ -295,6 +266,16 @@ export function findPathSurface(
     return { cells: [{ cx: startCx, cz: startCz }], reached: true, expanded: 0 };
   }
 
+  // Hoist nav buffers into locals so the tight loop reads from monomorphic
+  // typed-array references instead of property-loading them on every iteration.
+  const navTopY = nav.topY;
+  const navBlocked = nav.blocked;
+  const navRoad = nav.road;
+  const navHeadroom = nav.headroom;
+  const unitBlockMask = ws.unitBlock;
+  const NAV_W_LOCAL = NAV_W;
+  const NAV_H_LOCAL = NAV_H;
+
   // Forward init.
   ws.fG[startI] = 0;
   ws.fGen[startI] = gen;
@@ -332,44 +313,74 @@ export function findPathSurface(
     // First meeting on pop: the other side has already settled this exact cell.
     if (otherGen[i] === gen) { meetNode = i; break; }
 
-    const cx = i % NAV_W;
-    const cz = (i / NAV_W) | 0;
-    const cy = nav.topY[i]!;
+    const cx = i % NAV_W_LOCAL;
+    const cz = (i / NAV_W_LOCAL) | 0;
+    const cy = navTopY[i]!;
+    const gI = myG[i]!;
 
     for (let n = 0; n < 8; n++) {
-      const nx = cx + NB_DX[n]!;
-      const nz = cz + NB_DZ[n]!;
-      if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) continue;
-      const ni = navIndex(nx, nz);
+      const dx = NB_DX[n]!;
+      const dz = NB_DZ[n]!;
+      const nx = cx + dx;
+      const nz = cz + dz;
+      if (nx < 0 || nz < 0 || nx >= NAV_W_LOCAL || nz >= NAV_H_LOCAL) continue;
+      const ni = nz * NAV_W_LOCAL + nx;
       if (myClosed[ni] === gen) continue;
-      if (nav.blocked[ni]) continue;
-      if (ws.unitBlock[ni] === 1) continue;
-      const nyTop = nav.topY[ni]!;
-      const dY = Math.abs(nyTop - cy);
+      if (navBlocked[ni]) continue;
+      if (unitBlockMask[ni] === 1) continue;
+      const nyTop = navTopY[ni]!;
+      const dY = nyTop > cy ? nyTop - cy : cy - nyTop;
       if (dY > maxStepVoxels) continue;
       if (bodyHalfCells > 0 && !cachedBodyRoughnessOk(nav, ws, gen, ni, nx, nz, bodyHalfCells, bodyRoughnessVoxels)) continue;
-      if (headroomVoxels > 0 && nav.headroom[ni]! < headroomVoxels) continue;
+      if (headroomVoxels > 0 && navHeadroom[ni]! < headroomVoxels) continue;
       if (n >= 4) {
-        const a = navIndex(cx + NB_DX[n]!, cz);
-        const b = navIndex(cx, cz + NB_DZ[n]!);
-        const aBlocked = nav.blocked[a]! === 1 || ws.unitBlock[a] === 1;
-        const bBlocked = nav.blocked[b]! === 1 || ws.unitBlock[b] === 1;
-        // No diagonal across a 1-cell void: even agile units can't leap a gap
-        // where both cardinals are blocked. Stationary peers count as blockers
-        // here too, otherwise a unit could squeeze diagonally between two
-        // shoulder-to-shoulder neighbours.
+        // Cardinals adjacent to the diagonal: (nx, cz) and (cx, nz). These are
+        // the two cells the unit would brush past on the way through. We
+        // already know nx/nz are in bounds, and cx/cz are too (this is the
+        // current cell), so the cardinal indices are always valid.
+        const a = cz * NAV_W_LOCAL + nx;
+        const b = nz * NAV_W_LOCAL + cx;
+        const aBlocked = navBlocked[a]! === 1 || unitBlockMask[a] === 1;
+        const bBlocked = navBlocked[b]! === 1 || unitBlockMask[b] === 1;
         if (aBlocked && bBlocked) continue;
         if (!agile) {
           // Vehicles also need at least one cardinal both passable AND within the
           // climb step — they can't squeeze through a wall corner.
-          const aOk = !aBlocked && Math.abs(nav.topY[a]! - cy) <= maxStepVoxels;
-          const bOk = !bBlocked && Math.abs(nav.topY[b]! - cy) <= maxStepVoxels;
+          let aOk = !aBlocked;
+          if (aOk) {
+            const ay = navTopY[a]!;
+            const ad = ay > cy ? ay - cy : cy - ay;
+            if (ad > maxStepVoxels) aOk = false;
+          }
+          let bOk = !bBlocked;
+          if (bOk) {
+            const by = navTopY[b]!;
+            const bd = by > cy ? by - cy : cy - by;
+            if (bd > maxStepVoxels) bOk = false;
+          }
           if (!aOk && !bOk) continue;
         }
       }
 
-      const stepCost = edgeCost(nav, i, ni, NB_COST[n]!, slopePenalty, prefersRoads, routeSeed);
-      const g = myG[i]! + stepCost;
+      // Edge cost — inlined so the per-request flags hoist out of branches:
+      //   base + dY * slopePenalty
+      //   * (road discount if prefersRoads && either endpoint is a road)
+      //   + jitter (if routeSeed != 0)
+      let cost = NB_COST[n]! + dY * slopePenalty;
+      if (prefersRoads) {
+        const rwA = navRoad[i]!;
+        const rwB = navRoad[ni]!;
+        const rw = (rwA > rwB ? rwA : rwB) * (1 / 255);
+        cost *= 1.0 - 0.6 * rw;
+      }
+      if (routeSeed !== 0) {
+        const lo = i < ni ? i : ni;
+        const hi = i < ni ? ni : i;
+        const h = ((Math.imul(lo, 0x9e3779b9) ^ Math.imul(hi, 0x85ebca6b) ^ routeSeed) >>> 0);
+        cost += ((h & 0xff) * (1 / 255) - 0.5) * 0.6;
+      }
+
+      const g = gI + cost;
       const seen = myGen[ni] === gen;
       if (!seen || g < myG[ni]!) {
         myGen[ni] = gen;
