@@ -215,17 +215,20 @@ export class Game {
     this.input.beginFrame();
     const w = window.innerWidth, h = window.innerHeight;
 
-    // RMB is overloaded: when a weapon-bearing unit is selected and we're not
-    // in build / plant mode, the right mouse button is the fire-aim gesture
-    // (hold to aim, release to fire, vertical drag = target altitude). In
-    // every other case it falls through to the camera yaw drag.
+    // RMB is overloaded: with a weapon-bearing unit selected it's the
+    // fire-aim gesture; with a tunneler/worm selected it's the dig-aim
+    // gesture (hold to aim, vertical drag = target altitude, release to
+    // commit the dig command). In every other case it falls through to
+    // the camera yaw drag.
     const fireAimActive = this.isFireAimActive();
+    const digAimActive = !fireAimActive && this.isDigAimActive();
+    const rmbConsumed = fireAimActive || digAimActive;
     this.camera.update({
       keys: this.input.keys,
       mouseX: this.input.mouseX, mouseY: this.input.mouseY,
-      rmbDown: fireAimActive ? false : this.input.rmbDown,
-      rmbDx: fireAimActive ? 0 : this.input.rmbDx,
-      rmbDy: fireAimActive ? 0 : this.input.rmbDy,
+      rmbDown: rmbConsumed ? false : this.input.rmbDown,
+      rmbDx: rmbConsumed ? 0 : this.input.rmbDx,
+      rmbDy: rmbConsumed ? 0 : this.input.rmbDy,
       wheel: this.input.wheel,
       width: w, height: h,
     }, dt);
@@ -285,7 +288,7 @@ export class Game {
       this.updateGhost(w, h);
     }
 
-    // LMB hold → preview marker (tunneler altitude drag); release → fire actual command.
+    // LMB hold → preview marker at the cursor; release → fire actual command.
     this.updateLmbPreview(w, h);
     this.updateSelectionBox();
     if (this.input.release) {
@@ -297,7 +300,20 @@ export class Game {
     // marker. Released aim becomes a `firingTarget` on the unit, which the
     // weapon-tick consumes (slewing turret/hull and firing once aligned).
     this.updateFireAim(w, h);
-    if (this.input.rmbRelease) this.handleFireRelease(this.input.rmbRelease, w, h);
+    // Dig-aim preview: with a tunneler/worm selected, RMB hold draws a
+    // surface→target marker (vertical drag adjusts target Y), and release
+    // commits the dig as a normal volume-nav route command.
+    this.updateDigAim(w, h);
+    if (this.input.rmbRelease) {
+      // Dispatch by selection — at release time `rmbHold` has already been
+      // cleared, so we can't rely on the aim-active flags computed earlier.
+      const sel = this.units.units.find(u => u.selected);
+      if (sel && sel.canDig && sel.weapon === null) {
+        this.handleDigRelease(this.input.rmbRelease, w, h);
+      } else {
+        this.handleFireRelease(this.input.rmbRelease, w, h);
+      }
+    }
 
     if (this.pathClient) {
       this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, this.world.buffers.voxels, (req) => this.handleWorldEdit(req));
@@ -380,7 +396,9 @@ export class Game {
           : sel.kind === 'worker' ? `worker(${sel.workerRole}) #${sel.id}` : `${sel.kind} #${sel.id}`;
       const weaponDesc = sel && selected.length === 1 && sel.weapon !== null
         ? ` weapon: ${WEAPONS[sel.weapon].label} (RMB to fire, drag Y for altitude)`
-        : '';
+        : sel && selected.length === 1 && sel.canDig
+          ? ' (LMB walks on surface, RMB hold + drag Y to dig)'
+          : '';
       const buildDesc = this.mode === 'build'
         ? `MODE: BUILD ${this.buildSpec.label} (LMB place, B/1-${ALL_BUILDINGS.length} cycle, Esc cancel)`
         : this.mode === 'plant'
@@ -526,17 +544,8 @@ export class Game {
       return;
     }
     const selected = this.units.units.find(u => u.selected);
-    // Preview only matters for tunnelers (vertical drag) — keep marker visible when held over terrain.
     if (!selected) { this.target.hide(); return; }
-    const verticalDrag = hold.currentY - hold.startY;
-    const useDrag = selected.canDig;
-    // Tunneler depth is relative to its current Y (so the user can drop the cursor
-    // anywhere and a 0-drag click means "stay at this height"). Other units take
-    // the click's voxel y as the base.
-    const baseY = useDrag ? selected.y : undefined;
-    const pitchCap = useDrag ? selected.maxPitchRad : undefined;
-    const pitchOrigin = useDrag ? { x: selected.x, z: selected.z } : undefined;
-    const r = this.resolveTarget(hold.startX, hold.startY, w, h, useDrag ? verticalDrag : 0, baseY, pitchCap, pitchOrigin);
+    const r = this.resolveTarget(hold.startX, hold.startY, w, h, 0);
     if (!r) { this.target.hide(); return; }
     this.target.show(r.surface, r.target);
   }
@@ -760,19 +769,17 @@ export class Game {
     // Click on terrain → command the current selection to move. Solo
     // selection keeps the per-unit task / earth-mover wiring; multi
     // selection issues a formation move and skips per-unit task pickers.
+    // LMB never carries a vertical-drag dig altitude — that gesture lives
+    // on RMB now (see handleDigRelease). Tunnelers/worms commanded via LMB
+    // surface-walk to the click instead of digging down.
     const selected = this.units.units.filter(u => u.selected);
     if (selected.length === 0) return;
     const lead = selected[0]!;
-    const verticalDrag = release.endY - release.startY;
-    const useDrag = selected.length === 1 && lead.canDig;
-    const baseY = useDrag ? lead.y : undefined;
-    const pitchCap = useDrag ? lead.maxPitchRad : undefined;
-    const pitchOrigin = useDrag ? { x: lead.x, z: lead.z } : undefined;
-    const r = this.resolveTarget(release.startX, release.startY, w, h, useDrag ? verticalDrag : 0, baseY, pitchCap, pitchOrigin);
+    const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
     if (!r) return;
 
     if (selected.length === 1) {
-      this.commandSingle(lead, r);
+      this.commandSingle(lead, r, lead.canDig);
       return;
     }
     this.commandFormation(selected, r.target.x, r.target.z);
@@ -786,6 +793,7 @@ export class Game {
   private commandSingle(
     selected: Unit,
     r: { surface: THREE.Vector3; target: THREE.Vector3; voxelXYZ: { x: number; y: number; z: number; nx: number; ny: number; nz: number } },
+    forceSurface = false,
   ): void {
     if (selected.kind === 'worker' && selected.workerRole === 'harvester') {
       const m = this.world.get(r.voxelXYZ.x, r.voxelXYZ.y, r.voxelXYZ.z);
@@ -817,7 +825,7 @@ export class Game {
       const mode = selected.spoilLoad > 0 ? 'dump' : 'load';
       selected.haulerJob = { vx: r.voxelXYZ.x, vz: r.voxelXYZ.z, mode };
     }
-    void this.routePath(selected, r.target.x, r.target.y, r.target.z);
+    void this.routePath(selected, r.target.x, r.target.y, r.target.z, { forceSurface });
   }
 
   /**
@@ -1041,13 +1049,18 @@ export class Game {
    *  - Anyone whose start OR destination is meaningfully below the local surface uses volume.
    *  - Otherwise surface pathing (cheaper, gives a smoother surface walk).
    */
-  private async routePath(unit: Unit, wx: number, wy: number, wz: number): Promise<void> {
+  private async routePath(unit: Unit, wx: number, wy: number, wz: number, opts?: { forceSurface?: boolean }): Promise<void> {
     if (!this.pathClient) return;
     const goalSurfaceY = this.surfaceWorldY(wx, wz);
     const startSurfaceY = this.surfaceWorldY(unit.x, unit.z);
     const goalUnderground = wy < goalSurfaceY - 0.5;
     const startUnderground = unit.y < startSurfaceY - 0.5;
-    const useVolume = unit.canDig || goalUnderground || startUnderground;
+    // forceSurface lets LMB on a tunneler/worm route via surface-nav so the
+    // unit walks to the target instead of digging through it. We still fall
+    // back to volume nav if the unit is currently underground (it has to dig
+    // back out before any surface route exists).
+    const allowSurface = opts?.forceSurface && !startUnderground;
+    const useVolume = !allowSurface && (unit.canDig || goalUnderground || startUnderground);
 
     if (useVolume) {
       // Tunneler shortcut — it can grind through anything that isn't bedrock, so
@@ -1217,6 +1230,21 @@ export class Game {
   }
 
   /**
+   * True when the player is mid-aim with the right mouse button on a
+   * tunneler / worm. RMB hold + vertical drag picks the dig target Y; on
+   * release the unit is routed to that point via volume-nav (so it digs
+   * down through whatever's in the way). Camera RMB-yaw is suppressed
+   * while this gesture is active.
+   */
+  private isDigAimActive(): boolean {
+    if (this.mode !== 'play') return false;
+    if (!this.input.rmbHold) return false;
+    const sel = this.units.units.find(u => u.selected);
+    if (!sel || !sel.canDig || sel.weapon !== null) return false;
+    return true;
+  }
+
+  /**
    * Each frame while RMB is held with a weapon-bearing unit selected, ray-cast
    * from the cursor's start position into the world and use vertical drag to
    * raise/lower the impact altitude. Then ask the projectile manager to
@@ -1233,8 +1261,8 @@ export class Game {
     const sel = this.units.units.find(u => u.selected)!;
     const wcfg = WEAPONS[sel.weapon!];
     // Start cursor position is the aim point; vertical drag (down = +pixels)
-    // lowers the altitude, drag-up raises it. Same convention as the LMB
-    // tunneler altitude drag, so the player only learns one gesture.
+    // lowers the altitude, drag-up raises it. Same convention as the RMB
+    // tunneler dig drag, so the player only learns one gesture.
     const verticalDrag = hold.currentY - hold.startY;
     const r = this.resolveTarget(hold.startX, hold.startY, w, h, verticalDrag);
     if (!r) {
@@ -1318,6 +1346,46 @@ export class Game {
     for (const u of armed) {
       u.firingTarget = { x: r.target.x, y: r.target.y, z: r.target.z };
     }
+  }
+
+  /**
+   * Each frame while RMB is held with a tunneler / worm selected, render the
+   * surface→target marker at the cursor's start position. Vertical drag
+   * (down = deeper) shifts the target Y relative to the unit's current Y,
+   * clamped by the unit's max-pitch cap. Mirrors the old LMB drag preview
+   * but driven by RMB.
+   */
+  private updateDigAim(w: number, h: number): void {
+    if (!this.isDigAimActive()) return;
+    const hold = this.input.rmbHold!;
+    const sel = this.units.units.find(u => u.selected)!;
+    const verticalDrag = hold.currentY - hold.startY;
+    const r = this.resolveTarget(
+      hold.startX, hold.startY, w, h, verticalDrag,
+      sel.y, sel.maxPitchRad, { x: sel.x, z: sel.z },
+    );
+    if (!r) { this.target.hide(); return; }
+    this.target.show(r.surface, r.target);
+  }
+
+  /**
+   * On RMB release with a tunneler / worm selected, commit the aimed
+   * target as a normal route command. The drag's vertical component picks
+   * the target Y; routePath sees `canDig` and runs volume-nav so the unit
+   * grinds down to the goal.
+   */
+  private handleDigRelease(release: { startX: number; startY: number; endX: number; endY: number; shift: boolean }, w: number, h: number): void {
+    this.target.hide();
+    if (this.mode !== 'play') return;
+    const sel = this.units.units.find(u => u.selected);
+    if (!sel || !sel.canDig || sel.weapon !== null) return;
+    const verticalDrag = release.endY - release.startY;
+    const r = this.resolveTarget(
+      release.startX, release.startY, w, h, verticalDrag,
+      sel.y, sel.maxPitchRad, { x: sel.x, z: sel.z },
+    );
+    if (!r) return;
+    this.commandSingle(sel, r);
   }
 
   /**
