@@ -115,6 +115,14 @@ interface UnitConfig {
   bladeDepthMeters: number;
   /** Maximum carried-spoil capacity in voxel units (1 voxel = 0.125³ m³). 0 for non-earthmovers. */
   spoilCapacityVoxels: number;
+  /**
+   * Cap on the muzzle velocity (m/s) this unit's launcher can produce. The
+   * weapon catalog's muzzleVelocity * velocityScale is clamped to this on
+   * every shot, so a soldier's shoulder-fired weapon can't reach the same
+   * range as a tank's main gun even if you somehow gave them the same round.
+   * Set to 0 for non-combatant kinds (workers, dozer, hauler, diggers).
+   */
+  launcherMaxStrength: number;
 }
 
 export function unitConfig(kind: UnitKind): UnitConfig {
@@ -141,6 +149,10 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         segmentCount: 0, segmentSpacing: 0,
         bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
         spoilCapacityVoxels: 0,
+        // Shoulder-fired weapons: caps the 7.62/5.56/RPG/9 mm muzzle speeds so
+        // a soldier's effective range is short enough that a tank or turret
+        // outranges them every time.
+        launcherMaxStrength: 80,
       };
     case 'tank':
       // Tanks are restricted to fairly flat terrain.
@@ -167,6 +179,10 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         segmentCount: 0, segmentSpacing: 0,
         bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
         spoilCapacityVoxels: 0,
+        // Tank cannon: high muzzle velocity, comfortably above the tank_shell
+        // catalog speed so the cap doesn't bite normal play but does bound
+        // any future "swap weapon onto a tank" experiments.
+        launcherMaxStrength: 130,
       };
     case 'tunneler':
       // 5x5 cells (5 m x 5 m); 9 voxels (≈1.1 m) residual tolerance — generous because
@@ -194,6 +210,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         segmentCount: 0, segmentSpacing: 0,
         bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
         spoilCapacityVoxels: 0,
+        launcherMaxStrength: 0,
       };
     case 'worker':
       // Civilian worker. Single-cell footprint, soldier-class agility on
@@ -218,6 +235,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         segmentCount: 0, segmentSpacing: 0,
         bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
         spoilCapacityVoxels: 0,
+        launcherMaxStrength: 0,
       };
     case 'worm':
       // Smaller, articulated tunneler. Head (the controlled body) carries a narrower
@@ -245,6 +263,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         segmentSpacing: WORM_SEGMENT_SPACING,
         bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
         spoilCapacityVoxels: 0,
+        launcherMaxStrength: 0,
       };
     case 'dozer':
       // Tracked bulldozer. Walks the surface like a tank, but each frame the strip
@@ -278,6 +297,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         // ~8 m³ of carried dirt at a 0.125 m voxel — comfortably more than a
         // single hill-flatten run produces, so the dozer rarely runs dry mid-job.
         spoilCapacityVoxels: 4096,
+        launcherMaxStrength: 0,
       };
     case 'hauler':
       // Dump truck. Carries up to spoilCapacityVoxels of loose voxels. A single
@@ -304,6 +324,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         segmentCount: 0, segmentSpacing: 0,
         bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
         spoilCapacityVoxels: 12_288,
+        launcherMaxStrength: 0,
       };
     case 'rocket_truck':
       // Rocket-launcher platform. Same chassis class as a hauler (wheeled, can't
@@ -328,6 +349,9 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         segmentCount: 0, segmentSpacing: 0,
         bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
         spoilCapacityVoxels: 0,
+        // Rocket truck pod: rockets are heavy / slow, so the cap sits above
+        // the catalog rocket muzzle speed but well below tank-cannon levels.
+        launcherMaxStrength: 70,
       };
   }
 }
@@ -463,6 +487,14 @@ export interface Unit {
    * skips shots whose line of fire passes through a same-team body.
    */
   team: Team;
+  /**
+   * Cap on the actual muzzle velocity (m/s) this unit's launcher applies to
+   * a fired projectile. Mirrors `UnitConfig.launcherMaxStrength`; copied at
+   * spawn time so per-instance buffs/debuffs can mutate it later without
+   * touching the catalog. Zero for unarmed units (the weapon tick already
+   * skips them, but the field is still set for uniform read paths).
+   */
+  launcherMaxStrength: number;
 }
 
 /**
@@ -648,6 +680,7 @@ export class UnitManager {
       burstShotsRemaining: 0,
       burstShotTimer: 0,
       team: opts?.team ?? 'player',
+      launcherMaxStrength: cfg.launcherMaxStrength,
     };
     this.units.push(u);
     return u;

@@ -1,11 +1,21 @@
 import { VoxelWorld } from '../voxel/VoxelWorld';
 import { worldIndex } from '../voxel/VoxelWorld';
 import { WORLD_X, WORLD_Y, WORLD_Z, AIR, MaterialId, VOXEL_SIZE } from '../voxel/types';
-import { M_WOOD, M_FARM, M_STONE, M_PATH, M_DIRT_ROAD } from '../voxel/Materials';
+import { M_WOOD, M_FARM, M_STONE, M_PATH, M_DIRT_ROAD, M_METAL } from '../voxel/Materials';
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_VOXELS, FLAT_TOLERANCE_VOXELS } from '../path/SurfaceNav';
 import { UnitManager, UnitKind, Unit } from './Units';
+import { WeaponKind, WEAPONS } from './Weapons';
+import { ProjectileManager, muzzleOrigin, PROJECTILES } from './Projectiles';
 
-export type BuildingKind = 'barracks' | 'farm' | 'storage' | 'power_plant' | 'refinery' | 'tech_lab';
+export type BuildingKind =
+  | 'barracks'
+  | 'farm'
+  | 'storage'
+  | 'power_plant'
+  | 'refinery'
+  | 'tech_lab'
+  | 'turret'
+  | 'silo';
 
 export interface BuildingSpec {
   kind: BuildingKind;
@@ -24,6 +34,26 @@ export interface BuildingSpec {
   produces: UnitKind[];
   /** Voxel stamper for this building. Returns the wall-voxel count for liveness math. */
   stamp: (world: VoxelWorld, ox: number, oz: number, floorY: number) => number;
+  /**
+   * Optional weapon mounted on this building. Buildings with a weapon
+   * auto-target the nearest enemy unit within the weapon's `rangeMeters` and
+   * fire on its cooldown. Aim mount is always treated as 'turret' regardless
+   * of the weapon catalog entry, since the building itself doesn't yaw.
+   */
+  weapon?: WeaponKind;
+  /**
+   * Cap on actual muzzle velocity (m/s) for shots fired by this building. Same
+   * semantics as `UnitConfig.launcherMaxStrength` — the projectile manager
+   * clamps the spawn speed to this. Allows a fixed turret to outrange hand-
+   * carried weapons and a silo to reach much further still.
+   */
+  launcherMaxStrength?: number;
+  /**
+   * Height in meters above the building's floor where projectiles emerge from
+   * the weapon mount. Used to position the muzzle origin so shots come out
+   * the top of the turret head / silo cluster, not from inside the wall.
+   */
+  weaponMuzzleHeight?: number;
 }
 
 export const BARRACKS: BuildingSpec = {
@@ -113,8 +143,55 @@ export const TECH_LAB: BuildingSpec = {
   stamp: stampTechLab,
 };
 
+/**
+ * Defensive turret. A small stone emplacement with a rotating cannon head on
+ * top — auto-fires `building_turret` rounds at the nearest enemy unit in
+ * range (90 m, with a launcher cap that lets the lobbed shell actually reach
+ * that far against the doubled gravity). Smaller footprint than a barracks
+ * and roofless so the cannon head can swing freely.
+ */
+export const TURRET: BuildingSpec = {
+  kind: 'turret',
+  label: 'Turret',
+  cellsW: 2,
+  cellsD: 2,
+  headroomVoxels: 12,           // ~1.5 m base; the cannon head sits above
+  wall: M_STONE,
+  productionInterval: Infinity, // doesn't produce units; weapon firing is per-frame
+  produces: [],
+  stamp: stampTurret,
+  weapon: 'building_turret',
+  launcherMaxStrength: 110,
+  // Top of the base + a 4-voxel pintle column the renderer's turret head
+  // sits on. Matches the visual mount point so projectiles come out the
+  // barrel, not the floor.
+  weaponMuzzleHeight: (12 + 4) * VOXEL_SIZE,
+};
+
+/**
+ * Heavy silo launcher. A large fortified emplacement with a missile cluster
+ * on the roof. Auto-fires `silo_missile` rounds at the nearest enemy in a
+ * very long range (320 m). Long cooldown — the missile is devastating but
+ * you only get one off every several seconds.
+ */
+export const SILO: BuildingSpec = {
+  kind: 'silo',
+  label: 'Silo Launcher',
+  cellsW: 5,
+  cellsD: 5,
+  headroomVoxels: 36,           // ~4.5 m main hall + missile tubes above
+  wall: M_STONE,
+  productionInterval: Infinity,
+  produces: [],
+  stamp: stampSilo,
+  weapon: 'silo_launcher',
+  launcherMaxStrength: 220,
+  // Top of the missile cluster sits ~6 voxels above the parapet.
+  weaponMuzzleHeight: (36 + 6) * VOXEL_SIZE,
+};
+
 /** All building specs in the order they appear on the build-mode hotkeys (1..N). */
-export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, FARM, STORAGE, POWER_PLANT, REFINERY, TECH_LAB];
+export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, FARM, STORAGE, POWER_PLANT, REFINERY, TECH_LAB, TURRET, SILO];
 
 export interface FootprintHit {
   ok: boolean;
@@ -157,6 +234,19 @@ export interface Building {
    * the harvester delivers / dies / drops task.
    */
   harvesterClaimId: number | null;
+  /**
+   * Weapon-bearing buildings (turret, silo): seconds until the weapon is
+   * ready to fire again. 0 = ready. Buildings without a weapon never touch
+   * this field; it stays at 0 forever.
+   */
+  weaponFireCooldown: number;
+  /**
+   * Weapon-bearing buildings: world-space yaw (radians) of the visible turret
+   * head. Slewed toward the current target each tick, same convention as
+   * unit `turretYaw` (yaw=0 → forward = -Z). For buildings without a weapon
+   * the value stays at 0.
+   */
+  weaponTurretYaw: number;
 }
 
 /**
@@ -598,6 +688,164 @@ export function stampTechLab(
 }
 
 /**
+ * Defensive turret: a 2x2 stone emplacement with a stout pintle column at the
+ * centre. The renderer mounts the rotating cannon head on top of the column;
+ * the stamp here only lays out the static base + pintle.
+ */
+export function stampTurret(
+  world: VoxelWorld,
+  ox: number, oz: number,
+  floorY: number,
+): number {
+  const spec = TURRET;
+  const wxStart = ox * NAV_CELL_VOXELS;
+  const wzStart = oz * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const yFloor = floorY + 1;
+  const yRoof = floorY + spec.headroomVoxels;
+
+  let wallCount = 0;
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      // Stone floor.
+      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
+        world.set(x, yFloor, z, spec.wall);
+        wallCount++;
+      }
+      for (let y = yFloor + 1; y <= yRoof; y++) {
+        if (y >= WORLD_Y) break;
+        const onPerimeter =
+          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+        if (onPerimeter) {
+          world.set(x, y, z, spec.wall);
+          wallCount++;
+        } else {
+          world.set(x, y, z, AIR);
+        }
+      }
+    }
+  }
+  // Pintle column at the centre — a 2x2 metal column 4 voxels tall sitting on
+  // top of the perimeter wall. The renderer's turret head bolts to the top of
+  // this column.
+  const cxv = (wxStart + wxEnd) >> 1;
+  const czv = (wzStart + wzEnd) >> 1;
+  const pintleH = 4;
+  for (let dy = 1; dy <= pintleH; dy++) {
+    const py = yRoof + dy;
+    if (py >= WORLD_Y) break;
+    for (let xo = -1; xo <= 0; xo++) {
+      for (let zo = -1; zo <= 0; zo++) {
+        world.set(cxv + xo, py, czv + zo, M_METAL);
+        wallCount++;
+      }
+    }
+  }
+  return wallCount;
+}
+
+/**
+ * Heavy silo launcher: a 5x5 stone fortress with a tall parapet and a 3x3
+ * missile-tube cluster on the roof (six metal columns capped with red warhead
+ * voxels). The renderer doesn't add any animated accessories — the missile
+ * tubes are part of the static stamp.
+ */
+export function stampSilo(
+  world: VoxelWorld,
+  ox: number, oz: number,
+  floorY: number,
+): number {
+  const spec = SILO;
+  const wxStart = ox * NAV_CELL_VOXELS;
+  const wzStart = oz * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const yFloor = floorY + 1;
+  const yRoof = floorY + spec.headroomVoxels;
+  // Door on +X face (matches barracks/refinery convention).
+  const doorWz0 = ((wzStart + wzEnd) >> 1) - 1;
+  const doorWz1 = doorWz0 + 1;
+  const doorYTop = yFloor + 6;
+
+  let wallCount = 0;
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
+        world.set(x, yFloor, z, M_STONE);
+        wallCount++;
+      }
+      for (let y = yFloor + 1; y <= yRoof; y++) {
+        if (y >= WORLD_Y) break;
+        const onPerimeter =
+          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+        if (y === yRoof) {
+          world.set(x, y, z, spec.wall);
+          wallCount++;
+        } else if (onPerimeter) {
+          const isDoor = (x === wxEnd - 1 && (z === doorWz0 || z === doorWz1) && y < doorYTop);
+          if (!isDoor) {
+            world.set(x, y, z, spec.wall);
+            wallCount++;
+          } else {
+            world.set(x, y, z, AIR);
+          }
+        } else {
+          world.set(x, y, z, AIR);
+        }
+      }
+    }
+  }
+  // Parapet — 2-voxel-tall ring of stone inset 1 from the perimeter.
+  const parapetInset = 1;
+  for (let dy = 1; dy <= 2; dy++) {
+    const py = yRoof + dy;
+    if (py >= WORLD_Y) break;
+    for (let z = wzStart + parapetInset; z < wzEnd - parapetInset; z++) {
+      for (let x = wxStart + parapetInset; x < wxEnd - parapetInset; x++) {
+        const onParapet =
+          x === wxStart + parapetInset || x === wxEnd - parapetInset - 1 ||
+          z === wzStart + parapetInset || z === wzEnd - parapetInset - 1;
+        if (!onParapet) continue;
+        world.set(x, py, z, spec.wall);
+        wallCount++;
+      }
+    }
+  }
+  // Missile tube cluster — 6 vertical tubes arranged in a 3x2 grid on the
+  // roof. Each tube is a 2x2 metal column 5 voxels tall capped with a single
+  // red-tinted M_METAL warhead voxel (we just use M_METAL throughout; the
+  // renderer's voxel-meshes pick the colour from the material catalog).
+  const tubeBaseY = yRoof + 3; // sits above the parapet
+  const tubeHeight = 5;
+  // Layout: 3 tubes along X × 2 tubes along Z, centred. Tube footprint is 2
+  // voxels each side, gap of 1 between → 3*2+2*1 = 8 voxels along X (fits the
+  // 5-cell × 8-voxel = 40-voxel building width with margin).
+  const tubeStride = 3; // 2-wide tube + 1 gap
+  const cxv = (wxStart + wxEnd) >> 1;
+  const czv = (wzStart + wzEnd) >> 1;
+  const xStartTube = cxv - tubeStride - 1; // covers tube columns at -4..-3, -1..0, +2..+3
+  const zStartTube = czv - 2;
+  for (let tx = 0; tx < 3; tx++) {
+    for (let tz = 0; tz < 2; tz++) {
+      const baseX = xStartTube + tx * tubeStride;
+      const baseZ = zStartTube + tz * tubeStride;
+      for (let dy = 0; dy < tubeHeight; dy++) {
+        const py = tubeBaseY + dy;
+        if (py >= WORLD_Y) break;
+        for (let xo = 0; xo < 2; xo++) {
+          for (let zo = 0; zo < 2; zo++) {
+            world.set(baseX + xo, py, baseZ + zo, M_METAL);
+            wallCount++;
+          }
+        }
+      }
+    }
+  }
+  return wallCount;
+}
+
+/**
  * Sample wall voxels and return roughly how many remain. Used for "destroyed" check.
  * Cheap: only checks perimeter columns of the main hall (ignores chimneys / domes —
  * those are accents, the building is "alive" while the perimeter still stands).
@@ -645,6 +893,21 @@ export class BuildingManager {
    * silently (used by tests that don't bother with a Resources instance).
    */
   foodSink: ((amount: number, b: Building) => void) | null = null;
+  /**
+   * Projectile manager that weapon-bearing buildings (turret, silo) use to
+   * launch their rounds. Wired by Game; null in tests that don't care about
+   * building weapons (the firing logic short-circuits when null).
+   */
+  projectiles: ProjectileManager | null = null;
+  /**
+   * Muzzle-flash sink. Same shape as the unit weapon-tick hook so Game can
+   * forward both into the same FlashPool. Optional — when null, building
+   * shots fire without a visible flash (still works for tests).
+   */
+  onBuildingMuzzleFlash:
+    | ((x: number, y: number, z: number, radiusMeters: number, lifeSeconds: number,
+        color: { r: number; g: number; b: number }) => void)
+    | null = null;
 
   place(world: VoxelWorld, spec: BuildingSpec, ox: number, oz: number, floorY: number): Building {
     const wallCount = spec.stamp(world, ox, oz, floorY);
@@ -661,6 +924,8 @@ export class BuildingManager {
       cropReady: false,
       farmerId: null,
       harvesterClaimId: null,
+      weaponFireCooldown: 0,
+      weaponTurretYaw: 0,
     };
     this.buildings.push(b);
     return b;
@@ -669,6 +934,14 @@ export class BuildingManager {
   tick(dt: number, world: VoxelWorld, units: UnitManager): void {
     for (const b of this.buildings) {
       if (b.destroyed) continue;
+
+      // Weapon-bearing buildings (turret, silo): auto-target the nearest
+      // enemy unit in range and fire on cooldown. Runs in addition to any
+      // other behaviour the spec carries; for turret/silo there's nothing
+      // else to do, so the firing logic IS the building's tick.
+      if (b.spec.weapon) {
+        this.tickBuildingWeapon(b, dt, units);
+      }
 
       // Farm crop growth runs every tick (continuous), independent of the
       // production-timer cycle the barracks uses. Slow ambient growth lets
@@ -679,8 +952,9 @@ export class BuildingManager {
         continue;
       }
 
-      // Storage has no timer; non-producers (power plant / refinery / tech lab)
-      // carry an Infinity interval so the spawn loop never fires for them.
+      // Storage has no timer; non-producers (power plant / refinery / tech lab,
+      // turret, silo) carry an Infinity interval so the spawn loop never fires
+      // for them.
       if (b.spec.kind === 'storage' || b.spec.productionInterval <= 0 || !isFinite(b.spec.productionInterval)) continue;
       b.productionTimer -= dt;
       if (b.productionTimer > 0) continue;
@@ -701,6 +975,112 @@ export class BuildingManager {
         b.nextProduceIdx++;
         this.spawner(kind, door.x, door.y, door.z);
       }
+    }
+  }
+
+  /**
+   * Per-frame firing pipeline for a weapon-bearing building. Mirrors the
+   * unit-side `tickWeapons`:
+   *
+   *   1. Decay cooldown.
+   *   2. Pick the nearest enemy unit within `weapon.rangeMeters`.
+   *   3. Slew the building's `weaponTurretYaw` toward the target at the
+   *      weapon's slew rate.
+   *   4. When aligned within `aimToleranceRad` AND cooldown == 0, spawn one
+   *      projectile from the muzzle position and reset the cooldown.
+   *
+   * Buildings always treat the mount as 'turret' regardless of catalog —
+   * they don't have a hull to spin. Friendly-fire gating is deliberately
+   * skipped for now: a player turret will happily shoot through their own
+   * units. Real turret-line awareness can be layered on later.
+   */
+  private tickBuildingWeapon(b: Building, dt: number, units: UnitManager): void {
+    if (b.weaponFireCooldown > 0) {
+      b.weaponFireCooldown = Math.max(0, b.weaponFireCooldown - dt);
+    }
+    const wKind = b.spec.weapon!;
+    const w = WEAPONS[wKind];
+
+    // Building's footprint centre in world meters, plus muzzle height above
+    // the floor (per spec).
+    const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+    const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+    const floorTopMeters = (b.floorY + 1) * VOXEL_SIZE;
+    const muzzleY = floorTopMeters + (b.spec.weaponMuzzleHeight ?? 1.0);
+
+    // Find the closest LIVING enemy in horizontal range. We use 2D distance
+    // because the weapon's `rangeMeters` is meant as an engagement radius on
+    // the ground, not a 3D sphere.
+    let bestU: Unit | null = null;
+    let bestD2 = w.rangeMeters * w.rangeMeters;
+    for (const u of units.units) {
+      if (u.hp <= 0) continue;
+      if (u.team !== 'enemy') continue;
+      const dx = u.x - cxw, dz = u.z - czw;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > bestD2) continue;
+      bestD2 = d2;
+      bestU = u;
+    }
+
+    if (!bestU) return;
+
+    // Slew the visible turret toward the target.
+    const tdx = bestU.x - cxw;
+    const tdz = bestU.z - czw;
+    const targetYaw = Math.atan2(-tdx, -tdz);
+    const diff = wrapAngle(targetYaw - b.weaponTurretYaw);
+    const step = w.aimSlewRadPerSec * dt;
+    b.weaponTurretYaw += diff < -step ? -step : diff > step ? step : diff;
+
+    const remaining = wrapAngle(targetYaw - b.weaponTurretYaw);
+    if (Math.abs(remaining) > w.aimToleranceRad) return;
+    if (b.weaponFireCooldown > 0) return;
+    if (!this.projectiles) return;
+
+    // Pitch toward the target's torso so a shot fired downhill doesn't sail
+    // past the unit.
+    const targetTorsoY = bestU.y + Math.max(0.7, bestU.widthMeters * 0.6);
+    const ddx = bestU.x - cxw;
+    const ddz = bestU.z - czw;
+    const ddy = targetTorsoY - muzzleY;
+    const horiz = Math.hypot(ddx, ddz);
+    const pitchY = horiz > 1e-3 ? ddy / horiz : 0;
+
+    // Forward unit-vector from the (now-aligned) turret yaw. Same convention
+    // as units (yaw=0 → forward = -Z).
+    const fx = -Math.sin(b.weaponTurretYaw);
+    const fz = -Math.cos(b.weaponTurretYaw);
+
+    let dirX = fx;
+    let dirZ = fz;
+    let dirY = pitchY;
+    const dl = Math.hypot(dirX, dirY, dirZ) || 1;
+    dirX /= dl; dirY /= dl; dirZ /= dl;
+
+    // Building's "owner id" for the projectile — negative numbers can't
+    // collide with any real unit id, so the friendly-skip logic in the
+    // projectile manager is a no-op for building shots (which is what we
+    // want; the building itself isn't a unit).
+    const ownerId = -1000 - b.id;
+    const muzzle = muzzleOrigin(cxw, muzzleY - 1.2, czw, dirX, dirY, dirZ, 0.5, 1.2);
+    this.projectiles.spawn(
+      w.projectile,
+      muzzle.x, muzzle.y, muzzle.z,
+      dirX, dirY, dirZ,
+      ownerId,
+      w.velocityScale,
+      b.spec.launcherMaxStrength ?? Infinity,
+    );
+    b.weaponFireCooldown = w.fireInterval;
+
+    if (this.onBuildingMuzzleFlash) {
+      const pcfg = PROJECTILES[w.projectile];
+      this.onBuildingMuzzleFlash(
+        muzzle.x, muzzle.y, muzzle.z,
+        w.muzzleFlashRadius, w.muzzleFlashSeconds,
+        { r: pcfg.colorR, g: pcfg.colorG, b: pcfg.colorB },
+      );
     }
   }
 
@@ -833,4 +1213,10 @@ export class BuildingManager {
 function lookupUnit(units: UnitManager, id: number): Unit | null {
   for (const u of units.units) if (u.id === id) return u;
   return null;
+}
+
+function wrapAngle(a: number): number {
+  while (a > Math.PI) a -= 2 * Math.PI;
+  while (a < -Math.PI) a += 2 * Math.PI;
+  return a;
 }

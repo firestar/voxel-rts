@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { buildVoxelModel, VoxelBlock } from './UnitModels';
-import { POWER_PLANT, REFINERY, TECH_LAB } from '../sim/Buildings';
+import { POWER_PLANT, REFINERY, TECH_LAB, TURRET } from '../sim/Buildings';
 import { VOXEL_SIZE } from '../voxel/types';
 import { NAV_CELL_VOXELS } from '../path/SurfaceNav';
 
@@ -200,3 +200,38 @@ export function buildWheatStalkGeometry(): THREE.BufferGeometry {
 /** Per-farm count of each stalk variant. */
 export const FARM_CORN_PER_FARM = 8;
 export const FARM_WHEAT_PER_FARM = 8;
+
+// ---------- Turret — rotating cannon head ------------------------------------
+// Sits on top of the stamped stone base + central pintle. Origin is at the top
+// of the pintle; the head is composed of a low-profile rotating mantle and a
+// long forward-facing cannon barrel. Faces -Z (matches the unit convention)
+// so a yaw rotation around Y aims the barrel.
+
+const TURRET_MANTLE = { r: 0.42, g: 0.45, b: 0.50 };
+const TURRET_MANTLE_DARK = { r: 0.28, g: 0.30, b: 0.34 };
+const TURRET_BARREL = { r: 0.22, g: 0.22, b: 0.24 };
+const TURRET_BARREL_TIP = { r: 0.10, g: 0.10, b: 0.12 };
+
+export function buildTurretHeadGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [
+    // Mantle base — low cylinder-ish rectangle hugging the pintle.
+    { x: 0, y: 0.18, z: 0.00, sx: 0.95, sy: 0.36, sz: 0.95, ...TURRET_MANTLE },
+    // Mantle cap with a slight bevel around the rim.
+    { x: 0, y: 0.40, z: 0.00, sx: 0.80, sy: 0.10, sz: 0.80, ...TURRET_MANTLE_DARK },
+    // Barrel housing — sticks forward (-Z) over the front edge of the mantle.
+    { x: 0, y: 0.30, z: -0.50, sx: 0.36, sy: 0.30, sz: 0.65, ...TURRET_MANTLE_DARK },
+    // Cannon barrel — long thin column extending toward -Z.
+    { x: 0, y: 0.30, z: -1.10, sx: 0.16, sy: 0.16, sz: 0.85, ...TURRET_BARREL },
+    // Muzzle brake.
+    { x: 0, y: 0.30, z: -1.55, sx: 0.20, sy: 0.20, sz: 0.10, ...TURRET_BARREL_TIP },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+/**
+ * Y position (meters above the building floor) of the turret-head pivot. The
+ * stamp lays down a 12-voxel-tall base capped with a 4-voxel pintle column —
+ * the head bolts to the top of the pintle.
+ */
+export const TURRET_HEAD_Y_M =
+  (TURRET.headroomVoxels + 4 /* pintle height */) * VOXEL_SIZE;

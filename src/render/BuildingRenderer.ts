@@ -11,6 +11,7 @@ import {
   TECH_LAB_MAST_TOP_Y_M,
   buildCornStalkGeometry, buildWheatStalkGeometry,
   FARM_CORN_PER_FARM, FARM_WHEAT_PER_FARM,
+  buildTurretHeadGeometry, TURRET_HEAD_Y_M,
 } from './BuildingModels';
 
 /**
@@ -34,6 +35,7 @@ export class BuildingRenderer {
   private pulseCore: THREE.InstancedMesh;
   private cornStalk: THREE.InstancedMesh;
   private wheatStalk: THREE.InstancedMesh;
+  private turretHead: THREE.InstancedMesh;
 
   private capacity: number;
   private tmpM = new THREE.Matrix4();
@@ -59,17 +61,19 @@ export class BuildingRenderer {
     // map-full of farms doesn't run out of slots.
     this.cornStalk = makeIM(buildCornStalkGeometry(), lit, capacity * FARM_CORN_PER_FARM);
     this.wheatStalk = makeIM(buildWheatStalkGeometry(), lit, capacity * FARM_WHEAT_PER_FARM);
+    this.turretHead = makeIM(buildTurretHeadGeometry(), lit, capacity);
 
     this.group.add(
       this.turbineHub, this.turbineBlade,
       this.smoke,
       this.satDish, this.pulseCore,
       this.cornStalk, this.wheatStalk,
+      this.turretHead,
     );
   }
 
   update(buildings: Building[]): void {
-    let nHub = 0, nBlade = 0, nSmoke = 0, nDish = 0, nCore = 0, nCorn = 0, nWheat = 0;
+    let nHub = 0, nBlade = 0, nSmoke = 0, nDish = 0, nCore = 0, nCorn = 0, nWheat = 0, nTurret = 0;
     const t = performance.now() / 1000;
 
     // Pulse colour modulation for the tech-lab core (shared across all labs).
@@ -107,8 +111,14 @@ export class BuildingRenderer {
           nCorn += FARM_CORN_PER_FARM;
           nWheat += FARM_WHEAT_PER_FARM;
           break;
+        case 'turret':
+          if (nTurret >= this.capacity) break;
+          this.placeTurretHead(b, cx, cz, floorTopY, nTurret);
+          nTurret++;
+          break;
         default:
-          // Barracks has no animated accessories.
+          // Barracks / storage / silo: no rotating accessories. The silo's
+          // missile cluster is part of the static voxel stamp.
           break;
       }
     }
@@ -120,14 +130,34 @@ export class BuildingRenderer {
     this.pulseCore.count = nCore;
     this.cornStalk.count = nCorn;
     this.wheatStalk.count = nWheat;
+    this.turretHead.count = nTurret;
     for (const m of [
       this.turbineHub, this.turbineBlade,
       this.smoke,
       this.satDish, this.pulseCore,
       this.cornStalk, this.wheatStalk,
+      this.turretHead,
     ]) {
       m.instanceMatrix.needsUpdate = true;
     }
+  }
+
+  /**
+   * Position + yaw the rotating cannon head on top of a turret. Pivot sits at
+   * the top of the building's pintle column (TURRET_HEAD_Y_M above the floor
+   * top) and yaws to `weaponTurretYaw` so the visible barrel points at the
+   * current target.
+   */
+  private placeTurretHead(
+    b: Building,
+    cx: number, cz: number, floorTopY: number,
+    slot: number,
+  ): void {
+    this.tmpEuler.set(0, b.weaponTurretYaw, 0, 'YXZ');
+    this.tmpQ.setFromEuler(this.tmpEuler);
+    this.tmpV.set(cx, floorTopY + TURRET_HEAD_Y_M, cz);
+    this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+    this.turretHead.setMatrixAt(slot, this.tmpM);
   }
 
   private placePowerPlantTurbine(

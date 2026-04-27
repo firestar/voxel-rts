@@ -233,12 +233,16 @@ function fireShot(
 
   const muzzle = muzzleOrigin(u.x, u.y, u.z, dirX, dirY, dirZ, 1.4, 1.2);
   const kind = projectileOverride ?? w.projectile;
+  // Each unit's launcher caps the actual muzzle speed via launcherMaxStrength
+  // — a soldier with a 7.62 sniper still throws the round noticeably slower
+  // than the same round fired from a tank's launcher rating.
   projectiles.spawn(
     kind,
     muzzle.x, muzzle.y, muzzle.z,
     dirX, dirY, dirZ,
     u.id,
     w.velocityScale,
+    u.launcherMaxStrength,
   );
   const pcfg = PROJECTILES[kind];
   hooks.onMuzzleFlash(
