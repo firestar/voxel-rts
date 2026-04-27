@@ -86,6 +86,13 @@ export class Game {
 
   private readonly explosionRadiusBigMeters = 3.0;
   private readonly explosionPeak = 90;
+  /**
+   * Scale applied to a projectile-impact `damagePeak` before it is fed to
+   * `damageSphere` for voxel destruction. Unit splash damage uses the
+   * unscaled peak — only the terrain dig-out is dampened, so explosions
+   * still hurt anything they hit but leave noticeably smaller craters.
+   */
+  private readonly explosionTerrainDamageScale = 0.35;
 
   constructor(canvas: HTMLCanvasElement, statsEl: HTMLElement | null) {
     this.renderer = new Renderer(canvas);
@@ -1533,7 +1540,10 @@ export class Game {
     const cy = imp.y / VOXEL_SIZE;
     const cz = imp.z / VOXEL_SIZE;
     const radiusMeters = imp.explosive ? imp.explosionRadiusMeters : imp.hitRadiusMeters;
-    const result = this.world.damageSphere(cx, cy, cz, radiusMeters / VOXEL_SIZE, imp.damagePeak);
+    const terrainPeak = imp.explosive
+      ? imp.damagePeak * this.explosionTerrainDamageScale
+      : imp.damagePeak;
+    const result = this.world.damageSphere(cx, cy, cz, radiusMeters / VOXEL_SIZE, terrainPeak);
     if (result.destroyed.length > 0) {
       const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
       const burst = imp.explosive
