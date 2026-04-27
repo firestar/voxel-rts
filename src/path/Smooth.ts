@@ -20,6 +20,7 @@ function navLineClear(
   bodyHalfCells: number,
   bodyRoughnessVoxels: number,
   headroomVoxels: number,
+  unitBlock: Uint8Array | null,
 ): boolean {
   const dx = bx - ax;
   const dz = bz - az;
@@ -43,6 +44,7 @@ function navLineClear(
     if (x < 0 || z < 0 || x >= NAV_W || z >= NAV_H) return false;
     const idx = navIndex(x, z);
     if (nav.blocked[idx]) return false;
+    if (unitBlock !== null && unitBlock[idx] === 1) return false;
     const y = nav.topY[idx]!;
     if (havePrev && Math.abs(y - prevY) > stepLimit) return false;
     if (bodyHalfCells > 0 && !bodyRoughnessOk(nav, x, z, bodyHalfCells, bodyRoughnessVoxels)) return false;
@@ -72,6 +74,7 @@ export function smoothPath(
   bodyHalfCells: number,
   bodyRoughnessVoxels: number,
   headroomVoxels: number,
+  unitBlock: Uint8Array | null = null,
   maxLookaheadCells = 12,
 ): { cx: number; cz: number }[] {
   if (cells.length <= 2) return cells;
@@ -82,7 +85,7 @@ export function smoothPath(
     while (j > i + 1) {
       const a = cells[i]!;
       const b = cells[j]!;
-      if (navLineClear(nav, a.cx, a.cz, b.cx, b.cz, footprintRadius, maxStepVoxels, bodyHalfCells, bodyRoughnessVoxels, headroomVoxels)) break;
+      if (navLineClear(nav, a.cx, a.cz, b.cx, b.cz, footprintRadius, maxStepVoxels, bodyHalfCells, bodyRoughnessVoxels, headroomVoxels, unitBlock)) break;
       j--;
     }
     out.push(cells[j]!);

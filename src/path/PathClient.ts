@@ -90,6 +90,48 @@ export class PathClient {
   }
 
   /**
+   * Stamp every nav cell within `obstacleRadiusMeters` of the world-space point
+   * `(wx, wz)` into `out` (deduplicated). Used by `Game.routePath` to convert
+   * each stationary peer into the obstacle list passed into the surface A*.
+   *
+   * Caller passes the Minkowski sum of the blocker's collision radius and the
+   * requesting unit's radius so the planner routes around each peer with enough
+   * clearance for the requester to actually fit, instead of brushing the very
+   * edge of the blocker's body and then collision-stalling.
+   */
+  stampUnitObstacleCells(
+    wx: number, wz: number,
+    obstacleRadiusMeters: number,
+    seen: Set<number>,
+    out: number[],
+  ): void {
+    const r = obstacleRadiusMeters;
+    const minCx = Math.max(0, Math.floor((wx - r) / NAV_CELL_METERS));
+    const maxCx = Math.min(NAV_W - 1, Math.floor((wx + r) / NAV_CELL_METERS));
+    const minCz = Math.max(0, Math.floor((wz - r) / NAV_CELL_METERS));
+    const maxCz = Math.min(NAV_H - 1, Math.floor((wz + r) / NAV_CELL_METERS));
+    // Cell-circle overlap: any cell whose closest point to (wx, wz) is within r
+    // overlaps the obstacle disc. We compute that closest point by clamping the
+    // obstacle position into the cell's [min, max] bounds on each axis.
+    const r2 = r * r;
+    for (let cz = minCz; cz <= maxCz; cz++) {
+      const cellMinZ = cz * NAV_CELL_METERS;
+      const cellMaxZ = cellMinZ + NAV_CELL_METERS;
+      const dzClamped = wz < cellMinZ ? cellMinZ - wz : wz > cellMaxZ ? wz - cellMaxZ : 0;
+      for (let cx = minCx; cx <= maxCx; cx++) {
+        const cellMinX = cx * NAV_CELL_METERS;
+        const cellMaxX = cellMinX + NAV_CELL_METERS;
+        const dxClamped = wx < cellMinX ? cellMinX - wx : wx > cellMaxX ? wx - cellMaxX : 0;
+        if (dxClamped * dxClamped + dzClamped * dzClamped > r2) continue;
+        const idx = navIndex(cx, cz);
+        if (seen.has(idx)) continue;
+        seen.add(idx);
+        out.push(idx);
+      }
+    }
+  }
+
+  /**
    * Like cellAt, but if the requested cell is blocked, expands outward in concentric
    * rings up to `maxRing` cells away looking for the nearest walkable cell. Returns
    * that cell's coords with ok=true. Useful for resolving ambiguous user clicks that
