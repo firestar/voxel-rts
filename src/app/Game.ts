@@ -9,7 +9,7 @@ import { raycastVoxel } from '../voxel/Raycast';
 import { VOXEL_SIZE } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
 import { PathClient } from '../path/PathClient';
-import { UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest, ScoopRequest, DumpRequest } from '../sim/Units';
+import { UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest, ScoopRequest, DumpRequest, unitCollisionRadius } from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
 import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS, NAV_CELL_VOXELS } from '../path/SurfaceNav';
 import { worldToVolumeCell, vnavIndex, getBit } from '../path/VolumeNav';
@@ -95,6 +95,13 @@ export class Game {
 
   private readonly explosionRadiusBigMeters = 3.0;
   private readonly explosionPeak = 90;
+  /**
+   * Scale applied to a projectile-impact `damagePeak` before it is fed to
+   * `damageSphere` for voxel destruction. Unit splash damage uses the
+   * unscaled peak — only the terrain dig-out is dampened, so explosions
+   * still hurt anything they hit but leave noticeably smaller craters.
+   */
+  private readonly explosionTerrainDamageScale = 0.35;
 
   constructor(canvas: HTMLCanvasElement, statsEl: HTMLElement | null) {
     this.renderer = new Renderer(canvas);
@@ -340,6 +347,9 @@ export class Game {
 
     if (this.pathClient) {
       this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, this.world.buffers.voxels, (req) => this.handleWorldEdit(req));
+      // Any unit that latched needsRepath this frame (because it has been
+      // collision-stuck long enough) gets a fresh route around the offending peer.
+      this.servicePendingRepaths();
       this.buildings.tick(dt, this.world, this.units);
       this.paintTankTracks();
       // Aggressive-stance auto-engage: armed units in 'aggressive' mode pick
@@ -1143,6 +1153,7 @@ export class Game {
     // so the unit at least gets close instead of refusing to move.
     const goal = this.pathClient.nearestWalkable(wx, wz, 4);
     const start = this.pathClient.cellAt(unit.x, unit.z);
+    const unitObstacles = this.collectUnitObstacles(unit);
     const res = await this.pathClient.requestPath({
       startCx: start.cx, startCz: start.cz,
       goalCx: goal.cx, goalCz: goal.cz,
@@ -1156,9 +1167,56 @@ export class Game {
       // Per-unit seed so units headed to the same goal don't all share the same A*-optimal
       // line — they spread out along nearby alternates instead.
       routeSeed: unit.id * 0x9e3779b9 + 1,
+      unitObstacles,
     });
     if (res.cells.length === 0 || !res.reached) return;
     this.units.setPath(unit, this.pathClient.cellsToWaypoints(res.cells));
+  }
+
+  /**
+   * Build the per-query unit-obstacle list passed into surface A*. Only stationary
+   * peers (empty path) on roughly the same height as the requester count — a unit
+   * standing on a bridge above doesn't block a unit walking under it. The cells
+   * are Minkowski-expanded by the requester's radius so the planner leaves enough
+   * clearance for the requester's body, not just the blocker's centre.
+   */
+  private collectUnitObstacles(requester: Unit): number[] {
+    if (!this.pathClient) return [];
+    const out: number[] = [];
+    const seen = new Set<number>();
+    const requesterR = unitCollisionRadius(requester);
+    for (const u of this.units.units) {
+      if (u === requester) continue;
+      if (u.hp <= 0) continue;
+      // Only stationary peers stamp into the obstacle layer — a moving unit
+      // will be somewhere else by the time this path is followed, and the
+      // unit-vs-unit collision rule already lets two movers phase through.
+      if (u.path.length > 0) continue;
+      // Vertical separation > 2 m exempts the pair (matches unitCollidesAt).
+      if (Math.abs(u.y - requester.y) > 2.0) continue;
+      const obstacleR = unitCollisionRadius(u) + requesterR;
+      this.pathClient.stampUnitObstacleCells(u.x, u.z, obstacleR, seen, out);
+    }
+    return out;
+  }
+
+  /**
+   * After every unit tick, re-route any unit that has been blocked long enough to
+   * cross the BLOCKED_REPATH_FRAMES threshold. The flag was latched by the unit
+   * tick; we consume it here, snapshot the current destination (last waypoint of
+   * the surviving path), and request a fresh route with the offending peers as
+   * obstacles. If no new route is found the unit just keeps walking the old one
+   * until BLOCKED_GIVE_UP_FRAMES drops it for good.
+   */
+  private servicePendingRepaths(): void {
+    if (!this.pathClient) return;
+    for (const u of this.units.units) {
+      if (!u.needsRepath) continue;
+      u.needsRepath = false;
+      if (u.path.length === 0) continue;
+      const goal = u.path[u.path.length - 1]!;
+      void this.routePath(u, goal.x, goal.y, goal.z);
+    }
   }
 
   /**

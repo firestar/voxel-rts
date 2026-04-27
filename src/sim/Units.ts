@@ -395,6 +395,14 @@ export interface Unit {
   /** Frames the unit has been blocked by collision. We pause motion but don't drop
    *  the path — gravity / terrain edits may resolve the block. */
   blockedFrames: number;
+  /**
+   * Latched flag the harness reads each frame to know this unit wants its route
+   * recomputed. Set when `blockedFrames` first crosses BLOCKED_REPATH_FRAMES so
+   * a stationary peer that arrived after the path was planned can be routed
+   * around. The harness consumes the flag (clears it) and issues a fresh path
+   * request to the unit's current destination.
+   */
+  needsRepath: boolean;
   /** Vertical velocity in m/s. Negative = falling. Reset to 0 on landing. */
   vy: number;
   /** Mass in kg — see UnitConfig.massKg. */
@@ -674,6 +682,7 @@ export class UnitManager {
       distanceWalked: 0,
       lastTrackDistance: 0,
       blockedFrames: 0,
+      needsRepath: false,
       vy: 0,
       massKg: cfg.massKg,
       terminalFallSpeed: cfg.terminalFallSpeed,
@@ -715,6 +724,7 @@ export class UnitManager {
       unit.path = [];
       unit.carveCooldown = 0;
       unit.blockedFrames = 0;
+      unit.needsRepath = false;
       return;
     }
     let i = 0;
@@ -741,6 +751,7 @@ export class UnitManager {
     unit.path = waypoints.slice(i);
     unit.carveCooldown = 0;
     unit.blockedFrames = 0;
+    unit.needsRepath = false;
   }
 
   tick(
@@ -862,9 +873,15 @@ export class UnitManager {
     let moved = 0;
     if (this.unitCollidesAt(u, nx, nz)) {
       u.blockedFrames++;
+      // Latch the repath request the first frame we cross the threshold —
+      // strict equality so we set the flag exactly once per stuck stretch.
+      // The harness will clear it (and reset blockedFrames via setPath) when
+      // a fresh route is in hand.
+      if (u.blockedFrames === BLOCKED_REPATH_FRAMES) u.needsRepath = true;
       if (u.blockedFrames > BLOCKED_GIVE_UP_FRAMES) {
         u.path = [];
         u.blockedFrames = 0;
+        u.needsRepath = false;
         if (u.kind === 'dozer') u.levelTargetY = null;
       }
     } else {
@@ -970,9 +987,13 @@ export class UnitManager {
     }
     if (this.unitCollidesAt(u, nextX, nextZ)) {
       u.blockedFrames++;
+      // Same one-shot latch as tickSurface — the harness sees the flag, asks
+      // for a fresh route, and the resulting setPath() resets blockedFrames.
+      if (u.blockedFrames === BLOCKED_REPATH_FRAMES) u.needsRepath = true;
       if (u.blockedFrames > BLOCKED_GIVE_UP_FRAMES) {
         u.path = [];
         u.blockedFrames = 0;
+        u.needsRepath = false;
       }
     } else {
       u.x = nextX; u.y = nextY; u.z = nextZ;
@@ -1109,12 +1130,19 @@ export class UnitManager {
  * `widthMeters * 0.5` so two units in adjacent formation slots can stand
  * shoulder to shoulder without the planner refusing to seat them.
  */
-function unitCollisionRadius(u: Unit): number {
+export function unitCollisionRadius(u: Unit): number {
   return Math.max(0.3, u.widthMeters * 0.45);
 }
 
 /** Frames a unit can be blocked by a peer before its path is dropped. */
 const BLOCKED_GIVE_UP_FRAMES = 240;
+/**
+ * Frames a unit must stay collision-blocked before it asks the harness to
+ * recompute its route around the offending peer. Smaller than the give-up
+ * timer so the unit retries pathing well before it abandons the move; the
+ * give-up timer remains the absolute fallback if even the new route fails.
+ */
+export const BLOCKED_REPATH_FRAMES = 30;
 
 /**
  * True when the unit is meaningfully below the local surface — used to suppress the

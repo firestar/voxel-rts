@@ -61,12 +61,15 @@ self.onmessage = (ev: MessageEvent<Message>) => {
         break;
       }
       const r = findPathSurface(nav, ws2, msg.req);
+      // Pass the workspace's unit-obstacle mask into the smoother so post-pass
+      // shortcuts don't slice straight through a peer that A* routed around.
       const smoothed = r.cells.length > 2
         ? smoothPath(
             nav, r.cells,
             msg.req.footprintRadius, msg.req.maxStepVoxels,
             msg.req.bodyHalfCells, msg.req.bodyRoughnessVoxels,
             msg.req.headroomVoxels,
+            ws2.unitBlock,
           )
         : r.cells;
       (self as unknown as Worker).postMessage({

@@ -30,6 +30,13 @@ export interface AStarRequest {
   routeSeed?: number;
   /** Hard cap on expansions (combined across forward + backward) before bailing. */
   maxExpansions?: number;
+  /**
+   * Nav-cell indices treated as blocked by other (stationary) units for this query.
+   * The start and goal cells are exempt — even if listed, they pass through so a unit
+   * standing on top of a "blocked" cell can still leave it and a goal under another
+   * unit can still be approached.
+   */
+  unitObstacles?: number[];
 }
 
 export interface AStarResult {
@@ -111,6 +118,13 @@ export class AStarWorkspace {
   readonly bClosed = new Uint8Array(NAV_COUNT);
   readonly bGen = new Int32Array(NAV_COUNT);
   readonly bOpen = new FourAryHeap(2048);
+  /**
+   * Per-call mask of cells blocked by other units. Stamped in by `markUnitObstacles`
+   * before each search and cleared on the next call. The smoother reads the same
+   * buffer so post-pass shortcuts don't slice through a blocking peer.
+   */
+  readonly unitBlock = new Uint8Array(NAV_COUNT);
+  private unitBlockMarks: number[] = [];
   private genTick = 0;
 
   resetGeneration(): number {
@@ -123,6 +137,27 @@ export class AStarWorkspace {
     this.fOpen.clear();
     this.bOpen.clear();
     return this.genTick;
+  }
+
+  markUnitObstacles(indices: readonly number[] | undefined, exemptStart: number, exemptGoal: number): void {
+    this.clearUnitObstacles();
+    if (!indices) return;
+    for (let k = 0; k < indices.length; k++) {
+      const i = indices[k]!;
+      if (i === exemptStart || i === exemptGoal) continue;
+      if (i < 0 || i >= NAV_COUNT) continue;
+      if (this.unitBlock[i] === 0) {
+        this.unitBlock[i] = 1;
+        this.unitBlockMarks.push(i);
+      }
+    }
+  }
+
+  clearUnitObstacles(): void {
+    for (let k = 0; k < this.unitBlockMarks.length; k++) {
+      this.unitBlock[this.unitBlockMarks[k]!] = 0;
+    }
+    this.unitBlockMarks.length = 0;
   }
 }
 
@@ -200,6 +235,11 @@ export function findPathSurface(
   const startI = navIndex(startCx, startCz);
   const goalI = navIndex(goalCx, goalCz);
 
+  // Stamp the per-query unit-obstacle mask. Start and goal cells are always exempt
+  // so a unit standing on a "blocked" cell can still leave it. Cleared at the end
+  // of the search (and again at the start of the next one).
+  ws.markUnitObstacles(req.unitObstacles, startI, goalI);
+
   if (nav.blocked[startI] || nav.blocked[goalI]) {
     return { cells: [], reached: false, expanded: 0 };
   }
@@ -265,6 +305,7 @@ export function findPathSurface(
       const ni = navIndex(nx, nz);
       if (myClosed[ni] === gen) continue;
       if (nav.blocked[ni]) continue;
+      if (ws.unitBlock[ni] === 1) continue;
       const nyTop = nav.topY[ni]!;
       const dY = Math.abs(nyTop - cy);
       if (dY > maxStepVoxels) continue;
@@ -273,14 +314,18 @@ export function findPathSurface(
       if (n >= 4) {
         const a = navIndex(cx + NB_DX[n]!, cz);
         const b = navIndex(cx, cz + NB_DZ[n]!);
+        const aBlocked = nav.blocked[a]! === 1 || ws.unitBlock[a] === 1;
+        const bBlocked = nav.blocked[b]! === 1 || ws.unitBlock[b] === 1;
         // No diagonal across a 1-cell void: even agile units can't leap a gap
-        // where both cardinals are blocked.
-        if (nav.blocked[a] && nav.blocked[b]) continue;
+        // where both cardinals are blocked. Stationary peers count as blockers
+        // here too, otherwise a unit could squeeze diagonally between two
+        // shoulder-to-shoulder neighbours.
+        if (aBlocked && bBlocked) continue;
         if (!agile) {
           // Vehicles also need at least one cardinal both passable AND within the
           // climb step — they can't squeeze through a wall corner.
-          const aOk = !nav.blocked[a] && Math.abs(nav.topY[a]! - cy) <= maxStepVoxels;
-          const bOk = !nav.blocked[b] && Math.abs(nav.topY[b]! - cy) <= maxStepVoxels;
+          const aOk = !aBlocked && Math.abs(nav.topY[a]! - cy) <= maxStepVoxels;
+          const bOk = !bBlocked && Math.abs(nav.topY[b]! - cy) <= maxStepVoxels;
           if (!aOk && !bOk) continue;
         }
       }

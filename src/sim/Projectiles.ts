@@ -196,7 +196,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   tank_shell: {
     kind: 'tank_shell',
     massKg: 18,
-    muzzleVelocity: 110,
+    muzzleVelocity: 27.5,
     dragPerSecond: 0.03,
     hitDamage: 80, hitRadiusMeters: 0.5,
     explosive: true, explosionPeak: 240, explosionRadiusMeters: 2.8,
@@ -214,7 +214,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   turret_shell: {
     kind: 'turret_shell',
     massKg: 14,
-    muzzleVelocity: 95,
+    muzzleVelocity: 23.75,
     dragPerSecond: 0.04,
     hitDamage: 70, hitRadiusMeters: 0.45,
     explosive: true, explosionPeak: 200, explosionRadiusMeters: 2.4,
