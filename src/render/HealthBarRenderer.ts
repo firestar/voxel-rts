@@ -95,17 +95,16 @@ export class HealthBarRenderer {
 }
 
 /**
- * Pack the worker's carry state and load timer into a small integer. Any
- * change rotates the key, which is enough for the cache check.
+ * Pack the worker's carry state into a small integer. Any change rotates
+ * the key, which is enough for the cache check.
  */
 function computeCarryKey(u: Unit): number {
   if (u.kind !== 'worker') return 0;
-  // 8-bit wood, 8-bit metals, 8-bit load decisecond — overflow is fine
-  // because we only need inequality detection.
+  // 8-bit wood, 8-bit metals — overflow is fine because we only need
+  // inequality detection.
   const wood = u.carrying.wood & 0xff;
   const metals = u.carrying.metals & 0xff;
-  const load = Math.min(255, Math.round(u.loadTimer * 10)) & 0xff;
-  return (wood << 16) | (metals << 8) | load;
+  return (wood << 8) | metals;
 }
 
 /**
@@ -117,7 +116,6 @@ function carryLineFor(u: Unit): string {
   const parts: string[] = [];
   if (u.carrying.wood > 0) parts.push(`${u.carrying.wood}W`);
   if (u.carrying.metals > 0) parts.push(`${u.carrying.metals}M`);
-  if (u.loadTimer > 0) parts.push(`load ${u.loadTimer.toFixed(1)}s`);
   return parts.join(' ');
 }
 
@@ -133,7 +131,6 @@ function hpBarYOffset(u: Unit): number {
     case 'tunneler':     return 3.6;
     case 'worm':         return 2.4;
     case 'dozer':        return 3.0;
-    case 'hauler':       return 3.4;
     case 'rocket_truck': return 3.6;
   }
 }

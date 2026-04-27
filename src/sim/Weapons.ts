@@ -179,7 +179,7 @@ export const WEAPONS: Record<WeaponKind, WeaponConfig> = {
     kind: 'aa_turret', label: 'AA flak turret',
     projectile: 'flak_shell', aimedBy: 'turret',
     aimToleranceRad: 0.18, aimSlewRadPerSec: 6.0,
-    fireInterval: 0.55, rangeMeters: 110, spreadRad: 0.02,
+    fireInterval: 0.55, rangeMeters: 150, spreadRad: 0.02,
     shotsPerBurst: 1, burstInterval: 0,
     velocityScale: 1.0,
     muzzleFlashRadius: 0.45, muzzleFlashSeconds: 0.10,

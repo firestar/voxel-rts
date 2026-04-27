@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { UnitManager } from '../src/sim/Units';
 import { Resources } from '../src/sim/Resources';
-import { PileManager } from '../src/sim/Piles';
 import { SaplingManager } from '../src/sim/Saplings';
 import { BuildingManager, STORAGE, checkFootprint } from '../src/sim/Buildings';
 import { tickWorkers, WORKER_CARRY_CAP } from '../src/sim/Workers';
@@ -29,7 +28,6 @@ interface Deps {
   units: UnitManager;
   world: VoxelWorld;
   buildings: BuildingManager;
-  piles: PileManager;
   saplings: SaplingManager;
   resources: Resources;
   taskBoard: WorkerTaskBoard;
@@ -42,7 +40,6 @@ function makeDeps(): Deps {
     units: new UnitManager(),
     world,
     buildings: new BuildingManager(),
-    piles: new PileManager(),
     saplings: new SaplingManager(),
     resources: new Resources(),
     taskBoard: new WorkerTaskBoard(),
@@ -55,7 +52,6 @@ function tick(deps: Deps, dt: number): void {
     units: deps.units,
     world: deps.world,
     buildings: deps.buildings,
-    piles: deps.piles,
     saplings: deps.saplings,
     resources: deps.resources,
     taskBoard: deps.taskBoard,
@@ -64,7 +60,7 @@ function tick(deps: Deps, dt: number): void {
   });
 }
 
-describe('harvester worker — chop tree', () => {
+describe('worker — chop tree', () => {
   let deps: Deps;
   beforeEach(() => { deps = makeDeps(); });
 
@@ -81,7 +77,6 @@ describe('harvester worker — chop tree', () => {
       (baseX + 0.5) * VOXEL_SIZE,
       (SURFACE_Y + 1) * VOXEL_SIZE,
       (baseZ + 0.5) * VOXEL_SIZE,
-      { workerRole: 'harvester' },
     );
     // Pre-set the chop task pointed at the lowest wood voxel so the auto-
     // scanner doesn't pick something far away (testing the action, not the
@@ -103,7 +98,7 @@ describe('harvester worker — chop tree', () => {
   });
 });
 
-describe('harvester worker — mine metal', () => {
+describe('worker — mine metal', () => {
   it('damages an exposed metal voxel and accumulates carry.metals', () => {
     const deps = makeDeps();
     const baseX = 200, baseZ = 200;
@@ -114,7 +109,6 @@ describe('harvester worker — mine metal', () => {
       (baseX + 0.5) * VOXEL_SIZE,
       (SURFACE_Y + 1) * VOXEL_SIZE,
       (baseZ + 0.5) * VOXEL_SIZE,
-      { workerRole: 'harvester' },
     );
     w.task = {
       kind: 'mine',
@@ -127,71 +121,45 @@ describe('harvester worker — mine metal', () => {
   });
 });
 
-describe('harvester worker — drops pile when full', () => {
-  it('drops a pile and clears carrying once total >= cap', () => {
+describe('worker — switches to deliver when full', () => {
+  it('switches task to deliver and keeps the carry buffer once total >= cap', () => {
     const deps = makeDeps();
-    const w = deps.units.spawn('worker', 50, 4, 50, { workerRole: 'harvester' });
+    const w = deps.units.spawn('worker', 50, 4, 50);
     w.carrying.wood = WORKER_CARRY_CAP; // already at cap
     tick(deps, 0.1);
-    expect(deps.piles.piles.length).toBe(1);
-    expect(deps.piles.piles[0]!.wood).toBe(WORKER_CARRY_CAP);
-    expect(w.carrying.wood).toBe(0);
-    expect(w.task.kind).toBe('idle');
+    expect(w.task.kind).toBe('deliver');
+    expect(w.carrying.wood).toBe(WORKER_CARRY_CAP);
   });
 });
 
-describe('transporter worker — picks up pile and delivers to storage', () => {
-  it('pile drops to zero and resources counter rises after delivery', () => {
+describe('worker — delivers carried resources to storage', () => {
+  it('drops carry into resources counter when in range of a storage door', () => {
     const deps = makeDeps();
     const nav = allocateNav(false);
     buildSurfaceNav(deps.world.buffers.voxels, nav);
-    // Place a storage at known coords and a pile within reach of where we
-    // teleport the transporter. Ticks happen in lockstep without routing —
-    // the test bypasses pathing by keeping the transporter close enough each
-    // step that INTERACT_REACH_M (1.6 m) is satisfied.
+    // Place a storage at known coords. The worker starts the test in
+    // 'deliver' state so the tick logic walks it to the storage door.
     const fp = checkFootprint(deps.world.buffers.voxels, nav, STORAGE, 40, 40);
     expect(fp.ok).toBe(true);
     deps.buildings.place(deps.world, STORAGE, fp.ox, fp.oz, fp.floorY);
-
-    const pile = deps.piles.drop(50, (SURFACE_Y + 1) * VOXEL_SIZE, 50, 3, 2);
-
-    const t = deps.units.spawn(
-      'worker',
-      pile.x, pile.y, pile.z,
-      { workerRole: 'transporter' },
-    );
-
-    // Pickup is now gated on a weight-scaled load timer. For 3 wood + 2
-    // metal that's ~1.6 seconds, so we need to step the tick repeatedly
-    // before the carrying buffer fills. We grant a generous budget and bail
-    // out once the pickup completes.
-    for (let i = 0; i < 40 && deps.piles.piles.length > 0; i++) {
-      tick(deps, 0.1);
-    }
-    expect(t.carrying.wood + t.carrying.metals).toBeGreaterThan(0);
-    expect(deps.piles.piles.length).toBe(0);
-
-    // Second tick (still at pile spot): task is now 'deliver'; routeWorker
-    // is called once because we're not at storage yet. Move the transporter
-    // to the storage door and tick again — they should drop off.
-    const door = deps.buildings.buildings[0]!;
-    const dpos = { x: (door.ox + door.spec.cellsW) * 1.0 + 1 * VOXEL_SIZE, y: (door.floorY + 1) * VOXEL_SIZE, z: (door.oz + door.spec.cellsD * 0.5) };
-    void dpos; // not used directly — we use nearestStorage to get the door
     const storage = deps.buildings.buildings[0]!;
-    // doorWorldPos lives in Buildings — re-use the helper indirectly through
-    // nearestStorage to confirm position calculation; then teleport.
-    const nearest = deps.buildings.nearestStorage(t.x, t.z)!;
-    expect(nearest.id).toBe(storage.id);
-    // Compute the door directly off the building rect.
+
+    const w = deps.units.spawn('worker', 50, 4, 50);
+    w.carrying.wood = 3;
+    w.carrying.metals = 2;
+    w.task = { kind: 'deliver' };
+
+    // Teleport the worker to the storage door so the in-range branch fires
+    // immediately rather than depending on path follow.
     const wxEnd = (storage.ox + storage.spec.cellsW) * 8; // NAV_CELL_VOXELS=8
     const wzMid = (storage.oz + storage.spec.cellsD * 0.5) * 8;
-    t.x = (wxEnd + 1) * VOXEL_SIZE;
-    t.y = (storage.floorY + 1) * VOXEL_SIZE;
-    t.z = wzMid * VOXEL_SIZE;
+    w.x = (wxEnd + 1) * VOXEL_SIZE;
+    w.y = (storage.floorY + 1) * VOXEL_SIZE;
+    w.z = wzMid * VOXEL_SIZE;
 
     tick(deps, 0.1);
-    expect(t.carrying.wood).toBe(0);
-    expect(t.carrying.metals).toBe(0);
+    expect(w.carrying.wood).toBe(0);
+    expect(w.carrying.metals).toBe(0);
     expect(deps.resources.wood).toBe(3);
     expect(deps.resources.metals).toBe(2);
   });

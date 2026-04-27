@@ -9,18 +9,23 @@ import { raycastVoxel } from '../voxel/Raycast';
 import { VOXEL_SIZE } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
 import { PathClient } from '../path/PathClient';
-import { UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest, ScoopRequest, DumpRequest, unitCollisionRadius } from '../sim/Units';
+import { UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest, unitCollisionRadius } from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
 import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS, NAV_CELL_VOXELS } from '../path/SurfaceNav';
 import { worldToVolumeCell, vnavIndex, getBit, VNAV_Y } from '../path/VolumeNav';
-import { trackDamageFor, M_DIRT, M_WOOD, M_METAL } from '../voxel/Materials';
+import {
+  trackDamageFor,
+  M_DIRT, M_WOOD, M_METAL,
+  M_GRASS, M_STONE, M_PATH, M_MUD,
+} from '../voxel/Materials';
+import type { MaterialId } from '../voxel/types';
 import { BuildingManager, BARRACKS, STORAGE, ALL_BUILDINGS, BuildingSpec, Building, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { BuildingRenderer } from '../render/BuildingRenderer';
+import { BuildingRangeIndicator } from '../render/BuildingRangeIndicator';
 import { PathPreview } from '../render/PathPreview';
 import { TargetMarker } from '../render/TargetMarker';
 import { Resources } from '../sim/Resources';
-import { PileManager } from '../sim/Piles';
 import { SaplingManager } from '../sim/Saplings';
 import { tickWorkers } from '../sim/Workers';
 import { WorkerTaskBoard, describeOrder } from '../sim/WorkerTasks';
@@ -40,9 +45,31 @@ import {
 /**
  * Player UI mode. `build*` modes preview a building footprint; `plant` mode
  * tells the next LMB-on-grass to dispatch a sapling-plant task to the
- * selected worker. `play` is everything else.
+ * selected worker. `terrain` is the sandbox / map-editor mode where LMB
+ * paints a sphere of the active material onto the world (shift-LMB carves
+ * one out). `play` is everything else.
  */
-type Mode = 'play' | 'build' | 'plant';
+type Mode = 'play' | 'build' | 'plant' | 'terrain';
+
+/**
+ * Material palette the terrain editor cycles through. Order maps to
+ * Digit1..Digit{N} while the editor is active. Bedrock and air are
+ * intentionally excluded — bedrock is indestructible, and air is reached
+ * via shift-LMB carve.
+ */
+const TERRAIN_PALETTE: { id: MaterialId; label: string }[] = [
+  { id: M_GRASS, label: 'grass' },
+  { id: M_DIRT,  label: 'dirt' },
+  { id: M_STONE, label: 'stone' },
+  { id: M_WOOD,  label: 'wood' },
+  { id: M_METAL, label: 'metal' },
+  { id: M_PATH,  label: 'path' },
+  { id: M_MUD,   label: 'mud' },
+];
+
+/** Brush radius bounds for the terrain editor, in voxel units. */
+const TERRAIN_BRUSH_MIN = 1;
+const TERRAIN_BRUSH_MAX = 12;
 
 export class Game {
   readonly renderer: Renderer;
@@ -55,13 +82,13 @@ export class Game {
   readonly unitRenderer = new UnitRenderer();
   readonly buildings = new BuildingManager();
   readonly buildingRenderer = new BuildingRenderer();
+  readonly buildingRange = new BuildingRangeIndicator();
   readonly ghost = new BuildingGhost();
   /** The spec the user will place next while in build mode. Cycled via 1..N keys. */
   private buildSpec: BuildingSpec = BARRACKS;
   readonly pathPreview = new PathPreview();
   readonly target = new TargetMarker();
   readonly resources = new Resources();
-  readonly piles = new PileManager();
   readonly saplings = new SaplingManager();
   readonly taskBoard = new WorkerTaskBoard();
   readonly projectiles = new ProjectileManager();
@@ -94,6 +121,10 @@ export class Game {
   /** Last rendered task-panel signature. Same purpose as `actionsRenderedKey`. */
   private tasksRenderedKey = '';
   private mode: Mode = 'play';
+  /** Active terrain-editor material (palette index). Persists across mode toggles. */
+  private terrainPaletteIdx = 0;
+  /** Active terrain-editor brush radius, in voxels. */
+  private terrainBrushRadius = 3;
   /**
    * Y-axis cutoff (in meters). Anything at or above this Y is rendered at 5%
    * opacity so the player can see underground tunnels through it. Raycasts —
@@ -129,6 +160,7 @@ export class Game {
     this.renderer.scene.add(this.debris.mesh);
     this.renderer.scene.add(this.unitRenderer.group);
     this.renderer.scene.add(this.buildingRenderer.group);
+    this.renderer.scene.add(this.buildingRange.group);
     this.renderer.scene.add(this.ghost.group);
     this.renderer.scene.add(this.pathPreview.object);
     this.renderer.scene.add(this.target.group);
@@ -193,7 +225,6 @@ export class Game {
     this.spawnUnit('tunneler', c.x - 2.0, c.y, c.z);
     this.spawnUnit('worm', c.x + 0.5, c.y, c.z + 4.0);
     this.spawnUnit('dozer', c.x + 5.0, c.y, c.z + 1.5);
-    this.spawnUnit('hauler', c.x - 5.0, c.y, c.z + 1.5);
     // Vehicle rocket platforms — one cluster, one heavy. The cluster_pod is
     // the rocket_truck default; the heavy platform spawns with the
     // single-warhead rocket_pod weapon override.
@@ -205,14 +236,14 @@ export class Game {
     this.units.spawn('soldier', c.x - 1.5, c.y, c.z - 2.0, { weapon: 'machine_gun' });
     this.units.spawn('soldier', c.x + 0.0, c.y, c.z - 3.0, { weapon: 'rpg_launcher' });
     this.units.spawn('soldier', c.x + 2.5, c.y, c.z - 3.0, { weapon: 'pistol' });
-    // Two harvester workers + one transporter so the player sees the
-    // economy loop running from the first frame. They auto-pick targets
-    // via tickWorkers — the player can still override with click commands.
-    this.spawnWorker('harvester', c.x - 4.0, c.y, c.z + 1.0);
-    this.spawnWorker('harvester', c.x - 4.5, c.y, c.z - 1.0);
-    this.spawnWorker('transporter', c.x - 3.0, c.y, c.z + 2.5);
+    // Three workers so the player sees the economy loop running from the
+    // first frame. They auto-pick targets via tickWorkers — the player can
+    // still override with click commands.
+    this.spawnWorker(c.x - 4.0, c.y, c.z + 1.0);
+    this.spawnWorker(c.x - 4.5, c.y, c.z - 1.0);
+    this.spawnWorker(c.x - 3.0, c.y, c.z + 2.5);
 
-    // Place a starter Storage depot near spawn so transporters always have a
+    // Place a starter Storage depot near spawn so workers always have a
     // delivery target. We try a handful of candidate footprints around the
     // central flat cell; first valid wins. If none is valid (very rare on a
     // generated world) we just skip — the player can build one manually.
@@ -236,8 +267,8 @@ export class Game {
     return this.units.spawn(kind, x, y, z);
   }
 
-  private spawnWorker(role: 'harvester' | 'transporter', x: number, y: number, z: number): Unit | null {
-    return this.units.spawn('worker', x, y, z, { workerRole: role });
+  private spawnWorker(x: number, y: number, z: number): Unit | null {
+    return this.units.spawn('worker', x, y, z);
   }
 
   start(): void {
@@ -296,19 +327,39 @@ export class Game {
       this.mode = this.mode === 'plant' ? 'play' : 'plant';
       this.ghost.hide();
     }
+    // Sandbox / map-editor terrain edit mode. Toggled with G; while active,
+    // LMB paints a sphere of the active material and shift-LMB carves one
+    // out. Material is cycled via the digit keys (overriding the build-mode
+    // cycle for as long as terrain mode is on); brush radius is adjusted
+    // with comma / period.
+    if (this.input.pressed.has('KeyG')) {
+      this.mode = this.mode === 'terrain' ? 'play' : 'terrain';
+      this.ghost.hide();
+    }
     if (this.input.pressed.has('Escape') && this.mode !== 'play') {
       this.mode = 'play';
       this.ghost.hide();
     }
-    // Cycle building spec via Digit1..Digit{ALL_BUILDINGS.length}. Works in either
-    // mode — pressing a digit also enters build mode so the user doesn't have to
-    // hit B first.
-    for (let i = 0; i < ALL_BUILDINGS.length; i++) {
-      const code = `Digit${i + 1}`;
-      if (this.input.pressed.has(code)) {
-        this.buildSpec = ALL_BUILDINGS[i]!;
-        this.ghost.setSpec(this.buildSpec);
-        this.mode = 'build';
+    if (this.mode === 'terrain') {
+      // In terrain mode the digit row picks a palette material instead of
+      // entering build mode. Bracket / period keys nudge the brush radius.
+      for (let i = 0; i < TERRAIN_PALETTE.length; i++) {
+        const code = `Digit${i + 1}`;
+        if (this.input.pressed.has(code)) this.terrainPaletteIdx = i;
+      }
+      if (this.input.pressed.has('Comma'))  this.terrainBrushRadius = Math.max(TERRAIN_BRUSH_MIN, this.terrainBrushRadius - 1);
+      if (this.input.pressed.has('Period')) this.terrainBrushRadius = Math.min(TERRAIN_BRUSH_MAX, this.terrainBrushRadius + 1);
+    } else {
+      // Cycle building spec via Digit1..Digit{ALL_BUILDINGS.length}. Works in either
+      // mode — pressing a digit also enters build mode so the user doesn't have to
+      // hit B first.
+      for (let i = 0; i < ALL_BUILDINGS.length; i++) {
+        const code = `Digit${i + 1}`;
+        if (this.input.pressed.has(code)) {
+          this.buildSpec = ALL_BUILDINGS[i]!;
+          this.ghost.setSpec(this.buildSpec);
+          this.mode = 'build';
+        }
       }
     }
     if (this.input.pressed.has('Tab')) this.cycleSelection();
@@ -407,7 +458,6 @@ export class Game {
         units: this.units,
         world: this.world,
         buildings: this.buildings,
-        piles: this.piles,
         saplings: this.saplings,
         resources: this.resources,
         taskBoard: this.taskBoard,
@@ -420,6 +470,7 @@ export class Game {
     this.unitRenderer.update(this.units);
     this.healthBars.update(this.units.units);
     this.buildingRenderer.update(this.buildings.buildings);
+    this.buildingRange.show(this.buildings.getSelected());
     this.projectileRenderer.update(this.projectiles);
     this.updateProjectileArcs();
     this.muzzleFlashes.update(dt);
@@ -444,7 +495,7 @@ export class Game {
     if (this.fpsTimer >= 0.5 && this.fpsEl) {
       const fps = this.fpsCount / this.fpsAcc;
       const r = this.resources;
-      this.fpsEl.textContent = `FPS ${fps.toFixed(0)} | meshed ${this.meshes.getMeshCount()} | inflight ${this.meshes.getInflight()} | units ${this.units.units.length} | buildings ${this.buildings.buildings.length} | wood ${r.wood} metals ${r.metals} food ${r.food} | piles ${this.piles.piles.length}`;
+      this.fpsEl.textContent = `FPS ${fps.toFixed(0)} | meshed ${this.meshes.getMeshCount()} | inflight ${this.meshes.getInflight()} | units ${this.units.units.length} | buildings ${this.buildings.buildings.length} | wood ${r.wood} metals ${r.metals} food ${r.food}`;
       this.fpsAcc = 0; this.fpsCount = 0; this.fpsTimer = 0;
     }
     if (this.modeEl) {
@@ -454,7 +505,7 @@ export class Game {
         ? 'none'
         : selected.length > 1
           ? `${selected.length} units (lead: ${sel.kind} #${sel.id})`
-          : sel.kind === 'worker' ? `worker(${sel.workerRole}) #${sel.id}` : `${sel.kind} #${sel.id}`;
+          : `${sel.kind} #${sel.id}`;
       const weaponDesc = sel && selected.length === 1 && sel.weapon !== null
         ? ` weapon: ${WEAPONS[sel.weapon].label} (RMB to fire, drag Y for altitude)`
         : sel && selected.length === 1 && sel.canDig
@@ -464,7 +515,9 @@ export class Game {
         ? `MODE: BUILD ${this.buildSpec.label} (LMB place, B/1-${ALL_BUILDINGS.length} cycle, Esc cancel)`
         : this.mode === 'plant'
           ? 'MODE: PLANT SAPLING (LMB on grass, P cancel)'
-          : 'MODE: PLAY';
+          : this.mode === 'terrain'
+            ? `MODE: TERRAIN EDIT — ${TERRAIN_PALETTE[this.terrainPaletteIdx]!.label} r=${this.terrainBrushRadius} (LMB paint, shift+LMB carve, 1-${TERRAIN_PALETTE.length} material, ,/. brush, G/Esc exit)`
+            : 'MODE: PLAY';
       this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}${weaponDesc}`;
     }
     this.renderActionPanel();
@@ -605,7 +658,7 @@ export class Game {
 
   private updateLmbPreview(w: number, h: number): void {
     const hold = this.input.hold;
-    if (!hold || isBuildMode(this.mode) || this.mode === 'plant' || hold.shift) {
+    if (!hold || isBuildMode(this.mode) || this.mode === 'plant' || this.mode === 'terrain' || hold.shift) {
       this.target.hide();
       return;
     }
@@ -797,6 +850,16 @@ export class Game {
       return;
     }
 
+    if (this.mode === 'terrain') {
+      // Sandbox / map-editor: LMB paints a sphere of the active material at
+      // the clicked voxel, shift-LMB carves voxels out instead. Drag is
+      // ignored — only the release point matters; the player can hold the
+      // gesture and click again to extend a stroke.
+      const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
+      if (r) this.applyTerrainEdit(r.voxelXYZ, release.shift);
+      return;
+    }
+
     // Box-select on drag (play mode only). Shift makes it additive.
     if (dragged && this.mode === 'play') {
       this.boxSelect(release.startX, release.startY, release.endX, release.endY, w, h, release.shift);
@@ -812,13 +875,13 @@ export class Game {
     }
 
     if (this.mode === 'plant') {
-      // Plant mode: a harvester needs to be selected, but the actual
-      // assignment runs through the global task board so the same plant
-      // order survives if the chosen worker dies / is reassigned. Any free
-      // harvester will pick it up next tick.
+      // Plant mode: a worker needs to be selected, but the actual assignment
+      // runs through the global task board so the same plant order survives
+      // if the chosen worker dies / is reassigned. Any free worker will
+      // pick it up next tick.
       const selected = this.units.units.find(u => u.selected);
       const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
-      if (!r || !selected || selected.kind !== 'worker' || selected.workerRole !== 'harvester') return;
+      if (!r || !selected || selected.kind !== 'worker') return;
       const wx = r.target.x, wz = r.target.z;
       this.taskBoard.addPlant(wx, wz);
       return;
@@ -876,15 +939,14 @@ export class Game {
 
   /**
    * Single-unit command path — preserves the per-kind tasking we already had:
-   * harvesters chop / mine specific voxels; dozers latch their level Y;
-   * haulers attach a load/dump job.
+   * workers chop / mine specific voxels; dozers latch their level Y.
    */
   private commandSingle(
     selected: Unit,
     r: { surface: THREE.Vector3; target: THREE.Vector3; voxelXYZ: { x: number; y: number; z: number; nx: number; ny: number; nz: number } },
     forceSurface = false,
   ): void {
-    if (selected.kind === 'worker' && selected.workerRole === 'harvester') {
+    if (selected.kind === 'worker') {
       const m = this.world.get(r.voxelXYZ.x, r.voxelXYZ.y, r.voxelXYZ.z);
       if (m === M_WOOD) {
         selected.task = {
@@ -910,9 +972,6 @@ export class Game {
     }
     if (selected.kind === 'dozer') {
       selected.levelTargetY = r.voxelXYZ.y;
-    } else if (selected.kind === 'hauler') {
-      const mode = selected.spoilLoad > 0 ? 'dump' : 'load';
-      selected.haulerJob = { vx: r.voxelXYZ.x, vz: r.voxelXYZ.z, mode };
     }
     void this.routePath(selected, r.target.x, r.target.y, r.target.z, { forceSurface });
   }
@@ -928,7 +987,6 @@ export class Game {
     for (const s of slots) {
       const u = s.unit;
       if (u.kind === 'dozer') u.levelTargetY = null;
-      if (u.kind === 'hauler') u.haulerJob = null;
       if (u.kind === 'worker') u.task = { kind: 'idle' };
       void this.routePath(u, s.x, u.y, s.z);
     }
@@ -980,13 +1038,34 @@ export class Game {
     this.removeDeadUnits();
   }
 
+  /**
+   * Sandbox / map-editor terrain edit. Paints (or carves) a sphere of voxels
+   * around the picked voxel. The sphere is centred slightly outside the hit
+   * face when painting so a click on flat ground stacks new material on top
+   * rather than burying half the brush inside the existing surface; carving
+   * centres on the hit voxel itself so a click directly removes that voxel.
+   * Bedrock is preserved by the underlying VoxelWorld helpers.
+   */
+  private applyTerrainEdit(
+    hit: { x: number; y: number; z: number; nx: number; ny: number; nz: number },
+    carve: boolean,
+  ): void {
+    const radius = this.terrainBrushRadius;
+    const offset = carve ? 0 : 0.5;
+    const cx = hit.x + 0.5 + hit.nx * offset;
+    const cy = hit.y + 0.5 + hit.ny * offset;
+    const cz = hit.z + 0.5 + hit.nz * offset;
+    const changed = carve
+      ? this.world.carveSphere(cx, cy, cz, radius)
+      : this.world.fillSphere(cx, cy, cz, radius, TERRAIN_PALETTE[this.terrainPaletteIdx]!.id);
+    if (changed > 0) this.requestNavRebuild();
+  }
+
   /** Single dispatch for every kind of world edit a unit can request. */
   private handleWorldEdit(req: WorldEditRequest): void {
     switch (req.kind) {
       case 'carve': this.handleCarve(req); return;
       case 'level': this.handleLevel(req); return;
-      case 'scoop': this.handleScoop(req); return;
-      case 'dump':  this.handleDump(req); return;
     }
   }
 
@@ -1081,24 +1160,6 @@ export class Game {
       }
     }
     if (touched) this.requestNavRebuild(false);
-  }
-
-  private handleScoop(req: ScoopRequest): void {
-    if (req.maxVoxels <= 0) return;
-    const taken = this.world.scoopColumn(req.vx, req.vz, req.maxVoxels);
-    if (taken > 0) {
-      req.unit.spoilLoad = Math.min(req.unit.spoilCapacity, req.unit.spoilLoad + taken);
-      this.requestNavRebuild(false);
-    }
-  }
-
-  private handleDump(req: DumpRequest): void {
-    if (req.voxels <= 0) return;
-    const placed = this.world.dumpColumn(req.vx, req.vz, req.voxels, req.material);
-    if (placed > 0) {
-      req.unit.spoilLoad = Math.max(0, req.unit.spoilLoad - placed);
-      this.requestNavRebuild(false);
-    }
   }
 
   private requestNavRebuild(replan = true): void {
@@ -1472,9 +1533,7 @@ export class Game {
       // Worker → farm gesture only fires on a short click (no drag), so the
       // existing camera-yaw drag still works for unarmed selections.
       if (this.isDragging(release.startX, release.startY, release.endX, release.endY)) return;
-      // Only harvesters tend farms — transporters' tick state machine doesn't
-      // know how to handle the 'farm' task and would just reset it to idle.
-      const worker = this.units.units.find(u => u.selected && u.kind === 'worker' && u.workerRole === 'harvester');
+      const worker = this.units.units.find(u => u.selected && u.kind === 'worker');
       if (!worker) return;
       const b = this.pickBuildingAt(release.startX, release.startY, w, h);
       if (!b || b.spec.kind !== 'farm') return;
@@ -1821,9 +1880,7 @@ export class Game {
       if (key !== this.actionsRenderedKey) {
         const title = selUnits.length > 1
           ? `${selUnits.length} units selected`
-          : lead.kind === 'worker'
-            ? `Worker (${lead.workerRole}) #${lead.id}`
-            : `${lead.kind} #${lead.id}`;
+          : `${lead.kind} #${lead.id}`;
         this.buildActionsDom(
           title,
           'Unit',
@@ -1908,7 +1965,7 @@ export class Game {
     if (!this.tasksEl) return;
     const orders = this.taskBoard.snapshot();
     const key = orders
-      .map(o => `${o.id}:${o.kind}:${o.claimedBy}:${o.pileId ?? ''}:${o.buildingId ?? ''}:${o.wx ?? ''}:${o.wz ?? ''}`)
+      .map(o => `${o.id}:${o.kind}:${o.claimedBy}:${o.buildingId ?? ''}:${o.wx ?? ''}:${o.wz ?? ''}`)
       .join('|');
     if (key === this.tasksRenderedKey) return;
     this.tasksRenderedKey = key;
@@ -1932,7 +1989,7 @@ export class Game {
       k.textContent = o.kind;
       const d = document.createElement('span');
       d.className = 'task-detail';
-      d.textContent = describeOrder(o, this.piles, this.buildings);
+      d.textContent = describeOrder(o, this.buildings);
       const c = document.createElement('span');
       c.className = 'task-claim';
       c.textContent = o.claimedBy !== 0 ? `→ #${o.claimedBy}` : 'queued';
