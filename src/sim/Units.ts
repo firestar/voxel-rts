@@ -1,7 +1,7 @@
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { VOXEL_SIZE, WORLD_X, WORLD_Y, WORLD_Z, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
-import { digSpeedMultiplier, groundSpeedMultiplier, M_WOOD, M_LEAF, M_DIRT } from '../voxel/Materials';
+import { digSpeedMultiplier, groundSpeedMultiplier, M_WOOD, M_LEAF } from '../voxel/Materials';
 import {
   worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers,
 } from '../path/VolumeNav';
@@ -13,7 +13,7 @@ import {
 import { WeaponKind, WEAPONS, defaultWeaponFor } from './Weapons';
 import { ProjectileKind } from './Projectiles';
 
-export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'hauler' | 'rocket_truck';
+export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'rocket_truck';
 
 /**
  * Faction the unit belongs to. The player owns 'player' units; 'enemy' units are
@@ -31,34 +31,24 @@ export type Team = 'player' | 'enemy';
 export type CombatStance = 'aggressive' | 'defensive';
 
 /**
- * Worker role. Harvesters auto-find resources (trees, exposed metal ore) and
- * mine them, dropping piles when full. Transporters watch piles and ferry
- * them to storage buildings. Both share the same UnitKind, geometry, and
- * config — only the `tickWorkers` automation differentiates them.
- */
-export type WorkerRole = 'harvester' | 'transporter';
-
-/**
  * Worker task — what the per-frame `tickWorkers` automation should do for
  * this worker right now. The state machine lives in `Workers.ts`; this is
  * just the shape it stores on each Unit.
  */
 export type WorkerTask =
   | { kind: 'idle' }
-  /** Harvester chopping a wood voxel at the given world meters. */
+  /** Worker chopping a wood voxel at the given world meters. */
   | { kind: 'chop'; wx: number; wy: number; wz: number }
-  /** Harvester mining a metal-ore voxel at the given world meters. */
+  /** Worker mining a metal-ore voxel at the given world meters. */
   | { kind: 'mine'; wx: number; wy: number; wz: number }
   /** Player-issued plant action; once at target xz, calls SaplingManager.plant. */
   | { kind: 'plant'; wx: number; wz: number }
-  /** Transporter is en-route to claimedPileId. */
-  | { kind: 'fetchPile'; pileId: number }
-  /** Carrying resources back to a storage building (transporter or harvester). */
+  /** Carrying a full load back to the nearest storage building. */
   | { kind: 'deliver' }
   /** Player-assigned dedicated farmer — tends a specific farm building so its
    *  crop progress advances faster than the slow ambient growth rate. */
   | { kind: 'farm'; buildingId: number }
-  /** Harvester is collecting a ripe crop from a specific farm — auto-picked
+  /** Worker is collecting a ripe crop from a specific farm — auto-picked
    *  in `assignNextHarvestTask` when a `cropReady` farm is in range. */
   | { kind: 'harvestFarm'; buildingId: number };
 
@@ -128,7 +118,7 @@ interface UnitConfig {
    * weapon catalog's muzzleVelocity * velocityScale is clamped to this on
    * every shot, so a soldier's shoulder-fired weapon can't reach the same
    * range as a tank's main gun even if you somehow gave them the same round.
-   * Set to 0 for non-combatant kinds (workers, dozer, hauler, diggers).
+   * Set to 0 for non-combatant kinds (workers, dozer, diggers).
    */
   launcherMaxStrength: number;
 }
@@ -278,7 +268,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       // ahead of the blade is levelled to `levelTargetY`. Cut volume goes into the
       // unit's spoilLoad up to spoilCapacityVoxels; fill draws from the same load.
       // Excess (when the load saturates) is dropped behind the unit as a M_DIRT
-      // spoil mound the hauler can later collect.
+      // spoil mound.
       //   Footprint mirrors the tank (2-cell radius, ~2.6 m wide chassis).
       //   Speed is somewhat slower than the tank — heavier vehicle pushing earth.
       return {
@@ -307,36 +297,9 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         spoilCapacityVoxels: 4096,
         launcherMaxStrength: 0,
       };
-    case 'hauler':
-      // Dump truck. Carries up to spoilCapacityVoxels of loose voxels. A single
-      // click commands one job, picked from the unit's current load:
-      //   - Empty hauler  → drive to the click XZ, scoop up to capacity from
-      //     the top of that column.
-      //   - Loaded hauler → drive to the click XZ, dump the entire load on top
-      //     of that column as M_DIRT.
-      // Triple the dozer's capacity so a hauler trip is meaningful relative to
-      // the spoil one dozer pass produces.
-      return {
-        footprintRadius: 2, widthMeters: 2.4,
-        maxStepVoxels: 4, slopePenalty: 0.25,
-        bodyHalfCells: 1, bodyRoughnessVoxels: 5,
-        turnRateRadPerSec: 1.4,
-        maxPitchRad: Math.PI / 6,
-        heightVoxels: 18,
-        canDig: false, requiresGround: true,
-        speed: 4.0, speedDigging: 0,
-        hp: 200,
-        massKg: 25_000,                          // 25 t
-        terminalFallSpeed: 40,
-        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
-        segmentCount: 0, segmentSpacing: 0,
-        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
-        spoilCapacityVoxels: 12_288,
-        launcherMaxStrength: 0,
-      };
     case 'rocket_truck':
-      // Rocket-launcher platform. Same chassis class as a hauler (wheeled, can't
-      // dig, fairly nimble), but carries a yawing rocket pod on the deck. The
+      // Rocket-launcher platform. Wheeled, can't dig, fairly nimble — carries
+      // a yawing rocket pod on the deck. The
       // pod aims independently of the hull — the hull keeps doing path follow,
       // the pod swings around to face the firing target. Ammunition is
       // configured via the unit's `weapon` field (cluster_pod by default;
@@ -414,15 +377,9 @@ export interface Unit {
   cutterForward: number;
   cutterHeight: number;
   /**
-   * Worker role — only meaningful when `kind === 'worker'`. Defaults to
-   * 'harvester' for non-worker spawns; tickWorkers ignores non-workers
-   * entirely so the value is harmless.
-   */
-  workerRole: WorkerRole;
-  /**
    * Worker's current automation task. 'idle' means tickWorkers will pick a
-   * new task next frame (find nearest tree / ore for harvesters; nearest
-   * pile for transporters). Non-workers always carry { kind: 'idle' }.
+   * new task next frame (find nearest tree / ore). Non-workers always carry
+   * { kind: 'idle' }.
    */
   task: WorkerTask;
   /**
@@ -443,14 +400,6 @@ export interface Unit {
    * tell when something tangible advanced.
    */
   taskProgressKey: number;
-  /**
-   * Seconds remaining on a transporter's pickup animation. Set when the
-   * transporter reaches a pile; ticks down each frame; the actual transfer
-   * doesn't fire until it hits 0. Scaled by the pile's material weight so
-   * a heavy metal pile takes meaningfully longer to load than a wood pile.
-   * 0 means "no load in progress".
-   */
-  loadTimer: number;
   /**
    * TaskBoard order id this worker has claimed, or 0 when none. Cleared on
    * task completion, on stall, and when the worker dies — `releaseDead`
@@ -483,20 +432,17 @@ export interface Unit {
    * `spoilCapacity` — max load.
    * `levelTargetY` — voxel-space Y the dozer levels every column it sweeps to.
    *   Set by Game.handleRelease from the click's voxel y; cleared on path drop.
-   * `haulerJob` — pending one-shot job for the hauler. Set when the player
-   *   issues a command; consumed when the unit reaches the goal column.
    */
   spoilLoad: number;
   spoilCapacity: number;
   levelTargetY: number | null;
-  haulerJob: HaulerJob | null;
   /** Cached blade dimensions, copied from the config so the renderer + sim share them. */
   bladeHalfWidthMeters: number;
   bladeForwardMeters: number;
   bladeDepthMeters: number;
   /**
    * Weapon currently mounted on this unit, or null if the unit is unarmed
-   * (workers, tunneler, dozer, hauler, worm). The default is filled from
+   * (workers, tunneler, dozer, worm). The default is filled from
    * `defaultWeaponFor(kind)` at spawn time and can be overridden via
    * `UnitManager.spawn` opts.
    */
@@ -565,15 +511,6 @@ export interface FiringTarget {
   projectileOverride?: ProjectileKind;
 }
 
-/** Pending hauler one-shot. Resolved into one ScoopRequest or DumpRequest on arrival. */
-export interface HaulerJob {
-  /** Voxel-space target column. */
-  vx: number;
-  vz: number;
-  /** Snapshot of mode at command time — captures the intent at click. */
-  mode: 'load' | 'dump';
-}
-
 /** Minimum head movement between recorded breadcrumbs, meters. Smaller values
  *  give finer curve resolution at the cost of a longer history; 0.15 m keeps the
  *  buffer to ~60 entries even for the longest chain. */
@@ -628,24 +565,7 @@ export interface LevelRequest {
   targetVoxY: number;
 }
 
-/** One-shot scoop: take up to `maxVoxels` from the top of voxel column (vx, vz). */
-export interface ScoopRequest {
-  kind: 'scoop';
-  unit: Unit;
-  vx: number; vz: number;
-  maxVoxels: number;
-}
-
-/** One-shot dump: stack `voxels` of `material` on top of column (vx, vz). */
-export interface DumpRequest {
-  kind: 'dump';
-  unit: Unit;
-  vx: number; vz: number;
-  voxels: number;
-  material: number;
-}
-
-export type WorldEditRequest = CarveRequest | LevelRequest | ScoopRequest | DumpRequest;
+export type WorldEditRequest = CarveRequest | LevelRequest;
 
 
 export class UnitManager {
@@ -655,7 +575,7 @@ export class UnitManager {
   spawn(
     kind: UnitKind,
     x: number, y: number, z: number,
-    opts?: { workerRole?: WorkerRole; weapon?: WeaponKind | null; team?: Team; stance?: CombatStance },
+    opts?: { weapon?: WeaponKind | null; team?: Team; stance?: CombatStance },
   ): Unit {
     const cfg = unitConfig(kind);
     const segments: WormSegment[] = [];
@@ -716,19 +636,16 @@ export class UnitManager {
       cutterRadius: cfg.cutterRadius,
       cutterForward: cfg.cutterForward,
       cutterHeight: cfg.cutterHeight,
-      workerRole: opts?.workerRole ?? 'harvester',
       task: { kind: 'idle' },
       carrying: { wood: 0, metals: 0 },
       taskStallTimer: 0,
       taskProgressKey: 0,
-      loadTimer: 0,
       claimedOrderId: 0,
       segments,
       pathHistory,
       spoilLoad: 0,
       spoilCapacity: cfg.spoilCapacityVoxels,
       levelTargetY: null,
-      haulerJob: null,
       bladeHalfWidthMeters: cfg.bladeHalfWidthMeters,
       bladeForwardMeters: cfg.bladeForwardMeters,
       bladeDepthMeters: cfg.bladeDepthMeters,
@@ -803,23 +720,6 @@ export class UnitManager {
           sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
         } else {
           relaxOrientation(u, dt);
-        }
-        // Hauler: a job persists on the unit until the path empties (i.e. the
-        // unit reached its goal cell). Emit exactly one scoop/dump request and
-        // clear the job so we don't fire it again on subsequent idle frames.
-        if (u.kind === 'hauler' && u.haulerJob !== null) {
-          const job = u.haulerJob;
-          u.haulerJob = null;
-          if (job.mode === 'load') {
-            const headroom = u.spoilCapacity - u.spoilLoad;
-            if (headroom > 0) {
-              worldEdit({ kind: 'scoop', unit: u, vx: job.vx, vz: job.vz, maxVoxels: headroom });
-            }
-          } else {
-            if (u.spoilLoad > 0) {
-              worldEdit({ kind: 'dump', unit: u, vx: job.vx, vz: job.vz, voxels: u.spoilLoad, material: M_DIRT });
-            }
-          }
         }
         // Dozer: stop levelling once the path completes.
         if (u.kind === 'dozer' && u.levelTargetY !== null) {

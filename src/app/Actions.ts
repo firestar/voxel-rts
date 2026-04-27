@@ -66,12 +66,11 @@ export const UNIT_ACTIONS: UnitAction[] = [
     label: 'Cancel task',
     key: 'KeyX',
     keyLabel: 'X',
-    applicable: (u) => u.kind === 'worker' || u.kind === 'dozer' || u.kind === 'hauler',
+    applicable: (u) => u.kind === 'worker' || u.kind === 'dozer',
     run: (units): void => {
       for (const u of units) {
         if (u.kind === 'worker') u.task = { kind: 'idle' };
         if (u.kind === 'dozer') u.levelTargetY = null;
-        if (u.kind === 'hauler') u.haulerJob = null;
       }
     },
   },
@@ -80,7 +79,7 @@ export const UNIT_ACTIONS: UnitAction[] = [
     label: 'Plant sapling',
     key: 'KeyJ',
     keyLabel: 'J',
-    applicable: (u) => u.kind === 'worker' && u.workerRole === 'harvester',
+    applicable: (u) => u.kind === 'worker',
     run: (_units, ctx): void => ctx.enterPlantMode(),
   },
   {
@@ -142,7 +141,6 @@ const TRAIN_KEYS: Record<UnitKind, { key: string; keyLabel: string }> = {
   tunneler:     { key: 'KeyT', keyLabel: 'T' },
   worm:         { key: 'KeyY', keyLabel: 'Y' },
   dozer:        { key: 'KeyU', keyLabel: 'U' },
-  hauler:       { key: 'KeyI', keyLabel: 'I' },
   worker:       { key: 'KeyO', keyLabel: 'O' },
   rocket_truck: { key: 'KeyN', keyLabel: 'N' },
 };
@@ -168,7 +166,6 @@ export const BUILDING_ACTIONS: BuildingAction[] = [
   trainAction('tunneler'),
   trainAction('worm'),
   trainAction('dozer'),
-  trainAction('hauler'),
   trainAction('worker'),
   trainAction('rocket_truck'),
   {

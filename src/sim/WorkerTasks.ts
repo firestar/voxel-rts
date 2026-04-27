@@ -1,19 +1,18 @@
 /**
  * Global queue of pending work for worker units.
  *
- * Each `WorkOrder` represents a discrete job that any free worker (with the
- * right role) can claim, work on, and complete. The board is the single
- * source of truth for what economy work the player has on the agenda — the
- * UI reads it to draw the right-side task list, the workers read it to pick
- * up jobs without all racing the same target, and stall recovery in
- * `tickWorkers` releases an order back to the board if the assigned worker
- * gets stuck so somebody else can pick it up.
+ * Each `WorkOrder` represents a discrete job that any free worker can claim,
+ * work on, and complete. The board is the single source of truth for what
+ * economy work the player has on the agenda — the UI reads it to draw the
+ * right-side task list, the workers read it to pick up jobs without all
+ * racing the same target, and stall recovery in `tickWorkers` releases an
+ * order back to the board if the assigned worker gets stuck so somebody
+ * else can pick it up.
  *
  * What lives on the board:
  *   - `plant`        — player-issued plant order at an XZ.
  *   - `farmTend`     — player-assigned farmer for a specific farm building.
  *   - `harvestFarm`  — auto-published when a farm's crop ripens.
- *   - `fetchPile`    — auto-published when a harvester drops a resource pile.
  *
  * What does NOT live here: chop / mine voxel work. Harvesters scan the
  * world directly when no board order is available, because there are far
@@ -26,10 +25,9 @@
  * workers). Within the same seq bucket the natural array order wins.
  */
 
-import { Pile, PileManager } from './Piles';
 import { Building, BuildingManager } from './Buildings';
 
-export type WorkOrderKind = 'plant' | 'farmTend' | 'harvestFarm' | 'fetchPile';
+export type WorkOrderKind = 'plant' | 'farmTend' | 'harvestFarm';
 
 export interface WorkOrder {
   id: number;
@@ -44,21 +42,17 @@ export interface WorkOrder {
   wz?: number;
   /** farmTend / harvestFarm: building id of the farm. */
   buildingId?: number;
-  /** fetchPile: pile id to collect. */
-  pileId?: number;
 }
 
 /**
  * Priority bucket per order kind. Lower number = picked first. Plant orders
  * jump the queue because they're player-issued and time-sensitive (you
- * usually plant on a specific cleared spot); pile pickups come last because
- * they're routine flow-of-resources work that can wait a moment.
+ * usually plant on a specific cleared spot).
  */
 const PRIORITY: Record<WorkOrderKind, number> = {
   plant: 0,
   farmTend: 1,
   harvestFarm: 2,
-  fetchPile: 3,
 };
 
 export class WorkerTaskBoard {
@@ -100,22 +94,13 @@ export class WorkerTaskBoard {
   }
 
   /**
-   * Auto-publish helper run from `tickWorkers`. Walks `piles` and `buildings`
-   * and ensures the board has exactly one `fetchPile` order per pile and
-   * exactly one `harvestFarm` order per ripe farm. Cleans up stale entries
-   * whose targets disappeared.
+   * Auto-publish helper run from `tickWorkers`. Walks `buildings` and
+   * ensures the board has exactly one `harvestFarm` order per ripe farm.
+   * Cleans up stale entries whose targets disappeared.
    */
-  syncAutoOrders(piles: PileManager, buildings: BuildingManager): void {
-    // Drop fetchPile orders whose pile is gone.
+  syncAutoOrders(buildings: BuildingManager): void {
     for (let i = this.orders.length - 1; i >= 0; i--) {
       const o = this.orders[i]!;
-      if (o.kind === 'fetchPile') {
-        const stillExists = piles.piles.some(p => p.id === o.pileId);
-        if (!stillExists) {
-          this.orders.splice(i, 1);
-          continue;
-        }
-      }
       if (o.kind === 'harvestFarm') {
         const b = buildings.byId(o.buildingId!);
         if (!b || b.destroyed || !b.cropReady) {
@@ -129,15 +114,6 @@ export class WorkerTaskBoard {
           this.orders.splice(i, 1);
           continue;
         }
-      }
-    }
-    // Add a fetchPile order for any pile not yet on the board.
-    for (const p of piles.piles) {
-      if (!this.orders.some(o => o.kind === 'fetchPile' && o.pileId === p.id)) {
-        this.orders.push({
-          id: this.nextId++, kind: 'fetchPile', seq: this.nextSeq++,
-          claimedBy: p.claimedBy, pileId: p.id,
-        });
       }
     }
     // Add a harvestFarm order for any newly-ripe farm.
@@ -156,9 +132,7 @@ export class WorkerTaskBoard {
   /**
    * Pick the highest-priority unclaimed order for which `accept` returns
    * true, claim it for `unitId`, and return it. Returns null when nothing
-   * suitable is available. The accept predicate lets the caller filter by
-   * worker role (harvesters take chop / fetch / etc., transporters mostly
-   * take fetchPile, etc.).
+   * suitable is available.
    */
   claim(unitId: number, accept: (o: WorkOrder) => boolean): WorkOrder | null {
     let best: WorkOrder | null = null;
@@ -222,14 +196,13 @@ export class WorkerTaskBoard {
 }
 
 /**
- * Pretty-print an order for the right-side UI panel. Resolves pile / farm
- * references through the supplied managers so the line reads naturally
- * ("Pile @ (123, 45)" instead of just "fetchPile #7"). Falls back to a
- * minimal label when the target has been despawned mid-frame.
+ * Pretty-print an order for the right-side UI panel. Resolves farm
+ * references through the supplied manager so the line reads naturally
+ * ("Tend farm #3" instead of just "farmTend #7"). Falls back to a minimal
+ * label when the target has been despawned mid-frame.
  */
 export function describeOrder(
   o: WorkOrder,
-  piles: PileManager,
   buildings: BuildingManager,
 ): string {
   switch (o.kind) {
@@ -243,17 +216,8 @@ export function describeOrder(
       const b = buildings.byId(o.buildingId!);
       return b ? `Harvest farm #${b.id}` : `Harvest farm`;
     }
-    case 'fetchPile': {
-      const p = piles.piles.find(pp => pp.id === o.pileId);
-      if (!p) return `Pile`;
-      const parts: string[] = [];
-      if (p.wood > 0) parts.push(`${p.wood}W`);
-      if (p.metals > 0) parts.push(`${p.metals}M`);
-      const contents = parts.length > 0 ? parts.join(' ') : 'empty';
-      return `Pile (${contents}) @ (${p.x.toFixed(0)}, ${p.z.toFixed(0)})`;
-    }
   }
 }
 
-// Re-export Pile / Building so call-sites don't need to import them just for the type.
-export type { Pile, Building };
+// Re-export Building so call-sites don't need to import them just for the type.
+export type { Building };

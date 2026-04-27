@@ -519,70 +519,10 @@ export function buildDozerBladeGeometry(): THREE.BufferGeometry {
 export const DOZER_BLADE_PIVOT_Y = 0.10;
 export const DOZER_BLADE_PIVOT_Z = -1.80;
 
-// ---------- Hauler (dump truck) ----------------------------------------------
-// Boxy cab + tall open-top dump bed. Origin = feet, centred in XZ. Faces -Z.
-
-const HAULER_BODY = { r: 0.78, g: 0.32, b: 0.18 };       // industrial red-orange
-const HAULER_BODY_DARK = { r: 0.55, g: 0.20, b: 0.10 };
-const HAULER_BED = { r: 0.34, g: 0.34, b: 0.36 };
-const HAULER_BED_DARK = { r: 0.20, g: 0.20, b: 0.22 };
-const HAULER_BED_RIB = { r: 0.55, g: 0.55, b: 0.58 };
-const HAULER_GLASS = { r: 0.20, g: 0.45, b: 0.55 };
-const HAULER_TIRE = { r: 0.08, g: 0.08, b: 0.10 };
-const HAULER_HUB = { r: 0.45, g: 0.45, b: 0.45 };
-
-export function buildHaulerHullGeometry(): THREE.BufferGeometry {
-  const blocks: VoxelBlock[] = [];
-  // Wheels: four large tires.
-  for (const sx of [-1.00, 1.00]) {
-    for (const sz of [-1.10, 1.10]) {
-      blocks.push({ x: sx, y: 0.40, z: sz, sx: 0.40, sy: 0.80, sz: 0.80, ...HAULER_TIRE });
-      blocks.push({ x: sx, y: 0.40, z: sz, sx: 0.30, sy: 0.40, sz: 0.40, ...HAULER_HUB });
-    }
-  }
-  // Lower frame.
-  blocks.push({ x: 0.0, y: 0.50, z: 0.0, sx: 1.80, sy: 0.30, sz: 2.80, ...HAULER_BODY_DARK });
-  // Cab over the front wheels.
-  blocks.push({ x: 0.0, y: 0.95, z: -1.05, sx: 1.50, sy: 0.85, sz: 0.95, ...HAULER_BODY });
-  blocks.push({ x: 0.0, y: 1.42, z: -1.05, sx: 1.55, sy: 0.10, sz: 1.00, ...HAULER_BODY_DARK });
-  // Cab windscreen.
-  blocks.push({ x: 0.0, y: 1.10, z: -1.50, sx: 1.20, sy: 0.45, sz: 0.05, ...HAULER_GLASS });
-  // Side windows.
-  blocks.push({ x: -0.78, y: 1.10, z: -1.05, sx: 0.05, sy: 0.40, sz: 0.70, ...HAULER_GLASS });
-  blocks.push({ x:  0.78, y: 1.10, z: -1.05, sx: 0.05, sy: 0.40, sz: 0.70, ...HAULER_GLASS });
-  // Front bumper.
-  blocks.push({ x: 0.0, y: 0.55, z: -1.55, sx: 1.70, sy: 0.20, sz: 0.10, ...HAULER_BED_RIB });
-  return buildVoxelModel(blocks);
-}
-
-/** Open-top dump bed. Built to pivot around its rear lower edge for tip-up animation. */
-export function buildHaulerBedGeometry(): THREE.BufferGeometry {
-  const blocks: VoxelBlock[] = [];
-  // Bed sits with origin at the rear-lower edge so a positive X-rotation tips it
-  // up at the front. Bed is 1.8 m wide × 1.6 m long × 0.7 m tall.
-  // Floor.
-  blocks.push({ x: 0, y: 0.05, z: -0.80, sx: 1.70, sy: 0.10, sz: 1.60, ...HAULER_BED });
-  // Side walls.
-  blocks.push({ x: -0.85, y: 0.45, z: -0.80, sx: 0.10, sy: 0.70, sz: 1.60, ...HAULER_BED });
-  blocks.push({ x:  0.85, y: 0.45, z: -0.80, sx: 0.10, sy: 0.70, sz: 1.60, ...HAULER_BED });
-  // Front wall (tall).
-  blocks.push({ x: 0, y: 0.55, z: -1.55, sx: 1.80, sy: 0.90, sz: 0.10, ...HAULER_BED_DARK });
-  // Rear wall (shorter — tipping gate).
-  blocks.push({ x: 0, y: 0.30, z: -0.05, sx: 1.80, sy: 0.50, sz: 0.10, ...HAULER_BED_DARK });
-  // Top rib for visual structure.
-  blocks.push({ x: 0, y: 0.78, z: -0.80, sx: 1.80, sy: 0.06, sz: 1.60, ...HAULER_BED_RIB });
-  return buildVoxelModel(blocks);
-}
-
-/** Bed pivot in unit-local coords — placed at the rear lower edge of the bed. */
-export const HAULER_BED_PIVOT_Y = 0.85;
-export const HAULER_BED_PIVOT_Z = 1.10;
-
 // ---------- Rocket truck -----------------------------------------------------
-// Wheeled chassis (slimmer than the hauler) with an independently-yawing
-// rocket pod on the deck. Pod pivots around the centre of the deck so the
-// renderer can rotate it freely on (turretYaw - heading) regardless of the
-// hull's orientation.
+// Wheeled chassis with an independently-yawing rocket pod on the deck. Pod
+// pivots around the centre of the deck so the renderer can rotate it freely
+// on (turretYaw - heading) regardless of the hull's orientation.
 
 const ROCKET_HULL = { r: 0.35, g: 0.45, b: 0.30 };       // olive drab
 const ROCKET_HULL_DARK = { r: 0.22, g: 0.28, b: 0.18 };

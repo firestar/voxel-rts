@@ -11,8 +11,6 @@ import {
   WORKER_HIP_Y, WORKER_LEG_X,
   buildDozerHullGeometry, buildDozerBladeGeometry,
   DOZER_BLADE_PIVOT_Y, DOZER_BLADE_PIVOT_Z,
-  buildHaulerHullGeometry, buildHaulerBedGeometry,
-  HAULER_BED_PIVOT_Y, HAULER_BED_PIVOT_Z,
   buildRocketTruckHullGeometry, buildRocketTruckPodGeometry,
   ROCKET_TRUCK_POD_PIVOT_Y, ROCKET_TRUCK_POD_PIVOT_Z,
 } from './UnitModels';
@@ -44,8 +42,6 @@ export class UnitRenderer {
   private workerCrateMetal: THREE.InstancedMesh;
   private dozerHull: THREE.InstancedMesh;
   private dozerBlade: THREE.InstancedMesh;
-  private haulerHull: THREE.InstancedMesh;
-  private haulerBed: THREE.InstancedMesh;
   private rocketTruckHull: THREE.InstancedMesh;
   private rocketTruckPod: THREE.InstancedMesh;
 
@@ -101,8 +97,6 @@ export class UnitRenderer {
     this.workerCrateMetal = makeIM(buildWorkerCrateGeometry(true),  mat, capacity);
     this.dozerHull = makeIM(buildDozerHullGeometry(), mat, capacity);
     this.dozerBlade = makeIM(buildDozerBladeGeometry(), mat, capacity);
-    this.haulerHull = makeIM(buildHaulerHullGeometry(), mat, capacity);
-    this.haulerBed = makeIM(buildHaulerBedGeometry(), mat, capacity);
     this.rocketTruckHull = makeIM(buildRocketTruckHullGeometry(), mat, capacity);
     this.rocketTruckPod = makeIM(buildRocketTruckPodGeometry(), mat, capacity);
 
@@ -114,7 +108,6 @@ export class UnitRenderer {
       this.workerBody, this.workerLegL, this.workerLegR,
       this.workerCrateWood, this.workerCrateMetal,
       this.dozerHull, this.dozerBlade,
-      this.haulerHull, this.haulerBed,
       this.rocketTruckHull, this.rocketTruckPod,
     );
 
@@ -124,7 +117,6 @@ export class UnitRenderer {
     this.ringTemplates.set('worm',         { radius: 0.9,  color: 0xc266ff });
     this.ringTemplates.set('worker',       { radius: 0.55, color: 0x33ccff });
     this.ringTemplates.set('dozer',        { radius: 1.7,  color: 0xffc044 });
-    this.ringTemplates.set('hauler',       { radius: 1.5,  color: 0xff5544 });
     this.ringTemplates.set('rocket_truck', { radius: 1.55, color: 0xff8855 });
     for (const kind of this.ringTemplates.keys()) this.ringPools.set(kind, []);
   }
@@ -144,7 +136,7 @@ export class UnitRenderer {
   update(units: UnitManager): void {
     let nSold = 0, nTank = 0, nTun = 0, nWorm = 0, nWormSeg = 0;
     let nWork = 0, nCrateW = 0, nCrateM = 0;
-    let nDoz = 0, nHaul = 0, nRkt = 0;
+    let nDoz = 0, nRkt = 0;
     const ringCounts = new Map<string, number>();
     const now = performance.now() / 1000;
 
@@ -157,7 +149,7 @@ export class UnitRenderer {
       // bodies still use the full pitch as before.
       const bodyPitchScale =
         (u.kind === 'tunneler' || u.kind === 'worm') ? 0.2
-        : (u.kind === 'dozer' || u.kind === 'hauler') ? 0.6
+        : u.kind === 'dozer' ? 0.6
         : 1.0;
       const bodyPitch = u.pitch * bodyPitchScale;
       const cutterExtraPitch = u.pitch - bodyPitch;
@@ -175,14 +167,14 @@ export class UnitRenderer {
         : u.kind === 'worm' ? 5.0
         : u.kind === 'worker' ? 6.0
         : u.kind === 'dozer' ? 3.5
-        : 3.5; // hauler
+        : 3.5; // rocket_truck
       const bobAmp  = u.kind === 'soldier' ? 0.08
         : u.kind === 'tank' ? 0.04
         : u.kind === 'tunneler' ? 0.05
         : u.kind === 'worm' ? 0.03
         : u.kind === 'worker' ? 0.07
         : u.kind === 'dozer' ? 0.04
-        : 0.05; // hauler — slightly more bounce on tires
+        : 0.05; // rocket_truck — slightly more bounce on tires
       const sineRaw = Math.sin(u.distanceWalked * bobFreq + u.id);
       const bodyBob = isMoving ? Math.max(0, sineRaw) * bobAmp : 0;
       // Per-kind feet offset. Each model has its lowest geometry at a different
@@ -331,22 +323,6 @@ export class UnitRenderer {
         this.partM.premultiply(this.bodyM);
         this.dozerBlade.setMatrixAt(nDoz, this.partM);
         nDoz++;
-      } else if (u.kind === 'hauler') {
-        if (nHaul >= this.capacity) continue;
-        this.haulerHull.setMatrixAt(nHaul, this.bodyM);
-        this.haulerHull.setColorAt(nHaul, tint);
-        this.haulerBed.setColorAt(nHaul, tint);
-        // Bed tilts up when there's a pending dump job. Pivot at the rear lower
-        // edge of the bed; positive X-rotation lifts the front of the bed.
-        const tipping = u.haulerJob !== null && u.haulerJob.mode === 'dump' && u.spoilLoad > 0;
-        const tilt = tipping ? 0.45 : 0.0;
-        const bedTiltM = new THREE.Matrix4().makeRotationX(tilt);
-        const bedLocal = new THREE.Matrix4()
-          .makeTranslation(0, HAULER_BED_PIVOT_Y, HAULER_BED_PIVOT_Z)
-          .multiply(bedTiltM);
-        this.partM.multiplyMatrices(this.bodyM, bedLocal);
-        this.haulerBed.setMatrixAt(nHaul, this.partM);
-        nHaul++;
       } else if (u.kind === 'rocket_truck') {
         if (nRkt >= this.capacity) continue;
         this.rocketTruckHull.setMatrixAt(nRkt, this.bodyM);
@@ -392,8 +368,6 @@ export class UnitRenderer {
     this.workerCrateMetal.count = nCrateM;
     this.dozerHull.count = nDoz;
     this.dozerBlade.count = nDoz;
-    this.haulerHull.count = nHaul;
-    this.haulerBed.count = nHaul;
     this.rocketTruckHull.count = nRkt;
     this.rocketTruckPod.count = nRkt;
     for (const m of [
@@ -404,7 +378,6 @@ export class UnitRenderer {
       this.workerBody, this.workerLegL, this.workerLegR,
       this.workerCrateWood, this.workerCrateMetal,
       this.dozerHull, this.dozerBlade,
-      this.haulerHull, this.haulerBed,
       this.rocketTruckHull, this.rocketTruckPod,
     ]) {
       m.instanceMatrix.needsUpdate = true;

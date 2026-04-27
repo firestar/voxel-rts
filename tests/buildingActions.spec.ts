@@ -168,37 +168,31 @@ describe('Unit actions', () => {
     expect(u.burstShotTimer).toBe(0);
   });
 
-  it('Cancel task only applies to workers / dozers / haulers', () => {
+  it('Cancel task only applies to workers / dozers', () => {
     const um = new UnitManager();
     const w = um.spawn('worker', 0, 1, 0);
     const d = um.spawn('dozer', 0, 1, 0);
-    const h = um.spawn('hauler', 0, 1, 0);
     const sol = um.spawn('soldier', 0, 1, 0);
     const cancel = UNIT_ACTIONS.find(a => a.id === 'cancel-task')!;
     expect(cancel.applicable(w)).toBe(true);
     expect(cancel.applicable(d)).toBe(true);
-    expect(cancel.applicable(h)).toBe(true);
     expect(cancel.applicable(sol)).toBe(false);
     w.task = { kind: 'chop', wx: 1, wy: 1, wz: 1 };
     d.levelTargetY = 30;
-    h.haulerJob = { vx: 5, vz: 5, mode: 'load' };
-    cancel.run([w, d, h], NOOP_CTX);
+    cancel.run([w, d], NOOP_CTX);
     expect(w.task.kind).toBe('idle');
     expect(d.levelTargetY).toBeNull();
-    expect(h.haulerJob).toBeNull();
   });
 
-  it('Plant action only applies to harvester workers and calls enterPlantMode', () => {
+  it('Plant action only applies to workers and calls enterPlantMode', () => {
     const um = new UnitManager();
-    const harv = um.spawn('worker', 0, 1, 0, { workerRole: 'harvester' });
-    const tx = um.spawn('worker', 0, 1, 0, { workerRole: 'transporter' });
+    const w = um.spawn('worker', 0, 1, 0);
     const sol = um.spawn('soldier', 0, 1, 0);
     const plant = UNIT_ACTIONS.find(a => a.id === 'plant')!;
-    expect(plant.applicable(harv)).toBe(true);
-    expect(plant.applicable(tx)).toBe(false);
+    expect(plant.applicable(w)).toBe(true);
     expect(plant.applicable(sol)).toBe(false);
     let entered = false;
-    plant.run([harv], { ...NOOP_CTX, enterPlantMode: () => { entered = true; } });
+    plant.run([w], { ...NOOP_CTX, enterPlantMode: () => { entered = true; } });
     expect(entered).toBe(true);
   });
 
@@ -222,17 +216,17 @@ describe('Unit actions', () => {
     expect(ids).toContain('stop');
     expect(ids).toContain('hold-fire');
     expect(ids).not.toContain('cancel-task'); // soldier doesn't have tasks
-    expect(ids).not.toContain('plant');       // soldier isn't a harvester
+    expect(ids).not.toContain('plant');       // soldier isn't a worker
   });
 
   it('unit action keys are unique within a single applicable selection', () => {
     // The dispatcher fires every action whose key matches `pressed`. If two
     // applicable actions for the same selection ever shared a key, both
     // would fire on a single keypress — almost certainly a bug. We don't
-    // currently have a mixed harvester+armed case; the explicit guard
+    // currently have a mixed worker+armed case; the explicit guard
     // catches it if we ever add overlapping bindings.
     const um = new UnitManager();
-    const harv = um.spawn('worker', 0, 1, 0, { workerRole: 'harvester' });
+    const harv = um.spawn('worker', 0, 1, 0);
     const acts = unitActionsFor([harv]);
     const keys = acts.map(a => a.key);
     expect(new Set(keys).size).toBe(keys.length);

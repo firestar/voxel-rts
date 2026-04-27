@@ -234,9 +234,57 @@ export class VoxelWorld {
   }
 
   /**
+   * Sandbox/map-editor helper: write `material` into every voxel inside the
+   * sphere centered at (cx, cy, cz) with `radius` (all voxel units), skipping
+   * bedrock so the indestructible floor stays intact. Returns the count of
+   * voxels actually changed; callers use that to decide whether to rebuild
+   * nav.
+   */
+  fillSphere(cx: number, cy: number, cz: number, radius: number, material: MaterialId): number {
+    const r = Math.max(0.1, radius);
+    const r2 = r * r;
+    const x0 = Math.max(0, Math.floor(cx - r));
+    const y0 = Math.max(0, Math.floor(cy - r));
+    const z0 = Math.max(0, Math.floor(cz - r));
+    const x1 = Math.min(WORLD_X - 1, Math.ceil(cx + r));
+    const y1 = Math.min(WORLD_Y - 1, Math.ceil(cy + r));
+    const z1 = Math.min(WORLD_Z - 1, Math.ceil(cz + r));
+    const voxels = this.buffers.voxels;
+    let changed = 0;
+    for (let y = y0; y <= y1; y++) {
+      const dy = y + 0.5 - cy;
+      for (let z = z0; z <= z1; z++) {
+        const dz = z + 0.5 - cz;
+        for (let x = x0; x <= x1; x++) {
+          const dx = x + 0.5 - cx;
+          if (dx * dx + dy * dy + dz * dz > r2) continue;
+          const idx = worldIndex(x, y, z);
+          if (voxels[idx] === M_BEDROCK) continue;
+          if (voxels[idx] === material) continue;
+          voxels[idx] = material;
+          this.damage.delete(idx);
+          this.markDirty(x, y, z);
+          changed++;
+        }
+      }
+    }
+    return changed;
+  }
+
+  /**
+   * Sandbox/map-editor helper: clear every non-bedrock voxel inside the
+   * sphere at (cx, cy, cz) with `radius` (voxel units). Unlike `damageSphere`
+   * this isn't gated on accumulated HP — one click instantly removes the
+   * volume. Returns the count of voxels removed.
+   */
+  carveSphere(cx: number, cy: number, cz: number, radius: number): number {
+    return this.fillSphere(cx, cy, cz, radius, AIR);
+  }
+
+  /**
    * Remove up to `maxVoxels` non-bedrock voxels from the top of the column at (wx, wz),
    * walking downward from the highest solid voxel. Returns the number actually removed.
-   * Stops on the first bedrock voxel (or empty column) so the hauler can't dig forever.
+   * Stops on the first bedrock voxel (or empty column) so callers can't dig forever.
    */
   scoopColumn(wx: number, wz: number, maxVoxels: number): number {
     if (maxVoxels <= 0) return 0;

@@ -227,7 +227,7 @@ describe('Weapon firing — turret slew + cooldown', () => {
 
   it('an unarmed unit (worker) ignores firingTarget completely', () => {
     const um = new UnitManager();
-    const w = um.spawn('worker', 0, 1, 0, { workerRole: 'harvester' });
+    const w = um.spawn('worker', 0, 1, 0);
     expect(w.weapon).toBeNull();
     // Setting firingTarget on an unarmed unit should be a no-op.
     w.firingTarget = { x: 10, y: 1, z: 0 };

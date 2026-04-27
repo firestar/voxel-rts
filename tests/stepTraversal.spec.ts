@@ -90,7 +90,6 @@ describe('surface-follow Y on tall steps', () => {
       cxBoundaryM - 0.05,
       (lowTopY + 1) * VOXEL_SIZE,
       50 * NAV_CELL_METERS,
-      { workerRole: 'harvester' },
     );
 
     for (let i = 0; i < 60; i++) {

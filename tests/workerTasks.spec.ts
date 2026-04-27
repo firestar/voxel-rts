@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import { WorkerTaskBoard, describeOrder } from '../src/sim/WorkerTasks';
-import { PileManager } from '../src/sim/Piles';
 import { BuildingManager, FARM, BARRACKS, checkFootprint } from '../src/sim/Buildings';
 import { VoxelWorld, worldIndex } from '../src/voxel/VoxelWorld';
 import { WORLD_X, WORLD_Z } from '../src/voxel/types';
@@ -90,9 +89,8 @@ describe('WorkerTaskBoard', () => {
     expect(snap[1]).toBe(plant);
   });
 
-  it('syncAutoOrders publishes fetchPile and harvestFarm orders, prunes stale entries', () => {
+  it('syncAutoOrders publishes harvestFarm orders, prunes stale entries', () => {
     const board = new WorkerTaskBoard();
-    const piles = new PileManager();
     const world = buildFlatWorld();
     const nav = allocateNav(false);
     buildSurfaceNav(world.buffers.voxels, nav);
@@ -100,25 +98,17 @@ describe('WorkerTaskBoard', () => {
     const fp = checkFootprint(world.buffers.voxels, nav, FARM, 8, 8);
     const farm = buildings.place(world, FARM, fp.ox, fp.oz, fp.floorY);
     farm.cropReady = true;
-    piles.drop(40, 4, 40, 2, 1);
 
-    board.syncAutoOrders(piles, buildings);
-    expect(board.orders.find(o => o.kind === 'fetchPile')).toBeTruthy();
+    board.syncAutoOrders(buildings);
     expect(board.orders.find(o => o.kind === 'harvestFarm')).toBeTruthy();
 
     // Crop collected → harvestFarm order should drop next sync.
     farm.cropReady = false;
-    board.syncAutoOrders(piles, buildings);
+    board.syncAutoOrders(buildings);
     expect(board.orders.find(o => o.kind === 'harvestFarm')).toBeFalsy();
-
-    // Pile picked up → fetchPile order should drop too.
-    piles.piles.length = 0;
-    board.syncAutoOrders(piles, buildings);
-    expect(board.orders.find(o => o.kind === 'fetchPile')).toBeFalsy();
   });
 
   it('describeOrder produces a sensible label for each kind', () => {
-    const piles = new PileManager();
     const world = buildFlatWorld();
     const nav = allocateNav(false);
     buildSurfaceNav(world.buffers.voxels, nav);
@@ -127,6 +117,6 @@ describe('WorkerTaskBoard', () => {
     void buildings.place(world, BARRACKS, fp.ox, fp.oz, fp.floorY);
     const board = new WorkerTaskBoard();
     const plant = board.addPlant(11.5, 22.5);
-    expect(describeOrder(plant, piles, buildings)).toMatch(/Plant/);
+    expect(describeOrder(plant, buildings)).toMatch(/Plant/);
   });
 });

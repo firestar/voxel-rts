@@ -67,7 +67,7 @@ export const BARRACKS: BuildingSpec = {
   // Cycle through every kind the barracks can produce so a single building
   // visibly outputs a balanced mix. Order is roughly "infantry → vehicles
   // → diggers → economy" so the early ticks favour combat units.
-  produces: ['soldier', 'tank', 'tunneler', 'worm', 'dozer', 'hauler', 'worker'],
+  produces: ['soldier', 'tank', 'tunneler', 'worm', 'dozer', 'worker'],
   stamp: stampBarracks,
 };
 
