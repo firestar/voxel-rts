@@ -135,7 +135,7 @@ describe('Storage building', () => {
 });
 
 describe('Barracks unit production still works after BuildingManager refactor', () => {
-  it('produces units on its production interval', () => {
+  it('produces queued units on its production interval', () => {
     const world = buildGrassPlane();
     const nav = allocateNav(false);
     buildSurfaceNav(world.buffers.voxels, nav);
@@ -144,7 +144,10 @@ describe('Barracks unit production still works after BuildingManager refactor', 
     const mgr = new BuildingManager();
     let spawnCount = 0;
     mgr.spawner = (): null => { spawnCount++; return null; };
-    mgr.place(world, BARRACKS, fp.ox, fp.oz, fp.floorY);
+    const b = mgr.place(world, BARRACKS, fp.ox, fp.oz, fp.floorY);
+    // Queue three units up front — barracks only trains queued kinds, so
+    // without this push the building would sit idle indefinitely.
+    b.trainQueue.push('soldier', 'soldier', 'soldier');
     for (let i = 0; i < 3; i++) {
       mgr.tick(BARRACKS.productionInterval + 0.01, world, new UnitManager());
     }

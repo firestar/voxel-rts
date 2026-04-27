@@ -17,6 +17,9 @@ interface BarEntry {
   texture: THREE.CanvasTexture;
   lastHp: number;
   lastMax: number;
+  /** Cached worker carry signature so the canvas only repaints when the
+   *  displayed numbers (or load progress) actually change. */
+  lastCarryKey: number;
   yOffset: number;
 }
 
@@ -35,18 +38,20 @@ export class HealthBarRenderer {
         this.entries.set(u.id, entry);
         this.group.add(entry.sprite);
       }
-      // Position the bar above the unit. The yOffset is set per-kind at
-      // creation time so a soldier's bar floats above their helmet, not
-      // their belt, and a tank's bar floats above the turret.
       entry.sprite.position.set(u.x, u.y + entry.yOffset, u.z);
-      // Repaint only when the displayed integer HP or max HP changed —
-      // sub-integer hp drift (from explosion falloff) doesn't repaint.
       const hpInt = Math.max(0, Math.ceil(u.hp));
-      if (hpInt !== entry.lastHp || max !== entry.lastMax) {
-        drawBar(entry.canvas, hpInt, max);
+      // Workers (harvesters AND transporters) draw a small carry line under
+      // the HP value so the player can see "this worker is holding 3 wood,
+      // 1 metal" at a glance, plus a "Loading…" hint while a transporter is
+      // mid-pickup. Non-workers leave the field at zero so the cache key
+      // for them is constant.
+      const carryKey = computeCarryKey(u);
+      if (hpInt !== entry.lastHp || max !== entry.lastMax || carryKey !== entry.lastCarryKey) {
+        drawBar(entry.canvas, hpInt, max, carryLineFor(u));
         entry.texture.needsUpdate = true;
         entry.lastHp = hpInt;
         entry.lastMax = max;
+        entry.lastCarryKey = carryKey;
       }
     }
     // Clean up sprites for units that have died / despawned.
@@ -83,9 +88,37 @@ export class HealthBarRenderer {
       texture,
       lastHp: -1,
       lastMax: -1,
+      lastCarryKey: -1,
       yOffset: hpBarYOffset(u),
     };
   }
+}
+
+/**
+ * Pack the worker's carry state and load timer into a small integer. Any
+ * change rotates the key, which is enough for the cache check.
+ */
+function computeCarryKey(u: Unit): number {
+  if (u.kind !== 'worker') return 0;
+  // 8-bit wood, 8-bit metals, 8-bit load decisecond — overflow is fine
+  // because we only need inequality detection.
+  const wood = u.carrying.wood & 0xff;
+  const metals = u.carrying.metals & 0xff;
+  const load = Math.min(255, Math.round(u.loadTimer * 10)) & 0xff;
+  return (wood << 16) | (metals << 8) | load;
+}
+
+/**
+ * Build the second-line text that appears under the HP value for workers.
+ * Empty string → no second line (non-workers, or empty-handed workers).
+ */
+function carryLineFor(u: Unit): string {
+  if (u.kind !== 'worker') return '';
+  const parts: string[] = [];
+  if (u.carrying.wood > 0) parts.push(`${u.carrying.wood}W`);
+  if (u.carrying.metals > 0) parts.push(`${u.carrying.metals}M`);
+  if (u.loadTimer > 0) parts.push(`load ${u.loadTimer.toFixed(1)}s`);
+  return parts.join(' ');
 }
 
 /**
@@ -105,7 +138,7 @@ function hpBarYOffset(u: Unit): number {
   }
 }
 
-function drawBar(canvas: HTMLCanvasElement, hp: number, max: number): void {
+function drawBar(canvas: HTMLCanvasElement, hp: number, max: number, carryLine: string): void {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
   const w = canvas.width, h = canvas.height;
@@ -147,4 +180,14 @@ function drawBar(canvas: HTMLCanvasElement, hp: number, max: number): void {
   ctx.strokeText(text, barX, 0);
   ctx.fillStyle = '#ffffff';
   ctx.fillText(text, barX, 0);
+
+  // Worker carry line — drawn to the right of the HP integer in a smaller
+  // font so it doesn't crowd the bar but still reads at typical zoom.
+  if (carryLine.length > 0) {
+    ctx.font = 'bold 13px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.lineWidth = 3;
+    ctx.strokeText(carryLine, barX + 28, 4);
+    ctx.fillStyle = '#ffe28a';
+    ctx.fillText(carryLine, barX + 28, 4);
+  }
 }

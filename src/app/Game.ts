@@ -23,6 +23,7 @@ import { Resources } from '../sim/Resources';
 import { PileManager } from '../sim/Piles';
 import { SaplingManager } from '../sim/Saplings';
 import { tickWorkers } from '../sim/Workers';
+import { WorkerTaskBoard, describeOrder } from '../sim/WorkerTasks';
 import { ProjectileManager, PROJECTILES, muzzleOrigin, ProjectileImpact } from '../sim/Projectiles';
 import { WEAPONS } from '../sim/Weapons';
 import { tickWeapons } from '../sim/WeaponTick';
@@ -62,6 +63,7 @@ export class Game {
   readonly resources = new Resources();
   readonly piles = new PileManager();
   readonly saplings = new SaplingManager();
+  readonly taskBoard = new WorkerTaskBoard();
   readonly projectiles = new ProjectileManager();
   readonly projectileRenderer = new ProjectileRenderer();
   readonly muzzleFlashes = new FlashPool(256);
@@ -88,6 +90,9 @@ export class Game {
   private actionsEl: HTMLElement | null = null;
   /** Last rendered panel signature. Used to skip DOM rebuilds when nothing changed. */
   private actionsRenderedKey = '';
+  private tasksEl: HTMLElement | null = null;
+  /** Last rendered task-panel signature. Same purpose as `actionsRenderedKey`. */
+  private tasksRenderedKey = '';
   private mode: Mode = 'play';
   private rebuildPending = false;
   private rebuildQueued = false;
@@ -95,13 +100,6 @@ export class Game {
 
   private readonly explosionRadiusBigMeters = 3.0;
   private readonly explosionPeak = 90;
-  /**
-   * Scale applied to a projectile-impact `damagePeak` before it is fed to
-   * `damageSphere` for voxel destruction. Unit splash damage uses the
-   * unscaled peak — only the terrain dig-out is dampened, so explosions
-   * still hurt anything they hit but leave noticeably smaller craters.
-   */
-  private readonly explosionTerrainDamageScale = 0.35;
 
   constructor(canvas: HTMLCanvasElement, statsEl: HTMLElement | null) {
     this.renderer = new Renderer(canvas);
@@ -145,6 +143,7 @@ export class Game {
     this.modeEl = document.getElementById('mode');
     this.selBoxEl = document.getElementById('selbox');
     this.actionsEl = document.getElementById('actions');
+    this.tasksEl = document.getElementById('tasks');
 
     this.onResize();
     window.addEventListener('resize', this.onResize);
@@ -389,6 +388,7 @@ export class Game {
         piles: this.piles,
         saplings: this.saplings,
         resources: this.resources,
+        taskBoard: this.taskBoard,
         routeWorker: (u, wx, wy, wz): void => { void this.routePath(u, wx, wy, wz); },
         onVoxelEdit: (): void => { this.requestNavRebuild(false); },
       });
@@ -446,6 +446,7 @@ export class Game {
       this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}${weaponDesc}`;
     }
     this.renderActionPanel();
+    this.renderTaskPanel();
   }
 
   /**
@@ -782,15 +783,15 @@ export class Game {
     }
 
     if (this.mode === 'plant') {
-      // Plant mode: only meaningful with a harvester worker selected. Click
-      // anywhere on terrain — we drop the plant task at the click voxel xz
-      // and let tickWorkers route the worker to it.
+      // Plant mode: a harvester needs to be selected, but the actual
+      // assignment runs through the global task board so the same plant
+      // order survives if the chosen worker dies / is reassigned. Any free
+      // harvester will pick it up next tick.
       const selected = this.units.units.find(u => u.selected);
       const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
       if (!r || !selected || selected.kind !== 'worker' || selected.workerRole !== 'harvester') return;
       const wx = r.target.x, wz = r.target.z;
-      selected.task = { kind: 'plant', wx, wz };
-      void this.routePath(selected, wx, selected.y, wz);
+      this.taskBoard.addPlant(wx, wz);
       return;
     }
 
@@ -924,7 +925,7 @@ export class Game {
     const cx = hit.x + 0.5 - hit.nx * 0.5;
     const cy = hit.y + 0.5 - hit.ny * 0.5;
     const cz = hit.z + 0.5 - hit.nz * 0.5;
-    const result = this.world.damageSphere(cx, cy, cz, radiusVoxels, this.explosionPeak);
+    const result = this.world.damageSphere(cx, cy, cz, radiusVoxels, this.explosionPeak * TERRAIN_DAMAGE_GLOBAL_SCALE);
     if (result.destroyed.length > 0) {
       const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
       const wx = cx * VOXEL_SIZE, wy = cy * VOXEL_SIZE, wz = cz * VOXEL_SIZE;
@@ -1437,12 +1438,24 @@ export class Game {
       // Detach any existing farmer from this farm so the latest assignment
       // wins, then route the new farmer to the field. tickFarm validates the
       // assignment each tick; the worker will start tending on arrival.
+      // Also publish a farmTend order on the global board pre-claimed for
+      // this worker so the right-side panel reflects the assignment and a
+      // stall recovery later releases it cleanly.
       if (b.farmerId !== null && b.farmerId !== worker.id) {
         const prev = this.units.units.find(u => u.id === b.farmerId);
-        if (prev && prev.task.kind === 'farm') prev.task = { kind: 'idle' };
+        if (prev && prev.task.kind === 'farm') {
+          prev.task = { kind: 'idle' };
+          if (prev.claimedOrderId !== 0) {
+            this.taskBoard.remove(prev.claimedOrderId);
+            prev.claimedOrderId = 0;
+          }
+        }
       }
       b.farmerId = worker.id;
       worker.task = { kind: 'farm', buildingId: b.id };
+      const order = this.taskBoard.addFarmTend(b.id);
+      order.claimedBy = worker.id;
+      worker.claimedOrderId = order.id;
       const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
       const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
       void this.routePath(worker, cxw, worker.y, czw);
@@ -1584,8 +1597,9 @@ export class Game {
     const radiusMeters = imp.explosive ? imp.explosionRadiusMeters : imp.hitRadiusMeters;
     // Terrain damage uses a per-projectile multiplier so a turret round can
     // still hurt enemies at full peak without carving up the surrounding
-    // base. Unit damage below ignores this scale.
-    const terrainPeak = imp.damagePeak * imp.terrainDamageScale;
+    // base, plus a global TERRAIN_DAMAGE_GLOBAL_SCALE that softens craters
+    // across the board. Unit damage below ignores both scales.
+    const terrainPeak = imp.damagePeak * imp.terrainDamageScale * TERRAIN_DAMAGE_GLOBAL_SCALE;
     const result = this.world.damageSphere(cx, cy, cz, radiusMeters / VOXEL_SIZE, terrainPeak);
     if (result.destroyed.length > 0) {
       const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
@@ -1842,6 +1856,51 @@ export class Game {
   }
 
   /**
+   * Rebuild the right-side task panel from the live `WorkerTaskBoard`. Lists
+   * orders in execution order (claimed first, then by priority + FIFO seq).
+   * Keyed on a string signature so we only re-render the DOM when the
+   * displayed order set actually changes.
+   */
+  private renderTaskPanel(): void {
+    if (!this.tasksEl) return;
+    const orders = this.taskBoard.snapshot();
+    const key = orders
+      .map(o => `${o.id}:${o.kind}:${o.claimedBy}:${o.pileId ?? ''}:${o.buildingId ?? ''}:${o.wx ?? ''}:${o.wz ?? ''}`)
+      .join('|');
+    if (key === this.tasksRenderedKey) return;
+    this.tasksRenderedKey = key;
+    this.tasksEl.innerHTML = '';
+    const t = document.createElement('div');
+    t.className = 'tasks-title';
+    t.textContent = `Worker tasks (${orders.length})`;
+    this.tasksEl.appendChild(t);
+    if (orders.length === 0) {
+      const e = document.createElement('div');
+      e.className = 'tasks-empty';
+      e.textContent = '(none — workers idle)';
+      this.tasksEl.appendChild(e);
+      return;
+    }
+    for (const o of orders) {
+      const row = document.createElement('div');
+      row.className = `task-row ${o.claimedBy !== 0 ? 'claimed' : 'pending'}`;
+      const k = document.createElement('span');
+      k.className = 'task-kind';
+      k.textContent = o.kind;
+      const d = document.createElement('span');
+      d.className = 'task-detail';
+      d.textContent = describeOrder(o, this.piles, this.buildings);
+      const c = document.createElement('span');
+      c.className = 'task-claim';
+      c.textContent = o.claimedBy !== 0 ? `→ #${o.claimedBy}` : 'queued';
+      row.appendChild(k);
+      row.appendChild(d);
+      row.appendChild(c);
+      this.tasksEl.appendChild(row);
+    }
+  }
+
+  /**
    * Predict the remaining flight path for every live projectile and push the
    * sample arrays into the dashed-arc renderer. Called once per frame from
    * the tick — the arcs are visualisation only, no game state changes.
@@ -1911,11 +1970,23 @@ export class Game {
         continue;
       }
       // Trajectory blocked. Route toward the target so the unit walks into
-      // line-of-sight. Throttle re-route attempts so we don't spam path
-      // requests on every frame.
+      // line-of-sight, but stop short of the enemy at a preferred firing
+      // distance — without this clamp the unit would walk right up to the
+      // target and end up nose-to-nose. Throttle re-route attempts so we
+      // don't spam path requests on every frame.
       u.autoEngageCooldown = 0.6;
       if (u.path.length > 0) continue;
-      void this.routePath(u, target.x, target.y, target.z);
+      const stopRange = w.rangeMeters * AUTO_ENGAGE_STOP_FRACTION;
+      const dxBack = u.x - target.x;
+      const dzBack = u.z - target.z;
+      const distBack = Math.hypot(dxBack, dzBack);
+      let goalX = target.x;
+      let goalZ = target.z;
+      if (distBack > 1e-3 && distBack > stopRange) {
+        goalX = target.x + (dxBack / distBack) * stopRange;
+        goalZ = target.z + (dzBack / distBack) * stopRange;
+      }
+      void this.routePath(u, goalX, target.y, goalZ);
     }
   }
 
@@ -1938,6 +2009,23 @@ export class Game {
 function isBuildMode(m: Mode): boolean {
   return m === 'build';
 }
+
+/**
+ * Global multiplier folded into every terrain `damageSphere` peak that comes
+ * from a projectile impact or a player-triggered explosion. Scales the crater
+ * down 5× from the historical level so explosions still kill units at full
+ * peak (unit damage doesn't read this) but stop chewing huge holes in the
+ * map. Per-projectile `terrainDamageScale` is applied on top of this.
+ */
+const TERRAIN_DAMAGE_GLOBAL_SCALE = 0.2;
+
+/**
+ * When an aggressive-stance unit decides to walk closer to its target (because
+ * the trajectory is blocked), we route to a point this fraction of the unit's
+ * weapon range away from the enemy rather than to the enemy itself. Keeps the
+ * unit at a useful firing distance instead of parking on the enemy's feet.
+ */
+const AUTO_ENGAGE_STOP_FRACTION = 0.7;
 
 /**
  * Decide whether a sampled trajectory `points` would actually affect `target`.
