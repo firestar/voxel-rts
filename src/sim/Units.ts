@@ -127,13 +127,14 @@ export function unitConfig(kind: UnitKind): UnitConfig {
   switch (kind) {
     case 'soldier':
       // Single-cell footprint, so the body-roughness check is a no-op for soldiers.
-      // maxStepVoxels = 32 voxels (4 m climb between adjacent cells) — effectively
-      // soldiers scale anything that isn't a building wall. The path search also
-      // skips the diagonal corner-cut for agile units (footprintRadius <= 1), so
-      // a soldier can scramble onto a ledge from the inside of an L-shaped corner.
+      // maxStepVoxels = 6 voxels (0.75 m, ~hip-height) between adjacent cells —
+      // soldiers can step onto a low ledge but anything taller reads as a cliff
+      // and the path search routes around it. Stops infantry from dropping off
+      // multi-meter cliffs or scaling sheer faces. The corner-cut exemption for
+      // agile units (footprintRadius <= 1) is unchanged.
       return {
         footprintRadius: 1, widthMeters: 0.75,
-        maxStepVoxels: 32, slopePenalty: 0.08,
+        maxStepVoxels: 6, slopePenalty: 0.18,
         bodyHalfCells: 0, bodyRoughnessVoxels: 999,
         turnRateRadPerSec: 6.0,                  // ~340°/s, snappy infantry turn
         maxPitchRad: Math.PI / 2,                // soldiers are flexible — no real pitch cap
@@ -153,18 +154,17 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         launcherMaxStrength: 80,
       };
     case 'tank':
-      // Tanks are restricted to fairly flat terrain.
-      //   maxStepVoxels = 4 voxels (0.5 m climb between adjacent 1 m cells, ~27° slope).
-      //   bodyRoughnessVoxels = 5 (0.625 m residual from the plane fit) — uniform slopes
-      //     up to that 27° still pass, but ridges and rocky bumps are rejected.
-      //   slopePenalty = 0.25 — A* actively prefers flatter routes even when steeper
-      //     ones are technically allowed.
-      // Cliffs / steep hills now hard-block tank routes; the unit will detour around
-      // them instead of trying to scale them.
+      // Tanks are restricted to small hills only — anything past a gentle grade
+      // forces a detour around it.
+      //   maxStepVoxels = 3 voxels (0.375 m climb, ~21° slope).
+      //   bodyRoughnessVoxels = 4 (0.5 m residual from the plane fit) — uniform
+      //     small grades still pass, but ridges and rocky bumps are rejected.
+      //   slopePenalty = 0.45 — A* strongly prefers flat routes even when the
+      //     steeper edge is technically within climb cap.
       return {
         footprintRadius: 2, widthMeters: 2.4,
-        maxStepVoxels: 4, slopePenalty: 0.25,
-        bodyHalfCells: 1, bodyRoughnessVoxels: 5,
+        maxStepVoxels: 3, slopePenalty: 0.45,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 4,
         turnRateRadPerSec: 1.4,                  // ~80°/s — tank pivots are slow
         maxPitchRad: Math.PI / 6,                // 30° — pitched body cap matches the climb cap
         heightVoxels: 18,                        // ~2.25 m turret + antenna clearance
@@ -212,14 +212,15 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       };
     case 'worker':
       // Civilian worker. Single-cell footprint, soldier-class agility on
-      // hills (so they can scramble between an ore deposit and a depot
+      // gentle hills (so they can scramble between an ore deposit and a depot
       // without getting stuck on shallow benches), but slower than a soldier
       // since they're carrying tools / payload. canDig stays false — workers
       // mine voxels via direct damageSphere calls in tickWorkers, not by
-      // pathing through solid.
+      // pathing through solid. maxStepVoxels matches the soldier so workers
+      // can't trespass cliffs the rest of infantry can't.
       return {
         footprintRadius: 1, widthMeters: 0.65,
-        maxStepVoxels: 24, slopePenalty: 0.10,
+        maxStepVoxels: 6, slopePenalty: 0.20,
         bodyHalfCells: 0, bodyRoughnessVoxels: 999,
         turnRateRadPerSec: 5.0,
         maxPitchRad: Math.PI / 2,
@@ -273,8 +274,8 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       //   Speed is somewhat slower than the tank — heavier vehicle pushing earth.
       return {
         footprintRadius: 2, widthMeters: 2.6,
-        maxStepVoxels: 5, slopePenalty: 0.22,
-        bodyHalfCells: 1, bodyRoughnessVoxels: 6,
+        maxStepVoxels: 4, slopePenalty: 0.30,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 5,
         turnRateRadPerSec: 1.2,                  // ~70°/s
         maxPitchRad: Math.PI / 6,                // 30° — same chassis cap as tank
         heightVoxels: 16,                        // ~2 m
@@ -306,8 +307,8 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       // spawn opts can override to rocket_pod for a heavy single-warhead variant).
       return {
         footprintRadius: 2, widthMeters: 2.5,
-        maxStepVoxels: 4, slopePenalty: 0.25,
-        bodyHalfCells: 1, bodyRoughnessVoxels: 5,
+        maxStepVoxels: 3, slopePenalty: 0.45,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 4,
         turnRateRadPerSec: 1.2,
         maxPitchRad: Math.PI / 6,
         heightVoxels: 18,
@@ -498,6 +499,13 @@ export interface Unit {
    * tick; set to a positive value when an attempt fails.
    */
   autoEngageCooldown: number;
+  /**
+   * Re-arm timer for the evasion pass. Set to a positive value the moment a
+   * unit dives perpendicular out of an incoming projectile's path so it
+   * doesn't keep juking every single frame; ticks down at real time. The
+   * evade pass skips units whose timer is non-zero.
+   */
+  evadeCooldown: number;
 }
 
 /**
@@ -662,6 +670,7 @@ export class UnitManager {
       launcherMaxStrength: cfg.launcherMaxStrength,
       stance: opts?.stance ?? 'defensive',
       autoEngageCooldown: 0,
+      evadeCooldown: 0,
     };
     this.units.push(u);
     return u;
@@ -797,12 +806,15 @@ export class UnitManager {
       nz = u.z + dz * inv * step;
     }
     // Unit-vs-unit collision: if the next foothold overlaps another unit,
-    // hold position this frame. The path is preserved — the blocker will
-    // hopefully clear out of the way; if it doesn't within
-    // BLOCKED_GIVE_UP_FRAMES the unit drops its path so it stops grinding
-    // against an occupied slot forever.
+    // hold position this frame. We first try to nudge the offending peer
+    // perpendicular to our motion so it can shuffle off our line; the
+    // existing repath / give-up timers stay as fallbacks if the sidestep
+    // can't be placed (walls on both flanks, peer is busy with a task,
+    // etc).
     let moved = 0;
-    if (this.unitCollidesAt(u, nx, nz)) {
+    const blocker = this.findCollisionBlocker(u, nx, nz);
+    if (blocker !== null) {
+      this.tryNudgeAside(blocker, u, nav);
       u.blockedFrames++;
       // Latch the repath request the first frame we cross the threshold —
       // strict equality so we set the flag exactly once per stuck stretch.
@@ -916,7 +928,9 @@ export class UnitManager {
       nextY = u.y + dy * inv * step;
       nextZ = u.z + dz * inv * step;
     }
-    if (this.unitCollidesAt(u, nextX, nextZ)) {
+    const volumeBlocker = this.findCollisionBlocker(u, nextX, nextZ);
+    if (volumeBlocker !== null) {
+      this.tryNudgeAside(volumeBlocker, u, nav);
       u.blockedFrames++;
       // Same one-shot latch as tickSurface — the harness sees the flag, asks
       // for a fresh route, and the resulting setPath() resets blockedFrames.
@@ -1018,8 +1032,11 @@ export class UnitManager {
   }
 
   /**
-   * True when stepping unit `u` into world-space (px, pz) would intrude on
-   * the body cylinder of another live unit. The collision rules:
+   * Returns the stationary peer whose body cylinder a hypothetical step from
+   * `u` to (px, pz) would intrude on, or null when nothing is in the way.
+   * Used by the surface + volume ticks to (a) decide whether to advance and
+   * (b) target a sidestep nudge at whichever peer is actually blocking. The
+   * collision rules:
    *
    *  - Only stationary peers (empty path) block — two moving units phase
    *    through each other so a column of marching units doesn't jam on
@@ -1031,7 +1048,7 @@ export class UnitManager {
    *  - Vertical separation > 2 m exempts the pair (one unit on a bridge,
    *    another walking under it).
    */
-  private unitCollidesAt(u: Unit, px: number, pz: number): boolean {
+  private findCollisionBlocker(u: Unit, px: number, pz: number): Unit | null {
     const r1 = unitCollisionRadius(u);
     for (const other of this.units) {
       if (other === u) continue;
@@ -1048,6 +1065,64 @@ export class UnitManager {
       const cdz = other.z - u.z;
       const curD2 = cdx * cdx + cdz * cdz;
       if (curD2 < minDist2 && newD2 > curD2) continue; // already overlapping, separating
+      return other;
+    }
+    return null;
+  }
+
+  /**
+   * Push `blocker` one body-width perpendicular to `mover`'s travel direction so
+   * the moving unit can pass on its next tick. The sidestep is implemented as a
+   * one-waypoint path on the blocker — it then walks via the normal surface
+   * tick, which means peer-vs-peer collision still applies if multiple units
+   * are crowded together. Returns true when a sidestep was assigned.
+   *
+   * Skipped when the blocker is busy doing something the player would not want
+   * silently abandoned: firing on a target, executing a worker task, or driving
+   * a digger (tunneler/worm). Skipped when neither perpendicular cell is a
+   * valid foothold for the blocker's kind (cliff, low headroom, etc.).
+   */
+  private tryNudgeAside(blocker: Unit, mover: Unit, nav: SurfaceNavBuffers): boolean {
+    if (blocker.path.length > 0) return false;
+    if (blocker.firingTarget !== null) return false;
+    if (blocker.task.kind !== 'idle') return false;
+    if (blocker.canDig) return false;
+
+    const tgt = mover.path[0];
+    if (!tgt) return false;
+    let dx = tgt.x - mover.x;
+    let dz = tgt.z - mover.z;
+    const d2 = dx * dx + dz * dz;
+    if (d2 < 1e-6) return false;
+    const inv = 1 / Math.sqrt(d2);
+    dx *= inv; dz *= inv;
+
+    // Sidestep enough to clear the sum of body radii, plus slack so the
+    // next-frame collision check sees daylight between the two cylinders.
+    const dist = unitCollisionRadius(mover) + unitCollisionRadius(blocker) + 0.6;
+
+    // Two perpendicular candidates. Prefer the side the blocker is already
+    // biased toward so it doesn't have to cross the mover's line of travel.
+    const offX = blocker.x - mover.x;
+    const offZ = blocker.z - mover.z;
+    const sideDot = offX * -dz + offZ * dx;
+    const candidates: Array<{ x: number; z: number }> = sideDot >= 0
+      ? [
+          { x: blocker.x + -dz * dist, z: blocker.z +  dx * dist },
+          { x: blocker.x +  dz * dist, z: blocker.z + -dx * dist },
+        ]
+      : [
+          { x: blocker.x +  dz * dist, z: blocker.z + -dx * dist },
+          { x: blocker.x + -dz * dist, z: blocker.z +  dx * dist },
+        ];
+
+    for (const c of candidates) {
+      if (!sidestepCellOk(nav, blocker, c.x, c.z)) continue;
+      const y = surfaceWorldY(nav, c.x, c.z);
+      blocker.path = [{ x: c.x, y, z: c.z }];
+      blocker.blockedFrames = 0;
+      blocker.needsRepath = false;
+      blocker.carveCooldown = 0;
       return true;
     }
     return false;
@@ -1229,6 +1304,32 @@ function relaxOrientation(u: Unit, dt: number): void {
   u.roll  += (0 - u.roll)  * kRoll;
 }
 
+/**
+ * Per-cell footing check used by tryNudgeAside. The blocker is going to walk
+ * one short hop — we don't run a full A* for it, so we just gate on the
+ * properties that the path search would otherwise reject:
+ *
+ *  - In-bounds and unblocked nav cell (no tree, building, cliff column).
+ *  - Enough air over the topY for the unit's height.
+ *  - Climb between the blocker's current cell and the candidate cell stays
+ *    within its maxStepVoxels so a tank doesn't sidestep off a ledge.
+ */
+function sidestepCellOk(nav: SurfaceNavBuffers, u: Unit, wx: number, wz: number): boolean {
+  const cx = Math.floor(wx / NAV_CELL_METERS);
+  const cz = Math.floor(wz / NAV_CELL_METERS);
+  if (cx < 0 || cz < 0 || cx >= NAV_W || cz >= NAV_H) return false;
+  const i = navIndex(cx, cz);
+  if (nav.blocked[i]) return false;
+  if (nav.headroom[i]! < u.heightVoxels) return false;
+  const fromCx = Math.max(0, Math.min(NAV_W - 1, Math.floor(u.x / NAV_CELL_METERS)));
+  const fromCz = Math.max(0, Math.min(NAV_H - 1, Math.floor(u.z / NAV_CELL_METERS)));
+  const fromTop = nav.topY[navIndex(fromCx, fromCz)]!;
+  const toTop = nav.topY[i]!;
+  if (fromTop < 0 || toTop < 0) return false;
+  if (Math.abs(toTop - fromTop) > u.maxStepVoxels) return false;
+  return true;
+}
+
 function surfaceWorldY(nav: SurfaceNavBuffers, wx: number, wz: number): number {
   const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(wx / NAV_CELL_METERS)));
   const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(wz / NAV_CELL_METERS)));
@@ -1307,12 +1408,14 @@ function sampleSurfaceFollow(u: Unit, nav: SurfaceNavBuffers, voxels: Uint8Array
   const halfWidthM = u.widthMeters * 0.5;
   // The search must reach at least one full climb-step above the cell-centre topY,
   // because A* let the unit straddle a cell boundary where the neighbour cell can be
-  // up to maxStepVoxels taller. The +4 margin covers cases where two adjacent steps
-  // stack up under a wide chassis (e.g. a tank's footprint reaching two cells over).
-  // Without it, soldiers crossing a tall step had their feet snapped into the dirt
-  // a couple voxels below the actual ledge, which the renderer drew as the unit
-  // half-buried in the hillside.
-  const searchRange = Math.max(12, u.maxStepVoxels + 4);
+  // up to maxStepVoxels taller. We also bake in a generous fixed floor (36 voxels =
+  // 4.5 m) so the snap still works when a unit ends up on terrain the path search
+  // wouldn't have routed it onto — explosion knockback, hand-spawned units, edits
+  // that lift the ground after the path was committed. Without it, soldiers
+  // crossing a tall step had their feet snapped into the dirt a couple voxels
+  // below the actual ledge, which the renderer drew as the unit half-buried in
+  // the hillside.
+  const searchRange = Math.max(36, u.maxStepVoxels + 4);
   const topVoxel = findFootprintTopVoxel(voxels, nav, u.x, u.z, halfWidthM, searchRange);
   if (topVoxel === null) return;
   const targetY = (topVoxel + 1) * VOXEL_SIZE;

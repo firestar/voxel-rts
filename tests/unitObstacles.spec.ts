@@ -5,7 +5,7 @@ import { smoothPath } from '../src/path/Smooth';
 import { VoxelWorld, worldIndex } from '../src/voxel/VoxelWorld';
 import { allocateVolumeNav, buildVolumeNav } from '../src/path/VolumeNav';
 import { WORLD_X, WORLD_Z, VOXEL_SIZE } from '../src/voxel/types';
-import { M_GRASS, M_DIRT, M_BEDROCK } from '../src/voxel/Materials';
+import { M_GRASS, M_DIRT, M_BEDROCK, M_STONE } from '../src/voxel/Materials';
 import { UnitManager, BLOCKED_REPATH_FRAMES } from '../src/sim/Units';
 
 const SURFACE_Y = 32;
@@ -171,6 +171,24 @@ describe('A* respects unit obstacles', () => {
 describe('blocked unit signals a re-path request', () => {
   it('latches needsRepath after BLOCKED_REPATH_FRAMES of collision-stalling', () => {
     const world = buildGrassPlane();
+    // Wall the parked tank in on both perpendicular flanks so the sidestep
+    // nudge can't place a valid foothold — that forces the older fallback
+    // (blocked-frames latch) to fire. Walls span the whole nav cells +Z and
+    // -Z of the parked tank's cell (60, 60); each nav cell is 8 voxels.
+    const v = world.buffers.voxels;
+    for (const cellDz of [-4, -3, -2, -1, 1, 2, 3, 4]) {
+      for (let cellDx = -3; cellDx <= 3; cellDx++) {
+        const cellX = 60 + cellDx;
+        const cellZ = 60 + cellDz;
+        for (let dx = 0; dx < 8; dx++) {
+          for (let dz = 0; dz < 8; dz++) {
+            for (let y = SURFACE_Y + 1; y <= SURFACE_Y + 12; y++) {
+              v[worldIndex(cellX * 8 + dx, y, cellZ * 8 + dz)] = M_STONE;
+            }
+          }
+        }
+      }
+    }
     const nav = allocateNav(false);
     buildSurfaceNav(world.buffers.voxels, nav);
     const vnav = allocateVolumeNav(false);

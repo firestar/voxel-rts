@@ -169,6 +169,16 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
         u.task = { kind: 'idle' };
         return;
       }
+      // Metal must be reachable on a voxel face — interior ore can't be picked
+      // out without first exposing it (e.g. by demolishing the stone shell).
+      // Wood doesn't get this gate; tree trunks intentionally splinter from a
+      // single hit on the column edge. We re-check every swing because spoil
+      // can bury ore between tasks.
+      if (u.task.kind === 'mine'
+          && !isExposed(deps.world.buffers.voxels, vx, vy, vz)) {
+        u.task = { kind: 'idle' };
+        return;
+      }
 
       if (horiz2 > WORK_REACH_M * WORK_REACH_M) {
         if (u.path.length === 0) deps.routeWorker(u, tx, ty, tz);
@@ -176,9 +186,14 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
       }
 
       const peak = Math.max(1, Math.min(255, Math.round(WORK_DPS * dt)));
+      // Mining narrows the damage sphere to the single target voxel so the
+      // surrounding (potentially un-exposed) ore never gets chipped via
+      // sphere falloff. Chopping keeps the wider radius so a swing that
+      // overlaps two adjacent trunk voxels still progresses both.
+      const radius = u.task.kind === 'mine' ? 0.4 : WORK_RADIUS_VOXELS;
       const result = deps.world.damageSphere(
         vx + 0.5, vy + 0.5, vz + 0.5,
-        WORK_RADIUS_VOXELS,
+        radius,
         peak,
       );
       if (result.destroyed.length > 0) {
