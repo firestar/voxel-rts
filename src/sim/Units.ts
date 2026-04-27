@@ -16,6 +16,13 @@ import { ProjectileKind } from './Projectiles';
 export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'hauler' | 'rocket_truck';
 
 /**
+ * Faction the unit belongs to. The player owns 'player' units; 'enemy' units are
+ * spawned via the sandbox (E key) and can be shot at without friendly-fire
+ * gating. Units only avoid hitting same-team peers along the firing line.
+ */
+export type Team = 'player' | 'enemy';
+
+/**
  * Worker role. Harvesters auto-find resources (trees, exposed metal ore) and
  * mine them, dropping piles when full. Transporters watch piles and ferry
  * them to storage buildings. Both share the same UnitKind, geometry, and
@@ -39,7 +46,13 @@ export type WorkerTask =
   /** Transporter is en-route to claimedPileId. */
   | { kind: 'fetchPile'; pileId: number }
   /** Carrying resources back to a storage building (transporter or harvester). */
-  | { kind: 'deliver' };
+  | { kind: 'deliver' }
+  /** Player-assigned dedicated farmer — tends a specific farm building so its
+   *  crop progress advances faster than the slow ambient growth rate. */
+  | { kind: 'farm'; buildingId: number }
+  /** Harvester is collecting a ripe crop from a specific farm — auto-picked
+   *  in `assignNextHarvestTask` when a `cropReady` farm is in range. */
+  | { kind: 'harvestFarm'; buildingId: number };
 
 /** Downward acceleration in m/s². Slightly snappier than real-world 9.81 — units feel
  *  "weighty" without dragging out the fall arc. Per-unit terminal velocity then sets
@@ -444,6 +457,12 @@ export interface Unit {
    */
   burstShotsRemaining: number;
   burstShotTimer: number;
+  /**
+   * Faction this unit fights for. Defaults to 'player'; the sandbox 'E'
+   * hotkey spawns 'enemy' units. Friendly-fire gating in the weapon tick
+   * skips shots whose line of fire passes through a same-team body.
+   */
+  team: Team;
 }
 
 /**
@@ -547,7 +566,7 @@ export class UnitManager {
   spawn(
     kind: UnitKind,
     x: number, y: number, z: number,
-    opts?: { workerRole?: WorkerRole; weapon?: WeaponKind | null },
+    opts?: { workerRole?: WorkerRole; weapon?: WeaponKind | null; team?: Team },
   ): Unit {
     const cfg = unitConfig(kind);
     const segments: WormSegment[] = [];
@@ -628,6 +647,7 @@ export class UnitManager {
       turretYaw: 0,
       burstShotsRemaining: 0,
       burstShotTimer: 0,
+      team: opts?.team ?? 'player',
     };
     this.units.push(u);
     return u;

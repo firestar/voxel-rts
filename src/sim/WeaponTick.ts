@@ -3,6 +3,46 @@ import { WEAPONS, WeaponConfig, WeaponMount } from './Weapons';
 import { ProjectileManager, PROJECTILES, muzzleOrigin, ProjectileKind } from './Projectiles';
 
 /**
+ * True when a same-team peer of `shooter` is on the line from the shooter's
+ * muzzle to (tx, ty, tz). Used to gate the trigger so friendly fire is
+ * impossible — a soldier won't shoot through another soldier on the way to
+ * an enemy. We treat each peer as a body sphere matching the projectile
+ * unit-hit test in `Game.unitRayHit`.
+ */
+function friendlyOnLineOfFire(shooter: Unit, tx: number, ty: number, tz: number, units: UnitManager): boolean {
+  const sx = shooter.x;
+  const sy = shooter.y + 1.2;
+  const sz = shooter.z;
+  const dx = tx - sx, dy = ty - sy, dz = tz - sz;
+  const dist = Math.hypot(dx, dy, dz);
+  if (dist < 1e-3) return false;
+  const inv = 1 / dist;
+  const dirX = dx * inv, dirY = dy * inv, dirZ = dz * inv;
+  for (const o of units.units) {
+    if (o.id === shooter.id) continue;
+    if (o.hp <= 0) continue;
+    if (o.team !== shooter.team) continue;
+    // Body sphere — same conventions as Game.unitRayHit so the gate matches
+    // what an actual round would clip on.
+    const radius = o.widthMeters * 0.55 + 0.35;
+    const cx = o.x;
+    const cy = o.y + Math.max(0.7, o.widthMeters * 0.6);
+    const cz = o.z;
+    const ox = sx - cx, oy = sy - cy, oz = sz - cz;
+    const b = ox * dirX + oy * dirY + oz * dirZ;
+    const cTerm = ox * ox + oy * oy + oz * oz - radius * radius;
+    const disc = b * b - cTerm;
+    if (disc < 0) continue;
+    const sq = Math.sqrt(disc);
+    let t = -b - sq;
+    if (t < 0) t = -b + sq;
+    if (t < 0 || t > dist) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
  * Per-frame firing pipeline. Walks every armed unit and:
  *
  *   1. Decays cooldowns (`fireCooldown`, `burstShotTimer`).
@@ -64,16 +104,22 @@ export function tickWeapons(
       const slewed = slewToward(u, w, targetYaw, dt);
       if (slewed.aligned) {
         if (u.fireCooldown === 0) {
-          fireShot(u, w, projectiles, hooks, tgt.projectileOverride);
-          // Single-shot: clear the firing target now. Burst weapons keep the
-          // remaining shots queued via burstShotsRemaining/burstShotTimer
-          // (handled below) but still drop the explicit firingTarget so the
-          // player can re-issue without another RMB hold for follow-up bursts.
-          u.firingTarget = null;
-          u.fireCooldown = w.fireInterval;
-          if (w.shotsPerBurst > 1) {
-            u.burstShotsRemaining = w.shotsPerBurst - 1;
-            u.burstShotTimer = w.burstInterval;
+          // Friendly-fire gate: don't pull the trigger while a same-team peer
+          // is between the muzzle and the target. We hold the firingTarget so
+          // the unit will fire as soon as the lane clears, rather than dropping
+          // the order silently.
+          if (!friendlyOnLineOfFire(u, tgt.x, tgt.y, tgt.z, units)) {
+            fireShot(u, w, projectiles, hooks, tgt.projectileOverride);
+            // Single-shot: clear the firing target now. Burst weapons keep the
+            // remaining shots queued via burstShotsRemaining/burstShotTimer
+            // (handled below) but still drop the explicit firingTarget so the
+            // player can re-issue without another RMB hold for follow-up bursts.
+            u.firingTarget = null;
+            u.fireCooldown = w.fireInterval;
+            if (w.shotsPerBurst > 1) {
+              u.burstShotsRemaining = w.shotsPerBurst - 1;
+              u.burstShotTimer = w.burstInterval;
+            }
           }
         }
       }
@@ -83,7 +129,16 @@ export function tickWeapons(
       // turret/hull currently points at, which is exactly what a burst-firing
       // weapon should do (track the last commanded direction).
       if (u.burstShotsRemaining > 0 && u.burstShotTimer === 0) {
-        fireShot(u, w, projectiles, hooks);
+        // Re-check friendly-fire on every burst follow-up — a peer can wander
+        // into the cone between rounds. We aim straight along the current
+        // hull/turret yaw to a far probe point.
+        const yaw = w.aimedBy === 'turret' ? u.turretYaw : u.heading;
+        const probeDx = -Math.sin(yaw) * w.rangeMeters;
+        const probeDz = -Math.cos(yaw) * w.rangeMeters;
+        const probeY = u.y + 1.2;
+        if (!friendlyOnLineOfFire(u, u.x + probeDx, probeY, u.z + probeDz, units)) {
+          fireShot(u, w, projectiles, hooks);
+        }
         u.burstShotsRemaining--;
         if (u.burstShotsRemaining > 0) {
           u.burstShotTimer = w.burstInterval;

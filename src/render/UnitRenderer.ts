@@ -58,6 +58,16 @@ export class UnitRenderer {
   private quat = new THREE.Quaternion();
   private tmpEuler = new THREE.Euler();
   private tmpV = new THREE.Vector3();
+  /**
+   * Per-instance team tint. We store one Color object per team and reuse it via
+   * `setColorAt`, so each instance is multiplied by either white (no tint, for
+   * player units) or a red multiplier (so enemy fatigues / hulls read red while
+   * still preserving the underlying voxel-colour silhouette). The instance
+   * colour multiplies the per-vertex colour at draw time, so values >1 are
+   * clamped to 1 — we keep all components ≤ 1.
+   */
+  private playerTint = new THREE.Color(1.0, 1.0, 1.0);
+  private enemyTint = new THREE.Color(1.0, 0.32, 0.30);
 
   /**
    * Pool of selection rings keyed by unit kind. Each frame we lay out the
@@ -189,10 +199,14 @@ export class UnitRenderer {
         : 0.0;
       this.tmpV.set(u.x, u.y + feetOffset + bodyBob, u.z);
       this.bodyM.compose(this.tmpV, this.quat, new THREE.Vector3(1, 1, 1));
+      const tint = u.team === 'enemy' ? this.enemyTint : this.playerTint;
 
       if (u.kind === 'soldier') {
         if (nSold >= this.capacity) continue;
         this.soldierBody.setMatrixAt(nSold, this.bodyM);
+        this.soldierBody.setColorAt(nSold, tint);
+        this.soldierLegL.setColorAt(nSold, tint);
+        this.soldierLegR.setColorAt(nSold, tint);
         const swing = isMoving ? Math.sin(u.distanceWalked * 4.5 + u.id) * 0.6 : 0;
         this.applyLegMatrix(nSold, this.soldierLegL, swing,  +SOLDIER_LEG_X);
         this.applyLegMatrix(nSold, this.soldierLegR, -swing, -SOLDIER_LEG_X);
@@ -200,6 +214,9 @@ export class UnitRenderer {
       } else if (u.kind === 'worker') {
         if (nWork >= this.capacity) continue;
         this.workerBody.setMatrixAt(nWork, this.bodyM);
+        this.workerBody.setColorAt(nWork, tint);
+        this.workerLegL.setColorAt(nWork, tint);
+        this.workerLegR.setColorAt(nWork, tint);
         // Same gait as soldier — counter-swinging legs around the same hip
         // pivot. Workers reuse the soldier hip constants since the geometry
         // is identical except for colour and the toolbelt.
@@ -215,9 +232,11 @@ export class UnitRenderer {
           this.partM.multiplyMatrices(this.bodyM, crateLocal);
           if (carryM > carryW) {
             this.workerCrateMetal.setMatrixAt(nCrateM, this.partM);
+            this.workerCrateMetal.setColorAt(nCrateM, tint);
             nCrateM++;
           } else {
             this.workerCrateWood.setMatrixAt(nCrateW, this.partM);
+            this.workerCrateWood.setColorAt(nCrateW, tint);
             nCrateW++;
           }
         }
@@ -225,6 +244,8 @@ export class UnitRenderer {
       } else if (u.kind === 'tank') {
         if (nTank >= this.capacity) continue;
         this.tankHull.setMatrixAt(nTank, this.bodyM);
+        this.tankHull.setColorAt(nTank, tint);
+        this.tankTurret.setColorAt(nTank, tint);
         // Turret rides on the hull at the pivot, but yaws independently of
         // the hull. We rotate the turret geometry by (turretYaw - heading)
         // around its own pivot so the cannon ends up pointing at the unit's
@@ -240,6 +261,8 @@ export class UnitRenderer {
       } else if (u.kind === 'tunneler') {
         if (nTun >= this.capacity) continue;
         this.tunnelerHull.setMatrixAt(nTun, this.bodyM);
+        this.tunnelerHull.setColorAt(nTun, tint);
+        this.tunnelerDrill.setColorAt(nTun, tint);
         // Drill spins around its local Z axis (forward) when moving or carving.
         const spin = isMoving ? now * 18 : u.carveCooldown > 0 ? now * 12 : 0;
         const spinE = new THREE.Euler(0, 0, spin, 'XYZ');
@@ -265,6 +288,8 @@ export class UnitRenderer {
       } else if (u.kind === 'worm') {
         if (nWorm >= this.capacity) continue;
         this.wormHead.setMatrixAt(nWorm, this.bodyM);
+        this.wormHead.setColorAt(nWorm, tint);
+        this.wormDrill.setColorAt(nWorm, tint);
         // Same drill-spin idea as the tunneler — cutter rotates around its forward
         // axis when moving/carving, with the residual path-pitch applied at the
         // mounting pivot so the head points along the dig.
@@ -291,11 +316,14 @@ export class UnitRenderer {
           const segM = new THREE.Matrix4();
           segM.compose(this.tmpV, this.quat, new THREE.Vector3(1, 1, 1));
           this.wormSegment.setMatrixAt(nWormSeg, segM);
+          this.wormSegment.setColorAt(nWormSeg, tint);
           nWormSeg++;
         }
       } else if (u.kind === 'dozer') {
         if (nDoz >= this.capacity) continue;
         this.dozerHull.setMatrixAt(nDoz, this.bodyM);
+        this.dozerHull.setColorAt(nDoz, tint);
+        this.dozerBlade.setColorAt(nDoz, tint);
         // Blade rides at the front of the chassis. No moving pivot for now —
         // it's a static plate. Blade model origin is centred at the leading
         // edge, so we translate to the pivot then leave the geometry as-is.
@@ -306,6 +334,8 @@ export class UnitRenderer {
       } else if (u.kind === 'hauler') {
         if (nHaul >= this.capacity) continue;
         this.haulerHull.setMatrixAt(nHaul, this.bodyM);
+        this.haulerHull.setColorAt(nHaul, tint);
+        this.haulerBed.setColorAt(nHaul, tint);
         // Bed tilts up when there's a pending dump job. Pivot at the rear lower
         // edge of the bed; positive X-rotation lifts the front of the bed.
         const tipping = u.haulerJob !== null && u.haulerJob.mode === 'dump' && u.spoilLoad > 0;
@@ -320,6 +350,8 @@ export class UnitRenderer {
       } else if (u.kind === 'rocket_truck') {
         if (nRkt >= this.capacity) continue;
         this.rocketTruckHull.setMatrixAt(nRkt, this.bodyM);
+        this.rocketTruckHull.setColorAt(nRkt, tint);
+        this.rocketTruckPod.setColorAt(nRkt, tint);
         // Pod rides on the deck, yaws independently of the hull. Same trick
         // as the tank turret: rotate the pod geometry by (turretYaw -
         // heading) around its own pivot so it points at the world-space aim
@@ -376,6 +408,11 @@ export class UnitRenderer {
       this.rocketTruckHull, this.rocketTruckPod,
     ]) {
       m.instanceMatrix.needsUpdate = true;
+      // instanceColor only exists once setColorAt has been called at least
+      // once, so it's null on the first frame for meshes that have no
+      // active instances. Guard the upload so we don't throw on a bare
+      // mesh.
+      if (m.instanceColor) m.instanceColor.needsUpdate = true;
     }
 
     // Hide any leftover rings from frames where more units were selected.
