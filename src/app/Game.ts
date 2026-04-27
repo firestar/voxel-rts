@@ -1285,6 +1285,23 @@ export class Game {
     // so the unit at least gets close instead of refusing to move.
     const goal = this.pathClient.nearestWalkable(wx, wz, 4);
     const start = this.pathClient.cellAt(unit.x, unit.z);
+    // Optimistic first leg — set the unit walking *this frame* along the goal direction
+    // so LMB→move feels instant regardless of the worker round-trip. The full route
+    // arrives milliseconds later and `Units.setPath` splices it onto wherever the unit
+    // is by then. We skip if the unit already has a path that ends at the same cell
+    // (e.g. mid-tick repath after rebuildNav) so we don't snap a moving unit back to a
+    // close-by cell-center for one frame.
+    if (unit.path.length === 0) {
+      const step = this.pathClient.firstStepWaypoint(
+        unit.x, unit.z,
+        (goal.cx + 0.5) * NAV_CELL_METERS, (goal.cz + 0.5) * NAV_CELL_METERS,
+        unit.maxStepVoxels,
+        unit.heightVoxels,
+      );
+      if (step !== null) {
+        this.units.setPath(unit, [step]);
+      }
+    }
     const unitObstacles = this.collectUnitObstacles(unit);
     const res = await this.pathClient.requestPath({
       startCx: start.cx, startCz: start.cz,
