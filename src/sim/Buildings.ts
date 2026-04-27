@@ -5,7 +5,7 @@ import { M_WOOD, M_FARM, M_STONE, M_PATH, M_DIRT_ROAD, M_METAL } from '../voxel/
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_VOXELS, FLAT_TOLERANCE_VOXELS } from '../path/SurfaceNav';
 import { UnitManager, UnitKind, Unit } from './Units';
 import { WeaponKind, WEAPONS } from './Weapons';
-import { ProjectileManager, muzzleOrigin, PROJECTILES, PROJECTILE_GRAVITY, Projectile, solveBallisticDirection } from './Projectiles';
+import { ProjectileManager, muzzleOrigin, PROJECTILES, PROJECTILE_GRAVITY, Projectile, ProjectileImpact, solveBallisticDirection } from './Projectiles';
 
 export type BuildingKind =
   | 'barracks'
@@ -16,6 +16,14 @@ export type BuildingKind =
   | 'tech_lab'
   | 'turret'
   | 'silo';
+
+/**
+ * Faction the building belongs to. Mirrors the unit `Team` type — buildings
+ * default to 'player'; the sandbox can place 'enemy' buildings for testing
+ * the attack pipeline. Projectile damage is team-agnostic (any round that
+ * lands inside / near the AABB hurts the building's HP).
+ */
+export type BuildingTeam = 'player' | 'enemy';
 
 export interface BuildingSpec {
   kind: BuildingKind;
@@ -28,6 +36,13 @@ export interface BuildingSpec {
   headroomVoxels: number;
   /** Primary wall material — used for the perimeter + countLivingWalls sample. */
   wall: MaterialId;
+  /**
+   * Hit-point pool the building starts with. Drained by projectile impacts
+   * (direct hits inside the AABB take the round's full `hitDamage`; explosive
+   * blasts apply falloff damage based on distance to the AABB). Once HP
+   * reaches zero the building flips to `destroyed` and stops ticking.
+   */
+  maxHp: number;
   /** Time between unit spawns in seconds. Infinity disables production. */
   productionInterval: number;
   /** Cycled through on each spawn. Empty array = doesn't produce units. */
@@ -63,6 +78,7 @@ export const BARRACKS: BuildingSpec = {
   cellsD: 4,
   headroomVoxels: 24, // 3 m at 0.125 m voxels
   wall: M_WOOD,
+  maxHp: 600,
   productionInterval: 6.0,
   // Cycle through every kind the barracks can produce so a single building
   // visibly outputs a balanced mix. Order is roughly "infantry → vehicles
@@ -84,6 +100,7 @@ export const FARM: BuildingSpec = {
   cellsD: 3,
   headroomVoxels: 4,            // ~0.5 m fence + open sky
   wall: M_DIRT_ROAD,            // low fence stamped from packed dirt
+  maxHp: 200,
   productionInterval: 5.0,      // food tick interval (seconds)
   produces: [],
   stamp: stampFarm,
@@ -102,6 +119,7 @@ export const STORAGE: BuildingSpec = {
   cellsD: 3,
   headroomVoxels: 12,
   wall: M_WOOD,
+  maxHp: 400,
   productionInterval: 0,        // no timer-driven behaviour
   produces: [],
   stamp: stampStorage,
@@ -114,6 +132,7 @@ export const POWER_PLANT: BuildingSpec = {
   cellsD: 5,
   headroomVoxels: 24, // 3 m main hall — wind turbine pylon sits above
   wall: M_STONE,
+  maxHp: 800,
   productionInterval: Infinity,
   produces: [],
   stamp: stampPowerPlant,
@@ -126,6 +145,7 @@ export const REFINERY: BuildingSpec = {
   cellsD: 4,
   headroomVoxels: 28, // 3.5 m hall — chimney rises above the roof
   wall: M_STONE,
+  maxHp: 800,
   productionInterval: Infinity,
   produces: [],
   stamp: stampRefinery,
@@ -138,6 +158,7 @@ export const TECH_LAB: BuildingSpec = {
   cellsD: 4,
   headroomVoxels: 20, // 2.5 m base — domed roof rises above
   wall: M_STONE,
+  maxHp: 700,
   productionInterval: Infinity,
   produces: [],
   stamp: stampTechLab,
@@ -157,6 +178,7 @@ export const TURRET: BuildingSpec = {
   cellsD: 2,
   headroomVoxels: 12,           // ~1.5 m base; the cannon head sits above
   wall: M_STONE,
+  maxHp: 500,
   productionInterval: Infinity, // doesn't produce units; weapon firing is per-frame
   produces: [],
   stamp: stampTurret,
@@ -184,6 +206,7 @@ export const AA_TURRET: BuildingSpec = {
   cellsD: 2,
   headroomVoxels: 12,
   wall: M_STONE,
+  maxHp: 500,
   productionInterval: Infinity,
   produces: [],
   stamp: stampTurret,
@@ -205,6 +228,7 @@ export const SILO: BuildingSpec = {
   cellsD: 5,
   headroomVoxels: 36,           // ~4.5 m main hall + missile tubes above
   wall: M_STONE,
+  maxHp: 1000,
   productionInterval: Infinity,
   produces: [],
   stamp: stampSilo,
@@ -235,6 +259,25 @@ export interface Building {
   productionTimer: number;
   wallVoxelsAtBuild: number;
   destroyed: boolean;
+  /**
+   * Faction this building belongs to. Player buildings are placed by the
+   * normal build flow; enemy buildings come from the sandbox / scenarios.
+   * Damage doesn't read team — any projectile hurts any building — but the
+   * player UI and aggressive-stance targeting do.
+   */
+  team: BuildingTeam;
+  /**
+   * Current hit-point pool. Drained by projectile impacts; once it reaches
+   * zero the building flips to `destroyed` and is treated as dead by every
+   * subsequent tick. Visual destruction (wall voxels carved away by the
+   * round's `damageSphere`) still happens in parallel — the HP gate just
+   * gives the building a clean numeric death even when only the roof has
+   * collapsed.
+   */
+  hp: number;
+  /** Snapshot of `spec.maxHp` taken at place-time — exposed on the instance
+   *  so renderers / HUD don't need to walk back to the spec. */
+  maxHp: number;
   /** True when this building is the player's currently selected building. */
   selected: boolean;
   /**
@@ -939,7 +982,12 @@ export class BuildingManager {
         color: { r: number; g: number; b: number }) => void)
     | null = null;
 
-  place(world: VoxelWorld, spec: BuildingSpec, ox: number, oz: number, floorY: number): Building {
+  place(
+    world: VoxelWorld,
+    spec: BuildingSpec,
+    ox: number, oz: number, floorY: number,
+    opts?: { team?: BuildingTeam },
+  ): Building {
     const wallCount = spec.stamp(world, ox, oz, floorY);
     const b: Building = {
       id: this.nextId++,
@@ -949,6 +997,9 @@ export class BuildingManager {
       productionTimer: spec.productionInterval,
       wallVoxelsAtBuild: wallCount,
       destroyed: false,
+      team: opts?.team ?? 'player',
+      hp: spec.maxHp,
+      maxHp: spec.maxHp,
       selected: false,
       trainQueue: [],
       cropProgress: 0,
@@ -960,6 +1011,43 @@ export class BuildingManager {
     };
     this.buildings.push(b);
     return b;
+  }
+
+  /**
+   * Apply a projectile impact's damage to every building in range. Direct
+   * hits — impact point lying inside the building's footprint AABB — take
+   * the round's full `hitDamage`. Explosive blasts apply falloff damage to
+   * every building whose AABB lies within `explosionRadiusMeters`, scaled
+   * linearly to zero at the blast edge (same shape as the unit splash math
+   * in Game.handleProjectileImpact). HP that drops to zero flips
+   * `destroyed`, mirroring the existing wall-count threshold.
+   *
+   * Buildings are not team-filtered here — anyone's projectile can damage
+   * anyone's structure. Friendly-fire on your own base is the player's
+   * problem, just like turret placement next to a barracks.
+   */
+  applyImpactDamage(impact: ProjectileImpact): void {
+    for (const b of this.buildings) {
+      if (b.destroyed) continue;
+      const dist = aabbDistance(b, impact.x, impact.y, impact.z);
+      let damage = 0;
+      // Direct hit: impact point lies inside the AABB. Full direct damage.
+      if (dist <= 0) damage += impact.hitDamage;
+      // Explosive splash: any AABB-overlap within the blast radius takes a
+      // falloff fraction of the explosion peak. The directly-hit building
+      // (dist == 0) catches the splash on top of the direct hit, mirroring
+      // the unit pipeline.
+      if (impact.explosive && impact.explosionRadiusMeters > 0 && dist < impact.explosionRadiusMeters) {
+        const falloff = 1 - dist / impact.explosionRadiusMeters;
+        damage += impact.damagePeak * falloff;
+      }
+      if (damage <= 0) continue;
+      b.hp -= damage;
+      if (b.hp <= 0) {
+        b.hp = 0;
+        b.destroyed = true;
+      }
+    }
   }
 
   tick(dt: number, world: VoxelWorld, units: UnitManager): void {
@@ -1432,6 +1520,25 @@ export class BuildingManager {
 function lookupUnit(units: UnitManager, id: number): Unit | null {
   for (const u of units.units) if (u.id === id) return u;
   return null;
+}
+
+/**
+ * Distance in meters from world point `(x, y, z)` to the building's footprint
+ * AABB. The Y span covers floor → roof (plus 1 voxel of slack so a hit on the
+ * uppermost roof voxel still reads as inside). Returns 0 when the point lies
+ * inside the box. Used by `applyImpactDamage` to decide direct-hit vs splash.
+ */
+function aabbDistance(b: Building, x: number, y: number, z: number): number {
+  const wxStart = b.ox * NAV_CELL_VOXELS * VOXEL_SIZE;
+  const wzStart = b.oz * NAV_CELL_VOXELS * VOXEL_SIZE;
+  const wxEnd = wxStart + b.spec.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE;
+  const wzEnd = wzStart + b.spec.cellsD * NAV_CELL_VOXELS * VOXEL_SIZE;
+  const yFloor = b.floorY * VOXEL_SIZE;
+  const yRoof = (b.floorY + b.spec.headroomVoxels + 1) * VOXEL_SIZE;
+  const cx = Math.max(wxStart, Math.min(x, wxEnd));
+  const cy = Math.max(yFloor, Math.min(y, yRoof));
+  const cz = Math.max(wzStart, Math.min(z, wzEnd));
+  return Math.hypot(x - cx, y - cy, z - cz);
 }
 
 function wrapAngle(a: number): number {
