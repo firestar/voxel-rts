@@ -192,6 +192,12 @@ export interface SVOLookup {
   size: number;
   /** Internal node index of the leaf, for callers that need to attach side data (clearance, etc.). */
   nodeIdx: number;
+  /** Chunk-local min corner (x) of the leaf the query landed in. */
+  minLx: number;
+  /** Chunk-local min corner (y). */
+  minLy: number;
+  /** Chunk-local min corner (z). */
+  minLz: number;
 }
 
 /**
@@ -205,6 +211,9 @@ export interface SVOLookup {
 export function querySVO(svo: ChunkSVO, lx: number, ly: number, lz: number): SVOLookup {
   let i = 0;
   let size = CHUNK;
+  // (cx, cy, cz) starts at the query and shrinks toward the leaf-local origin.
+  // The min corner of the leaf in chunk coords = (lx - cx, ly - cy, lz - cz)
+  // once we stop descending.
   let cx = lx, cy = ly, cz = lz;
   while (svo.tag[i]! === SVO_MIXED) {
     const half = size >> 1;
@@ -223,6 +232,9 @@ export function querySVO(svo: ChunkSVO, lx: number, ly: number, lz: number): SVO
     level: svo.level[i]!,
     size,
     nodeIdx: i,
+    minLx: lx - cx,
+    minLy: ly - cy,
+    minLz: lz - cz,
   };
 }
 

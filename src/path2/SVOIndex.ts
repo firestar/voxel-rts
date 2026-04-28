@@ -30,6 +30,12 @@ import {
  * resolve annotations or follow up with adjacency queries. */
 export interface WorldLookup extends SVOLookup {
   chunkKey: number;
+  /** World-space min corner of the leaf (x). */
+  minWx: number;
+  /** World-space min corner of the leaf (y). */
+  minWy: number;
+  /** World-space min corner of the leaf (z). */
+  minWz: number;
 }
 
 export class SVOIndex {
@@ -105,7 +111,13 @@ export class SVOIndex {
       wy - cy * CHUNK,
       wz - cz * CHUNK,
     );
-    return { ...lookup, chunkKey: k };
+    return {
+      ...lookup,
+      chunkKey: k,
+      minWx: cx * CHUNK + lookup.minLx,
+      minWy: cy * CHUNK + lookup.minLy,
+      minWz: cz * CHUNK + lookup.minLz,
+    };
   }
 
   /**
