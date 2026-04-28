@@ -432,3 +432,247 @@ function addFaceEdges(
 
 // Reference dimensions exported for callers that don't want to import from VolumeNav directly.
 export const NAV_DIMS_DEFAULT = { w: VNAV_X, h: VNAV_Y, d: VNAV_Z } as const;
+
+/**
+ * Recompute one super-cell's planes, cellPlaneMap slice, bedrockOnly, and avgDigCost.
+ * Mirrors the per-cell pass inside buildLevel so the incremental updater can reuse it.
+ * Does NOT touch edges — call rebuildSuperCellFaceEdges separately.
+ */
+export function rebuildSuperCellPlanes(
+  vnav: VolumeNavBuffers,
+  level: ResLevel3D,
+  sx: number, sy: number, sz: number,
+  navW: number, navH: number, navD: number,
+): void {
+  const f = level.factor;
+  if (f === 1) return;
+  const f3 = f * f * f;
+  const sIdx = superCellIndex(level, sx, sy, sz);
+  if (sIdx < 0 || sIdx >= level.count) return;
+  const cell = level.cells[sIdx]!;
+  const map = level.cellPlaneMap;
+  const baseMapOff = sIdx * f3;
+
+  // Reset this cell's slice and plane list. Edges are handled separately.
+  for (let i = 0; i < f3; i++) map[baseMapOff + i] = 0;
+  cell.planes.length = 0;
+
+  const x0 = sx * f, y0 = sy * f, z0 = sz * f;
+  const xMax = Math.min(f, navW - x0);
+  const yMax = Math.min(f, navH - y0);
+  const zMax = Math.min(f, navD - z0);
+  if (xMax <= 0 || yMax <= 0 || zMax <= 0) {
+    cell.bedrockOnly = false;
+    cell.avgDigCost = 0;
+    return;
+  }
+
+  const queue = new Int32Array(f3);
+
+  let solidCount = 0;
+  let digSum = 0;
+  let allBedrock = true;
+  let anySolid = false;
+
+  for (let ly = 0; ly < yMax; ly++) {
+    const cy = y0 + ly;
+    for (let lz = 0; lz < zMax; lz++) {
+      const cz = z0 + lz;
+      for (let lx = 0; lx < xMax; lx++) {
+        const cx = x0 + lx;
+        const bi = vnavIndex(cx, cy, cz);
+        if (getBit(vnav.solid, bi) === 1) {
+          anySolid = true;
+          solidCount++;
+          digSum += vnav.digCost[bi]!;
+          if (getBit(vnav.bedrock, bi) === 0) allBedrock = false;
+        } else {
+          allBedrock = false;
+        }
+      }
+    }
+  }
+
+  cell.bedrockOnly = anySolid && allBedrock;
+  cell.avgDigCost = solidCount > 0 ? Math.min(255, Math.round(digSum / solidCount)) : 0;
+
+  let planeCount = 0;
+  for (let ly = 0; ly < yMax; ly++) {
+    const cy = y0 + ly;
+    for (let lz = 0; lz < zMax; lz++) {
+      const cz = z0 + lz;
+      for (let lx = 0; lx < xMax; lx++) {
+        const cx = x0 + lx;
+        const bi = vnavIndex(cx, cy, cz);
+        if (getBit(vnav.solid, bi) === 1) continue;
+        const off = ((ly * f) + lz) * f + lx;
+        if (map[baseMapOff + off]! !== 0) continue;
+
+        const isMergeIntoLast = planeCount >= MAX_PLANES_PER_CELL;
+        const targetPlaneIdx = isMergeIntoLast ? MAX_PLANES_PER_CELL - 1 : planeCount;
+        const stamp = targetPlaneIdx + 1;
+
+        let qhead = 0;
+        let qtail = 0;
+        queue[qtail++] = off;
+        map[baseMapOff + off] = stamp;
+
+        let size = 0;
+        let ySum = 0;
+        let surfaceConnected = false;
+        const rootBaseCell = bi;
+
+        while (qhead < qtail) {
+          const cur = queue[qhead++]!;
+          const curLx = cur % f;
+          const tmp = (cur / f) | 0;
+          const curLz = tmp % f;
+          const curLy = (tmp / f) | 0;
+          const curCx = x0 + curLx;
+          const curCy = y0 + curLy;
+          const curCz = z0 + curLz;
+          const curBi = vnavIndex(curCx, curCy, curCz);
+
+          size++;
+          ySum += curCy;
+          if (getBit(vnav.surfaceConnected, curBi) === 1) surfaceConnected = true;
+
+          if (curLx + 1 < xMax) {
+            const nOff = cur + 1;
+            if (map[baseMapOff + nOff]! === 0) {
+              const nBi = vnavIndex(curCx + 1, curCy, curCz);
+              if (getBit(vnav.solid, nBi) === 0) {
+                map[baseMapOff + nOff] = stamp;
+                queue[qtail++] = nOff;
+              }
+            }
+          }
+          if (curLx > 0) {
+            const nOff = cur - 1;
+            if (map[baseMapOff + nOff]! === 0) {
+              const nBi = vnavIndex(curCx - 1, curCy, curCz);
+              if (getBit(vnav.solid, nBi) === 0) {
+                map[baseMapOff + nOff] = stamp;
+                queue[qtail++] = nOff;
+              }
+            }
+          }
+          if (curLz + 1 < zMax) {
+            const nOff = cur + f;
+            if (map[baseMapOff + nOff]! === 0) {
+              const nBi = vnavIndex(curCx, curCy, curCz + 1);
+              if (getBit(vnav.solid, nBi) === 0) {
+                map[baseMapOff + nOff] = stamp;
+                queue[qtail++] = nOff;
+              }
+            }
+          }
+          if (curLz > 0) {
+            const nOff = cur - f;
+            if (map[baseMapOff + nOff]! === 0) {
+              const nBi = vnavIndex(curCx, curCy, curCz - 1);
+              if (getBit(vnav.solid, nBi) === 0) {
+                map[baseMapOff + nOff] = stamp;
+                queue[qtail++] = nOff;
+              }
+            }
+          }
+          if (curLy + 1 < yMax) {
+            const nOff = cur + f * f;
+            if (map[baseMapOff + nOff]! === 0) {
+              const nBi = vnavIndex(curCx, curCy + 1, curCz);
+              if (getBit(vnav.solid, nBi) === 0) {
+                map[baseMapOff + nOff] = stamp;
+                queue[qtail++] = nOff;
+              }
+            }
+          }
+          if (curLy > 0) {
+            const nOff = cur - f * f;
+            if (map[baseMapOff + nOff]! === 0) {
+              const nBi = vnavIndex(curCx, curCy - 1, curCz);
+              if (getBit(vnav.solid, nBi) === 0) {
+                map[baseMapOff + nOff] = stamp;
+                queue[qtail++] = nOff;
+              }
+            }
+          }
+        }
+
+        if (isMergeIntoLast) {
+          const merged = cell.planes[targetPlaneIdx]!;
+          merged.size += size;
+          merged.ySum += ySum;
+          merged.surfaceConnected = merged.surfaceConnected || surfaceConnected;
+        } else {
+          cell.planes.push({ rootBaseCell, size, ySum, surfaceConnected });
+          planeCount++;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Rebuild every face-edge incident to (sx,sy,sz). Clears existing edges from
+ * the cell and from each of its 6 neighbours that point back, then re-runs
+ * addFaceEdges across all 6 axes. Caller must have already rebuilt planes for
+ * this cell AND every neighbour whose plane table might have shifted.
+ */
+export function rebuildSuperCellFaceEdges(
+  vnav: VolumeNavBuffers,
+  level: ResLevel3D,
+  sx: number, sy: number, sz: number,
+  navW: number, navH: number, navD: number,
+): void {
+  if (level.factor === 1) return;
+  const sIdx = superCellIndex(level, sx, sy, sz);
+  if (sIdx < 0 || sIdx >= level.count) return;
+  const cell = level.cells[sIdx]!;
+
+  // Collect neighbour indices that exist; -1 for OOB.
+  const negX = sx > 0 ? superCellIndex(level, sx - 1, sy, sz) : -1;
+  const posX = sx + 1 < level.w ? superCellIndex(level, sx + 1, sy, sz) : -1;
+  const negY = sy > 0 ? superCellIndex(level, sx, sy - 1, sz) : -1;
+  const posY = sy + 1 < level.h ? superCellIndex(level, sx, sy + 1, sz) : -1;
+  const negZ = sz > 0 ? superCellIndex(level, sx, sy, sz - 1) : -1;
+  const posZ = sz + 1 < level.d ? superCellIndex(level, sx, sy, sz + 1) : -1;
+
+  // Drop any edge from this cell into one of the 6 neighbours.
+  cell.edges = cell.edges.filter(e =>
+    e.neighbourCellIdx !== negX &&
+    e.neighbourCellIdx !== posX &&
+    e.neighbourCellIdx !== negY &&
+    e.neighbourCellIdx !== posY &&
+    e.neighbourCellIdx !== negZ &&
+    e.neighbourCellIdx !== posZ,
+  );
+  // And drop neighbour edges that point back at us.
+  if (negX >= 0) level.cells[negX]!.edges = level.cells[negX]!.edges.filter(e => e.neighbourCellIdx !== sIdx);
+  if (posX >= 0) level.cells[posX]!.edges = level.cells[posX]!.edges.filter(e => e.neighbourCellIdx !== sIdx);
+  if (negY >= 0) level.cells[negY]!.edges = level.cells[negY]!.edges.filter(e => e.neighbourCellIdx !== sIdx);
+  if (posY >= 0) level.cells[posY]!.edges = level.cells[posY]!.edges.filter(e => e.neighbourCellIdx !== sIdx);
+  if (negZ >= 0) level.cells[negZ]!.edges = level.cells[negZ]!.edges.filter(e => e.neighbourCellIdx !== sIdx);
+  if (posZ >= 0) level.cells[posZ]!.edges = level.cells[posZ]!.edges.filter(e => e.neighbourCellIdx !== sIdx);
+
+  if (cell.planes.length === 0) {
+    // Still want neighbour-side faces touching us cleared (done above) — nothing to add.
+    return;
+  }
+
+  // Re-emit edges on +X, +Y, +Z faces of this cell, and on the +X/+Y/+Z faces of the
+  // 3 negative-direction neighbours (whose +faces touch our -face). addFaceEdges pushes
+  // to both sides, so this covers all 6 faces of (sx,sy,sz).
+  if (posX >= 0) addFaceEdges(level, vnav, sIdx, sx, sy, sz, 1, 0, 0, 0, navW, navH, navD);
+  if (posY >= 0) addFaceEdges(level, vnav, sIdx, sx, sy, sz, 0, 1, 0, 2, navW, navH, navD);
+  if (posZ >= 0) addFaceEdges(level, vnav, sIdx, sx, sy, sz, 0, 0, 1, 4, navW, navH, navD);
+  if (negX >= 0 && level.cells[negX]!.planes.length > 0) {
+    addFaceEdges(level, vnav, negX, sx - 1, sy, sz, 1, 0, 0, 0, navW, navH, navD);
+  }
+  if (negY >= 0 && level.cells[negY]!.planes.length > 0) {
+    addFaceEdges(level, vnav, negY, sx, sy - 1, sz, 0, 1, 0, 2, navW, navH, navD);
+  }
+  if (negZ >= 0 && level.cells[negZ]!.planes.length > 0) {
+    addFaceEdges(level, vnav, negZ, sx, sy, sz - 1, 0, 0, 1, 4, navW, navH, navD);
+  }
+}
