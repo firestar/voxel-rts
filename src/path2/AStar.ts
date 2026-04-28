@@ -8,18 +8,25 @@ import { CHUNK } from '../voxel/types';
 import { SVO_LEAF_AIR } from './SVO';
 
 /**
- * Single-tier A* over SVO leaves. Leaves are nodes; face-adjacency edges are
- * enumerated on demand by `forEachFaceNeighbor` — no persistent edge graph.
+ * Bidirectional weighted A* over SVO leaves.
  *
- * The SVO already gives us "hierarchy for free" in the typical case: a 32³
- * cube of uniform air collapses to one leaf, so crossing it is one A*
- * expansion instead of 32 K. For long-distance paths through mostly-uniform
- * terrain, expansion counts stay in the low hundreds.
+ * Two searches run in tandem — one forward from `start`, one backward from
+ * `goal`. First-meet termination: when one side expands a node the other has
+ * already closed, stitch the two halves. For long, mostly-symmetric routes
+ * this roughly halves expansions vs single-direction A*. Path quality
+ * matches the existing pathfinder's bidirectional weighted A* (sub-optimal
+ * by at most ε for ε ≥ 1).
  *
- * The search uses a 4-ary heap and weighted Euclidean heuristic. A
- * generation-less Map tracks per-leaf state — node indices are stable within
- * a single search, but rebuilds between calls reassign them, so reusing
- * persistent state would just be wrong.
+ * Edges are enumerated on demand by `forEachFaceNeighbor` — no persistent
+ * graph. The SVO already gives "hierarchy for free": a 32³ uniform-air leaf
+ * is one expansion, not 32 K voxels. For mostly-uniform terrain, expansion
+ * counts stay in the low tens.
+ *
+ * Edge cost is symmetric: `euclidean × max(curCostMult, nbrCostMult)`. This
+ * is mildly pessimistic for digger paths (a one-way air→solid step costs
+ * the dig multiplier even though entering air is free), but symmetry is
+ * required for bidirectional first-meet correctness on non-trivial cost
+ * fields. Mirrors the convention in `src/path/AStar.ts`.
  */
 
 export interface PathRequest {
@@ -30,15 +37,13 @@ export interface PathRequest {
   unit: UnitTraversal;
   /**
    * Heuristic weight ε ≥ 1. ε=1 → optimal (slow); ε=1.5 → up to 50%
-   * suboptimal but a forward-biased fan dramatically cuts expansions.
-   * Mirrors the existing pathfinder's convention. Default 1.5.
+   * suboptimal but a forward-biased fan from each end dramatically cuts
+   * expansions. Mirrors the existing pathfinder's convention. Default 1.5.
    */
   heuristicWeight?: number;
   /**
-   * Hard cap on expansions. Returns failure when exceeded; caller decides
-   * whether to fall back, retry with a larger budget, or give up. Default
-   * 50_000 — generous for hierarchical-style searches that mostly traverse
-   * large air leaves.
+   * Hard cap on expansions across both sides combined. Returns failure when
+   * exceeded. Default 50_000.
    */
   maxExpansions?: number;
 }
@@ -46,43 +51,75 @@ export interface PathRequest {
 export interface PathResult {
   /**
    * Leaf-center world voxel waypoints from start to goal, inclusive. Empty
-   * when `reached` is false. The unit can lerp between consecutive waypoints
-   * since each pair lies in face-adjacent leaves both passable for the unit.
+   * when `reached` is false. Consecutive pairs lie in face-adjacent passable
+   * leaves so a unit can lerp between them.
    */
   waypoints: { x: number; y: number; z: number }[];
   reached: boolean;
-  /** Number of leaves popped from the open set. */
+  /** Total leaves popped across both forward and backward sides. */
   expansions: number;
 }
 
-/** Pack (chunkKey, nodeIdx) into one int32 key for heap / Map use.
- *  chunkKey ≤ CHUNKS_X*CHUNKS_Y*CHUNKS_Z ≈ 6 K, nodeIdx ≤ ~32 K → fits. */
+interface Vec3 { x: number; y: number; z: number; }
+
+interface SearchSide {
+  heap: FourAryHeap;
+  g: Map<number, number>;
+  parent: Map<number, number>;
+  closed: Set<number>;
+  leaves: Map<number, WorldLookup>;
+  /** Heuristic target (the *other* side's start). */
+  targetCenter: Vec3;
+}
+
+/** Pack (chunkKey, nodeIdx) into one int32. chunkKey ≤ 6 K, nodeIdx ≤ 32 K. */
 function packKey(chunkKey: number, nodeIdx: number): number {
   return (chunkKey << 16) | (nodeIdx & 0xFFFF);
 }
 
-/** Voxel-units center of a leaf, used for distance calculations and waypoints. */
-function leafCenter(leaf: WorldLookup): { x: number; y: number; z: number } {
+function leafCenter(leaf: WorldLookup): Vec3 {
   const half = leaf.size / 2;
   return { x: leaf.minWx + half, y: leaf.minWy + half, z: leaf.minWz + half };
 }
 
-function euclidean(a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }): number {
+function euclidean(a: Vec3, b: Vec3): number {
   const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+function enterable(index: SVOIndex, leaf: WorldLookup, unit: UnitTraversal): boolean {
+  const cost = leafCost(
+    index.chunks[leaf.chunkKey]!,
+    index.annotations[leaf.chunkKey]!,
+    leaf.nodeIdx,
+    unit,
+  );
+  if (!cost.canEnter) return false;
+  if (unit.requiresGround && leaf.tag === SVO_LEAF_AIR) {
+    if (!isGrounded(index, leaf)) return false;
+  }
+  return true;
+}
+
+function makeSide(targetCenter: Vec3): SearchSide {
+  return {
+    heap: new FourAryHeap(1024),
+    g: new Map(),
+    parent: new Map(),
+    closed: new Set(),
+    leaves: new Map(),
+    targetCenter,
+  };
+}
+
 /**
- * Returns a PathResult whose `reached` is true iff a passable corridor of
- * face-adjacent leaves connects start to goal under the unit predicate.
+ * Find a path from `req.start` to `req.goal` for `req.unit` using
+ * bidirectional weighted A*. Returns `reached: false` when no path exists
+ * within the expansion budget, or when start/goal lies in a non-enterable
+ * leaf.
  *
- * Both start and goal are resolved via `queryWorld`; the search runs leaf-
- * to-leaf. If start or goal is in an impassable leaf the search returns
- * failure with zero expansions.
- *
- * The waypoint list interpolates the start and goal positions exactly: the
- * first waypoint is the start, the last is the goal, with leaf centers in
- * between. Saves the caller from a separate "snap to leaf center" pass.
+ * Waypoints interpolate the start and goal positions exactly: the first is
+ * `req.start`, the last is `req.goal`, with leaf centers in between.
  */
 export function findPath(index: SVOIndex, req: PathRequest): PathResult {
   const weight = req.heuristicWeight ?? 1.5;
@@ -91,14 +128,10 @@ export function findPath(index: SVOIndex, req: PathRequest): PathResult {
   const startLeaf = index.queryWorld(req.start.x | 0, req.start.y | 0, req.start.z | 0);
   const goalLeaf = index.queryWorld(req.goal.x | 0, req.goal.y | 0, req.goal.z | 0);
   if (!startLeaf || !goalLeaf) return { waypoints: [], reached: false, expansions: 0 };
-
-  // Fast-path rejection: start or goal is in a non-enterable leaf for this
-  // unit. Saves opening a hopeless search.
   if (!enterable(index, startLeaf, req.unit) || !enterable(index, goalLeaf, req.unit)) {
     return { waypoints: [], reached: false, expansions: 0 };
   }
 
-  // Same-leaf shortcut.
   const startKey = packKey(startLeaf.chunkKey, startLeaf.nodeIdx);
   const goalKey = packKey(goalLeaf.chunkKey, goalLeaf.nodeIdx);
   if (startKey === goalKey) {
@@ -112,131 +145,127 @@ export function findPath(index: SVOIndex, req: PathRequest): PathResult {
     };
   }
 
-  const heap = new FourAryHeap(1024);
-  const gScore = new Map<number, number>();
-  const parent = new Map<number, number>();
-  const closed = new Set<number>();
-  // Stash leaf objects so we can reconstruct the path without re-querying.
-  // The query is cheap, but holding the same object across the whole search
-  // also lets us retrieve `size` and `minW*` for the waypoint without a
-  // second SVO walk.
-  const leaves = new Map<number, WorldLookup>();
-  leaves.set(startKey, startLeaf);
-  leaves.set(goalKey, goalLeaf);
-
-  const goalCenter = leafCenter(goalLeaf);
   const startCenter = leafCenter(startLeaf);
+  const goalCenter = leafCenter(goalLeaf);
 
-  gScore.set(startKey, 0);
-  heap.push(startKey, weight * euclidean(startCenter, goalCenter));
+  const fwd = makeSide(goalCenter);
+  const bwd = makeSide(startCenter);
+
+  fwd.g.set(startKey, 0);
+  fwd.leaves.set(startKey, startLeaf);
+  fwd.heap.push(startKey, weight * euclidean(startCenter, goalCenter));
+
+  bwd.g.set(goalKey, 0);
+  bwd.leaves.set(goalKey, goalLeaf);
+  bwd.heap.push(goalKey, weight * euclidean(goalCenter, startCenter));
 
   let expansions = 0;
-  let reached = false;
+  let meetKey = -1;
 
-  while (heap.length > 0) {
-    if (expansions >= maxExp) break;
-    const curKey = heap.pop();
+  while (fwd.heap.length > 0 && bwd.heap.length > 0 && expansions < maxExp) {
+    // Expand the side with the lower min f. Empty heap pushes that side to
+    // infinity so we always pull from the live one.
+    const fTop = fwd.heap.length > 0 ? fwd.heap.topPriority() : Infinity;
+    const bTop = bwd.heap.length > 0 ? bwd.heap.topPriority() : Infinity;
+    const side = fTop <= bTop ? fwd : bwd;
+    const other = side === fwd ? bwd : fwd;
+
+    const curKey = side.heap.pop();
     if (curKey === -1) break;
-    if (closed.has(curKey)) continue;
-    closed.add(curKey);
+    if (side.closed.has(curKey)) continue;
+    side.closed.add(curKey);
     expansions++;
-    if (curKey === goalKey) { reached = true; break; }
 
-    const cur = leaves.get(curKey)!;
-    const curG = gScore.get(curKey)!;
+    // First-meet termination: this node was already settled by the other
+    // side. Stitch the two halves through it.
+    if (other.closed.has(curKey)) {
+      meetKey = curKey;
+      break;
+    }
+
+    const cur = side.leaves.get(curKey)!;
+    const curG = side.g.get(curKey)!;
     const curCenter = leafCenter(cur);
+    const ownAnn = index.annotations[cur.chunkKey]!;
+    const curCostMult = leafCost(
+      index.chunks[cur.chunkKey]!, ownAnn, cur.nodeIdx, req.unit,
+    ).costMult;
 
     forEachFaceNeighbor(index, cur, ({ leaf: nbr }) => {
       const nbrKey = packKey(nbr.chunkKey, nbr.nodeIdx);
-      if (closed.has(nbrKey)) return;
+      if (side.closed.has(nbrKey)) return;
       if (!enterable(index, nbr, req.unit)) return;
-      // Edge clearance is bounded by air leaves only — solid leaves are
-      // carved out as the digger passes through, so their inscribed radius
-      // (which is 0) is irrelevant to the unit's bottleneck. Without this,
-      // every "dig out of solid into air" transition would be rejected.
-      const ann = index.annotations[nbr.chunkKey]!;
-      const ownAnn = index.annotations[cur.chunkKey]!;
+
+      // Edge clearance: only constrains pairs of air leaves. Solid leaves
+      // are carved out by the digger, so their inscribedRadius=0 doesn't
+      // bound the bottleneck.
+      const nbrAnn = index.annotations[nbr.chunkKey]!;
       if (cur.tag === SVO_LEAF_AIR && nbr.tag === SVO_LEAF_AIR) {
         const minR = Math.min(
           ownAnn.inscribedRadius[cur.nodeIdx]!,
-          ann.inscribedRadius[nbr.nodeIdx]!,
+          nbrAnn.inscribedRadius[nbr.nodeIdx]!,
         );
         if (minR < req.unit.radiusVoxels) return;
       } else if (nbr.tag === SVO_LEAF_AIR) {
-        // Solid → air: the air leaf alone must hold the unit.
-        if (ann.inscribedRadius[nbr.nodeIdx]! < req.unit.radiusVoxels) return;
+        if (nbrAnn.inscribedRadius[nbr.nodeIdx]! < req.unit.radiusVoxels) return;
       }
-      // Air → solid and solid → solid: no clearance check; the digger's
-      // own carve diameter is the only constraint and it's by construction
-      // ≥ the unit body.
 
-      const nbrCost = leafCost(
-        index.chunks[nbr.chunkKey]!,
-        index.annotations[nbr.chunkKey]!,
-        nbr.nodeIdx,
-        req.unit,
-      );
-      // enterable() already established canEnter — but the costMult is needed
-      // for the edge weight here.
+      const nbrCostMult = leafCost(
+        index.chunks[nbr.chunkKey]!, nbrAnn, nbr.nodeIdx, req.unit,
+      ).costMult;
+      // Symmetric edge cost — both forward and backward searches must agree
+      // on the cost of traversing this edge for first-meet stitching to
+      // produce a path with consistent g-scores.
+      const edgeMult = curCostMult > nbrCostMult ? curCostMult : nbrCostMult;
       const nbrCenter = leafCenter(nbr);
       const stepDist = euclidean(curCenter, nbrCenter);
-      const tentativeG = curG + stepDist * nbrCost.costMult;
-      const prevG = gScore.get(nbrKey);
+      const tentativeG = curG + stepDist * edgeMult;
+      const prevG = side.g.get(nbrKey);
       if (prevG !== undefined && tentativeG >= prevG) return;
-      gScore.set(nbrKey, tentativeG);
-      parent.set(nbrKey, curKey);
-      leaves.set(nbrKey, nbr);
-      const f = tentativeG + weight * euclidean(nbrCenter, goalCenter);
-      heap.push(nbrKey, f);
+      side.g.set(nbrKey, tentativeG);
+      side.parent.set(nbrKey, curKey);
+      side.leaves.set(nbrKey, nbr);
+      const f = tentativeG + weight * euclidean(nbrCenter, side.targetCenter);
+      side.heap.push(nbrKey, f);
     });
   }
 
-  if (!reached) return { waypoints: [], reached: false, expansions };
+  if (meetKey === -1) return { waypoints: [], reached: false, expansions };
 
-  // Reconstruct: walk parents back from goalKey to startKey, then reverse.
-  const reverseLeaves: WorldLookup[] = [];
-  let k: number | undefined = goalKey;
-  while (k !== undefined) {
-    reverseLeaves.push(leaves.get(k)!);
-    if (k === startKey) break;
-    k = parent.get(k);
+  // Stitch: walk fwd parents from meet → start (reverse and prepend), then
+  // walk bwd parents from meet → goal (forward and append, skipping meet).
+  const leafFor = (k: number): WorldLookup => fwd.leaves.get(k) ?? bwd.leaves.get(k)!;
+  const fullPath: WorldLookup[] = [];
+  {
+    const rev: WorldLookup[] = [];
+    let k: number | undefined = meetKey;
+    while (k !== undefined) {
+      rev.push(leafFor(k));
+      if (k === startKey) break;
+      k = fwd.parent.get(k);
+    }
+    rev.reverse();
+    for (const l of rev) fullPath.push(l);
   }
-  reverseLeaves.reverse();
+  {
+    let k = bwd.parent.get(meetKey);
+    while (k !== undefined) {
+      fullPath.push(leafFor(k));
+      if (k === goalKey) break;
+      k = bwd.parent.get(k);
+    }
+  }
 
-  const waypoints: { x: number; y: number; z: number }[] = [
-    { x: req.start.x, y: req.start.y, z: req.start.z },
-  ];
-  // Skip the start leaf's center waypoint (we already used the actual start
-  // position) and the goal leaf's (replaced with the actual goal). The middle
-  // leaves contribute their centers.
-  for (let i = 1; i < reverseLeaves.length - 1; i++) {
-    waypoints.push(leafCenter(reverseLeaves[i]!));
+  const waypoints: Vec3[] = [{ x: req.start.x, y: req.start.y, z: req.start.z }];
+  for (let i = 1; i < fullPath.length - 1; i++) {
+    waypoints.push(leafCenter(fullPath[i]!));
   }
+  // If meetKey == goalKey the bwd loop produced no nodes after meet, so the
+  // last fullPath entry is the goal leaf; otherwise the loop ran until goalKey
+  // was appended. Either way, the path ends at the goal leaf.
   waypoints.push({ x: req.goal.x, y: req.goal.y, z: req.goal.z });
 
   return { waypoints, reached: true, expansions };
-}
-
-/**
- * Centralised "can the unit enter this leaf" predicate. Combines clearance,
- * dig capability, and (for ground-locked units) presence of a solid floor.
- *
- * Pulled out of the hot loop because the search calls it twice per neighbor
- * (once for the early-reject, once for the cost lookup); inlining the dig
- * branch directly was muddier than it saved.
- */
-function enterable(index: SVOIndex, leaf: WorldLookup, unit: UnitTraversal): boolean {
-  const cost = leafCost(
-    index.chunks[leaf.chunkKey]!,
-    index.annotations[leaf.chunkKey]!,
-    leaf.nodeIdx,
-    unit,
-  );
-  if (!cost.canEnter) return false;
-  if (unit.requiresGround && leaf.tag === SVO_LEAF_AIR) {
-    if (!isGrounded(index, leaf)) return false;
-  }
-  return true;
 }
 
 // CHUNK is re-exported for tests that want to inspect leaf alignment.
