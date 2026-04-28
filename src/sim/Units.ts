@@ -15,6 +15,11 @@ import { ProjectileKind } from './Projectiles';
 
 export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'rocket_truck';
 
+/** Every unit kind in spawn-order. Useful for iterating over the catalog. */
+export const UNIT_KINDS: UnitKind[] = [
+  'soldier', 'tank', 'tunneler', 'worm', 'worker', 'dozer', 'rocket_truck',
+];
+
 /**
  * Faction the unit belongs to. The player owns 'player' units; 'enemy' units are
  * spawned via the sandbox (E key) and can be shot at without friendly-fire

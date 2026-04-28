@@ -8,11 +8,20 @@ import { generateWorld } from '../voxel/WorldGen';
 import { raycastVoxel } from '../voxel/Raycast';
 import { VOXEL_SIZE } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
-import { PathClient } from '../path/PathClient';
-import { UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest, unitCollisionRadius } from '../sim/Units';
+import { Pathfinder, profileFromUnit } from '../path/Pathfinder';
+import {
+  SurfaceNavBuffers, allocateNav, buildSurfaceNav,
+  NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS, NAV_CELL_VOXELS,
+} from '../path/SurfaceNav';
+import {
+  VolumeNavBuffers, allocateVolumeNav, buildVolumeNav,
+  worldToVolumeCell, vnavIndex, getBit,
+} from '../path/VolumeNav';
+import {
+  UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest,
+  unitConfig, UNIT_KINDS,
+} from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
-import { NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS, NAV_CELL_VOXELS } from '../path/SurfaceNav';
-import { worldToVolumeCell, vnavIndex, getBit, VNAV_Y } from '../path/VolumeNav';
 import {
   trackDamageFor,
   M_DIRT, M_WOOD, M_METAL,
@@ -102,7 +111,9 @@ export class Game {
   readonly projectileArcs = new ProjectileArcPool(64, 96);
   readonly impactMarker = new ImpactMarker();
   readonly healthBars = new HealthBarRenderer();
-  pathClient: PathClient | null = null;
+  pathfinder: Pathfinder | null = null;
+  surfaceNav: SurfaceNavBuffers | null = null;
+  vnav: VolumeNavBuffers | null = null;
   /** Pixels of vertical drag = 1 m of altitude offset for tunneler targets. */
   private readonly altitudeDragSensitivity = 8;
   /** Squared px threshold above which a click is treated as a "drag". */
@@ -138,10 +149,6 @@ export class Game {
    * (back to disabled, i.e. show everything).
    */
   private hideAboveY = Infinity;
-  private rebuildPending = false;
-  private rebuildQueued = false;
-  private rebuildShouldReplan = false;
-
   private readonly explosionRadiusBigMeters = 3.0;
   private readonly explosionPeak = 90;
 
@@ -201,14 +208,39 @@ export class Game {
 
   async generate(seed: number, onProgress?: (done: number, total: number) => void): Promise<void> {
     await generateWorld(this.world, seed, p => onProgress?.(p.done, p.total));
-    this.pathClient = new PathClient(this.world);
-    await this.pathClient.awaitReady();
+    const useShared = typeof SharedArrayBuffer !== 'undefined' && (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
+    // Surface projection — used by buildings, render code, Y-snap. Independent
+    // of the per-unit-type 3D pathfinding grids below.
+    this.surfaceNav = allocateNav(useShared);
+    buildSurfaceNav(this.world.buffers.voxels, this.surfaceNav);
+    // Volume summary — exposed for diggers' "is the next cell still solid?"
+    // mid-tick check inside Units.tickVolume. Same shape the legacy code used.
+    this.vnav = allocateVolumeNav(useShared);
+    buildVolumeNav(this.world.buffers.voxels, this.vnav);
+    // Per-unit-type pathfinding grids. The Pathfinder owns its own VolumeGrid
+    // (a richer flavour of the vnav above with per-cell topY) and one
+    // UnitGrid per kind, derived from the unit's footprint width and body
+    // height. A* and Theta* run synchronously on these grids.
+    this.pathfinder = new Pathfinder(useShared);
+    this.pathfinder.attach(this.world);
+    for (const kind of UNIT_KINDS) {
+      const cfg = unitConfig(kind);
+      this.pathfinder.registerProfile(profileFromUnit({
+        kind,
+        footprintRadius: cfg.footprintRadius,
+        heightVoxels: cfg.heightVoxels,
+        canDig: cfg.canDig,
+        requiresGround: cfg.requiresGround,
+        maxStepVoxels: cfg.maxStepVoxels,
+        slopePenalty: cfg.slopePenalty,
+      }), useShared);
+    }
     this.spawnInitialUnits();
   }
 
   private spawnInitialUnits(): void {
-    if (!this.pathClient) return;
-    const nav = this.pathClient.nav;
+    if (!this.pathfinder) return;
+    const nav = this.surfaceNav!;
     const cx = NAV_W >> 1, cz = NAV_H >> 1;
     let found = { cx, cz };
     let bestFlat = -1;
@@ -256,7 +288,7 @@ export class Game {
     for (const [dx, dz] of offsets) {
       const ox = Math.max(0, Math.min(NAV_W - STORAGE.cellsW, startCx + dx - (STORAGE.cellsW >> 1)));
       const oz = Math.max(0, Math.min(NAV_H - STORAGE.cellsD, startCz + dz - (STORAGE.cellsD >> 1)));
-      const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, STORAGE, ox, oz);
+      const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, STORAGE, ox, oz);
       if (fp.ok) {
         this.buildings.place(this.world, STORAGE, ox, oz, fp.floorY);
         this.requestNavRebuild(false);
@@ -424,8 +456,8 @@ export class Game {
       }
     }
 
-    if (this.pathClient) {
-      this.units.tick(dt, this.pathClient.nav, this.pathClient.vnav, this.world.buffers.voxels, (req) => this.handleWorldEdit(req));
+    if (this.pathfinder) {
+      this.units.tick(dt, this.surfaceNav!, this.vnav!, this.world.buffers.voxels, (req) => this.handleWorldEdit(req));
       // Any unit that latched needsRepath this frame (because it has been
       // collision-stuck long enough) gets a fresh route around the offending peer.
       this.servicePendingRepaths();
@@ -605,7 +637,7 @@ export class Game {
   }
 
   private updateGhost(w: number, h: number): void {
-    if (!this.pathClient) return;
+    if (!this.pathfinder) return;
     const spec = this.activeBuildSpec();
     if (!spec) { this.ghost.hide(); return; }
     if (this.input.mouseX < 0) { this.ghost.hide(); return; }
@@ -614,10 +646,10 @@ export class Game {
     if (!hit) { this.ghost.hide(); return; }
     const wx = hit.x * VOXEL_SIZE;
     const wz = hit.z * VOXEL_SIZE;
-    const cell = this.pathClient.cellAt(wx, wz);
+    const cell = this.surfaceCellAt(wx, wz);
     const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
     const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
-    const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, spec, ox, oz);
+    const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz);
     this.ghost.place(ox, oz, fp.floorY >= 0 ? fp.floorY : hit.y, fp.ok);
   }
 
@@ -1020,15 +1052,15 @@ export class Game {
   }
 
   private tryPlaceBuilding(hit: { x: number; z: number }): void {
-    if (!this.pathClient) return;
+    if (!this.pathfinder) return;
     const spec = this.activeBuildSpec();
     if (!spec) return;
     const wx = hit.x * VOXEL_SIZE;
     const wz = hit.z * VOXEL_SIZE;
-    const cell = this.pathClient.cellAt(wx, wz);
+    const cell = this.surfaceCellAt(wx, wz);
     const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
     const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
-    const fp = checkFootprint(this.world.buffers.voxels, this.pathClient.nav, spec, ox, oz);
+    const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz);
     if (!fp.ok) return;
     this.buildings.place(this.world, spec, ox, oz, fp.floorY);
     this.requestNavRebuild();
@@ -1189,30 +1221,62 @@ export class Game {
     if (touched) this.requestNavRebuild(false);
   }
 
+  /**
+   * Re-derive every nav buffer from the current world state. The new
+   * pathfinder runs synchronously, so this is a single in-place pass — no
+   * worker round-trip — and the caller can immediately query a fresh path.
+   *
+   * `replan` triggers a route refresh on every unit currently in motion so
+   * a tunnel that just opened up is consumed straight away, vs. the old
+   * route still pointing through what used to be solid stone. Callers that
+   * know the edit can only widen the navigable space (a digger carving
+   * forward) pass `false` to skip the replan.
+   */
   private requestNavRebuild(replan = true): void {
-    if (!this.pathClient) return;
-    if (this.rebuildPending) {
-      this.rebuildQueued = true;
-      // If any caller asks to replan, the eventual rebuild should replan.
-      if (replan) this.rebuildShouldReplan = true;
-      return;
-    }
-    this.rebuildPending = true;
-    this.rebuildShouldReplan = replan;
-    void this.pathClient.rebuildNav().then(() => {
-      this.rebuildPending = false;
-      const shouldReplan = this.rebuildShouldReplan;
-      this.rebuildShouldReplan = false;
-      if (shouldReplan) this.replanMovingUnits();
-      if (this.rebuildQueued) {
-        this.rebuildQueued = false;
-        this.requestNavRebuild(shouldReplan);
+    if (!this.pathfinder || !this.surfaceNav || !this.vnav) return;
+    buildSurfaceNav(this.world.buffers.voxels, this.surfaceNav);
+    buildVolumeNav(this.world.buffers.voxels, this.vnav);
+    this.pathfinder.rebuildAll();
+    if (replan) this.replanMovingUnits();
+  }
+
+  /**
+   * Surface-2D cell lookup helper (used by build placement, evade target,
+   * tank tracks). Returns the cell containing world (wx, wz) plus an `ok`
+   * flag from the surface nav's `blocked` bit — same shape the old
+   * PathClient.cellAt exposed.
+   */
+  private surfaceCellAt(wx: number, wz: number): { cx: number; cz: number; ok: boolean } {
+    const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(wx / NAV_CELL_METERS)));
+    const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(wz / NAV_CELL_METERS)));
+    const i = navIndex(cx, cz);
+    const ok = this.surfaceNav ? !this.surfaceNav.blocked[i] : true;
+    return { cx, cz, ok };
+  }
+
+  /**
+   * Like surfaceCellAt, but when the requested cell is blocked we expand
+   * outward in concentric rings looking for the nearest walkable cell.
+   * Disambiguates user clicks that land on a building edge / tree trunk.
+   */
+  private nearestSurfaceWalkable(wx: number, wz: number, maxRing = 4): { cx: number; cz: number; ok: boolean } {
+    const c = this.surfaceCellAt(wx, wz);
+    if (c.ok || !this.surfaceNav) return c;
+    for (let r = 1; r <= maxRing; r++) {
+      for (let dz = -r; dz <= r; dz++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (Math.abs(dx) !== r && Math.abs(dz) !== r) continue;
+          const nx = c.cx + dx, nz = c.cz + dz;
+          if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) continue;
+          if (!this.surfaceNav.blocked[navIndex(nx, nz)]) return { cx: nx, cz: nz, ok: true };
+        }
       }
-    });
+    }
+    return c;
   }
 
   private replanMovingUnits(): void {
-    if (!this.pathClient) return;
+    if (!this.pathfinder) return;
     for (const u of this.units.units) {
       if (u.path.length === 0) continue;
       const goal = u.path[u.path.length - 1]!;
@@ -1221,132 +1285,68 @@ export class Game {
   }
 
   /**
-   * Pick surface vs volume pathing for a unit:
-   *  - Tunneler always uses volume (it digs).
-   *  - Anyone whose start OR destination is meaningfully below the local surface uses volume.
-   *  - Otherwise surface pathing (cheaper, gives a smoother surface walk).
+   * Plan a route for `unit` to `(wx, wy, wz)`. Uses the unit's pre-built
+   * pathfinding grid (per-kind 3D bitmap that already accounts for footprint
+   * width and body height); single-cell agile units get Theta* for any-angle
+   * paths, wider chassis use plain weighted A*.
+   *
+   *   - `forceSurface` makes a digger walk on the surface to the target
+   *     instead of cutting through whatever's between it and the goal —
+   *     same intent as the old surface/volume branch.
+   *   - Tunnelers / worms whose target is reachable on a clean straight
+   *     line skip the search and head directly: at the speed they grind
+   *     through dirt, the graph search is overkill for the common "go
+   *     dig over there" command.
    */
+  // eslint-disable-next-line @typescript-eslint/require-await
   private async routePath(unit: Unit, wx: number, wy: number, wz: number, opts?: { forceSurface?: boolean }): Promise<void> {
-    if (!this.pathClient) return;
-    const goalSurfaceY = this.surfaceWorldY(wx, wz);
+    if (!this.pathfinder) return;
     const startSurfaceY = this.surfaceWorldY(unit.x, unit.z);
-    const goalUnderground = wy < goalSurfaceY - 0.5;
     const startUnderground = unit.y < startSurfaceY - 0.5;
-    // forceSurface lets LMB on a tunneler/worm route via surface-nav so the
-    // unit walks to the target instead of digging through it. We still fall
-    // back to volume nav if the unit is currently underground (it has to dig
-    // back out before any surface route exists).
     const allowSurface = opts?.forceSurface && !startUnderground;
-    const useVolume = !allowSurface && (unit.canDig || goalUnderground || startUnderground);
 
-    if (useVolume) {
-      // Tunneler shortcut — it can grind through anything that isn't bedrock, so
-      // we don't need a graph search to find a route. Just heading straight at
-      // the destination is correct in the common case; the only reasons to fall
-      // back to volume A* are:
-      //   - the line would require a steeper climb/dive than the unit can pitch,
-      //   - or it crosses a bedrock cell the unit physically can't cut.
-      if (unit.canDig && this.tunnelerCanGoStraight(unit, wx, wy, wz)) {
-        this.units.setPath(unit, [{ x: wx, y: wy, z: wz }]);
-        return;
-      }
-      const startCell = worldToVolumeCell(unit.x, unit.y, unit.z);
-      const goalCell = worldToVolumeCell(wx, wy, wz);
-      // The click landed on a solid surface (e.g. tunnel floor through the
-      // Y-cutoff overlay) so its volume cell is solid. A non-digger can't
-      // enter solid cells, so walk up until we find the air cell where the
-      // unit will actually stand. Diggers don't need this — they'll carve
-      // into the cell on arrival.
-      if (!unit.canDig) {
-        const vnav = this.pathClient.vnav;
-        while (
-          goalCell.cy < VNAV_Y - 1 &&
-          getBit(vnav.solid, vnavIndex(goalCell.cx, goalCell.cy, goalCell.cz)) === 1
-        ) {
-          goalCell.cy++;
-        }
-      }
-      const res = await this.pathClient.requestVolumePath({
-        startCx: startCell.cx, startCy: startCell.cy, startCz: startCell.cz,
-        goalCx: goalCell.cx, goalCy: goalCell.cy, goalCz: goalCell.cz,
-        canDig: unit.canDig,
-        requiresGround: unit.requiresGround,
-        footprintRadius: unit.footprintRadius,
-        maxPitchRad: unit.maxPitchRad,
-      });
-      // Refuse partial paths — the unit only moves if A* could reach the destination.
-      if (res.cells.length === 0 || !res.reached) return;
-      this.units.setPath(unit, this.pathClient.volumeCellsToWaypoints(res.cells));
+    // Diggers with a clear line to the goal skip the graph search — saves
+    // ~5 K cell expansions on the common "tell my tunneler to go grind over
+    // there" command. The straight-line check rejects routes that would
+    // need a steeper pitch than the chassis articulates, or that pass
+    // through any bedrock cell.
+    if (unit.canDig && !allowSurface && this.tunnelerCanGoStraight(unit, wx, wy, wz)) {
+      this.units.setPath(unit, [{ x: wx, y: wy, z: wz }]);
       return;
     }
 
-    // If the click landed on a blocked cell (e.g. a column where every voxel was carved
-    // out, or right at a building edge), pull the goal toward the nearest walkable cell
-    // so the unit at least gets close instead of refusing to move.
-    const goal = this.pathClient.nearestWalkable(wx, wz, 4);
-    const start = this.pathClient.cellAt(unit.x, unit.z);
-    // Optimistic first leg — set the unit walking *this frame* along the goal direction
-    // so LMB→move feels instant regardless of the worker round-trip. The full route
-    // arrives milliseconds later and `Units.setPath` splices it onto wherever the unit
-    // is by then. We skip if the unit already has a path that ends at the same cell
-    // (e.g. mid-tick repath after rebuildNav) so we don't snap a moving unit back to a
-    // close-by cell-center for one frame.
-    if (unit.path.length === 0) {
-      const step = this.pathClient.firstStepWaypoint(
-        unit.x, unit.z,
-        (goal.cx + 0.5) * NAV_CELL_METERS, (goal.cz + 0.5) * NAV_CELL_METERS,
-        unit.maxStepVoxels,
-        unit.heightVoxels,
-      );
-      if (step !== null) {
-        this.units.setPath(unit, [step]);
-      }
+    const grid = this.pathfinder.getGrid(unit.kind);
+    if (!grid) return;
+    const start = this.pathfinder.cellAt(unit.x, unit.y, unit.z);
+    let goal = this.pathfinder.cellAt(wx, wy, wz);
+    // If the click landed on a non-passable cell (carved-out column, building
+    // edge, ceiling), pull the goal toward the nearest cell where the unit's
+    // body actually fits. Vertical fallback: scan the column from the picked
+    // y upward for a passable layer (handles surface clicks in the cave overlay).
+    const groundCell = this.pathfinder.groundCellAt(unit.kind, wx, wz);
+    if (groundCell && !this.isUnitCellPassable(unit.kind, goal)) {
+      goal = groundCell;
     }
-    const unitObstacles = this.collectUnitObstacles(unit);
-    const res = await this.pathClient.requestPath({
-      startCx: start.cx, startCz: start.cz,
-      goalCx: goal.cx, goalCz: goal.cz,
-      footprintRadius: unit.footprintRadius,
-      maxStepVoxels: unit.maxStepVoxels,
-      slopePenalty: unit.slopePenalty,
-      bodyHalfCells: unit.bodyHalfCells,
-      bodyRoughnessVoxels: unit.bodyRoughnessVoxels,
-      headroomVoxels: unit.heightVoxels,
-      prefersRoads: false,
-      // Per-unit seed so units headed to the same goal don't all share the same A*-optimal
-      // line — they spread out along nearby alternates instead.
-      routeSeed: unit.id * 0x9e3779b9 + 1,
-      unitObstacles,
+    goal = this.pathfinder.nearestPassable(unit.kind, goal, 5);
+
+    const res = this.pathfinder.findPath(unit.kind, {
+      start, goal,
+      // Theta* shortcuts only fire for single-cell footprints; wider chassis
+      // fall back to grid A* internally (line-of-sight on a fat footprint
+      // becomes its own bottleneck and the path quality difference is tiny).
+      anyAngle: unit.footprintRadius <= 1,
+      maxExpansions: 30000,
     });
     if (res.cells.length === 0 || !res.reached) return;
-    this.units.setPath(unit, this.pathClient.cellsToWaypoints(res.cells));
+    this.units.setPath(unit, this.pathfinder.pathToWaypoints(res.cells));
   }
 
-  /**
-   * Build the per-query unit-obstacle list passed into surface A*. Only stationary
-   * peers (empty path) on roughly the same height as the requester count — a unit
-   * standing on a bridge above doesn't block a unit walking under it. The cells
-   * are Minkowski-expanded by the requester's radius so the planner leaves enough
-   * clearance for the requester's body, not just the blocker's centre.
-   */
-  private collectUnitObstacles(requester: Unit): number[] {
-    if (!this.pathClient) return [];
-    const out: number[] = [];
-    const seen = new Set<number>();
-    const requesterR = unitCollisionRadius(requester);
-    for (const u of this.units.units) {
-      if (u === requester) continue;
-      if (u.hp <= 0) continue;
-      // Only stationary peers stamp into the obstacle layer — a moving unit
-      // will be somewhere else by the time this path is followed, and the
-      // unit-vs-unit collision rule already lets two movers phase through.
-      if (u.path.length > 0) continue;
-      // Vertical separation > 2 m exempts the pair (matches unitCollidesAt).
-      if (Math.abs(u.y - requester.y) > 2.0) continue;
-      const obstacleR = unitCollisionRadius(u) + requesterR;
-      this.pathClient.stampUnitObstacleCells(u.x, u.z, obstacleR, seen, out);
-    }
-    return out;
+  /** True if the unit's kind grid says (cell) is passable. */
+  private isUnitCellPassable(kind: string, c: { cx: number; cy: number; cz: number }): boolean {
+    if (!this.pathfinder) return false;
+    const grid = this.pathfinder.getGrid(kind);
+    if (!grid) return false;
+    return getBit(grid.passable, vnavIndex(c.cx, c.cy, c.cz)) === 1;
   }
 
   /**
@@ -1358,7 +1358,7 @@ export class Game {
    * until BLOCKED_GIVE_UP_FRAMES drops it for good.
    */
   private servicePendingRepaths(): void {
-    if (!this.pathClient) return;
+    if (!this.pathfinder) return;
     for (const u of this.units.units) {
       if (!u.needsRepath) continue;
       u.needsRepath = false;
@@ -1376,10 +1376,10 @@ export class Game {
    * expose dirt below. Stone/wood/etc. are not affected (peak === 0).
    */
   private paintTankTracks(): void {
-    if (!this.pathClient) return;
+    if (!this.pathfinder) return;
     const TANK_TRACK_INTERVAL = 0.4;     // m between tread marks
     const TANK_TREAD_OFFSET = 1.20;      // half-spacing between treads, m (matches model)
-    const nav = this.pathClient.nav;
+    const nav = this.surfaceNav!;
     let anythingDestroyed = false;
 
     for (const u of this.units.units) {
@@ -1446,7 +1446,7 @@ export class Game {
    * A* on the common case where the user just wants it to head toward a target.
    */
   private tunnelerCanGoStraight(unit: { x: number; y: number; z: number; maxPitchRad: number }, wx: number, wy: number, wz: number): boolean {
-    if (!this.pathClient) return false;
+    if (!this.pathfinder) return false;
     const dx = wx - unit.x, dy = wy - unit.y, dz = wz - unit.z;
     const horiz = Math.hypot(dx, dz);
     const pitch = horiz < 1e-4 ? Math.PI / 2 : Math.atan2(Math.abs(dy), horiz);
@@ -1456,7 +1456,7 @@ export class Game {
     if (dist < 1e-3) return true;
     // One sample per metre — volume cells are 1 m so this hits every cell on the line.
     const steps = Math.max(1, Math.ceil(dist));
-    const vnav = this.pathClient.vnav;
+    const vnav = this.vnav!;
     let lastIdx = -1;
     for (let i = 0; i <= steps; i++) {
       const t = i / steps;
@@ -1820,10 +1820,10 @@ export class Game {
 
   /** World-space Y (meters) of the topY voxel under the given world-space (x, z). */
   private surfaceWorldY(wx: number, wz: number): number {
-    if (!this.pathClient) return 0;
-    const cell = this.pathClient.cellAt(wx, wz);
+    if (!this.pathfinder) return 0;
+    const cell = this.surfaceCellAt(wx, wz);
     const i = navIndex(cell.cx, cell.cz);
-    const top = this.pathClient.nav.topY[i]!;
+    const top = this.surfaceNav!.topY[i]!;
     return top < 0 ? 0 : (top + 1) * VOXEL_SIZE;
   }
 
@@ -2074,10 +2074,10 @@ export class Game {
    * abandon its line-up just because a stray bullet flies past).
    */
   private tickEvade(dt: number): void {
-    if (!this.pathClient) return;
+    if (!this.pathfinder) return;
     const projectiles = this.projectiles.projectiles;
     if (projectiles.length === 0) return;
-    const nav = this.pathClient.nav;
+    const nav = this.surfaceNav!;
     for (const u of this.units.units) {
       if (u.hp <= 0) continue;
       if (u.evadeCooldown > 0) {
@@ -2122,7 +2122,7 @@ export class Game {
         const sideSign = (offX * perpX + offZ * perpZ) >= 0 ? 1 : -1;
         const tx = u.x + perpX * dist * sideSign;
         const tz = u.z + perpZ * dist * sideSign;
-        const cell = this.pathClient.cellAt(tx, tz);
+        const cell = this.surfaceCellAt(tx, tz);
         if (!cell.ok) continue;
         const i = navIndex(cell.cx, cell.cz);
         if (nav.headroom[i]! < u.heightVoxels) continue;

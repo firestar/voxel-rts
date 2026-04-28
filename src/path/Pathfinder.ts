@@ -1,0 +1,229 @@
+/**
+ * Top-level pathfinding facade.
+ *
+ * Owns the shared VolumeGrid plus one UnitGrid per registered unit kind.
+ * Tracks dirty voxel chunks so subsequent rebuilds only touch cells that
+ * actually changed. Exposes a small API that the sim/UI calls into:
+ *
+ *   - registerProfile(profile)            — first-time creation of a kind's grid.
+ *   - rebuildAll(world)                   — full rebuild from scratch.
+ *   - applyDamage(world, x0,z0,x1,z1, ymin, ymax) — incremental rebuild around a box.
+ *   - findPath(profile, start, goal)      — A* (default) for that unit kind.
+ *   - findPathAnyAngle(profile, ...)      — Theta* for agile single-cell units.
+ *   - cellAt(wx, wy, wz)                  — meters → cell.
+ *   - nearestPassable(profile, target)    — search outward from a goal until passable.
+ */
+import { VOXEL_SIZE, AIR } from '../voxel/types';
+import { worldIndex, VoxelWorld } from '../voxel/VoxelWorld';
+import { M_WOOD, M_LEAF } from '../voxel/Materials';
+import {
+  GRID_X, GRID_Y, GRID_Z, NAV_CELL_VOXELS, NAV_CELL_METERS,
+  cellIndex, worldToCell, cellCenter,
+} from './Nav';
+import {
+  VolumeGrid, allocateVolumeGrid, buildVolumeGrid, rebuildCell,
+} from './VolumeGrid';
+import {
+  UnitProfile, UnitGrid, allocateUnitGrid, buildUnitGrid,
+  refreshUnitGridDirty, isPassable,
+} from './UnitGrid';
+import {
+  AStarWorkspace, findPath as runFindPath, findPathThetaStar,
+  PathResult, PathNode,
+} from './AStar';
+
+export interface PathRequest {
+  start: PathNode;
+  goal: PathNode;
+  /** When true, run Theta* — only meaningful for footprintRadiusCells <= 1. */
+  anyAngle?: boolean;
+  maxExpansions?: number;
+  heuristicWeight?: number;
+}
+
+export class Pathfinder {
+  readonly volume: VolumeGrid;
+  private readonly grids = new Map<string, UnitGrid>();
+  private readonly ws = new AStarWorkspace();
+  private voxels: Uint8Array | null = null;
+
+  constructor(useShared = false) {
+    this.volume = allocateVolumeGrid(useShared);
+  }
+
+  /** Wire up the world's voxel buffer. Required before any rebuild. */
+  attach(world: VoxelWorld): void {
+    this.voxels = world.buffers.voxels;
+    buildVolumeGrid(this.voxels, this.volume);
+    for (const grid of this.grids.values()) buildUnitGrid(this.volume, grid);
+  }
+
+  /**
+   * Register a unit profile and build (or rebuild) its grid. Idempotent — if
+   * the kind is already registered the existing grid is rebuilt in place.
+   */
+  registerProfile(profile: UnitProfile, useShared = false): UnitGrid {
+    let grid = this.grids.get(profile.kind);
+    if (!grid) {
+      grid = allocateUnitGrid(useShared, profile);
+      this.grids.set(profile.kind, grid);
+    } else {
+      grid.profile = profile;
+    }
+    if (this.voxels) buildUnitGrid(this.volume, grid);
+    return grid;
+  }
+
+  getGrid(kind: string): UnitGrid | undefined {
+    return this.grids.get(kind);
+  }
+
+  hasProfile(kind: string): boolean {
+    return this.grids.has(kind);
+  }
+
+  /**
+   * Re-evaluate every cell whose voxel column might have changed inside the
+   * given world-meter AABB. The box is widened by one cell on each side so
+   * neighbour-dependent passability (footprint overlap, ground-below check)
+   * settles correctly.
+   */
+  applyDamage(
+    minX: number, minY: number, minZ: number,
+    maxX: number, maxY: number, maxZ: number,
+  ): void {
+    if (!this.voxels) return;
+    const c0 = worldToCell(minX, minY, minZ);
+    const c1 = worldToCell(maxX, maxY, maxZ);
+    const x0 = Math.max(0, c0.cx - 1);
+    const y0 = Math.max(0, c0.cy - 1);
+    const z0 = Math.max(0, c0.cz - 1);
+    const x1 = Math.min(GRID_X - 1, c1.cx + 1);
+    const y1 = Math.min(GRID_Y - 1, c1.cy + 1);
+    const z1 = Math.min(GRID_Z - 1, c1.cz + 1);
+    const dirty: number[] = [];
+    for (let cy = y0; cy <= y1; cy++) {
+      for (let cz = z0; cz <= z1; cz++) {
+        for (let cx = x0; cx <= x1; cx++) {
+          rebuildCell(this.voxels, this.volume, cx, cy, cz);
+          dirty.push(cellIndex(cx, cy, cz));
+        }
+      }
+    }
+    for (const grid of this.grids.values()) {
+      refreshUnitGridDirty(this.volume, grid, dirty);
+    }
+  }
+
+  /**
+   * Force a full re-derivation of every unit grid from the current volume
+   * grid. Cheap-ish — only revisits the bitmaps, not the voxel buffer.
+   */
+  rebuildAllUnitGrids(): void {
+    for (const grid of this.grids.values()) buildUnitGrid(this.volume, grid);
+  }
+
+  /** Full rebuild from scratch — volume and every unit grid. */
+  rebuildAll(): void {
+    if (!this.voxels) return;
+    buildVolumeGrid(this.voxels, this.volume);
+    for (const grid of this.grids.values()) buildUnitGrid(this.volume, grid);
+  }
+
+  findPath(kind: string, req: PathRequest): PathResult {
+    const grid = this.grids.get(kind);
+    if (!grid) return { cells: [], reached: false, expanded: 0 };
+    const opts = {
+      maxExpansions: req.maxExpansions,
+      heuristicWeight: req.heuristicWeight,
+      volume: this.volume,
+    };
+    return req.anyAngle && grid.profile.footprintRadiusCells <= 1
+      ? findPathThetaStar(grid, req.start, req.goal, this.ws, opts)
+      : runFindPath(grid, req.start, req.goal, this.ws, opts);
+  }
+
+  /**
+   * Spiral outward from a 3D cell looking for a passable cell for this unit
+   * kind. Returns the original cell when nothing is found within `maxRing`
+   * steps (caller handles the failure).
+   */
+  nearestPassable(kind: string, c: PathNode, maxRing = 4): PathNode {
+    const grid = this.grids.get(kind);
+    if (!grid) return c;
+    if (isPassable(grid, c.cx, c.cy, c.cz)) return c;
+    for (let r = 1; r <= maxRing; r++) {
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dz = -r; dz <= r; dz++) {
+          for (let dx = -r; dx <= r; dx++) {
+            if (Math.abs(dx) !== r && Math.abs(dy) !== r && Math.abs(dz) !== r) continue;
+            const nx = c.cx + dx, ny = c.cy + dy, nz = c.cz + dz;
+            if (nx < 0 || ny < 0 || nz < 0 || nx >= GRID_X || ny >= GRID_Y || nz >= GRID_Z) continue;
+            if (isPassable(grid, nx, ny, nz)) return { cx: nx, cy: ny, cz: nz };
+          }
+        }
+      }
+    }
+    return c;
+  }
+
+  /**
+   * Walk the voxel column at (wx, wz) from the top down to find the highest
+   * cell where the unit can stand. Used to convert a 2D click target into a
+   * surface y for ground units. Trees (wood / leaf) are skipped so the unit
+   * stands on the ground under the canopy, not on top of it.
+   *
+   * Returns null if no surface fits the unit's body anywhere in the column.
+   */
+  groundCellAt(kind: string, wx: number, wz: number, ceilingMeters?: number): PathNode | null {
+    const grid = this.grids.get(kind);
+    if (!grid || !this.voxels) return null;
+    const cx = Math.max(0, Math.min(GRID_X - 1, Math.floor(wx / NAV_CELL_METERS)));
+    const cz = Math.max(0, Math.min(GRID_Z - 1, Math.floor(wz / NAV_CELL_METERS)));
+    const ceilCy = ceilingMeters !== undefined
+      ? Math.min(GRID_Y - 1, Math.max(0, Math.floor(ceilingMeters / NAV_CELL_METERS)))
+      : GRID_Y - 1;
+    for (let cy = ceilCy; cy >= 0; cy--) {
+      if (isPassable(grid, cx, cy, cz)) return { cx, cy, cz };
+    }
+    return null;
+  }
+
+  cellAt(wx: number, wy: number, wz: number): PathNode {
+    return worldToCell(wx, wy, wz);
+  }
+
+  pathToWaypoints(path: PathNode[]): { x: number; y: number; z: number }[] {
+    return path.map(c => cellCenter(c.cx, c.cy, c.cz));
+  }
+}
+
+/**
+ * Convenience: derive a UnitProfile from a unit-kind config. Done here rather
+ * than in the sim so the sim doesn't have to import nav constants — this
+ * mapping is the single source of truth for "how does the path planner see
+ * this unit kind".
+ */
+export interface UnitProfileSource {
+  kind: string;
+  footprintRadius: number;
+  heightVoxels: number;
+  canDig: boolean;
+  requiresGround: boolean;
+  maxStepVoxels: number;
+  slopePenalty: number;
+}
+
+export function profileFromUnit(src: UnitProfileSource): UnitProfile {
+  return {
+    kind: src.kind,
+    footprintRadiusCells: Math.max(1, src.footprintRadius),
+    heightCells: Math.max(1, Math.ceil(src.heightVoxels / NAV_CELL_VOXELS)),
+    canDig: src.canDig,
+    requiresGround: src.requiresGround,
+    maxStepVoxels: src.maxStepVoxels,
+    slopePenalty: src.slopePenalty,
+  };
+}
+
+export { GRID_X, GRID_Y, GRID_Z, NAV_CELL_VOXELS, NAV_CELL_METERS, cellIndex, worldToCell, cellCenter };
