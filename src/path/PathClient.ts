@@ -132,6 +132,64 @@ export class PathClient {
   }
 
   /**
+   * Synchronous "first leg" of the eventual route — used to start the unit walking the
+   * same frame the user clicks instead of waiting for the worker round-trip. Steps
+   * along the line from `(sx, sz)` toward `(gx, gz)` in 1m increments, stopping at
+   * the first cell that's blocked, requires too tall a step, or fails the headroom
+   * check. Returns `null` if even the first step is impassable (caller falls back to
+   * the worker's full result).
+   *
+   * This is intentionally cheaper than the post-A* smoother — no body-roughness fit,
+   * no unit-obstacle stamping, no road bias. The unit only walks ~`maxCells` along
+   * this line before the worker's full path arrives and replaces it; if our optimistic
+   * leg turns out to be wrong (the real route bends the other way), the trim logic in
+   * `Units.setPath` strips waypoints that are now behind the unit and the unit
+   * follows the corrected route from where it ended up.
+   */
+  firstStepWaypoint(
+    sx: number, sz: number,
+    gx: number, gz: number,
+    maxStepVoxels: number,
+    headroomVoxels: number,
+    maxCells = 6,
+  ): { x: number; y: number; z: number } | null {
+    const dx = gx - sx;
+    const dz = gz - sz;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    if (dist < NAV_CELL_METERS * 0.5) return null;
+    const stepMeters = NAV_CELL_METERS * 0.5; // half-cell oversample so we don't skip cells
+    const steps = Math.min(maxCells * 2, Math.ceil(dist / stepMeters));
+    const stepX = (dx / dist) * stepMeters;
+    const stepZ = (dz / dist) * stepMeters;
+    const startCx = Math.max(0, Math.min(NAV_W - 1, Math.floor(sx / NAV_CELL_METERS)));
+    const startCz = Math.max(0, Math.min(NAV_H - 1, Math.floor(sz / NAV_CELL_METERS)));
+    const startI = navIndex(startCx, startCz);
+    let prevCx = startCx, prevCz = startCz;
+    let prevTopY = this.nav.topY[startI]!;
+    let lastGoodCx = startCx, lastGoodCz = startCz;
+    let advanced = false;
+    for (let i = 1; i <= steps; i++) {
+      const px = sx + stepX * i;
+      const pz = sz + stepZ * i;
+      const cx = Math.floor(px / NAV_CELL_METERS);
+      const cz = Math.floor(pz / NAV_CELL_METERS);
+      if (cx < 0 || cz < 0 || cx >= NAV_W || cz >= NAV_H) break;
+      if (cx === prevCx && cz === prevCz) continue;
+      const idx = navIndex(cx, cz);
+      if (this.nav.blocked[idx]) break;
+      if (headroomVoxels > 0 && this.nav.headroom[idx]! < headroomVoxels) break;
+      const topY = this.nav.topY[idx]!;
+      const dy = topY > prevTopY ? topY - prevTopY : prevTopY - topY;
+      if (dy > maxStepVoxels) break;
+      lastGoodCx = cx; lastGoodCz = cz;
+      advanced = true;
+      prevCx = cx; prevCz = cz; prevTopY = topY;
+    }
+    if (!advanced) return null;
+    return navCenter(this.nav, lastGoodCx, lastGoodCz);
+  }
+
+  /**
    * Like cellAt, but if the requested cell is blocked, expands outward in concentric
    * rings up to `maxRing` cells away looking for the nearest walkable cell. Returns
    * that cell's coords with ok=true. Useful for resolving ambiguous user clicks that

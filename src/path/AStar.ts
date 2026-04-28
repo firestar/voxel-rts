@@ -226,10 +226,25 @@ export class AStarWorkspace {
 // production maps is minor, and the latency win matters when several units
 // repath at once.
 const HEURISTIC_WEIGHT = 2.0;
+/**
+ * If a `corridor` mask is supplied, the search hard-prunes neighbours whose cell is
+ * outside the corridor (mask byte 0). The corridor is computed by `computeCorridor`
+ * in `Hierarchy.ts`: an abstract A* on the 12×12 cluster graph picks a sequence of
+ * clusters between start and goal, widened by one cluster on each side. On a 96×96
+ * grid that typically prunes 70-80% of cells from the search before the first heap
+ * push, cutting expansions by a similar factor on long paths.
+ *
+ * Per-unit constraints (slope, footprint, roughness, headroom, road preference,
+ * route jitter) still run inside the corridor — the abstraction is purely physical
+ * connectivity. If those constraints reject the corridor (e.g. a 1-cell gap that's
+ * too narrow for a tank), the search returns reached=false and the caller can retry
+ * unrestricted.
+ */
 export function findPathSurface(
   nav: SurfaceNavBuffers,
   ws: AStarWorkspace,
   req: AStarRequest,
+  corridor: Uint8Array | null = null,
 ): AStarResult {
   const gen = ws.resetGeneration();
   const { startCx, startCz, goalCx, goalCz, prefersRoads, maxStepVoxels, slopePenalty,
@@ -328,6 +343,7 @@ export function findPathSurface(
       if (myClosed[ni] === gen) continue;
       if (navBlocked[ni]) continue;
       if (unitBlockMask[ni] === 1) continue;
+      if (corridor !== null && corridor[ni] === 0) continue;
       const nyTop = navTopY[ni]!;
       const dY = nyTop > cy ? nyTop - cy : cy - nyTop;
       if (dY > maxStepVoxels) continue;

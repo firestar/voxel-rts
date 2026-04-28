@@ -4,6 +4,10 @@ import { findPathSurface, AStarRequest, AStarWorkspace } from '../path/AStar';
 import { smoothPath } from '../path/Smooth';
 import { buildVolumeNav, VolumeNavBuffers } from '../path/VolumeNav';
 import { findPathVolume, smoothPathVolume, AStar3DRequest, AStar3DWorkspace } from '../path/AStar3D';
+import {
+  allocateClusterGraph, buildClusterGraph, computeCorridor,
+  cellToClusterCx, cellToClusterCz, ClusterGraph, HierarchyWorkspace,
+} from '../path/Hierarchy';
 
 interface InitMessage {
   kind: 'init';
@@ -36,6 +40,8 @@ let vnav: VolumeNavBuffers | null = null;
 let voxels: Uint8Array | null = null;
 const ws2 = new AStarWorkspace();
 const ws3 = new AStar3DWorkspace();
+const hg: ClusterGraph = allocateClusterGraph();
+const wsH = new HierarchyWorkspace();
 
 self.onmessage = (ev: MessageEvent<Message>) => {
   const msg = ev.data;
@@ -46,11 +52,15 @@ self.onmessage = (ev: MessageEvent<Message>) => {
       voxels = msg.voxels;
       buildSurfaceNav(voxels, nav);
       buildVolumeNav(voxels, vnav);
+      buildClusterGraph(nav, hg);
       (self as unknown as Worker).postMessage({ kind: 'ready' });
       break;
     }
     case 'rebuild': {
-      if (nav && voxels) buildSurfaceNav(voxels, nav);
+      if (nav && voxels) {
+        buildSurfaceNav(voxels, nav);
+        buildClusterGraph(nav, hg);
+      }
       if (vnav && voxels) buildVolumeNav(voxels, vnav);
       (self as unknown as Worker).postMessage({ kind: 'rebuild', reqId: msg.reqId });
       break;
@@ -60,7 +70,23 @@ self.onmessage = (ev: MessageEvent<Message>) => {
         (self as unknown as Worker).postMessage({ kind: 'path', reqId: msg.reqId, cells: [], reached: false, expanded: 0 });
         break;
       }
-      const r = findPathSurface(nav, ws2, msg.req);
+      // Hierarchy-restricted first attempt: build a cluster-corridor between start
+      // and goal and let the fine A* hard-prune cells outside it. If the corridor
+      // build fails (start/goal unreachable on the abstract graph) we skip straight
+      // to unrestricted A*. If the corridor *succeeds* but the fine A* can't fit
+      // the unit through it (e.g. a 1-cell gap a vehicle's footprint rejects), we
+      // retry unrestricted — the abstract graph is conservative on physical
+      // connectivity but doesn't model footprint / step-climb.
+      const startCluCx = cellToClusterCx(msg.req.startCx);
+      const startCluCz = cellToClusterCz(msg.req.startCz);
+      const goalCluCx = cellToClusterCx(msg.req.goalCx);
+      const goalCluCz = cellToClusterCz(msg.req.goalCz);
+      const haveCorridor = computeCorridor(hg, wsH, startCluCx, startCluCz, goalCluCx, goalCluCz);
+      let r = haveCorridor ? findPathSurface(nav, ws2, msg.req, wsH.corridor) : findPathSurface(nav, ws2, msg.req);
+      if (haveCorridor && !r.reached) {
+        // Corridor too tight for this unit — retry with the full grid available.
+        r = findPathSurface(nav, ws2, msg.req);
+      }
       // Pass the workspace's unit-obstacle mask into the smoother so post-pass
       // shortcuts don't slice straight through a peer that A* routed around.
       // Also pass the workspace itself so the smoother shares the roughness
