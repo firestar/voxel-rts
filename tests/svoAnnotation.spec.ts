@@ -14,9 +14,9 @@ import {
 } from '../src/voxel/types';
 import { M_BEDROCK, M_STONE, M_DIRT } from '../src/voxel/Materials';
 
-const SOLDIER: UnitTraversal = { radiusVoxels: 3, canDig: false, digCostMult: 0 };
-const TANK: UnitTraversal = { radiusVoxels: 10, canDig: false, digCostMult: 0 };
-const TUNNELER: UnitTraversal = { radiusVoxels: 14, canDig: true, digCostMult: 8 };
+const SOLDIER: UnitTraversal = { radiusVoxels: 3, canDig: false, digCostMult: 0, requiresGround: true };
+const TANK: UnitTraversal = { radiusVoxels: 10, canDig: false, digCostMult: 0, requiresGround: true };
+const TUNNELER: UnitTraversal = { radiusVoxels: 14, canDig: true, digCostMult: 8, requiresGround: true };
 
 describe('annotateChunkSVO', () => {
   it('inscribed radius for an all-air chunk equals CHUNK / 2', () => {

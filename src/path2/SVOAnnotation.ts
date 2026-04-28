@@ -91,6 +91,12 @@ export interface UnitTraversal {
    * Unused when `canDig` is false.
    */
   digCostMult: number;
+  /**
+   * True for soldiers / tanks / tunnelers (anything that walks or drives) —
+   * they can only enter air leaves with a solid leaf directly underneath.
+   * False for hypothetical flying units.
+   */
+  requiresGround: boolean;
 }
 
 export interface LeafCost {
