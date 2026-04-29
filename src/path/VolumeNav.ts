@@ -31,12 +31,12 @@ export interface VolumeNavBuffers {
   bedrock: Uint8Array;
   digCost: Uint8Array;
   /**
-   * Voxel-y of the highest solid voxel inside each cell, or -1 if all-air.
+   * Voxel-y of the highest solid voxel inside each cell, or 255 if all-air.
    * Replaces the old `surfaceConnected` flood-fill bitmap (the new pathfinder
    * uses per-unit grids instead, so the sealed-cave gate is no longer needed
    * — units route into caves only when their body actually fits the corridor).
    */
-  topY: Int16Array;
+  topY: Uint8Array;
   /**
    * Same shape as the old buffer for callers that still write to it. Always 0
    * after build; kept so any legacy code that consults it sees a defined
