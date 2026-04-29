@@ -44,13 +44,22 @@ export interface AStarOptions {
   volume?: VolumeGrid;
 }
 
+// y-major linear-index strides. Per +1 cy add Y_STRIDE, per +1 cz add Z_STRIDE.
+const Y_STRIDE = GRID_X * GRID_Z;
+const Z_STRIDE = GRID_X;
+
 // 26-connected neighbour offsets in (dx, dy, dz). Built once at module load
 // so the inner loop reads them as monomorphic Int8Array indexed loads.
+// NB_DI is the precomputed flat-index delta — `i + NB_DI[n]` lands on the
+// neighbour cell directly, avoiding a full cellIndex multiply per neighbour.
 const NB_DX = new Int8Array(26);
 const NB_DY = new Int8Array(26);
 const NB_DZ = new Int8Array(26);
 const NB_COST = new Float32Array(26);
+const NB_DI = new Int32Array(26);
 {
+  const SQRT2 = Math.SQRT2;
+  const SQRT3 = Math.sqrt(3);
   let k = 0;
   for (let dz = -1; dz <= 1; dz++) {
     for (let dy = -1; dy <= 1; dy++) {
@@ -60,20 +69,30 @@ const NB_COST = new Float32Array(26);
         NB_DX[k] = dx;
         NB_DY[k] = dy;
         NB_DZ[k] = dz;
-        NB_COST[k] = dim === 1 ? 1 : dim === 2 ? Math.SQRT2 : Math.sqrt(3);
+        NB_COST[k] = dim === 1 ? 1 : dim === 2 ? SQRT2 : SQRT3;
+        NB_DI[k] = dx + dz * Z_STRIDE + dy * Y_STRIDE;
         k++;
       }
     }
   }
 }
 
+// Math constants pulled into module-local consts so the inner loop avoids
+// a property lookup on the global Math object on every iteration.
+const SQRT2 = Math.SQRT2;
+const SQRT3 = Math.sqrt(3);
+
 /** Octile-style 3D heuristic — never overestimates the true 26-connected cost. */
 function heuristic(ax: number, ay: number, az: number, bx: number, by: number, bz: number): number {
-  const dx = Math.abs(ax - bx), dy = Math.abs(ay - by), dz = Math.abs(az - bz);
-  const max = Math.max(dx, dy, dz);
-  const min = Math.min(dx, dy, dz);
-  const mid = dx + dy + dz - max - min;
-  return (max - mid) + (mid - min) * Math.SQRT2 + min * Math.sqrt(3);
+  let dx = ax - bx; if (dx < 0) dx = -dx;
+  let dy = ay - by; if (dy < 0) dy = -dy;
+  let dz = az - bz; if (dz < 0) dz = -dz;
+  // Order so dx >= dy >= dz to avoid Math.max/min calls.
+  if (dx < dy) { const t = dx; dx = dy; dy = t; }
+  if (dy < dz) { const t = dy; dy = dz; dz = t; }
+  if (dx < dy) { const t = dx; dx = dy; dy = t; }
+  // dx = max, dz = min, dy = mid.
+  return (dx - dy) + (dy - dz) * SQRT2 + dz * SQRT3;
 }
 
 /**
@@ -101,42 +120,6 @@ export class AStarWorkspace {
 }
 
 /**
- * Compute the edge cost from `aIdx` to `bIdx` for a single 26-neighbour step.
- * Diggers pay an extra dig cost when the destination has any solid voxel; the
- * step cost itself is the geometric distance (1, √2, or √3).
- */
-function stepCost(grid: UnitGrid, vol: VolumeGrid | undefined, baseCost: number, dy: number, bIdx: number): number {
-  let c = baseCost;
-  if (grid.profile.canDig && vol) {
-    if (getBit(vol.solid, bIdx)) c += vol.digCost[bIdx]!;
-  }
-  if (grid.profile.slopePenalty > 0 && dy !== 0) {
-    c += Math.abs(dy) * grid.profile.slopePenalty;
-  }
-  return c;
-}
-
-/**
- * Step-climb gate. Returns true when the unit can transition between two cells
- * given the local floor heights inferred from the volume grid below them. We
- * compare the voxel-y of the highest solid in the cell directly under each
- * (the floor the unit stands on). When the difference exceeds the unit's
- * `maxStepVoxels`, the edge is impassable. Diggers bypass this check (they
- * grind through anything in their way).
- */
-function stepClimbOk(grid: UnitGrid, vol: VolumeGrid | undefined, ax: number, ay: number, az: number, bx: number, by: number, bz: number): boolean {
-  if (grid.profile.canDig) return true;
-  if (!grid.profile.requiresGround || !vol) return true;
-  if (ay === 0 || by === 0) return true;
-  const aFloorY = vol.topY[cellIndex(ax, ay - 1, az)]!;
-  const bFloorY = vol.topY[cellIndex(bx, by - 1, bz)]!;
-  if (aFloorY < 0 || bFloorY < 0) return true; // floor handled elsewhere
-  const dY = Math.abs(aFloorY - bFloorY);
-  if (dY > grid.profile.maxStepVoxels) return false;
-  return true;
-}
-
-/**
  * Find a path on the unit grid using weighted A*. Returns a list of cell
  * waypoints from start to goal (inclusive). `reached` is false when the goal
  * is unreachable or the expansion cap fired — the result still contains the
@@ -155,8 +138,9 @@ export function findPath(
   const cap = opts.maxExpansions ?? 40000;
   const vol = opts.volume;
 
+  const gcx = goal.cx, gcy = goal.cy, gcz = goal.cz;
   const startI = cellIndex(start.cx, start.cy, start.cz);
-  const goalI = cellIndex(goal.cx, goal.cy, goal.cz);
+  const goalI = cellIndex(gcx, gcy, gcz);
 
   if (startI === goalI) {
     return { cells: [{ ...start }], reached: true, expanded: 0 };
@@ -166,17 +150,29 @@ export function findPath(
   // goal inside dirt/stone is fine; only bedrock or out-of-bounds rejects.
   // The start cell is allowed to be impassable (the unit may be partially
   // buried after a cave-in); the search just doesn't gate it.
-  if (!isPassable(grid, goal.cx, goal.cy, goal.cz)) {
+  if (!isPassable(grid, gcx, gcy, gcz)) {
     return { cells: [], reached: false, expanded: 0 };
   }
+
+  const passable = grid.passable;
+  const profile = grid.profile;
+  const canDig = profile.canDig;
+  const slopePenalty = profile.slopePenalty;
+  const hasSlopePenalty = slopePenalty > 0;
+  const enforceStep = !canDig && profile.requiresGround && !!vol;
+  const maxStep = profile.maxStepVoxels;
+  const digCostArr = vol ? vol.digCost : null;
+  const solidArr = vol ? vol.solid : null;
+  const topYArr = vol ? vol.topY : null;
+  const useDigCost = canDig && !!digCostArr && !!solidArr;
 
   ws.gScore[startI] = 0;
   ws.gen[startI] = gen;
   ws.cameFrom[startI] = -1;
-  ws.open.push(startI, w * heuristic(start.cx, start.cy, start.cz, goal.cx, goal.cy, goal.cz));
+  ws.open.push(startI, w * heuristic(start.cx, start.cy, start.cz, gcx, gcy, gcz));
 
   let bestPartial = startI;
-  let bestPartialH = heuristic(start.cx, start.cy, start.cz, goal.cx, goal.cy, goal.cz);
+  let bestPartialH = heuristic(start.cx, start.cy, start.cz, gcx, gcy, gcz);
   let expanded = 0;
   let reached = false;
 
@@ -193,9 +189,17 @@ export function findPath(
     const cz = tmp % GRID_Z;
     const cy = (tmp / GRID_Z) | 0;
     const gI = ws.gScore[i]!;
-    const hI = heuristic(cx, cy, cz, goal.cx, goal.cy, goal.cz);
+    const hI = heuristic(cx, cy, cz, gcx, gcy, gcz);
     if (hI < bestPartialH) { bestPartialH = hI; bestPartial = i; }
     if (expanded >= cap) break;
+
+    // Step-climb floor for the parent cell — same for every neighbour, so
+    // hoist it once. -1 means we have no floor info (cy === 0 or all-air
+    // column) and the neighbour gate just passes.
+    let aFloorY = -2;
+    if (enforceStep && cy !== 0) {
+      aFloorY = topYArr![i - Y_STRIDE]!;
+    }
 
     for (let n = 0; n < 26; n++) {
       const dx = NB_DX[n]!;
@@ -205,18 +209,37 @@ export function findPath(
       const ny = cy + dy;
       const nz = cz + dz;
       if (nx < 0 || ny < 0 || nz < 0 || nx >= GRID_X || ny >= GRID_Y || nz >= GRID_Z) continue;
-      const ni = cellIndex(nx, ny, nz);
-      if (!isPassable(grid, nx, ny, nz)) continue;
+      const ni = i + NB_DI[n]!;
+      // Inlined bitmap passable check — same shape as isPassable() but skips
+      // a function call and a redundant cellIndex multiply.
+      if (((passable[ni >> 3]! >> (ni & 7)) & 1) === 0) continue;
       if (ws.closed[ni] === gen) continue;
-      if (!stepClimbOk(grid, vol, cx, cy, cz, nx, ny, nz)) continue;
 
-      const g = gI + stepCost(grid, vol, NB_COST[n]!, dy, ni);
+      // Step-climb gate (only meaningful for non-digger, requires-ground).
+      if (enforceStep && cy !== 0 && ny !== 0 && aFloorY >= 0) {
+        const bFloorY = topYArr![ni - Y_STRIDE]!;
+        if (bFloorY >= 0) {
+          const dY = aFloorY < bFloorY ? bFloorY - aFloorY : aFloorY - bFloorY;
+          if (dY > maxStep) continue;
+        }
+      }
+
+      // Edge cost: base distance + dig cost (diggers only, if cell has
+      // any solid voxel) + slope penalty (if kind has one).
+      let stepC = NB_COST[n]!;
+      if (useDigCost) {
+        if ((solidArr![ni >> 3]! >> (ni & 7)) & 1) stepC += digCostArr![ni]!;
+      }
+      if (hasSlopePenalty && dy !== 0) {
+        stepC += (dy < 0 ? -dy : dy) * slopePenalty;
+      }
+      const g = gI + stepC;
       const seen = ws.gen[ni] === gen;
       if (!seen || g < ws.gScore[ni]!) {
         ws.gen[ni] = gen;
         ws.gScore[ni] = g;
         ws.cameFrom[ni] = i;
-        const f = g + w * heuristic(nx, ny, nz, goal.cx, goal.cy, goal.cz);
+        const f = g + w * heuristic(nx, ny, nz, gcx, gcy, gcz);
         ws.open.push(ni, f);
       }
     }
@@ -249,17 +272,30 @@ export function findPathThetaStar(
   const cap = opts.maxExpansions ?? 40000;
   const vol = opts.volume;
 
+  const gcx = goal.cx, gcy = goal.cy, gcz = goal.cz;
   const startI = cellIndex(start.cx, start.cy, start.cz);
-  const goalI = cellIndex(goal.cx, goal.cy, goal.cz);
+  const goalI = cellIndex(gcx, gcy, gcz);
   if (startI === goalI) return { cells: [{ ...start }], reached: true, expanded: 0 };
+
+  const passable = grid.passable;
+  const profile = grid.profile;
+  const canDig = profile.canDig;
+  const slopePenalty = profile.slopePenalty;
+  const hasSlopePenalty = slopePenalty > 0;
+  const enforceStep = !canDig && profile.requiresGround && !!vol;
+  const maxStep = profile.maxStepVoxels;
+  const digCostArr = vol ? vol.digCost : null;
+  const solidArr = vol ? vol.solid : null;
+  const topYArr = vol ? vol.topY : null;
+  const useDigCost = canDig && !!digCostArr && !!solidArr;
 
   ws.gScore[startI] = 0;
   ws.gen[startI] = gen;
   ws.cameFrom[startI] = -1;
-  ws.open.push(startI, w * heuristic(start.cx, start.cy, start.cz, goal.cx, goal.cy, goal.cz));
+  ws.open.push(startI, w * heuristic(start.cx, start.cy, start.cz, gcx, gcy, gcz));
 
   let bestPartial = startI;
-  let bestPartialH = heuristic(start.cx, start.cy, start.cz, goal.cx, goal.cy, goal.cz);
+  let bestPartialH = heuristic(start.cx, start.cy, start.cz, gcx, gcy, gcz);
   let expanded = 0;
   let reached = false;
 
@@ -274,18 +310,26 @@ export function findPathThetaStar(
     const tmp = (i / GRID_X) | 0;
     const cz = tmp % GRID_Z;
     const cy = (tmp / GRID_Z) | 0;
-    const hI = heuristic(cx, cy, cz, goal.cx, goal.cy, goal.cz);
+    const gI = ws.gScore[i]!;
+    const hI = heuristic(cx, cy, cz, gcx, gcy, gcz);
     if (hI < bestPartialH) { bestPartialH = hI; bestPartial = i; }
     if (expanded >= cap) break;
 
     const parentI = ws.cameFrom[i]!;
     const parentValid = parentI >= 0 && ws.gen[parentI] === gen;
     let pcx = 0, pcy = 0, pcz = 0;
+    let parentG = 0;
     if (parentValid) {
       pcx = parentI % GRID_X;
       const ptmp = (parentI / GRID_X) | 0;
       pcz = ptmp % GRID_Z;
       pcy = (ptmp / GRID_Z) | 0;
+      parentG = ws.gScore[parentI]!;
+    }
+
+    let aFloorY = -2;
+    if (enforceStep && cy !== 0) {
+      aFloorY = topYArr![i - Y_STRIDE]!;
     }
 
     for (let n = 0; n < 26; n++) {
@@ -296,13 +340,27 @@ export function findPathThetaStar(
       const ny = cy + dy;
       const nz = cz + dz;
       if (nx < 0 || ny < 0 || nz < 0 || nx >= GRID_X || ny >= GRID_Y || nz >= GRID_Z) continue;
-      const ni = cellIndex(nx, ny, nz);
-      if (!isPassable(grid, nx, ny, nz)) continue;
+      const ni = i + NB_DI[n]!;
+      if (((passable[ni >> 3]! >> (ni & 7)) & 1) === 0) continue;
       if (ws.closed[ni] === gen) continue;
-      if (!stepClimbOk(grid, vol, cx, cy, cz, nx, ny, nz)) continue;
+
+      if (enforceStep && cy !== 0 && ny !== 0 && aFloorY >= 0) {
+        const bFloorY = topYArr![ni - Y_STRIDE]!;
+        if (bFloorY >= 0) {
+          const dY = aFloorY < bFloorY ? bFloorY - aFloorY : aFloorY - bFloorY;
+          if (dY > maxStep) continue;
+        }
+      }
 
       // Path 1: standard relax through current cell.
-      const g1 = ws.gScore[i]! + stepCost(grid, vol, NB_COST[n]!, dy, ni);
+      let stepC = NB_COST[n]!;
+      if (useDigCost) {
+        if ((solidArr![ni >> 3]! >> (ni & 7)) & 1) stepC += digCostArr![ni]!;
+      }
+      if (hasSlopePenalty && dy !== 0) {
+        stepC += (dy < 0 ? -dy : dy) * slopePenalty;
+      }
+      const g1 = gI + stepC;
       let bestG = g1;
       let bestParent = i;
 
@@ -312,7 +370,7 @@ export function findPathThetaStar(
         const dyp = ny - pcy;
         const dzp = nz - pcz;
         const lineCost = euclideanCost(grid, vol, pcx, pcy, pcz, nx, ny, nz, dxp, dyp, dzp);
-        const g2 = ws.gScore[parentI]! + lineCost;
+        const g2 = parentG + lineCost;
         if (g2 < bestG) { bestG = g2; bestParent = parentI; }
       }
 
@@ -321,7 +379,7 @@ export function findPathThetaStar(
         ws.gen[ni] = gen;
         ws.gScore[ni] = bestG;
         ws.cameFrom[ni] = bestParent;
-        const f = bestG + w * heuristic(nx, ny, nz, goal.cx, goal.cy, goal.cz);
+        const f = bestG + w * heuristic(nx, ny, nz, gcx, gcy, gcz);
         ws.open.push(ni, f);
       }
     }
@@ -362,20 +420,25 @@ export function lineOfSight(
   bx: number, by: number, bz: number,
 ): boolean {
   const dx = bx - ax, dy = by - ay, dz = bz - az;
-  const steps = Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz));
+  const adx = dx < 0 ? -dx : dx;
+  const ady = dy < 0 ? -dy : dy;
+  const adz = dz < 0 ? -dz : dz;
+  const steps = adx > ady ? (adx > adz ? adx : adz) : (ady > adz ? ady : adz);
   if (steps === 0) return true;
+  const passable = grid.passable;
+  const checkBedrock = grid.profile.canDig && !!vol;
+  const bedrock = vol ? vol.bedrock : null;
+  const inv = 1 / steps;
   for (let s = 1; s <= steps; s++) {
-    const t = s / steps;
+    const t = s * inv;
     const cx = Math.round(ax + dx * t);
     const cy = Math.round(ay + dy * t);
     const cz = Math.round(az + dz * t);
     if (cx < 0 || cy < 0 || cz < 0 || cx >= GRID_X || cy >= GRID_Y || cz >= GRID_Z) return false;
-    if (!isPassable(grid, cx, cy, cz)) return false;
-    if (grid.profile.canDig && vol) {
-      // Diggers can't cut through bedrock — even on a Theta* shortcut.
-      const i = cellIndex(cx, cy, cz);
-      if (getBit(vol.bedrock, i)) return false;
-    }
+    const i = cellIndex(cx, cy, cz);
+    if (((passable[i >> 3]! >> (i & 7)) & 1) === 0) return false;
+    // Diggers can't cut through bedrock — even on a Theta* shortcut.
+    if (checkBedrock && ((bedrock![i >> 3]! >> (i & 7)) & 1)) return false;
   }
   return true;
 }
@@ -395,10 +458,14 @@ function euclideanCost(
   const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
   let extra = 0;
   if (grid.profile.canDig && vol) {
-    const steps = Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz)) || 1;
+    const adx = dx < 0 ? -dx : dx;
+    const ady = dy < 0 ? -dy : dy;
+    const adz = dz < 0 ? -dz : dz;
+    const steps = (adx > ady ? (adx > adz ? adx : adz) : (ady > adz ? ady : adz)) || 1;
+    const inv = 1 / steps;
     let solidCost = 0;
     for (let s = 1; s <= steps; s++) {
-      const t = s / steps;
+      const t = s * inv;
       const cx = Math.round(ax + dx * t);
       const cy = Math.round(ay + dy * t);
       const cz = Math.round(az + dz * t);
@@ -408,7 +475,7 @@ function euclideanCost(
     extra = solidCost / steps * dist;
   }
   if (grid.profile.slopePenalty > 0 && dy !== 0) {
-    extra += Math.abs(dy) * grid.profile.slopePenalty;
+    extra += (dy < 0 ? -dy : dy) * grid.profile.slopePenalty;
   }
   return dist + extra;
 }
