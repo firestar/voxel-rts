@@ -1077,7 +1077,7 @@ export class Game {
       const wx = cx * VOXEL_SIZE, wy = cy * VOXEL_SIZE, wz = cz * VOXEL_SIZE;
       const burst = Math.min(160, 20 + result.destroyed.length * 2);
       this.debris.spawnBurst(wx, wy, wz, burst, sample.material);
-      const r = this.explosionRadiusBigMeters;
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
       this.requestNavRebuildAround(wx - r, wy - r, wz - r, wx + r, wy + r, wz + r);
     }
     // Player-triggered explosion also damages units in the blast radius, with
@@ -1120,7 +1120,7 @@ export class Game {
       : this.world.fillSphere(cx, cy, cz, radius, TERRAIN_PALETTE[this.terrainPaletteIdx]!.id);
     if (changed > 0) {
       const wx = cx * VOXEL_SIZE, wy = cy * VOXEL_SIZE, wz = cz * VOXEL_SIZE;
-      const r = radius * VOXEL_SIZE;
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
       // Fill blocks; carve only opens. Replan when fill could invalidate paths.
       this.requestNavRebuildAround(wx - r, wy - r, wz - r, wx + r, wy + r, wz + r, !carve);
     }
@@ -1158,13 +1158,10 @@ export class Game {
       this.debris.spawnBurst(req.x, req.y, req.z, 30, sample.material);
       // Carving only opens new space — it never blocks an existing path. Refresh nav so
       // future routes see the tunnel, but skip the replan that would yank live paths.
-      // Carve bbox covers the cylinder's bounding sphere when oriented, otherwise the
-      // sphere itself. Half-length defaults to the radius for the simple sphere case.
-      const halfLen = req.halfLengthMeters ?? req.radiusMeters;
-      const bound = halfLen + req.radiusMeters;
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
       this.requestNavRebuildAround(
-        req.x - bound, req.y - bound, req.z - bound,
-        req.x + bound, req.y + bound, req.z + bound,
+        req.x - r, req.y - r, req.z - r,
+        req.x + r, req.y + r, req.z + r,
       );
     }
   }
@@ -1232,15 +1229,10 @@ export class Game {
       }
     }
     if (touched) {
-      // BBox covers the levelled strip plus the 2-m drop zone behind the dozer.
-      // Vertical span runs from world floor up to the highest existing column —
-      // in practice editColumnToY only touches voxels in a narrow band around
-      // targetVoxY, so we bound y conservatively to the strip's pitch.
-      const halfX = Math.abs(req.fx) * req.halfDepthMeters + Math.abs(rx) * req.halfWidthMeters + 2.0;
-      const halfZ = Math.abs(req.fz) * req.halfDepthMeters + Math.abs(rz) * req.halfWidthMeters + 2.0;
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
       this.requestNavRebuildAround(
-        req.x - halfX, 0, req.z - halfZ,
-        req.x + halfX, WORLD_Y * VOXEL_SIZE, req.z + halfZ,
+        req.x - r, 0, req.z - r,
+        req.x + r, WORLD_Y * VOXEL_SIZE, req.z + r,
       );
     }
   }
@@ -1450,10 +1442,10 @@ export class Game {
     const TANK_TRACK_INTERVAL = 0.4;     // m between tread marks
     const TANK_TREAD_OFFSET = 1.20;      // half-spacing between treads, m (matches model)
     const nav = this.surfaceNav!;
+    // Union of every tread mark's centre that actually removed voxels this
+    // frame. The nav refresh always uses the fixed half-extent, so we only
+    // need the centroid bbox to position it.
     let anythingDestroyed = false;
-    // Union AABB of every tread mark that actually removed voxels this frame.
-    // Tracked in world meters so we can hand it to the incremental nav refresh
-    // at the end (single pass over a small box rather than a full rebuild).
     let bx0 = Infinity, by0 = Infinity, bz0 = Infinity;
     let bx1 = -Infinity, by1 = -Infinity, bz1 = -Infinity;
 
@@ -1505,20 +1497,20 @@ export class Game {
         if (result.destroyed.length > 0) {
           anythingDestroyed = true;
           const wxc = cxv * VOXEL_SIZE, wyc = cyv * VOXEL_SIZE, wzc = czv * VOXEL_SIZE;
-          const r = recipe.radiusMeters;
-          if (wxc - r < bx0) bx0 = wxc - r;
-          if (wyc - r < by0) by0 = wyc - r;
-          if (wzc - r < bz0) bz0 = wzc - r;
-          if (wxc + r > bx1) bx1 = wxc + r;
-          if (wyc + r > by1) by1 = wyc + r;
-          if (wzc + r > bz1) bz1 = wzc + r;
+          if (wxc < bx0) bx0 = wxc;
+          if (wyc < by0) by0 = wyc;
+          if (wzc < bz0) bz0 = wzc;
+          if (wxc > bx1) bx1 = wxc;
+          if (wyc > by1) by1 = wyc;
+          if (wzc > bz1) bz1 = wzc;
         }
       }
     }
     // Only request a nav rebuild when track damage actually removed voxels (changed
     // topY); a no-op pass over compacted grass/dirt just bumps damage counters.
     if (anythingDestroyed) {
-      this.requestNavRebuildAround(bx0, by0, bz0, bx1, by1, bz1);
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
+      this.requestNavRebuildAround(bx0 - r, by0 - r, bz0 - r, bx1 + r, by1 + r, bz1 + r);
     }
   }
 
@@ -1840,9 +1832,10 @@ export class Game {
         ? Math.min(220, 30 + result.destroyed.length * 2)
         : Math.min(20, 4 + result.destroyed.length);
       this.debris.spawnBurst(imp.x, imp.y, imp.z, burst, sample.material);
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
       this.requestNavRebuildAround(
-        imp.x - radiusMeters, imp.y - radiusMeters, imp.z - radiusMeters,
-        imp.x + radiusMeters, imp.y + radiusMeters, imp.z + radiusMeters,
+        imp.x - r, imp.y - r, imp.z - r,
+        imp.x + r, imp.y + r, imp.z + r,
       );
     }
     // Fire flash — bigger and longer for explosives so the player feels the
@@ -2408,6 +2401,23 @@ function isBuildMode(m: Mode): boolean {
  * map. Per-projectile `terrainDamageScale` is applied on top of this.
  */
 const TERRAIN_DAMAGE_GLOBAL_SCALE = 0.2;
+
+/**
+ * Half-extent (m) of the AABB handed to {@link Game.requestNavRebuildAround}
+ * for any voxel-edit event. Decoupling the nav-refresh window from each
+ * weapon's voxel-precise blast radius means every explosion / impact /
+ * carve refreshes the same fixed 8 m diameter box on the 1 m nav grid,
+ * regardless of how far the actual voxel sphere reached. Keeps refresh
+ * cost predictable (~10³ volume cells per event) and removes per-callsite
+ * per-weapon math.
+ *
+ * 4 m radius = 8 m diameter = 8 nav cells. Covers a tank shell's full
+ * blast (radius 4 m) and is generous for most other events; very large
+ * events (silo at 6 m) leave an outer ring stale until the next refresh
+ * rolls over those cells, which is acceptable for a rare player-fired
+ * weapon.
+ */
+const NAV_REFRESH_HALF_EXTENT_METERS = 4.0;
 
 /**
  * When an aggressive-stance unit decides to walk closer to its target (because
