@@ -23,6 +23,10 @@ import {
 } from './Nav';
 import { VolumeGrid, rebuildCell } from './VolumeGrid';
 
+// y-major linear-index strides — match the cellIndex layout.
+const Y_STRIDE = GRID_X * GRID_Z;
+const Z_STRIDE = GRID_X;
+
 export interface UnitProfile {
   /** Stable string id used as the map key (matches UnitKind). */
   kind: string;
@@ -72,39 +76,48 @@ function halfFootprint(p: UnitProfile): number {
  *
  * For diggers, "fits" means non-bedrock; the digger will carve out any
  * dirt/stone in the box at runtime. For non-diggers, every cell in the
- * footprint+height box must be air-only (vg.solid == 0).
+ * footprint+height box must be air-only (vg.solid == 0). Since bedrock is
+ * a subset of solid, non-diggers only need the solid bitmap to gate the box.
  */
 export function isUnitCellPassable(vg: VolumeGrid, p: UnitProfile, cx: number, cy: number, cz: number): boolean {
   const r = halfFootprint(p);
-  const h = Math.max(1, p.heightCells);
+  const h = p.heightCells > 1 ? p.heightCells : 1;
   if (cx - r < 0 || cz - r < 0 || cx + r >= GRID_X || cz + r >= GRID_Z) return false;
   if (cy < 0 || cy + h - 1 >= GRID_Y) return false;
 
+  // Non-diggers only need to test `solid` (bedrock implies solid). Diggers
+  // need to test `bedrock` only (any non-bedrock cell is diggable). Either
+  // way it's a single bit-test per cell instead of two.
+  const blockArr = p.canDig ? vg.bedrock : vg.solid;
+  const x0 = cx - r;
+  const x1 = cx + r;
+  const z0 = cz - r;
+  const z1 = cz + r;
   for (let dy = 0; dy < h; dy++) {
     const y = cy + dy;
-    for (let dz = -r; dz <= r; dz++) {
-      const z = cz + dz;
-      for (let dx = -r; dx <= r; dx++) {
-        const x = cx + dx;
-        const i = cellIndex(x, y, z);
-        if (getBit(vg.bedrock, i)) return false;
-        if (!p.canDig && getBit(vg.solid, i)) return false;
+    const yOff = y * Y_STRIDE;
+    for (let z = z0; z <= z1; z++) {
+      const yzOff = yOff + z * Z_STRIDE;
+      for (let x = x0; x <= x1; x++) {
+        const i = yzOff + x;
+        if ((blockArr[i >> 3]! >> (i & 7)) & 1) return false;
       }
     }
   }
 
   if (p.requiresGround) {
     if (cy === 0) return true; // standing on world floor (bedrock layer below)
-    let foundFloor = false;
     const yBelow = cy - 1;
-    for (let dz = -r; dz <= r && !foundFloor; dz++) {
-      const z = cz + dz;
-      for (let dx = -r; dx <= r && !foundFloor; dx++) {
-        const x = cx + dx;
-        if (getBit(vg.solid, cellIndex(x, yBelow, z)) === 1) foundFloor = true;
+    const yOff = yBelow * Y_STRIDE;
+    const solid = vg.solid;
+    for (let z = z0; z <= z1; z++) {
+      const yzOff = yOff + z * Z_STRIDE;
+      for (let x = x0; x <= x1; x++) {
+        const i = yzOff + x;
+        if ((solid[i >> 3]! >> (i & 7)) & 1) return true;
       }
     }
-    if (!foundFloor) return false;
+    return false;
   }
 
   return true;
@@ -119,10 +132,26 @@ export function refreshUnitCell(vg: VolumeGrid, grid: UnitGrid, cx: number, cy: 
 
 export function buildUnitGrid(vg: VolumeGrid, grid: UnitGrid): void {
   grid.passable.fill(0);
-  for (let cy = 0; cy < GRID_Y; cy++) {
-    for (let cz = 0; cz < GRID_Z; cz++) {
-      for (let cx = 0; cx < GRID_X; cx++) {
-        refreshUnitCell(vg, grid, cx, cy, cz);
+  // Walking the cells in layout order keeps the bitmap writes sequential.
+  // Skip the border that no unit can occupy (footprint + height) so we don't
+  // pay the per-cell isUnitCellPassable bounds-rejection cost on every edge.
+  const p = grid.profile;
+  const r = halfFootprint(p);
+  const h = p.heightCells > 1 ? p.heightCells : 1;
+  const x0 = r;
+  const x1 = GRID_X - 1 - r;
+  const z0 = r;
+  const z1 = GRID_Z - 1 - r;
+  const y0 = 0;
+  const y1 = GRID_Y - h;
+  if (x0 > x1 || z0 > z1 || y0 > y1) return;
+  for (let cy = y0; cy <= y1; cy++) {
+    for (let cz = z0; cz <= z1; cz++) {
+      for (let cx = x0; cx <= x1; cx++) {
+        if (isUnitCellPassable(vg, p, cx, cy, cz)) {
+          const i = cellIndex(cx, cy, cz);
+          grid.passable[i >> 3]! |= (1 << (i & 7));
+        }
       }
     }
   }
@@ -137,19 +166,49 @@ export function buildUnitGrid(vg: VolumeGrid, grid: UnitGrid): void {
 export function refreshUnitNeighborhood(vg: VolumeGrid, grid: UnitGrid, vx: number, vy: number, vz: number): void {
   const p = grid.profile;
   const r = halfFootprint(p);
-  const h = Math.max(1, p.heightCells);
-  const x0 = Math.max(0, vx - r);
-  const x1 = Math.min(GRID_X - 1, vx + r);
-  const z0 = Math.max(0, vz - r);
-  const z1 = Math.min(GRID_Z - 1, vz + r);
+  const h = p.heightCells > 1 ? p.heightCells : 1;
+  const x0 = vx - r > 0 ? vx - r : 0;
+  const x1 = vx + r < GRID_X - 1 ? vx + r : GRID_X - 1;
+  const z0 = vz - r > 0 ? vz - r : 0;
+  const z1 = vz + r < GRID_Z - 1 ? vz + r : GRID_Z - 1;
   // Vertical: a change at vy affects every cell whose body box contains vy,
   // i.e. cy in [vy - h + 1, vy]. Also a change at vy affects requiresGround
   // for the cell at vy + 1 (floor below). Cover both.
-  const y0 = Math.max(0, vy - h + 1);
-  const y1 = Math.min(GRID_Y - 1, vy + 1);
+  const y0 = vy - h + 1 > 0 ? vy - h + 1 : 0;
+  const y1 = vy + 1 < GRID_Y - 1 ? vy + 1 : GRID_Y - 1;
   for (let cy = y0; cy <= y1; cy++) {
     for (let cz = z0; cz <= z1; cz++) {
       for (let cx = x0; cx <= x1; cx++) {
+        refreshUnitCell(vg, grid, cx, cy, cz);
+      }
+    }
+  }
+}
+
+/**
+ * Re-evaluate every cell in `[x0..x1] × [y0..y1] × [z0..z1]` whose passability
+ * could be affected by changes inside the given box. Expands the box by the
+ * unit's neighborhood radius so callers can pass the raw dirty bounds — a
+ * coalesced single sweep replaces N overlapping per-cell neighborhoods.
+ */
+export function refreshUnitGridBox(
+  vg: VolumeGrid, grid: UnitGrid,
+  x0: number, y0: number, z0: number,
+  x1: number, y1: number, z1: number,
+): void {
+  const p = grid.profile;
+  const r = halfFootprint(p);
+  const h = p.heightCells > 1 ? p.heightCells : 1;
+  const ex0 = x0 - r > 0 ? x0 - r : 0;
+  const ez0 = z0 - r > 0 ? z0 - r : 0;
+  const ex1 = x1 + r < GRID_X - 1 ? x1 + r : GRID_X - 1;
+  const ez1 = z1 + r < GRID_Z - 1 ? z1 + r : GRID_Z - 1;
+  const ey0 = y0 - h + 1 > 0 ? y0 - h + 1 : 0;
+  const ey1 = y1 + 1 < GRID_Y - 1 ? y1 + 1 : GRID_Y - 1;
+  if (ex0 > ex1 || ey0 > ey1 || ez0 > ez1) return;
+  for (let cy = ey0; cy <= ey1; cy++) {
+    for (let cz = ez0; cz <= ez1; cz++) {
+      for (let cx = ex0; cx <= ex1; cx++) {
         refreshUnitCell(vg, grid, cx, cy, cz);
       }
     }
@@ -162,14 +221,25 @@ export function refreshUnitNeighborhood(vg: VolumeGrid, grid: UnitGrid, vx: numb
  * those cells in the VolumeGrid (so vg reflects the new world).
  */
 export function refreshUnitGridDirty(vg: VolumeGrid, grid: UnitGrid, dirtyCells: ReadonlyArray<number>): void {
+  if (dirtyCells.length === 0) return;
+  // Coalesce into a single bounding box so overlapping neighborhoods of
+  // clustered dirty cells (typical: a building demolition rebuilds 27+
+  // contiguous cells) are visited once instead of N×.
+  let x0 = GRID_X, x1 = -1, y0 = GRID_Y, y1 = -1, z0 = GRID_Z, z1 = -1;
   for (let k = 0; k < dirtyCells.length; k++) {
     const i = dirtyCells[k]!;
     const cx = i % GRID_X;
     const tmp = (i / GRID_X) | 0;
     const cz = tmp % GRID_Z;
     const cy = (tmp / GRID_Z) | 0;
-    refreshUnitNeighborhood(vg, grid, cx, cy, cz);
+    if (cx < x0) x0 = cx;
+    if (cx > x1) x1 = cx;
+    if (cy < y0) y0 = cy;
+    if (cy > y1) y1 = cy;
+    if (cz < z0) z0 = cz;
+    if (cz > z1) z1 = cz;
   }
+  refreshUnitGridBox(vg, grid, x0, y0, z0, x1, y1, z1);
 }
 
 /**

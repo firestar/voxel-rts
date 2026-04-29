@@ -25,7 +25,7 @@ import {
 } from './VolumeGrid';
 import {
   UnitProfile, UnitGrid, allocateUnitGrid, buildUnitGrid,
-  refreshUnitGridDirty, isPassable,
+  refreshUnitGridBox, isPassable,
 } from './UnitGrid';
 import {
   AStarWorkspace, findPath as runFindPath, findPathThetaStar,
@@ -101,17 +101,22 @@ export class Pathfinder {
     const x1 = Math.min(GRID_X - 1, c1.cx + 1);
     const y1 = Math.min(GRID_Y - 1, c1.cy + 1);
     const z1 = Math.min(GRID_Z - 1, c1.cz + 1);
-    const dirty: number[] = [];
+    // Refresh the volume cells in the dirty box.
     for (let cy = y0; cy <= y1; cy++) {
       for (let cz = z0; cz <= z1; cz++) {
         for (let cx = x0; cx <= x1; cx++) {
           rebuildCell(this.voxels, this.volume, cx, cy, cz);
-          dirty.push(cellIndex(cx, cy, cz));
         }
       }
     }
+    // Each unit grid then walks its expanded box once. Previously we built a
+    // per-cell dirty list and re-evaluated every cell's neighborhood — for a
+    // clustered edit (typical: 3³ to 5³ cells from a single building damage
+    // event) the overlapping neighborhoods redid the same cells O(box-size)
+    // times. Coalescing into one sweep cuts the cost back down to the
+    // expanded-box volume.
     for (const grid of this.grids.values()) {
-      refreshUnitGridDirty(this.volume, grid, dirty);
+      refreshUnitGridBox(this.volume, grid, x0, y0, z0, x1, y1, z1);
     }
   }
 
