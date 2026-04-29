@@ -6,15 +6,15 @@ import { VoxelWorld } from '../voxel/VoxelWorld';
 import { ChunkMeshRegistry } from '../render/ChunkMeshRegistry';
 import { generateWorld } from '../voxel/WorldGen';
 import { raycastVoxel } from '../voxel/Raycast';
-import { VOXEL_SIZE } from '../voxel/types';
+import { VOXEL_SIZE, WORLD_Y } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
 import { Pathfinder, profileFromUnit } from '../path/Pathfinder';
 import {
-  SurfaceNavBuffers, allocateNav, buildSurfaceNav,
+  SurfaceNavBuffers, allocateNav, buildSurfaceNav, refreshSurfaceNavBox,
   NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS, NAV_CELL_VOXELS,
 } from '../path/SurfaceNav';
 import {
-  VolumeNavBuffers, allocateVolumeNav, buildVolumeNav,
+  VolumeNavBuffers, allocateVolumeNav, buildVolumeNav, rebuildVolumeCell,
   worldToVolumeCell, vnavIndex, getBit,
 } from '../path/VolumeNav';
 import {
@@ -1077,7 +1077,8 @@ export class Game {
       const wx = cx * VOXEL_SIZE, wy = cy * VOXEL_SIZE, wz = cz * VOXEL_SIZE;
       const burst = Math.min(160, 20 + result.destroyed.length * 2);
       this.debris.spawnBurst(wx, wy, wz, burst, sample.material);
-      this.requestNavRebuild();
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
+      this.requestNavRebuildAround(wx - r, wy - r, wz - r, wx + r, wy + r, wz + r);
     }
     // Player-triggered explosion also damages units in the blast radius, with
     // the same falloff curve we use for projectile splash. Direct projectile
@@ -1117,7 +1118,12 @@ export class Game {
     const changed = carve
       ? this.world.carveSphere(cx, cy, cz, radius)
       : this.world.fillSphere(cx, cy, cz, radius, TERRAIN_PALETTE[this.terrainPaletteIdx]!.id);
-    if (changed > 0) this.requestNavRebuild();
+    if (changed > 0) {
+      const wx = cx * VOXEL_SIZE, wy = cy * VOXEL_SIZE, wz = cz * VOXEL_SIZE;
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
+      // Fill blocks; carve only opens. Replan when fill could invalidate paths.
+      this.requestNavRebuildAround(wx - r, wy - r, wz - r, wx + r, wy + r, wz + r, !carve);
+    }
   }
 
   /** Single dispatch for every kind of world edit a unit can request. */
@@ -1152,7 +1158,11 @@ export class Game {
       this.debris.spawnBurst(req.x, req.y, req.z, 30, sample.material);
       // Carving only opens new space — it never blocks an existing path. Refresh nav so
       // future routes see the tunnel, but skip the replan that would yank live paths.
-      this.requestNavRebuild(false);
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
+      this.requestNavRebuildAround(
+        req.x - r, req.y - r, req.z - r,
+        req.x + r, req.y + r, req.z + r,
+      );
     }
   }
 
@@ -1218,7 +1228,13 @@ export class Game {
         }
       }
     }
-    if (touched) this.requestNavRebuild(false);
+    if (touched) {
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
+      this.requestNavRebuildAround(
+        req.x - r, 0, req.z - r,
+        req.x + r, WORLD_Y * VOXEL_SIZE, req.z + r,
+      );
+    }
   }
 
   /**
@@ -1231,12 +1247,58 @@ export class Game {
    * route still pointing through what used to be solid stone. Callers that
    * know the edit can only widen the navigable space (a digger carving
    * forward) pass `false` to skip the replan.
+   *
+   * Prefer `requestNavRebuildAround` when the affected world region is
+   * known — a full rebuild scans 200+ M voxels and stalls the frame for a
+   * single explosion's worth of damage.
    */
   private requestNavRebuild(replan = true): void {
     if (!this.pathfinder || !this.surfaceNav || !this.vnav) return;
     buildSurfaceNav(this.world.buffers.voxels, this.surfaceNav);
     buildVolumeNav(this.world.buffers.voxels, this.vnav);
     this.pathfinder.rebuildAll();
+    if (replan) this.replanMovingUnits();
+  }
+
+  /**
+   * Incremental nav refresh bounded to the world-meter AABB
+   * `[minX..maxX] × [minY..maxY] × [minZ..maxZ]`. Refreshes only the surface
+   * cells in the 2-D footprint, the volume cells in the 3-D box, and each
+   * unit grid's matching window. Use this whenever the affected region is
+   * known (explosions, projectile impacts, tank track marks, terrain edits)
+   * — it's typically 100–1000× cheaper than the full rebuild.
+   *
+   * Defaults to `replan = false`: pure-carve edits (every voxel goes solid
+   * → air) only ever open up navigable space, so existing paths stay valid.
+   * Callers whose edit can *block* a path (e.g. terrain fill, building
+   * placement) should pass `replan = true`.
+   */
+  private requestNavRebuildAround(
+    minX: number, minY: number, minZ: number,
+    maxX: number, maxY: number, maxZ: number,
+    replan = false,
+  ): void {
+    if (!this.pathfinder || !this.surfaceNav || !this.vnav) return;
+    const voxels = this.world.buffers.voxels;
+    // Surface nav: 2-D box of NAV_CELL_METERS-sized cells.
+    const sx0 = Math.floor(minX / NAV_CELL_METERS);
+    const sz0 = Math.floor(minZ / NAV_CELL_METERS);
+    const sx1 = Math.floor(maxX / NAV_CELL_METERS);
+    const sz1 = Math.floor(maxZ / NAV_CELL_METERS);
+    refreshSurfaceNavBox(voxels, this.surfaceNav, sx0, sz0, sx1, sz1);
+    // Volume nav alias (Game.vnav is a separate copy of the volume summary
+    // from the one Pathfinder owns; both must be kept in sync).
+    const c0 = worldToVolumeCell(minX, minY, minZ);
+    const c1 = worldToVolumeCell(maxX, maxY, maxZ);
+    for (let cy = c0.cy; cy <= c1.cy; cy++) {
+      for (let cz = c0.cz; cz <= c1.cz; cz++) {
+        for (let cx = c0.cx; cx <= c1.cx; cx++) {
+          rebuildVolumeCell(voxels, this.vnav, cx, cy, cz);
+        }
+      }
+    }
+    // Pathfinder volume + per-unit-kind grids.
+    this.pathfinder.applyDamage(minX, minY, minZ, maxX, maxY, maxZ);
     if (replan) this.replanMovingUnits();
   }
 
@@ -1380,7 +1442,12 @@ export class Game {
     const TANK_TRACK_INTERVAL = 0.4;     // m between tread marks
     const TANK_TREAD_OFFSET = 1.20;      // half-spacing between treads, m (matches model)
     const nav = this.surfaceNav!;
+    // Union of every tread mark's centre that actually removed voxels this
+    // frame. The nav refresh always uses the fixed half-extent, so we only
+    // need the centroid bbox to position it.
     let anythingDestroyed = false;
+    let bx0 = Infinity, by0 = Infinity, bz0 = Infinity;
+    let bx1 = -Infinity, by1 = -Infinity, bz1 = -Infinity;
 
     for (const u of this.units.units) {
       if (u.kind !== 'tank') continue;
@@ -1427,12 +1494,24 @@ export class Game {
           recipe.radiusMeters / VOXEL_SIZE,
           recipe.peak,
         );
-        if (result.destroyed.length > 0) anythingDestroyed = true;
+        if (result.destroyed.length > 0) {
+          anythingDestroyed = true;
+          const wxc = cxv * VOXEL_SIZE, wyc = cyv * VOXEL_SIZE, wzc = czv * VOXEL_SIZE;
+          if (wxc < bx0) bx0 = wxc;
+          if (wyc < by0) by0 = wyc;
+          if (wzc < bz0) bz0 = wzc;
+          if (wxc > bx1) bx1 = wxc;
+          if (wyc > by1) by1 = wyc;
+          if (wzc > bz1) bz1 = wzc;
+        }
       }
     }
     // Only request a nav rebuild when track damage actually removed voxels (changed
     // topY); a no-op pass over compacted grass/dirt just bumps damage counters.
-    if (anythingDestroyed) this.requestNavRebuild(false);
+    if (anythingDestroyed) {
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
+      this.requestNavRebuildAround(bx0 - r, by0 - r, bz0 - r, bx1 + r, by1 + r, bz1 + r);
+    }
   }
 
   /**
@@ -1753,7 +1832,11 @@ export class Game {
         ? Math.min(220, 30 + result.destroyed.length * 2)
         : Math.min(20, 4 + result.destroyed.length);
       this.debris.spawnBurst(imp.x, imp.y, imp.z, burst, sample.material);
-      this.requestNavRebuild(false);
+      const r = NAV_REFRESH_HALF_EXTENT_METERS;
+      this.requestNavRebuildAround(
+        imp.x - r, imp.y - r, imp.z - r,
+        imp.x + r, imp.y + r, imp.z + r,
+      );
     }
     // Fire flash — bigger and longer for explosives so the player feels the
     // weight of an RPG / cluster hit. Bullets get a small spark.
@@ -2318,6 +2401,23 @@ function isBuildMode(m: Mode): boolean {
  * map. Per-projectile `terrainDamageScale` is applied on top of this.
  */
 const TERRAIN_DAMAGE_GLOBAL_SCALE = 0.2;
+
+/**
+ * Half-extent (m) of the AABB handed to {@link Game.requestNavRebuildAround}
+ * for any voxel-edit event. Decoupling the nav-refresh window from each
+ * weapon's voxel-precise blast radius means every explosion / impact /
+ * carve refreshes the same fixed 8 m diameter box on the 1 m nav grid,
+ * regardless of how far the actual voxel sphere reached. Keeps refresh
+ * cost predictable (~10³ volume cells per event) and removes per-callsite
+ * per-weapon math.
+ *
+ * 4 m radius = 8 m diameter = 8 nav cells. Covers a tank shell's full
+ * blast (radius 4 m) and is generous for most other events; very large
+ * events (silo at 6 m) leave an outer ring stale until the next refresh
+ * rolls over those cells, which is acceptable for a rare player-fired
+ * weapon.
+ */
+const NAV_REFRESH_HALF_EXTENT_METERS = 4.0;
 
 /**
  * When an aggressive-stance unit decides to walk closer to its target (because

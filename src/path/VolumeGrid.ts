@@ -25,11 +25,11 @@ export interface VolumeGrid {
    */
   digCost: Uint8Array;
   /**
-   * Highest solid voxel y inside the cell, or -1 if the cell is fully air.
-   * Used by the unit-grid builder for ground / step-climb checks. Int16 lets
-   * us encode -1 as a sentinel without juggling a separate validity bit.
+   * Highest solid voxel y inside the cell, or 255 if the cell is fully air.
+   * Used by the step-climb gate during pathfinding. Voxel y is in 0..WORLD_Y-1
+   * (= 0..191), so a Uint8Array fits with 255 as the "all-air" sentinel.
    */
-  topY: Int16Array;
+  topY: Uint8Array;
 }
 
 export function allocateVolumeGrid(useShared: boolean): VolumeGrid {
@@ -38,7 +38,7 @@ export function allocateVolumeGrid(useShared: boolean): VolumeGrid {
     solid: allocateBitmap(useShared, GRID_COUNT),
     bedrock: allocateBitmap(useShared, GRID_COUNT),
     digCost: new Uint8Array(new Buf(GRID_COUNT)),
-    topY: new Int16Array(new Buf(GRID_COUNT * 2)),
+    topY: new Uint8Array(new Buf(GRID_COUNT)),
   };
 }
 
@@ -76,7 +76,7 @@ export function rebuildCell(voxels: Uint8Array, vg: VolumeGrid, cx: number, cy: 
     clearBit(vg.solid, i);
     clearBit(vg.bedrock, i);
     vg.digCost[i] = 0;
-    vg.topY[i] = -1;
+    vg.topY[i] = 255;
   }
 }
 

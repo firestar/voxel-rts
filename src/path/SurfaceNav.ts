@@ -55,116 +55,91 @@ export function allocateNav(useShared: boolean): SurfaceNavBuffers {
 const TREE_TRUNK_PROBE_VOXELS = 4;
 
 /**
- * Build the surface nav grid from the voxel buffer.
- *
- * For each 1m cell (cx, cz), sample the column at the cell center voxel; topY is the
- * highest solid voxel under the sky (overhanging cells are detected by checking that
- * the column has air above topY). Then compute slope (max |dY| over 3x3 neighborhood).
- * Then run a 2-pass Chamfer (3,4) distance transform on "uneven" cells — the result
- * (in cells, capped) is each cell's flatnessRadius.
+ * Recompute pass-1 fields (topY, material, treeBlocked, blocked, road, headroom)
+ * for a single cell from the live voxel buffer. Pure per-cell scan — no neighbour
+ * dependency — so the caller can use this both for full-grid build and for an
+ * incremental refresh inside a damage box.
  */
-export function buildSurfaceNav(voxels: Uint8Array, nav: SurfaceNavBuffers): void {
-  // Pass 1: per-column topY + material + initial blocked.
-  for (let cz = 0; cz < NAV_H; cz++) {
-    const wz = cz * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
-    for (let cx = 0; cx < NAV_W; cx++) {
-      const wx = cx * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
-      let top = -1;
-      let mat = 0;
-      // Walk top-down to find the highest WALKABLE ground voxel — wood and leaf
-      // (trees) are skipped, so the ground voxel under a canopy still wins.
-      // Without this skip, a tree's TOP read as topY (it has air above), the
-      // grass underneath was buried, and the cell appeared to have full sky
-      // headroom above the canopy — exactly the wrong answer.
-      for (let y = WORLD_Y - 1; y >= 1; y--) {
-        const m = voxels[worldIndex(wx, y, wz)]!;
-        if (m === AIR) continue;
-        if (m === M_WOOD || m === M_LEAF) continue;
-        top = y; mat = m;
-        break;
-      }
-      const i = navIndex(cx, cz);
-      nav.topY[i] = top;
-      nav.material[i] = mat;
-      // Tree-trunk scan: walk every voxel column inside this cell and check
-      // the first TREE_TRUNK_PROBE_VOXELS voxels above topY for wood / leaf.
-      // Catches trunks no matter where they jitter inside the cell, so the
-      // entire cell goes blocked even when the trunk hugs an edge.
-      let treeBlocked = 0;
-      if (top >= 0) {
-        const x0 = cx * NAV_CELL_VOXELS;
-        const z0 = cz * NAV_CELL_VOXELS;
-        outer: for (let dz = 0; dz < NAV_CELL_VOXELS; dz++) {
-          for (let dx = 0; dx < NAV_CELL_VOXELS; dx++) {
-            const ax = x0 + dx, az = z0 + dz;
-            if (ax >= WORLD_X || az >= WORLD_Z) continue;
-            for (let h = 1; h <= TREE_TRUNK_PROBE_VOXELS; h++) {
-              const yy = top + h;
-              if (yy >= WORLD_Y) break;
-              const m = voxels[worldIndex(ax, yy, az)]!;
-              if (m === M_WOOD || m === M_LEAF) { treeBlocked = 1; break outer; }
-            }
-          }
+function recomputeCellPass1(voxels: Uint8Array, nav: SurfaceNavBuffers, cx: number, cz: number): void {
+  const wx = cx * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+  const wz = cz * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+  let top = -1;
+  let mat = 0;
+  // Walk top-down to find the highest WALKABLE ground voxel — wood and leaf
+  // (trees) are skipped, so the ground voxel under a canopy still wins.
+  for (let y = WORLD_Y - 1; y >= 1; y--) {
+    const m = voxels[worldIndex(wx, y, wz)]!;
+    if (m === AIR) continue;
+    if (m === M_WOOD || m === M_LEAF) continue;
+    top = y; mat = m;
+    break;
+  }
+  const i = navIndex(cx, cz);
+  nav.topY[i] = top;
+  nav.material[i] = mat;
+  // Tree-trunk scan: walk every voxel column inside this cell and check the
+  // first TREE_TRUNK_PROBE_VOXELS voxels above topY for wood / leaf.
+  let treeBlocked = 0;
+  if (top >= 0) {
+    const x0 = cx * NAV_CELL_VOXELS;
+    const z0 = cz * NAV_CELL_VOXELS;
+    outer: for (let dz = 0; dz < NAV_CELL_VOXELS; dz++) {
+      for (let dx = 0; dx < NAV_CELL_VOXELS; dx++) {
+        const ax = x0 + dx, az = z0 + dz;
+        if (ax >= WORLD_X || az >= WORLD_Z) continue;
+        for (let h = 1; h <= TREE_TRUNK_PROBE_VOXELS; h++) {
+          const yy = top + h;
+          if (yy >= WORLD_Y) break;
+          const m = voxels[worldIndex(ax, yy, az)]!;
+          if (m === M_WOOD || m === M_LEAF) { treeBlocked = 1; break outer; }
         }
       }
-      nav.treeBlocked[i] = treeBlocked;
-      // OR tree blocking into the main `blocked` flag so every A* user
-      // (surface + headroom checks) routes around the tree without each
-      // having to consult `treeBlocked` separately.
-      nav.blocked[i] = (top < 0 || treeBlocked) ? 1 : 0;
-      // Road weight: paved (M_PATH) gets a strong discount in A* edge cost,
-      // dirt roads (M_DIRT_ROAD) a milder one. See edgeCost in AStar.ts:
-      // 200/255 ≈ 0.78 → ~0.47x cost on paved, 120/255 ≈ 0.47 → ~0.72x on dirt.
-      nav.road[i] = mat === M_PATH ? 200 : (mat === M_DIRT_ROAD ? 120 : 0);
-      // Headroom: air voxels above topY before the next solid voxel. Capped at 255.
-      // Sample MULTIPLE columns within the cell — corners + centre — and take the
-      // minimum so a tree trunk sitting at a cell corner still flags the whole
-      // cell as low-headroom. Without this, anything off the cell-centre column
-      // (e.g. a 1-voxel-wide tree trunk stamped at a cell edge) was invisible.
-      // Headroom: count contiguous air voxels above the walkable topY at the cell's
-       // CENTRE column. We deliberately don't multi-probe — the previous "min over
-       // 5 probes" version locked down the entire region around a forest because
-       // canopies that overhang into a corner of an otherwise-clear cell would
-       // reduce that cell's headroom to nearly zero. With centre-only sampling,
-       // cells whose centre is genuinely under a canopy (or contain a trunk) get
-       // marked as low headroom, but cells next to a tree stay walkable.
-      let head = 0;
-      if (top >= 0) {
-        for (let y = top + 1; y < WORLD_Y; y++) {
-          if (voxels[worldIndex(wx, y, wz)] !== AIR) break;
-          head++;
-          if (head >= 255) { head = 255; break; }
-        }
-      }
-      nav.headroom[i] = head;
     }
   }
-
-  // Pass 2: slope (max |dY| over 3x3).
-  for (let cz = 0; cz < NAV_H; cz++) {
-    for (let cx = 0; cx < NAV_W; cx++) {
-      const i = navIndex(cx, cz);
-      if (nav.blocked[i]) { nav.slope[i] = 255; continue; }
-      const ty = nav.topY[i]!;
-      let maxD = 0;
-      for (let dz = -1; dz <= 1; dz++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          if (dx === 0 && dz === 0) continue;
-          const nx = cx + dx, nz = cz + dz;
-          if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) continue;
-          const ni = navIndex(nx, nz);
-          if (nav.blocked[ni]) { maxD = Math.max(maxD, 99); continue; }
-          const d = Math.abs(nav.topY[ni]! - ty);
-          if (d > maxD) maxD = d;
-        }
-      }
-      nav.slope[i] = Math.min(255, maxD);
+  nav.treeBlocked[i] = treeBlocked;
+  nav.blocked[i] = (top < 0 || treeBlocked) ? 1 : 0;
+  nav.road[i] = mat === M_PATH ? 200 : (mat === M_DIRT_ROAD ? 120 : 0);
+  // Headroom: count contiguous air voxels above the walkable topY at the cell's
+  // CENTRE column. Centre-only sampling keeps cells next to a tree walkable
+  // while still flagging the cell whose centre is genuinely under a canopy.
+  let head = 0;
+  if (top >= 0) {
+    for (let y = top + 1; y < WORLD_Y; y++) {
+      if (voxels[worldIndex(wx, y, wz)] !== AIR) break;
+      head++;
+      if (head >= 255) { head = 255; break; }
     }
   }
+  nav.headroom[i] = head;
+}
 
-  // Pass 3: Chamfer (3,4) distance transform on "uneven" cells.
-  // Score cell unevenness in cell-units: 0 if uneven, +Infinity if even, then propagate min(d+3 cardinal, d+4 diagonal).
-  // Scaled so flatness = floor(d/3); we cap at MAX_FLATNESS_RADIUS.
+/** Recompute slope (max |dY| over 3x3 neighbours) for one cell. */
+function recomputeCellSlope(nav: SurfaceNavBuffers, cx: number, cz: number): void {
+  const i = navIndex(cx, cz);
+  if (nav.blocked[i]) { nav.slope[i] = 255; return; }
+  const ty = nav.topY[i]!;
+  let maxD = 0;
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (dx === 0 && dz === 0) continue;
+      const nx = cx + dx, nz = cz + dz;
+      if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) continue;
+      const ni = navIndex(nx, nz);
+      if (nav.blocked[ni]) { maxD = Math.max(maxD, 99); continue; }
+      const d = Math.abs(nav.topY[ni]! - ty);
+      if (d > maxD) maxD = d;
+    }
+  }
+  nav.slope[i] = Math.min(255, maxD);
+}
+
+/**
+ * Run a 2-pass Chamfer (3,4) distance transform across the whole grid to
+ * derive `flatness` from `blocked` + `slope`. Result is in cells, capped at
+ * MAX_FLATNESS_RADIUS. Cheap (~16 K cells × small constant) so it's fine to
+ * rerun after an incremental box refresh — flatness is global by definition.
+ */
+export function recomputeFlatness(nav: SurfaceNavBuffers): void {
   const INF = 1 << 28;
   const dist = new Int32Array(NAV_COUNT);
   for (let i = 0; i < NAV_COUNT; i++) {
@@ -203,6 +178,55 @@ export function buildSurfaceNav(voxels: Uint8Array, nav: SurfaceNavBuffers): voi
     const r = Math.floor((dist[i]!) / 3);
     nav.flatness[i] = Math.min(MAX_FLATNESS_RADIUS, r);
   }
+}
+
+/**
+ * Build the surface nav grid from the voxel buffer.
+ *
+ * For each 1m cell (cx, cz), sample the column at the cell center voxel; topY is the
+ * highest solid voxel under the sky (overhanging cells are detected by checking that
+ * the column has air above topY). Then compute slope (max |dY| over 3x3 neighborhood).
+ * Then run a 2-pass Chamfer (3,4) distance transform on "uneven" cells — the result
+ * (in cells, capped) is each cell's flatnessRadius.
+ */
+export function buildSurfaceNav(voxels: Uint8Array, nav: SurfaceNavBuffers): void {
+  for (let cz = 0; cz < NAV_H; cz++) {
+    for (let cx = 0; cx < NAV_W; cx++) recomputeCellPass1(voxels, nav, cx, cz);
+  }
+  for (let cz = 0; cz < NAV_H; cz++) {
+    for (let cx = 0; cx < NAV_W; cx++) recomputeCellSlope(nav, cx, cz);
+  }
+  recomputeFlatness(nav);
+}
+
+/**
+ * Refresh the surface nav for cells whose voxel columns might have changed
+ * inside the given cell-space AABB. Pass 1 (per-column scan) runs over the
+ * box; pass 2 (slope) widens the box by 1 cell on each side because slope
+ * reads 3×3 neighbours. Pass 3 (chamfer flatness) is global and cheap, so
+ * we re-run it across the whole grid — its result is stable enough not to
+ * warrant a windowed update.
+ */
+export function refreshSurfaceNavBox(
+  voxels: Uint8Array, nav: SurfaceNavBuffers,
+  cx0: number, cz0: number, cx1: number, cz1: number,
+): void {
+  const x0 = Math.max(0, cx0);
+  const z0 = Math.max(0, cz0);
+  const x1 = Math.min(NAV_W - 1, cx1);
+  const z1 = Math.min(NAV_H - 1, cz1);
+  if (x0 > x1 || z0 > z1) return;
+  for (let cz = z0; cz <= z1; cz++) {
+    for (let cx = x0; cx <= x1; cx++) recomputeCellPass1(voxels, nav, cx, cz);
+  }
+  const sx0 = Math.max(0, x0 - 1);
+  const sz0 = Math.max(0, z0 - 1);
+  const sx1 = Math.min(NAV_W - 1, x1 + 1);
+  const sz1 = Math.min(NAV_H - 1, z1 + 1);
+  for (let cz = sz0; cz <= sz1; cz++) {
+    for (let cx = sx0; cx <= sx1; cx++) recomputeCellSlope(nav, cx, cz);
+  }
+  recomputeFlatness(nav);
 }
 
 /** Nearest in-bounds nav cell containing the world-space (x, z) in meters. */
