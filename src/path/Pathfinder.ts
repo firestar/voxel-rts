@@ -31,6 +31,11 @@ import {
   AStarWorkspace, findPath as runFindPath, findPathThetaStar,
   PathResult, PathNode,
 } from './AStar';
+import { ClusterGraph, buildClusterGraph } from './ClusterGraph';
+import { findPathHPA } from './HPAStar';
+import {
+  FlowField, FlowFieldCache, FlowFieldOptions,
+} from './FlowField';
 
 export interface PathRequest {
   start: PathNode;
@@ -46,6 +51,10 @@ export class Pathfinder {
   private readonly grids = new Map<string, UnitGrid>();
   private readonly ws = new AStarWorkspace();
   private voxels: Uint8Array | null = null;
+  /** Per-kind cluster graph for HPA*. Built lazily on first request. */
+  private readonly clusterGraphs = new Map<string, ClusterGraph>();
+  /** Per-kind flow-field cache (LRU) for many-units-one-goal queries. */
+  private readonly flowCaches = new Map<string, FlowFieldCache>();
 
   constructor(useShared = false) {
     this.volume = allocateVolumeGrid(useShared);
@@ -56,6 +65,8 @@ export class Pathfinder {
     this.voxels = world.buffers.voxels;
     buildVolumeGrid(this.voxels, this.volume);
     for (const grid of this.grids.values()) buildUnitGrid(this.volume, grid);
+    this.clusterGraphs.clear();
+    this.invalidateFlowFields();
   }
 
   /**
@@ -71,6 +82,8 @@ export class Pathfinder {
       grid.profile = profile;
     }
     if (this.voxels) buildUnitGrid(this.volume, grid);
+    this.clusterGraphs.delete(profile.kind);
+    this.flowCaches.get(profile.kind)?.clear();
     return grid;
   }
 
@@ -118,6 +131,11 @@ export class Pathfinder {
     for (const grid of this.grids.values()) {
       refreshUnitGridBox(this.volume, grid, x0, y0, z0, x1, y1, z1);
     }
+    // Cluster graph + flow field caches were built against the previous
+    // passability bitmap. Drop them so the next HPA* / flow-field call
+    // rebuilds against the updated grid. Plain A* is unaffected.
+    if (this.clusterGraphs.size > 0) this.clusterGraphs.clear();
+    if (this.flowCaches.size > 0) this.invalidateFlowFields();
   }
 
   /**
@@ -133,6 +151,8 @@ export class Pathfinder {
     if (!this.voxels) return;
     buildVolumeGrid(this.voxels, this.volume);
     for (const grid of this.grids.values()) buildUnitGrid(this.volume, grid);
+    this.clusterGraphs.clear();
+    this.invalidateFlowFields();
   }
 
   findPath(kind: string, req: PathRequest): PathResult {
@@ -146,6 +166,71 @@ export class Pathfinder {
     return req.anyAngle && grid.profile.footprintRadiusCells <= 1
       ? findPathThetaStar(grid, req.start, req.goal, this.ws, opts)
       : runFindPath(grid, req.start, req.goal, this.ws, opts);
+  }
+
+  /**
+   * Build (or rebuild) the HPA* cluster graph for this kind. Idempotent;
+   * subsequent calls overwrite the cached graph. Call after `attach()` or
+   * after large `applyDamage()` events that may have invalidated the
+   * existing portal layout.
+   */
+  buildClusterGraph(kind: string): ClusterGraph | null {
+    const grid = this.grids.get(kind);
+    if (!grid) return null;
+    const graph = buildClusterGraph(grid);
+    this.clusterGraphs.set(kind, graph);
+    // Flow fields are tied to the unit grid passability — rebuilding the
+    // cluster graph implies the field cache is also stale.
+    this.flowCaches.get(kind)?.clear();
+    return graph;
+  }
+
+  getClusterGraph(kind: string): ClusterGraph | undefined {
+    return this.clusterGraphs.get(kind);
+  }
+
+  /**
+   * Long-range HPA* search. If no cluster graph has been built for this kind,
+   * one is built lazily on the first call. Falls through to plain A* when the
+   * start and goal already share a cluster component.
+   */
+  findPathHPA(kind: string, req: PathRequest): PathResult {
+    const grid = this.grids.get(kind);
+    if (!grid) return { cells: [], reached: false, expanded: 0 };
+    let graph = this.clusterGraphs.get(kind);
+    if (!graph) graph = this.buildClusterGraph(kind)!;
+    return findPathHPA(grid, graph, req.start, req.goal, this.ws, {
+      maxExpansionsPerSegment: req.maxExpansions,
+      heuristicWeight: req.heuristicWeight,
+      volume: this.volume,
+    });
+  }
+
+  /**
+   * Look up (or build) a flow field rooted at `goal` for this unit kind.
+   * The returned field is owned by the per-kind cache; treat it as read-only
+   * and don't hold the reference across `applyDamage()`/`buildClusterGraph()`
+   * calls without re-fetching.
+   */
+  getFlowField(
+    kind: string,
+    goal: PathNode,
+    opts?: FlowFieldOptions,
+  ): FlowField | null {
+    const grid = this.grids.get(kind);
+    if (!grid) return null;
+    let cache = this.flowCaches.get(kind);
+    if (!cache) {
+      cache = new FlowFieldCache();
+      this.flowCaches.set(kind, cache);
+    }
+    return cache.get(grid, goal, opts);
+  }
+
+  /** Drop all cached flow fields for a kind (or all kinds). */
+  invalidateFlowFields(kind?: string): void {
+    if (kind) this.flowCaches.get(kind)?.clear();
+    else for (const c of this.flowCaches.values()) c.clear();
   }
 
   /**
