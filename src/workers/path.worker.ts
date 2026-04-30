@@ -1,0 +1,161 @@
+/// <reference lib="webworker" />
+/**
+ * Path worker — runs A* / Theta* and incremental nav-grid rebuilds off the main
+ * thread, reading and writing the same SharedArrayBuffer-backed VolumeGrid
+ * and per-kind UnitGrid bitmaps the main thread holds. No copies cross the
+ * postMessage boundary; only request descriptors and result waypoints do.
+ *
+ * Message protocol — see `PathWorkerClient` for the typed wrappers.
+ *
+ *   init             → wire up shared buffers + register every unit profile.
+ *   findPath         → run A* / Theta* against the shared grids.
+ *   applyDamage      → rebuild volume + per-kind unit cells inside an AABB.
+ *   rebuildAll       → full rebuild from the live voxel buffer.
+ *
+ * Ordering: postMessage delivers in FIFO order, and the worker processes
+ * messages serially, so an `applyDamage` posted before a `findPath` is
+ * guaranteed to have completed before the search runs.
+ */
+import { GRID_X, GRID_Y, GRID_Z, NAV_CELL_METERS, cellCenter, worldToCell } from '../path/Nav';
+import {
+  VolumeGrid, buildVolumeGrid, rebuildCell,
+} from '../path/VolumeGrid';
+import {
+  UnitProfile, UnitGrid, buildUnitGrid, refreshUnitGridBox,
+} from '../path/UnitGrid';
+import {
+  AStarWorkspace, findPath as runFindPath, findPathThetaStar, PathNode, PathResult,
+} from '../path/AStar';
+
+interface InitMsg {
+  type: 'init';
+  voxels: Uint8Array;
+  volume: VolumeGrid;
+  profiles: Array<{ profile: UnitProfile; passable: Uint8Array }>;
+}
+
+interface FindPathMsg {
+  type: 'findPath';
+  reqId: number;
+  kind: string;
+  start: PathNode;
+  goal: PathNode;
+  anyAngle: boolean;
+  maxExpansions?: number;
+  heuristicWeight?: number;
+}
+
+interface ApplyDamageMsg {
+  type: 'applyDamage';
+  reqId: number;
+  minX: number; minY: number; minZ: number;
+  maxX: number; maxY: number; maxZ: number;
+}
+
+interface RebuildAllMsg {
+  type: 'rebuildAll';
+  reqId: number;
+}
+
+type InMsg = InitMsg | FindPathMsg | ApplyDamageMsg | RebuildAllMsg;
+
+let voxels: Uint8Array | null = null;
+let volume: VolumeGrid | null = null;
+const grids = new Map<string, UnitGrid>();
+const ws = new AStarWorkspace();
+
+self.onmessage = (ev: MessageEvent<InMsg>): void => {
+  const msg = ev.data;
+  switch (msg.type) {
+    case 'init':
+      voxels = msg.voxels;
+      volume = msg.volume;
+      grids.clear();
+      for (const { profile, passable } of msg.profiles) {
+        grids.set(profile.kind, { profile, passable });
+      }
+      (self as unknown as Worker).postMessage({ type: 'init', reqId: 0 });
+      return;
+    case 'findPath':
+      handleFindPath(msg);
+      return;
+    case 'applyDamage':
+      handleApplyDamage(msg);
+      return;
+    case 'rebuildAll':
+      handleRebuildAll(msg);
+      return;
+  }
+};
+
+function handleFindPath(msg: FindPathMsg): void {
+  const grid = grids.get(msg.kind);
+  if (!grid || !volume) {
+    (self as unknown as Worker).postMessage({
+      type: 'findPath', reqId: msg.reqId, waypoints: [], reached: false, expanded: 0,
+    });
+    return;
+  }
+  const opts = {
+    maxExpansions: msg.maxExpansions,
+    heuristicWeight: msg.heuristicWeight,
+    volume,
+  };
+  const res: PathResult = msg.anyAngle && grid.profile.footprintRadiusCells <= 1
+    ? findPathThetaStar(grid, msg.start, msg.goal, ws, opts)
+    : runFindPath(grid, msg.start, msg.goal, ws, opts);
+  // Convert cells → world-space waypoints here (the main thread would do the
+  // same conversion right after receiving the result).
+  const waypoints: { x: number; y: number; z: number }[] = res.cells.length
+    ? res.cells.map(c => cellCenter(c.cx, c.cy, c.cz))
+    : [];
+  (self as unknown as Worker).postMessage({
+    type: 'findPath',
+    reqId: msg.reqId,
+    waypoints,
+    reached: res.reached,
+    expanded: res.expanded,
+  });
+}
+
+function handleApplyDamage(msg: ApplyDamageMsg): void {
+  if (!voxels || !volume) {
+    (self as unknown as Worker).postMessage({ type: 'applyDamage', reqId: msg.reqId });
+    return;
+  }
+  const c0 = worldToCell(msg.minX, msg.minY, msg.minZ);
+  const c1 = worldToCell(msg.maxX, msg.maxY, msg.maxZ);
+  const x0 = Math.max(0, c0.cx - 1);
+  const y0 = Math.max(0, c0.cy - 1);
+  const z0 = Math.max(0, c0.cz - 1);
+  const x1 = Math.min(GRID_X - 1, c1.cx + 1);
+  const y1 = Math.min(GRID_Y - 1, c1.cy + 1);
+  const z1 = Math.min(GRID_Z - 1, c1.cz + 1);
+  for (let cy = y0; cy <= y1; cy++) {
+    for (let cz = z0; cz <= z1; cz++) {
+      for (let cx = x0; cx <= x1; cx++) {
+        rebuildCell(voxels, volume, cx, cy, cz);
+      }
+    }
+  }
+  for (const grid of grids.values()) {
+    refreshUnitGridBox(volume, grid, x0, y0, z0, x1, y1, z1);
+  }
+  (self as unknown as Worker).postMessage({ type: 'applyDamage', reqId: msg.reqId });
+}
+
+function handleRebuildAll(msg: RebuildAllMsg): void {
+  if (!voxels || !volume) {
+    (self as unknown as Worker).postMessage({ type: 'rebuildAll', reqId: msg.reqId });
+    return;
+  }
+  buildVolumeGrid(voxels, volume);
+  for (const grid of grids.values()) buildUnitGrid(volume, grid);
+  (self as unknown as Worker).postMessage({ type: 'rebuildAll', reqId: msg.reqId });
+}
+
+// Silence "unused" — exported names aren't part of the worker protocol but
+// keep the import graph honest in case future changes need them.
+void GRID_X; void GRID_Y; void GRID_Z; void NAV_CELL_METERS;
+
+export {};

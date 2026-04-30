@@ -9,6 +9,8 @@ import { raycastVoxel } from '../voxel/Raycast';
 import { VOXEL_SIZE, WORLD_Y } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
 import { Pathfinder, profileFromUnit } from '../path/Pathfinder';
+import { PathWorkerClient } from '../path/PathWorkerClient';
+import { sharedBuffersAvailable } from '../util/Shared';
 import {
   SurfaceNavBuffers, allocateNav, buildSurfaceNav, refreshSurfaceNavBox,
   NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS, NAV_CELL_VOXELS,
@@ -112,8 +114,16 @@ export class Game {
   readonly impactMarker = new ImpactMarker();
   readonly healthBars = new HealthBarRenderer();
   pathfinder: Pathfinder | null = null;
+  pathWorker: PathWorkerClient | null = null;
   surfaceNav: SurfaceNavBuffers | null = null;
   vnav: VolumeNavBuffers | null = null;
+  /**
+   * Per-unit "latest pathfinding request" id. The path worker is async, so
+   * if the player issues two move orders to the same unit in quick succession
+   * the older response could otherwise clobber the newer one when it arrives.
+   * We bump this on every routePath call and ignore stale replies.
+   */
+  private readonly latestPathReqByUnit = new Map<number, number>();
   /** Pixels of vertical drag = 1 m of altitude offset for tunneler targets. */
   private readonly altitudeDragSensitivity = 8;
   /** Squared px threshold above which a click is treated as a "drag". */
@@ -158,7 +168,7 @@ export class Game {
     this.input = new Input();
     this.input.attach(window);
 
-    const sharedAvailable = typeof SharedArrayBuffer !== 'undefined' && (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
+    const sharedAvailable = sharedBuffersAvailable();
     this.world = VoxelWorld.create(sharedAvailable);
     this.meshes = new ChunkMeshRegistry(this.renderer.scene, this.world);
     // Wire the world into the projectile manager so newly spawned rounds
@@ -208,7 +218,7 @@ export class Game {
 
   async generate(seed: number, onProgress?: (done: number, total: number) => void): Promise<void> {
     await generateWorld(this.world, seed, p => onProgress?.(p.done, p.total));
-    const useShared = typeof SharedArrayBuffer !== 'undefined' && (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
+    const useShared = sharedBuffersAvailable();
     // Surface projection — used by buildings, render code, Y-snap. Independent
     // of the per-unit-type 3D pathfinding grids below.
     this.surfaceNav = allocateNav(useShared);
@@ -220,12 +230,15 @@ export class Game {
     // Per-unit-type pathfinding grids. The Pathfinder owns its own VolumeGrid
     // (a richer flavour of the vnav above with per-cell topY) and one
     // UnitGrid per kind, derived from the unit's footprint width and body
-    // height. A* and Theta* run synchronously on these grids.
+    // height. A* and Theta* run on these grids — when SAB is available, the
+    // expensive work (path search, incremental rebuild) is dispatched to a
+    // worker that shares the same bitmaps zero-copy.
     this.pathfinder = new Pathfinder(useShared);
     this.pathfinder.attach(this.world);
+    const profiles = [];
     for (const kind of UNIT_KINDS) {
       const cfg = unitConfig(kind);
-      this.pathfinder.registerProfile(profileFromUnit({
+      const profile = profileFromUnit({
         kind,
         footprintRadius: cfg.footprintRadius,
         heightVoxels: cfg.heightVoxels,
@@ -233,8 +246,17 @@ export class Game {
         requiresGround: cfg.requiresGround,
         maxStepVoxels: cfg.maxStepVoxels,
         slopePenalty: cfg.slopePenalty,
-      }), useShared);
+      });
+      this.pathfinder.registerProfile(profile, useShared);
+      profiles.push(profile);
     }
+    this.pathWorker = new PathWorkerClient(
+      this.pathfinder,
+      this.world.buffers.voxels,
+      profiles,
+      useShared,
+    );
+    await this.pathWorker.ready();
     this.spawnInitialUnits();
   }
 
@@ -1256,7 +1278,12 @@ export class Game {
     if (!this.pathfinder || !this.surfaceNav || !this.vnav) return;
     buildSurfaceNav(this.world.buffers.voxels, this.surfaceNav);
     buildVolumeNav(this.world.buffers.voxels, this.vnav);
-    this.pathfinder.rebuildAll();
+    // The pathfinder's volume + every per-kind unit grid runs on the worker
+    // when SAB is available. We don't await — subsequent findPath requests
+    // are queued behind it on the same worker and naturally see the fresh
+    // grid; main-thread sync helpers may briefly read pre-rebuild bits.
+    if (this.pathWorker) void this.pathWorker.rebuildAll();
+    else this.pathfinder.rebuildAll();
     if (replan) this.replanMovingUnits();
   }
 
@@ -1297,8 +1324,12 @@ export class Game {
         }
       }
     }
-    // Pathfinder volume + per-unit-kind grids.
-    this.pathfinder.applyDamage(minX, minY, minZ, maxX, maxY, maxZ);
+    // Pathfinder volume + per-unit-kind grids — dispatched to the worker
+    // when SAB is available (zero-copy on the shared bitmaps). FIFO ordering
+    // on the worker queue means a follow-up findPath posted after this call
+    // observes the rebuilt grid even though we don't await here.
+    if (this.pathWorker) void this.pathWorker.applyDamage(minX, minY, minZ, maxX, maxY, maxZ);
+    else this.pathfinder.applyDamage(minX, minY, minZ, maxX, maxY, maxZ);
     if (replan) this.replanMovingUnits();
   }
 
@@ -1360,9 +1391,8 @@ export class Game {
    *     through dirt, the graph search is overkill for the common "go
    *     dig over there" command.
    */
-  // eslint-disable-next-line @typescript-eslint/require-await
   private async routePath(unit: Unit, wx: number, wy: number, wz: number, opts?: { forceSurface?: boolean }): Promise<void> {
-    if (!this.pathfinder) return;
+    if (!this.pathfinder || !this.pathWorker) return;
     const startSurfaceY = this.surfaceWorldY(unit.x, unit.z);
     const startUnderground = unit.y < startSurfaceY - 0.5;
     const allowSurface = opts?.forceSurface && !startUnderground;
@@ -1391,7 +1421,12 @@ export class Game {
     }
     goal = this.pathfinder.nearestPassable(unit.kind, goal, 5);
 
-    const res = this.pathfinder.findPath(unit.kind, {
+    // Tag this request so a stale reply (older order superseded by a newer
+    // one for the same unit) can't clobber the fresh path on arrival.
+    const reqId = (this.latestPathReqByUnit.get(unit.id) ?? 0) + 1;
+    this.latestPathReqByUnit.set(unit.id, reqId);
+
+    const res = await this.pathWorker.findPath(unit.kind, {
       start, goal,
       // Theta* shortcuts only fire for single-cell footprints; wider chassis
       // fall back to grid A* internally (line-of-sight on a fat footprint
@@ -1399,8 +1434,9 @@ export class Game {
       anyAngle: unit.footprintRadius <= 1,
       maxExpansions: 30000,
     });
-    if (res.cells.length === 0 || !res.reached) return;
-    this.units.setPath(unit, this.pathfinder.pathToWaypoints(res.cells));
+    if (this.latestPathReqByUnit.get(unit.id) !== reqId) return;
+    if (res.waypoints.length === 0 || !res.reached) return;
+    this.units.setPath(unit, res.waypoints);
   }
 
   /** True if the unit's kind grid says (cell) is passable. */
