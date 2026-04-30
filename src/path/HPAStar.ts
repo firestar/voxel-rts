@@ -20,7 +20,7 @@ import { UnitGrid, isPassable } from './UnitGrid';
 import { VolumeGrid } from './VolumeGrid';
 import {
   ClusterGraph, AbstractEdge, dijkstraInCluster, octileHeuristic,
-  clusterBounds, clusterOfCell,
+  clusterBounds,
 } from './ClusterGraph';
 import {
   AStarWorkspace, findPath as runFindPath, PathNode, PathResult,
@@ -228,9 +228,4 @@ function refineSegment(
     heuristicWeight: opts.heuristicWeight,
     volume: opts.volume,
   });
-}
-
-/** Convenience: lookup the cluster containing a cell. */
-export function clusterFor(node: PathNode): number {
-  return clusterOfCell(node.cx, node.cy, node.cz);
 }

@@ -22,7 +22,7 @@ import {
 } from './Nav';
 import { UnitGrid } from './UnitGrid';
 import { FourAryHeap } from '../util/Heap';
-import { CLUSTER_COUNT, clusterOfCell } from './ClusterGraph';
+import { clusterOfCell } from './ClusterGraph';
 
 const Y_STRIDE = GRID_X * GRID_Z;
 const Z_STRIDE = GRID_X;
@@ -195,21 +195,4 @@ export class FlowFieldCache {
   }
 
   clear(): void { this.map.clear(); }
-}
-
-/**
- * Build a cluster mask covering the corridor implied by an abstract path
- * (sequence of waypoints). Includes each waypoint's cluster — pad with the
- * destination cluster's neighbours via `expandRadius` if you want the field
- * to spill into neighbouring clusters for natural unit fan-out.
- */
-export function clusterMaskForPath(
-  waypoints: { cx: number; cy: number; cz: number }[],
-): Uint8Array {
-  const mask = new Uint8Array(CLUSTER_COUNT);
-  for (let i = 0; i < waypoints.length; i++) {
-    const w = waypoints[i]!;
-    mask[clusterOfCell(w.cx, w.cy, w.cz)] = 1;
-  }
-  return mask;
 }
