@@ -138,6 +138,7 @@ export class ChunkMeshRegistry {
 
   getMeshCount(): number { return this.meshes.size; }
   getInflight(): number { return this.inflight.size; }
+  getInflightChunks(): ReadonlySet<number> { return this.inflight; }
 
   /**
    * Set the Y cutoff (in meters). Anything above this Y is rendered at 5%

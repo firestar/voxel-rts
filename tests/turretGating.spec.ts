@@ -71,7 +71,7 @@ describe('Unit combat stance', () => {
     const aggressive = UNIT_ACTIONS.find(a => a.id === 'stance-aggressive')!;
     expect(aggressive.applicable(sol)).toBe(true);
     expect(aggressive.applicable(worker)).toBe(false);
-    aggressive.run([sol], { enterBuildMode: () => {}, enterPlantMode: () => {}, cancelMode: () => {} });
+    aggressive.run([sol], { enterBuildMode: () => {}, enterPlantMode: () => {}, cancelMode: () => {}, enterWaypointMode: () => {} });
     expect(sol.stance).toBe('aggressive');
   });
 
@@ -81,7 +81,7 @@ describe('Unit combat stance', () => {
     sol.stance = 'aggressive';
     sol.firingTarget = { x: 10, y: 1, z: 0 };
     const def = UNIT_ACTIONS.find(a => a.id === 'stance-defensive')!;
-    def.run([sol], { enterBuildMode: () => {}, enterPlantMode: () => {}, cancelMode: () => {} });
+    def.run([sol], { enterBuildMode: () => {}, enterPlantMode: () => {}, cancelMode: () => {}, enterWaypointMode: () => {} });
     expect(sol.stance).toBe('defensive');
     expect(sol.firingTarget).toBeNull();
   });

@@ -170,19 +170,20 @@ export const WEAPONS: Record<WeaponKind, WeaponConfig> = {
     muzzleFlashRadius: 0.9, muzzleFlashSeconds: 0.20,
   },
   /**
-   * Anti-air turret. Auto-fires upward-tilted flak shells at enemy projectiles
-   * inside its dome, leading the target so the burst goes off just below the
-   * round on its way through. Snappy slew + short cooldown — interception is
-   * a per-projectile race against the clock.
+   * AA missile launcher. Fires a single large slow interceptor missile at an
+   * incoming enemy projectile. Long cooldown (10 s) — the missile is large
+   * and its 4 m blast sphere is wide enough to intercept without requiring
+   * perfect aim, but one shot per engagement means saturation attacks can
+   * overwhelm a single launcher.
    */
   aa_turret: {
-    kind: 'aa_turret', label: 'AA flak turret',
-    projectile: 'flak_shell', aimedBy: 'turret',
-    aimToleranceRad: 0.18, aimSlewRadPerSec: 6.0,
-    fireInterval: 0.55, rangeMeters: 150, spreadRad: 0.02,
+    kind: 'aa_turret', label: 'AA Missile Launcher',
+    projectile: 'aa_missile', aimedBy: 'turret',
+    aimToleranceRad: 0.25, aimSlewRadPerSec: 2.0,
+    fireInterval: 10.0, rangeMeters: 150, spreadRad: 0.01,
     shotsPerBurst: 1, burstInterval: 0,
     velocityScale: 1.0,
-    muzzleFlashRadius: 0.45, muzzleFlashSeconds: 0.10,
+    muzzleFlashRadius: 1.2, muzzleFlashSeconds: 0.30,
   },
   /**
    * Silo launcher. The heaviest weapon in the catalog — long cooldown, huge
@@ -210,6 +211,8 @@ export const WEAPONS: Record<WeaponKind, WeaponConfig> = {
 export function defaultWeaponFor(kind: string): WeaponKind | null {
   switch (kind) {
     case 'soldier':      return 'rifle';
+    case 'sniper':       return 'sniper';
+    case 'gunner':       return 'machine_gun';
     case 'tank':         return 'tank_cannon';
     case 'rocket_truck': return 'cluster_pod';
     default:             return null;

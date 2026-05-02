@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { Unit, unitConfig } from '../sim/Units';
 import { Building } from '../sim/Buildings';
+import { MetalCluster } from '../voxel/Metals';
 import { VOXEL_SIZE } from '../voxel/types';
 import { NAV_CELL_VOXELS } from '../path/SurfaceNav';
 
@@ -23,6 +24,8 @@ interface BarEntry {
   /** Cached worker carry signature so the canvas only repaints when the
    *  displayed numbers (or load progress) actually change. */
   lastCarryKey: number;
+  /** Cached building-status signature (production/reload/crop). Empty for units. */
+  lastStatusKey: string;
   yOffset: number;
 }
 
@@ -30,8 +33,9 @@ export class HealthBarRenderer {
   readonly group = new THREE.Group();
   private entries = new Map<number, BarEntry>();
   private buildingEntries = new Map<number, BarEntry>();
+  private clusterEntries = new Map<number, BarEntry>();
 
-  update(units: Unit[], buildings?: Building[]): void {
+  update(units: Unit[], buildings?: Building[], clusters?: MetalCluster[]): void {
     const seen = new Set<number>();
     for (const u of units) {
       seen.add(u.id);
@@ -67,16 +71,26 @@ export class HealthBarRenderer {
       this.entries.delete(id);
     }
 
-    // Building HP bars. Same canvas/sprite shape as units but anchored above
-    // the centre of the footprint at the roof line. Skipped while the
-    // building is at full HP so the screen isn't cluttered with bars on a
-    // freshly-built base.
+    // Building HP bars + status bars (production, reload, crop).
     if (buildings) {
       const seenB = new Set<number>();
       for (const b of buildings) {
         if (b.destroyed) continue;
-        const showBar = b.hp < b.maxHp || b.selected;
+
+        // Compute status values — quantised to 1% to throttle redraws.
+        const interval = b.spec.productionInterval;
+        const prodActive = b.trainQueue.length > 0 && isFinite(interval) && interval > 0;
+        const prodPct = prodActive ? Math.round((1 - b.productionTimer / interval) * 100) : -1;
+        const prodLabel = prodActive ? `▶ ${b.trainQueue[0]}` : '';
+        const reloadSecs = b.spec.weaponReloadSeconds ?? 0;
+        const reloadPct = b.weaponReloadTimer > 0 && reloadSecs > 0
+          ? Math.round((1 - b.weaponReloadTimer / reloadSecs) * 100) : -1;
+        const cropPct = b.spec.kind === 'farm' ? Math.round(b.cropProgress * 100) : -1;
+
+        const hasStatus = prodPct >= 0 || reloadPct >= 0 || cropPct >= 0;
+        const showBar = b.hp < b.maxHp || b.selected || hasStatus;
         if (!showBar) continue;
+
         seenB.add(b.id);
         let entry = this.buildingEntries.get(b.id);
         if (!entry) {
@@ -88,12 +102,15 @@ export class HealthBarRenderer {
         const cz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
         const cy = (b.floorY + b.spec.headroomVoxels + 1) * VOXEL_SIZE + entry.yOffset;
         entry.sprite.position.set(cx, cy, cz);
+
         const hpInt = Math.max(0, Math.ceil(b.hp));
-        if (hpInt !== entry.lastHp || b.maxHp !== entry.lastMax) {
-          drawBar(entry.canvas, hpInt, b.maxHp, '');
+        const statusKey = `${hpInt}:${prodPct}:${prodLabel}:${reloadPct}:${cropPct}`;
+        if (statusKey !== entry.lastStatusKey) {
+          drawBuildingBar(entry.canvas, hpInt, b.maxHp, prodPct, prodLabel, reloadPct, cropPct);
           entry.texture.needsUpdate = true;
           entry.lastHp = hpInt;
           entry.lastMax = b.maxHp;
+          entry.lastStatusKey = statusKey;
         }
       }
       for (const [id, entry] of this.buildingEntries) {
@@ -104,12 +121,44 @@ export class HealthBarRenderer {
         this.buildingEntries.delete(id);
       }
     }
+
+    // Metal cluster health bars.
+    if (clusters) {
+      const seenC = new Set<number>();
+      for (const c of clusters) {
+        if (c.destroyed) continue;
+        seenC.add(c.id);
+        let entry = this.clusterEntries.get(c.id);
+        if (!entry) {
+          entry = createClusterEntry();
+          this.clusterEntries.set(c.id, entry);
+          this.group.add(entry.sprite);
+        }
+        entry.sprite.position.set(c.worldX, c.worldY + 1.2, c.worldZ);
+        const activeWorkers = c.workerSlots.filter(id => id !== 0).length;
+        if (c.totalMetal !== entry.lastHp || c.maxMetal !== entry.lastMax || activeWorkers !== entry.lastCarryKey) {
+          drawClusterBar(entry.canvas, c.totalMetal, c.maxMetal, c.totalMetal, activeWorkers, c.maxWorkers);
+          entry.texture.needsUpdate = true;
+          entry.lastHp = c.totalMetal;
+          entry.lastMax = c.maxMetal;
+          entry.lastCarryKey = activeWorkers;
+        }
+      }
+      for (const [id, entry] of this.clusterEntries) {
+        if (seenC.has(id)) continue;
+        this.group.remove(entry.sprite);
+        entry.texture.dispose();
+        (entry.sprite.material as THREE.SpriteMaterial).dispose();
+        this.clusterEntries.delete(id);
+      }
+    }
   }
 
   private createBuildingEntry(_b: Building): BarEntry {
     const canvas = document.createElement('canvas');
     canvas.width = 192;
-    canvas.height = 40;
+    // Taller than unit bars to fit HP + up to two status bars (production/reload/crop).
+    canvas.height = 62;
     const texture = new THREE.CanvasTexture(canvas);
     texture.minFilter = THREE.LinearFilter;
     texture.magFilter = THREE.LinearFilter;
@@ -120,9 +169,7 @@ export class HealthBarRenderer {
       depthWrite: false,
     });
     const sprite = new THREE.Sprite(material);
-    // Wider sprite for buildings — ~3 m wide so the bar reads at typical
-    // RTS zoom while sitting above a medium-size building.
-    sprite.scale.set(3.2, 0.66, 1);
+    sprite.scale.set(3.2, 1.03, 1); // 3.2 m wide; height matches 192×62 aspect
     sprite.renderOrder = 1000;
     return {
       sprite,
@@ -131,7 +178,8 @@ export class HealthBarRenderer {
       lastHp: -1,
       lastMax: -1,
       lastCarryKey: -1,
-      yOffset: 1.0, // float ~1 m above the roof
+      lastStatusKey: '',
+      yOffset: 1.4, // higher than before to keep extra bars above the roof
     };
   }
 
@@ -160,6 +208,7 @@ export class HealthBarRenderer {
       lastHp: -1,
       lastMax: -1,
       lastCarryKey: -1,
+      lastStatusKey: '',
       yOffset: hpBarYOffset(u),
     };
   }
@@ -197,6 +246,8 @@ function carryLineFor(u: Unit): string {
 function hpBarYOffset(u: Unit): number {
   switch (u.kind) {
     case 'soldier':      return 2.4;
+    case 'sniper':       return 2.4;
+    case 'gunner':       return 2.6;
     case 'worker':       return 2.4;
     case 'tank':         return 3.4;
     case 'tunneler':     return 3.6;
@@ -204,6 +255,135 @@ function hpBarYOffset(u: Unit): number {
     case 'dozer':        return 3.0;
     case 'rocket_truck': return 3.6;
   }
+}
+
+/**
+ * Draw HP bar + optional production/reload/crop status bars for a building.
+ * Canvas is 192×62; unused lower rows stay transparent.
+ *
+ * prodPct / reloadPct / cropPct: 0..100 when active, -1 when inactive.
+ */
+function drawBuildingBar(
+  canvas: HTMLCanvasElement,
+  hp: number, maxHp: number,
+  prodPct: number, prodLabel: string,
+  reloadPct: number,
+  cropPct: number,
+): void {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const W = canvas.width;
+  ctx.clearRect(0, 0, W, canvas.height);
+  const BX = 4, BW = W - 8;
+
+  // HP value text
+  ctx.font = 'bold 13px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  const hpText = `${hp}`;
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+  ctx.strokeText(hpText, BX, 1);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(hpText, BX, 1);
+
+  // HP bar
+  const hpFrac = maxHp > 0 ? Math.max(0, Math.min(1, hp / maxHp)) : 0;
+  const r = Math.round(255 * (1 - hpFrac));
+  const g = Math.round(220 * hpFrac);
+  miniBar(ctx, BX, 16, BW, 8, hpFrac, `rgb(${r},${g},40)`, '');
+
+  // Secondary status bars
+  let nextY = 28;
+  if (prodPct >= 0) {
+    miniBar(ctx, BX, nextY, BW, 10, prodPct / 100, '#ffe55a', prodLabel);
+    nextY += 14;
+  } else if (cropPct >= 0) {
+    const cropLabel = cropPct >= 100 ? 'crop ready ✓' : `crop ${cropPct}%`;
+    miniBar(ctx, BX, nextY, BW, 10, cropPct / 100, '#55dd33', cropLabel);
+    nextY += 14;
+  }
+  if (reloadPct >= 0) {
+    miniBar(ctx, BX, nextY, BW, 10, reloadPct / 100, '#ff8833', `reload ${reloadPct}%`);
+  }
+}
+
+function miniBar(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, w: number, h: number,
+  frac: number,
+  fillColor: string,
+  label: string,
+): void {
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = fillColor;
+  ctx.fillRect(x, y, w * Math.max(0, Math.min(1, frac)), h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+  if (label) {
+    ctx.font = `bold ${h <= 8 ? 8 : 9}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+    ctx.strokeText(label, x + 3, y + h / 2);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(label, x + 3, y + h / 2);
+  }
+}
+
+function createClusterEntry(): BarEntry {
+  const canvas = document.createElement('canvas');
+  canvas.width = 192;
+  canvas.height = 48;
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(3.2, 0.8, 1);
+  sprite.renderOrder = 1000;
+  return { sprite, canvas, texture, lastHp: -1, lastMax: -1, lastCarryKey: -1, lastStatusKey: '', yOffset: 0 };
+}
+
+function drawClusterBar(canvas: HTMLCanvasElement, hp: number, maxHp: number, metalYield: number, workers: number, maxWorkers: number): void {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const W = canvas.width;
+  ctx.clearRect(0, 0, W, canvas.height);
+  const BX = 4, BW = W - 8;
+
+  ctx.font = 'bold 13px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+
+  // Left: remaining metal yield.
+  const metalLabel = `⛏ ${metalYield}M`;
+  ctx.strokeText(metalLabel, BX, 1);
+  ctx.fillStyle = '#ffe55a';
+  ctx.fillText(metalLabel, BX, 1);
+
+  // Right: worker count / max.
+  const workerLabel = `👷 ${workers}/${maxWorkers}`;
+  ctx.textAlign = 'right';
+  ctx.strokeText(workerLabel, W - BX, 1);
+  ctx.fillStyle = workers >= maxWorkers ? '#ff9944' : '#aaffaa';
+  ctx.fillText(workerLabel, W - BX, 1);
+
+  // Metal bar.
+  const frac = maxHp > 0 ? Math.max(0, Math.min(1, hp / maxHp)) : 0;
+  const r = Math.round(255 * (1 - frac));
+  const g = Math.round(220 * frac);
+  miniBar(ctx, BX, 18, BW, 10, frac, `rgb(${r},${g},40)`, '');
 }
 
 function drawBar(canvas: HTMLCanvasElement, hp: number, max: number, carryLine: string): void {

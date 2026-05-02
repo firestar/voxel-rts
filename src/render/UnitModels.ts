@@ -93,43 +93,210 @@ export function buildSoldierLegGeometry(): THREE.BufferGeometry {
 export const SOLDIER_HIP_Y = 0.55;
 export const SOLDIER_LEG_X = 0.10;
 
+// ---------- Sniper -----------------------------------------------------------
+// Ghillie/overwatch role. Earth-tone camo, long-barrelled sniper rifle held
+// across the chest. Same hip pivot as the soldier so leg geometry is shared.
+
+const SNIPER_GHILLIE = { r: 0.32, g: 0.26, b: 0.16 };   // dark earthy brown
+const SNIPER_BOOT    = { r: 0.15, g: 0.12, b: 0.08 };
+
+/** Body, head, balaclava, arms, sniper rifle — everything above the hips. */
+export function buildSniperBodyGeometry(): THREE.BufferGeometry {
+  const skin      = { r: 0.85, g: 0.70, b: 0.55 };
+  const balaclava = { r: 0.20, g: 0.17, b: 0.12 };      // dark balaclava
+  const rifleBody = { r: 0.14, g: 0.14, b: 0.16 };
+  const rifleStock= { r: 0.28, g: 0.18, b: 0.10 };
+  const scope     = { r: 0.08, g: 0.08, b: 0.10 };
+  const suppressor= { r: 0.12, g: 0.12, b: 0.14 };
+
+  const blocks: VoxelBlock[] = [
+    // Torso — ghillie strips over fatigues, slightly wider
+    { x: 0.00, y: 0.78, z: 0.00, sx: 0.48, sy: 0.50, sz: 0.28, ...SNIPER_GHILLIE },
+    // Ghillie fringe overlay (darker strips across chest and shoulders)
+    { x: 0.00, y: 0.94, z: -0.12, sx: 0.42, sy: 0.18, sz: 0.06, r: 0.22, g: 0.18, b: 0.10 },
+    { x: 0.00, y: 0.72, z: -0.12, sx: 0.42, sy: 0.14, sz: 0.06, r: 0.22, g: 0.18, b: 0.10 },
+    // Neck
+    { x: 0.00, y: 1.07, z: 0.00, sx: 0.16, sy: 0.10, sz: 0.16, ...skin },
+    // Head + balaclava (no helmet — only eyes exposed)
+    { x: 0.00, y: 1.22, z: 0.00, sx: 0.32, sy: 0.30, sz: 0.32, ...balaclava },
+    { x: 0.00, y: 1.24, z: -0.14, sx: 0.16, sy: 0.12, sz: 0.05, ...skin },  // eye slit
+    // Low-profile cap/hood
+    { x: 0.00, y: 1.40, z: 0.00, sx: 0.36, sy: 0.10, sz: 0.36, r: 0.24, g: 0.20, b: 0.14 },
+    // Arms — both forward, cradling long rifle
+    { x: -0.30, y: 0.80, z: -0.10, sx: 0.14, sy: 0.40, sz: 0.22, ...SNIPER_GHILLIE },
+    { x:  0.30, y: 0.80, z: -0.10, sx: 0.14, sy: 0.40, sz: 0.22, ...SNIPER_GHILLIE },
+    // Sniper rifle — long barrel extending well forward
+    { x:  0.00, y: 0.80, z: -0.55, sx: 0.06, sy: 0.06, sz: 0.72, ...rifleBody },  // barrel
+    { x:  0.00, y: 0.80, z: -0.04, sx: 0.06, sy: 0.12, sz: 0.22, ...rifleStock }, // stock
+    // Scope (mounted on top)
+    { x:  0.00, y: 0.88, z: -0.38, sx: 0.05, sy: 0.05, sz: 0.28, ...scope },
+    // Suppressor at muzzle
+    { x:  0.00, y: 0.80, z: -0.84, sx: 0.08, sy: 0.08, sz: 0.14, ...suppressor },
+    // Bipod legs folded under barrel
+    { x: -0.08, y: 0.74, z: -0.64, sx: 0.04, sy: 0.08, sz: 0.04, r: 0.10, g: 0.10, b: 0.12 },
+    { x:  0.08, y: 0.74, z: -0.64, sx: 0.04, sy: 0.08, sz: 0.04, r: 0.10, g: 0.10, b: 0.12 },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+/** Sniper leg — same pivot/dimensions as soldier leg but in ghillie colours. */
+export function buildSniperLegGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [
+    { x: 0.0, y: -0.25, z: 0.0, sx: 0.18, sy: 0.50, sz: 0.20, ...SNIPER_GHILLIE },
+    { x: 0.0, y: -0.55, z: 0.04, sx: 0.20, sy: 0.10, sz: 0.26, ...SNIPER_BOOT },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+// ---------- Gunner -----------------------------------------------------------
+// Heavy-weapons infantry. Dark tactical gear, wide armoured vest, belt-fed
+// machine gun held at waist height. Same hip pivot as soldier.
+
+const GUNNER_GEAR = { r: 0.22, g: 0.24, b: 0.20 };   // dark grey-green
+const GUNNER_BOOT = { r: 0.14, g: 0.11, b: 0.09 };
+
+/** Body, head, helmet, arms, machine gun — everything above the hips. */
+export function buildGunnerBodyGeometry(): THREE.BufferGeometry {
+  const skin    = { r: 0.85, g: 0.70, b: 0.55 };
+  const helmet  = { r: 0.16, g: 0.18, b: 0.14 };   // matte dark helmet
+  const vest    = { r: 0.18, g: 0.20, b: 0.16 };   // heavy armour vest
+  const gunMetal= { r: 0.15, g: 0.15, b: 0.17 };
+  const gunStock= { r: 0.22, g: 0.14, b: 0.08 };
+  const belt    = { r: 0.55, g: 0.48, b: 0.28 };   // ammo belt (brass colour)
+
+  const blocks: VoxelBlock[] = [
+    // Torso — wider/heavier silhouette
+    { x: 0.00, y: 0.80, z: 0.00, sx: 0.52, sy: 0.52, sz: 0.30, ...GUNNER_GEAR },
+    // Heavy armoured vest (full coverage)
+    { x: 0.00, y: 0.80, z: -0.14, sx: 0.46, sy: 0.48, sz: 0.06, ...vest },
+    { x: 0.00, y: 0.80, z:  0.14, sx: 0.46, sy: 0.48, sz: 0.06, ...vest },
+    // Ammo belt looped across chest
+    { x: -0.14, y: 0.78, z: -0.12, sx: 0.10, sy: 0.36, sz: 0.06, ...belt },
+    // Neck + head
+    { x: 0.00, y: 1.09, z: 0.00, sx: 0.18, sy: 0.10, sz: 0.18, ...skin },
+    { x: 0.00, y: 1.24, z: 0.00, sx: 0.34, sy: 0.30, sz: 0.34, ...skin },
+    // Helmet — large ballistic dome
+    { x: 0.00, y: 1.42, z: 0.00, sx: 0.44, sy: 0.20, sz: 0.44, ...helmet },
+    { x: 0.00, y: 1.33, z: 0.00, sx: 0.44, sy: 0.06, sz: 0.44, r: 0.12, g: 0.13, b: 0.11 },
+    // Ear/cheek guards
+    { x: -0.22, y: 1.28, z: 0.00, sx: 0.05, sy: 0.18, sz: 0.32, ...helmet },
+    { x:  0.22, y: 1.28, z: 0.00, sx: 0.05, sy: 0.18, sz: 0.32, ...helmet },
+    // Arms — both out to the sides carrying the heavy gun
+    { x: -0.34, y: 0.80, z: -0.04, sx: 0.14, sy: 0.46, sz: 0.22, ...GUNNER_GEAR },
+    { x:  0.34, y: 0.80, z: -0.04, sx: 0.14, sy: 0.46, sz: 0.22, ...GUNNER_GEAR },
+    // Machine gun body — chunky receiver carried at waist
+    { x:  0.00, y: 0.72, z: -0.30, sx: 0.12, sy: 0.14, sz: 0.44, ...gunMetal },
+    { x:  0.00, y: 0.72, z:  0.06, sx: 0.10, sy: 0.12, sz: 0.18, ...gunStock },  // butt
+    // Barrel — longer than rifle, protruding forward
+    { x:  0.00, y: 0.74, z: -0.62, sx: 0.06, sy: 0.06, sz: 0.32, ...gunMetal },
+    // Top-mounted carry handle / iron sights
+    { x:  0.00, y: 0.82, z: -0.24, sx: 0.05, sy: 0.08, sz: 0.20, ...gunMetal },
+    // Box magazine on left side
+    { x:  0.10, y: 0.66, z: -0.30, sx: 0.06, sy: 0.12, sz: 0.16, r: 0.22, g: 0.22, b: 0.24 },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+/** Gunner leg — same pivot/dimensions as soldier leg but in darker gear. */
+export function buildGunnerLegGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [
+    { x: 0.0, y: -0.25, z: 0.0, sx: 0.20, sy: 0.50, sz: 0.22, ...GUNNER_GEAR },
+    { x: 0.0, y: -0.55, z: 0.04, sx: 0.22, sy: 0.10, sz: 0.28, ...GUNNER_BOOT },
+  ];
+  return buildVoxelModel(blocks);
+}
+
 // ---------- Worker -----------------------------------------------------------
 // Civilian harvester / transporter. Same scale as the soldier (~1.6 m tall)
 // but in distinctive blue work clothes + yellow hard hat. Same hip pivot so
 // the leg geometry can be reused with a recolour.
+//
+// Four visual variants match the worker's focus setting:
+//   auto  — yellow hard hat,  tan shirt,    pickaxe
+//   mine  — steel hard hat,   orange shirt, pickaxe
+//   chop  — brown wide hat,   green shirt,  axe
+//   farm  — straw wide hat,   sky-blue shirt, hoe
+
+export type WorkerVariant = 'auto' | 'mine' | 'chop' | 'farm';
 
 const WORKER_JEANS = { r: 0.20, g: 0.30, b: 0.55 };
-const WORKER_SHIRT = { r: 0.78, g: 0.55, b: 0.18 }; // hi-vis tan
-const WORKER_HAT   = { r: 0.95, g: 0.78, b: 0.10 }; // safety yellow
 const WORKER_BOOT  = { r: 0.16, g: 0.12, b: 0.10 };
 
-export function buildWorkerBodyGeometry(): THREE.BufferGeometry {
+const VARIANT_SHIRT: Record<WorkerVariant, { r: number; g: number; b: number }> = {
+  auto:  { r: 0.78, g: 0.55, b: 0.18 },
+  mine:  { r: 0.90, g: 0.45, b: 0.10 },
+  chop:  { r: 0.25, g: 0.45, b: 0.20 },
+  farm:  { r: 0.30, g: 0.60, b: 0.85 },
+};
+const VARIANT_HAT: Record<WorkerVariant, { r: number; g: number; b: number }> = {
+  auto:  { r: 0.95, g: 0.78, b: 0.10 },
+  mine:  { r: 0.38, g: 0.38, b: 0.42 },
+  chop:  { r: 0.45, g: 0.28, b: 0.10 },
+  farm:  { r: 0.88, g: 0.78, b: 0.40 },
+};
+
+export function buildWorkerBodyGeometry(variant: WorkerVariant = 'auto'): THREE.BufferGeometry {
   const skin = { r: 0.85, g: 0.70, b: 0.55 };
-  const tool = { r: 0.28, g: 0.20, b: 0.12 };       // wooden pickaxe handle
-  const head = { r: 0.55, g: 0.55, b: 0.58 };       // pickaxe head
   const beltStrap = { r: 0.35, g: 0.22, b: 0.14 };
+  const shirt = VARIANT_SHIRT[variant];
+  const hat   = VARIANT_HAT[variant];
 
   const blocks: VoxelBlock[] = [
-    // Torso (hi-vis vest over a darker shirt)
-    { x: 0.00, y: 0.78, z: 0.00, sx: 0.46, sy: 0.50, sz: 0.28, ...WORKER_SHIRT },
-    // Tool belt
+    { x: 0.00, y: 0.78, z: 0.00, sx: 0.46, sy: 0.50, sz: 0.28, ...shirt },
     { x: 0.00, y: 0.55, z: 0.00, sx: 0.50, sy: 0.06, sz: 0.32, ...beltStrap },
-    // Neck + head
     { x: 0.00, y: 1.07, z: 0.00, sx: 0.16, sy: 0.10, sz: 0.16, ...skin },
     { x: 0.00, y: 1.22, z: 0.00, sx: 0.32, sy: 0.30, sz: 0.32, ...skin },
-    // Hard hat — domed top + narrow brim
-    { x: 0.00, y: 1.40, z: 0.00, sx: 0.36, sy: 0.14, sz: 0.36, ...WORKER_HAT },
-    { x: 0.00, y: 1.32, z: 0.04, sx: 0.40, sy: 0.04, sz: 0.40, ...WORKER_HAT },
-    // Arms — left at side, right gripping a pickaxe forward
-    { x: -0.30, y: 0.78, z: 0.00, sx: 0.14, sy: 0.46, sz: 0.18, ...WORKER_SHIRT },
-    { x:  0.30, y: 0.85, z: -0.06, sx: 0.14, sy: 0.18, sz: 0.30, ...WORKER_SHIRT },
-    { x:  0.30, y: 0.66, z: -0.16, sx: 0.14, sy: 0.18, sz: 0.18, ...WORKER_SHIRT },
-    // Pickaxe — handle running forward, head crossways near the tip
-    { x:  0.30, y: 0.84, z: -0.34, sx: 0.05, sy: 0.05, sz: 0.40, ...tool },
-    { x:  0.30, y: 0.84, z: -0.50, sx: 0.30, sy: 0.10, sz: 0.06, ...head },
+    { x: -0.30, y: 0.78, z: 0.00, sx: 0.14, sy: 0.46, sz: 0.18, ...shirt },
   ];
+
+  if (variant === 'auto' || variant === 'mine') {
+    // Hard hat — domed top + narrow brim
+    blocks.push({ x: 0.00, y: 1.40, z: 0.00, sx: 0.36, sy: 0.14, sz: 0.36, ...hat });
+    blocks.push({ x: 0.00, y: 1.32, z: 0.04, sx: 0.40, sy: 0.04, sz: 0.40, ...hat });
+  } else if (variant === 'chop') {
+    // Wide-brim leather hat
+    blocks.push({ x: 0.00, y: 1.38, z: 0.00, sx: 0.32, sy: 0.12, sz: 0.32, ...hat });
+    blocks.push({ x: 0.00, y: 1.30, z: 0.02, sx: 0.48, sy: 0.04, sz: 0.46, ...hat });
+  } else {
+    // Straw hat — very wide brim, flat low dome
+    blocks.push({ x: 0.00, y: 1.37, z: 0.00, sx: 0.28, sy: 0.08, sz: 0.28, ...hat });
+    blocks.push({ x: 0.00, y: 1.30, z: 0.02, sx: 0.54, sy: 0.03, sz: 0.52, ...hat });
+  }
+
   return buildVoxelModel(blocks);
 }
+
+/**
+ * Right arm + tool, modeled with the shoulder pivot at the local origin.
+ * Tool head shape varies by variant: pickaxe (auto/mine), axe (chop), hoe (farm).
+ */
+export function buildWorkerArmGeometry(variant: WorkerVariant = 'auto'): THREE.BufferGeometry {
+  const shirt = VARIANT_SHIRT[variant];
+  const handle = { r: 0.28, g: 0.20, b: 0.12 };
+  const steel  = { r: 0.55, g: 0.55, b: 0.58 };
+  const blocks: VoxelBlock[] = [
+    { x: 0, y: -0.09, z: -0.06, sx: 0.14, sy: 0.18, sz: 0.30, ...shirt },
+    { x: 0, y: -0.28, z: -0.16, sx: 0.14, sy: 0.18, sz: 0.18, ...shirt },
+    { x: 0, y: -0.10, z: -0.34, sx: 0.05, sy: 0.05, sz: 0.40, ...handle },
+  ];
+
+  if (variant === 'chop') {
+    // Axe — tall vertical blade at the tip
+    blocks.push({ x: 0, y: -0.10, z: -0.50, sx: 0.06, sy: 0.32, sz: 0.10, ...steel });
+  } else if (variant === 'farm') {
+    // Hoe — flat horizontal scraper perpendicular to handle
+    blocks.push({ x: 0, y: -0.22, z: -0.50, sx: 0.28, sy: 0.04, sz: 0.10, ...steel });
+  } else {
+    // Pickaxe — crossways head (auto / mine)
+    blocks.push({ x: 0, y: -0.10, z: -0.50, sx: 0.30, sy: 0.10, sz: 0.06, ...steel });
+  }
+
+  return buildVoxelModel(blocks);
+}
+
+/** Shoulder pivot in body-local coords — top of the right upper arm. */
+export const WORKER_SHOULDER_Y = 0.94;
+export const WORKER_SHOULDER_X = 0.30;
 
 /** One worker leg, modeled identically to the soldier leg but in jeans / boot colours. */
 export function buildWorkerLegGeometry(): THREE.BufferGeometry {

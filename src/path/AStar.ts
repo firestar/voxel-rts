@@ -22,10 +22,26 @@ import { UnitGrid, isPassable, isUnitCellPassable } from './UnitGrid';
 
 export interface PathNode { cx: number; cy: number; cz: number; }
 
+export interface PathTelemetry {
+  /** 'astar' | 'thetastar' | 'hpa' */
+  algorithm: string;
+  /** Wall-clock ms for the whole search. */
+  durationMs: number;
+  /** HPA* only: Dijkstra within start+goal clusters. */
+  hpaDijkstraMs?: number;
+  /** HPA* only: abstract portal graph A*. */
+  hpaAbstractMs?: number;
+  /** HPA* only: sum of per-segment refinement A* calls. */
+  hpaRefineMs?: number;
+  /** HPA* only: number of segments refined. */
+  hpaSegments?: number;
+}
+
 export interface PathResult {
   cells: PathNode[];
   reached: boolean;
   expanded: number;
+  timings?: PathTelemetry;
 }
 
 export interface AStarOptions {
@@ -139,6 +155,7 @@ export function findPath(
   ws: AStarWorkspace,
   opts: AStarOptions = {},
 ): PathResult {
+  const t0 = performance.now();
   const gen = ws.reset();
   const closedMark = gen + 1;
   const w = opts.heuristicWeight ?? 1.4;
@@ -150,7 +167,7 @@ export function findPath(
   const goalI = cellIndex(gcx, gcy, gcz);
 
   if (startI === goalI) {
-    return { cells: [{ ...start }], reached: true, expanded: 0 };
+    return { cells: [{ ...start }], reached: true, expanded: 0, timings: { algorithm: 'astar', durationMs: performance.now() - t0 } };
   }
   // Goal must be a cell the unit could actually stand in. For diggers, any
   // non-bedrock cell where the body fits is already marked passable, so a
@@ -158,7 +175,7 @@ export function findPath(
   // The start cell is allowed to be impassable (the unit may be partially
   // buried after a cave-in); the search just doesn't gate it.
   if (!isPassable(grid, gcx, gcy, gcz)) {
-    return { cells: [], reached: false, expanded: 0 };
+    return { cells: [], reached: false, expanded: 0, timings: { algorithm: 'astar', durationMs: performance.now() - t0 } };
   }
 
   const passable = grid.passable;
@@ -252,7 +269,7 @@ export function findPath(
   }
 
   const endI = reached ? goalI : bestPartial;
-  return { cells: reconstruct(ws, gen, startI, endI), reached, expanded };
+  return { cells: reconstruct(ws, gen, startI, endI), reached, expanded, timings: { algorithm: 'astar', durationMs: performance.now() - t0 } };
 }
 
 /**
@@ -273,6 +290,7 @@ export function findPathThetaStar(
   ws: AStarWorkspace,
   opts: AStarOptions = {},
 ): PathResult {
+  const t0 = performance.now();
   const gen = ws.reset();
   const closedMark = gen + 1;
   const w = opts.heuristicWeight ?? 1.4;
@@ -282,7 +300,7 @@ export function findPathThetaStar(
   const gcx = goal.cx, gcy = goal.cy, gcz = goal.cz;
   const startI = cellIndex(start.cx, start.cy, start.cz);
   const goalI = cellIndex(gcx, gcy, gcz);
-  if (startI === goalI) return { cells: [{ ...start }], reached: true, expanded: 0 };
+  if (startI === goalI) return { cells: [{ ...start }], reached: true, expanded: 0, timings: { algorithm: 'thetastar', durationMs: performance.now() - t0 } };
 
   const passable = grid.passable;
   const profile = grid.profile;
@@ -396,7 +414,7 @@ export function findPathThetaStar(
   }
 
   const endI = reached ? goalI : bestPartial;
-  return { cells: reconstruct(ws, gen, startI, endI), reached, expanded };
+  return { cells: reconstruct(ws, gen, startI, endI), reached, expanded, timings: { algorithm: 'thetastar', durationMs: performance.now() - t0 } };
 }
 
 function reconstruct(ws: AStarWorkspace, gen: number, startI: number, endI: number): PathNode[] {

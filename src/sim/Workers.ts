@@ -1,7 +1,8 @@
 import { VoxelWorld, worldIndex } from '../voxel/VoxelWorld';
 import { WORLD_X, WORLD_Y, WORLD_Z, AIR, VOXEL_SIZE } from '../voxel/types';
 import { M_WOOD, M_METAL } from '../voxel/Materials';
-import { Unit, UnitManager } from './Units';
+import type { MetalCluster } from '../voxel/Metals';
+import { Unit, UnitManager, WorkerFocus } from './Units';
 import { Resources } from './Resources';
 import { BuildingManager, Building, doorWorldPos } from './Buildings';
 import { SaplingManager } from './Saplings';
@@ -13,53 +14,28 @@ import { WorkerTaskBoard, WorkOrder } from './WorkerTasks';
  * once total carrying ≥ CARRY_CAP; the worker walks the load to the nearest
  * storage building before resuming.
  */
-export const WORKER_CARRY_CAP = 5;
+export const WORKER_CARRY_CAP = 20;
 
-/**
- * How close (in meters, XZ) a worker needs to be to its target voxel before
- * `tickWorkers` starts the chop/mine action. Slightly bigger than 1 cell so
- * the worker doesn't have to land exactly on the voxel below the tree.
- */
-const WORK_REACH_M = 1.4;
-/** Same idea, but tighter, for storage drop-off. */
-const INTERACT_REACH_M = 1.6;
+const WORK_REACH_M    = VOXEL_SIZE * 3;   // chop reach: 3 voxels
+const MINE_REACH_M    = VOXEL_SIZE * 10;  // mine reach: swing from perimeter
+const INTERACT_REACH_M = 1.6;             // storage drop-off / farm enter
 
-/**
- * Damage applied per second when a worker chops or mines.
- */
-const WORK_DPS = 60;
-/** Voxel-space radius of each chop/mine swing; small so we hit the target. */
-const WORK_RADIUS_VOXELS = 1.4;
+const WORK_DPS           = 60;   // damage per second when chopping / mining
+const MINE_SWING_INTERVAL = 1.0; // seconds per 1-metal chip from a cluster voxel
+const WORK_RADIUS_VOXELS  = 1.4; // voxel-space radius per chop swing
 
-/** Squared search radius (m²) for a harvester scanning for nearby resources. */
-const SCAN_RADIUS_M = 60;
+// Metal mining uses the cluster system in production and never reaches this scan.
+// This fallback is for wood (trees are typically within 30 m) and testing.
+const SCAN_RADIUS_M = 32;
 const SCAN_R2 = SCAN_RADIUS_M * SCAN_RADIUS_M;
 
-/**
- * Seconds a worker can spend on a non-idle task without any progress signal
- * (no path step, no carry change, no voxel chip) before the stall recovery
- * kicks in: the task is dropped to idle, any TaskBoard claim is released,
- * and the worker re-scans next tick. Generous enough that a pathfinder
- * waiting on a long surface route doesn't trip it, but small enough that a
- * truly stuck unit doesn't sit on a job indefinitely.
- */
+// Drop task after this many seconds with no measurable progress.
 const TASK_STALL_SECONDS = 8;
+// Minimum seconds between consecutive expensive voxel scans per idle worker.
+const SCAN_COOLDOWN_SECS = 0.5;
+// Minimum seconds between repeated routeWorker calls while waiting for an async path.
+const ROUTE_COOLDOWN_SECS = 0.4;
 
-/**
- * Per-frame automation for every worker unit. Drives the harvester task
- * state machine through the global `WorkerTaskBoard`:
- *
- *   - Ripe farms and player-issued plant orders become `WorkOrder` entries
- *     on the board.
- *   - Idle workers `claim()` an order from the board.
- *   - Local progress (voxel chip, carry change, path advance) keeps the
- *     stall timer at zero. If a worker can't make progress for
- *     `TASK_STALL_SECONDS`, the task is reset and the order is released.
- *
- * Movement is delegated back to the caller via `routeWorker`, which the
- * Game wires to its `routePath`. A* still runs asynchronously, so we
- * tolerate the path being empty for a frame after the call.
- */
 export interface WorkerDeps {
   units: UnitManager;
   world: VoxelWorld;
@@ -68,23 +44,52 @@ export interface WorkerDeps {
   resources: Resources;
   taskBoard: WorkerTaskBoard;
   routeWorker: (u: Unit, wx: number, wy: number, wz: number) => void;
-  onVoxelEdit: () => void;
+  onVoxelEdit: (wx: number, wy: number, wz: number) => void;
+  /**
+   * Look up the MetalCluster that owns the voxel at (vx, vy, vz), or null
+   * if no living cluster covers that position.
+   */
+  findMetalCluster?: (vx: number, vy: number, vz: number) => MetalCluster | null;
+  /**
+   * Called each time a worker chips 1 metal from a cluster voxel.
+   * The handler finds the nearest live voxel to (workerX, workerZ), decrements
+   * its metal, and destroys it when exhausted. Returns true if a voxel was
+   * destroyed, false if a voxel was chipped, null if no voxel is in range.
+   */
+  onClusterVoxelChipped?: (cluster: MetalCluster, workerX: number, workerZ: number) => boolean | null;
+  /** Claim one of the cluster's worker slots. Returns slot index or null if full. */
+  tryClaimClusterSlot?: (cluster: MetalCluster, unitId: number) => number | null;
+  /** Release a previously-claimed slot by unit ID. */
+  releaseClusterSlot?: (clusterId: number, unitId: number) => void;
+  /** World-space position a worker should stand at for the given slot index. */
+  clusterSlotPos?: (cluster: MetalCluster, slotIndex: number) => { x: number; y: number; z: number };
+  /**
+   * Find a mine-task target (ore voxel world position) in the nearest cluster
+   * with a free worker slot, excluding `excludeClusterId`. Returns null if no
+   * cluster has capacity.
+   */
+  findAlternateClusterTarget?: (excludeClusterId: number, fromX: number, fromZ: number) => { wx: number; wy: number; wz: number } | null;
 }
 
 export function tickWorkers(dt: number, deps: WorkerDeps): void {
-  // Refresh auto-published orders (newly-ripe farms, removed entries whose
-  // target despawned) before any worker reads from the board.
   deps.taskBoard.syncAutoOrders(deps.buildings);
 
-  const { units } = deps;
-  for (const u of units.units) {
+  // Allow at most one expensive voxel scan (findNearestExposed) per tickWorkers
+  // call. Without this limit, every idle worker fires its scan in the same JS
+  // call stack when a cluster depletes simultaneously — 9 workers × 19M
+  // iterations = multi-second main-thread freeze.
+  let scanFiredThisTick = false;
+
+  for (const u of deps.units.units) {
     if (u.kind !== 'worker') continue;
-    // Stall accounting: if a worker on a non-idle task has made no progress
-    // since the last tick, age the stall timer; on progress, reset it.
+
     if (u.task.kind === 'idle') {
       u.taskStallTimer = 0;
       u.taskProgressKey = 0;
+      u.workerScanCooldown = Math.max(0, u.workerScanCooldown - dt);
+      u.workerRouteCooldown = Math.max(0, u.workerRouteCooldown - dt);
     } else {
+      u.workerRouteCooldown = Math.max(0, u.workerRouteCooldown - dt);
       const key = workerProgressKey(u);
       if (key !== u.taskProgressKey) {
         u.taskProgressKey = key;
@@ -92,21 +97,16 @@ export function tickWorkers(dt: number, deps: WorkerDeps): void {
       } else {
         u.taskStallTimer += dt;
         if (u.taskStallTimer >= TASK_STALL_SECONDS) {
-          // Stall recovery: drop to idle, release any board claim, kill the
-          // path so the next tick gets a fresh route. Do NOT drop carried
-          // resources — the worker keeps what they already have so they can
-          // still go deliver.
           if (u.claimedOrderId !== 0) {
             const o = deps.taskBoard.byId(u.claimedOrderId);
             if (o && o.claimedBy === u.id) o.claimedBy = 0;
             u.claimedOrderId = 0;
           }
-          // If the worker was claimed as a farmer/harvester on a building,
-          // release that too so the building doesn't think we're still on it.
           for (const b of deps.buildings.buildings) {
             if (b.farmerId === u.id) b.farmerId = null;
             if (b.harvesterClaimId === u.id) b.harvesterClaimId = null;
           }
+          releaseClusterSlotIfHeld(u, deps);
           u.task = { kind: 'idle' };
           u.path = [];
           u.taskStallTimer = 0;
@@ -116,31 +116,38 @@ export function tickWorkers(dt: number, deps: WorkerDeps): void {
       }
     }
 
-    tickHarvester(u, dt, deps);
+    if (tickHarvester(u, dt, deps, scanFiredThisTick)) scanFiredThisTick = true;
   }
 }
 
-/**
- * Cheap signal of whether `u` has made tangible progress on its task since
- * the last tick: packs path length and carry totals into a single number.
- * Any real change rotates the key, which is enough for stall detection.
- */
 function workerProgressKey(u: Unit): number {
   const carry = u.carrying.wood * 31 + u.carrying.metals;
   const path = u.path.length;
-  return ((carry & 0xffff) << 16) ^ (path & 0xff);
+  return ((carry & 0xffff) << 16) ^ (path & 0xff) ^ ((u.miningTicks & 0xff) << 8);
 }
 
 // ----------------------------- Harvester -------------------------------------
 
-function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
-  // External cancel (e.g. the player hit X) leaves the worker idle but with
-  // a stale `claimedOrderId`. Release the claim back to the board so a
-  // different worker can pick the order up — we don't `remove()` it because
-  // the player only cancelled this worker, not the order itself.
-  if (u.task.kind === 'idle' && u.claimedOrderId !== 0) {
-    releaseClaimedOrder(u, deps);
-  }
+/** Fire a route request only when the per-unit cooldown has elapsed, then reset it.
+ *  Prevents flooding the pathWorker queue while waiting for an async response. */
+function routeIfDue(u: Unit, deps: WorkerDeps, wx: number, wy: number, wz: number): void {
+  if (u.workerRouteCooldown > 0) return;
+  u.workerRouteCooldown = ROUTE_COOLDOWN_SECS;
+  deps.routeWorker(u, wx, wy, wz);
+}
+
+function releaseClusterSlotIfHeld(u: Unit, deps: WorkerDeps): void {
+  if (u.claimedClusterId < 0) return;
+  deps.releaseClusterSlot?.(u.claimedClusterId, u.id);
+  u.claimedClusterId = -1;
+  u.claimedSlotIndex = -1;
+}
+
+/** Returns true if a voxel scan fired this call (so the outer loop can suppress further scans this tick). */
+function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick: boolean): boolean {
+  if (u.task.kind === 'idle' && u.claimedOrderId !== 0) releaseClaimedOrder(u, deps);
+  if (u.task.kind !== 'mine') releaseClusterSlotIfHeld(u, deps);
+
   const total = u.carrying.wood + u.carrying.metals;
   // Cap reached → switch to delivery so the worker walks the load to storage
   // before resuming. Done in any non-deliver state so a fresh chop/mine that
@@ -152,8 +159,7 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
 
   switch (u.task.kind) {
     case 'idle':
-      assignNextHarvestTask(u, deps);
-      return;
+      return assignNextHarvestTask(u, deps, scanFiredThisTick);
 
     case 'chop':
     case 'mine': {
@@ -167,29 +173,81 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
       const m = readVoxel(deps.world.buffers.voxels, vx, vy, vz);
       if (m !== targetMat) {
         u.task = { kind: 'idle' };
-        return;
-      }
-      // Metal must be reachable on a voxel face — interior ore can't be picked
-      // out without first exposing it (e.g. by demolishing the stone shell).
-      // Wood doesn't get this gate; tree trunks intentionally splinter from a
-      // single hit on the column edge. We re-check every swing because spoil
-      // can bury ore between tasks.
-      if (u.task.kind === 'mine'
-          && !isExposed(deps.world.buffers.voxels, vx, vy, vz)) {
-        u.task = { kind: 'idle' };
-        return;
+        return false;
       }
 
-      if (horiz2 > WORK_REACH_M * WORK_REACH_M) {
-        if (u.path.length === 0) deps.routeWorker(u, tx, ty, tz);
-        return;
+      if (u.task.kind === 'mine' && deps.findMetalCluster) {
+        const cluster = deps.findMetalCluster(vx, vy, vz);
+        if (cluster) {
+          if (u.claimedClusterId !== cluster.id) {
+            const cdx = cluster.worldX - u.x, cdz = cluster.worldZ - u.z;
+            const approachR = (cluster.rxz + 8) * VOXEL_SIZE;
+            if (cdx * cdx + cdz * cdz > approachR * approachR) {
+              if (u.path.length === 0)
+                routeIfDue(u, deps, cluster.worldX, (cluster.surfaceTop + 1) * VOXEL_SIZE, cluster.worldZ);
+              return false;
+            }
+            const slot = deps.tryClaimClusterSlot?.(cluster, u.id) ?? null;
+            if (slot === null) {
+              const alt = deps.findAlternateClusterTarget?.(cluster.id, u.x, u.z) ?? null;
+              if (alt) { u.task = { kind: 'mine', wx: alt.wx, wy: alt.wy, wz: alt.wz }; u.path = []; }
+              else { u.task = { kind: 'idle' }; }
+              return false;
+            }
+            u.claimedClusterId = cluster.id;
+            u.claimedSlotIndex = slot;
+            u.path = [];
+            // Snap to the slot immediately — worker is already inside the approach
+            // radius so the teleport is at most a few voxels.
+            if (deps.clusterSlotPos) {
+              const sp = deps.clusterSlotPos(cluster, slot);
+              u.x = sp.x; u.y = sp.y; u.z = sp.z;
+              u.blockedFrames = 0;
+            }
+          }
+          // Re-snap if the separation pass or physics nudged the worker off their spot.
+          if (deps.clusterSlotPos) {
+            const sp = deps.clusterSlotPos(cluster, u.claimedSlotIndex);
+            const sdx = sp.x - u.x, sdz = sp.z - u.z;
+            if (sdx * sdx + sdz * sdz > WORK_REACH_M * WORK_REACH_M) {
+              u.x = sp.x; u.y = sp.y; u.z = sp.z;
+              u.path = []; u.blockedFrames = 0;
+            }
+          }
+          if (u.path.length > 0) u.path = [];
+          u.mineSwingTimer += dt;
+          u.miningTicks++;
+          if (u.mineSwingTimer >= MINE_SWING_INTERVAL) {
+            u.mineSwingTimer -= MINE_SWING_INTERVAL;
+            const result = deps.onClusterVoxelChipped?.(cluster, u.x, u.z) ?? null;
+            if (result !== null) {
+              u.carrying.metals += 1;
+              if (result) deps.onVoxelEdit(u.x, u.y, u.z);
+            }
+            if (cluster.destroyed) { releaseClusterSlotIfHeld(u, deps); u.task = { kind: 'idle' }; }
+          }
+          return false;
+        }
       }
+
+      const reachM = u.task.kind === 'mine' ? MINE_REACH_M : WORK_REACH_M;
+      if (horiz2 > reachM * reachM) {
+        if (u.path.length === 0) {
+          if (u.task.kind === 'mine') {
+            // Route directly to the ore voxel; the pathfinder's nearestPassable
+            // snaps the goal to the nearest walkable cell adjacent to the ore pile,
+            // keeping the worker within MINE_REACH_M.
+            routeIfDue(u, deps, tx, ty, tz);
+          } else {
+            const ap = approachPos(u.x, u.z, tx, tz, 3);
+            routeIfDue(u, deps, ap.x, ty, ap.z);
+          }
+        }
+        return false;
+      }
+      if (u.path.length > 0) u.path = [];
 
       const peak = Math.max(1, Math.min(255, Math.round(WORK_DPS * dt)));
-      // Mining narrows the damage sphere to the single target voxel so the
-      // surrounding (potentially un-exposed) ore never gets chipped via
-      // sphere falloff. Chopping keeps the wider radius so a swing that
-      // overlaps two adjacent trunk voxels still progresses both.
       const radius = u.task.kind === 'mine' ? 0.4 : WORK_RADIUS_VOXELS;
       const result = deps.world.damageSphere(
         vx + 0.5, vy + 0.5, vz + 0.5,
@@ -201,29 +259,26 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
           if (d.material === M_WOOD) u.carrying.wood++;
           else if (d.material === M_METAL) u.carrying.metals++;
         }
-        deps.onVoxelEdit();
+        deps.onVoxelEdit(tx, ty, tz);
         const after = readVoxel(deps.world.buffers.voxels, vx, vy, vz);
         if (after !== targetMat) u.task = { kind: 'idle' };
       }
-      return;
+      return false;
     }
 
     case 'plant': {
       const tx = u.task.wx, tz = u.task.wz;
       const dx = tx - u.x, dz = tz - u.z;
       if (dx * dx + dz * dz > INTERACT_REACH_M * INTERACT_REACH_M) {
-        if (u.path.length === 0) {
-          deps.routeWorker(u, tx, u.y, tz);
-        }
-        return;
+        if (u.path.length === 0) routeIfDue(u, deps, tx, u.y, tz);
+        return false;
       }
       const seed = (u.id * 0x9e3779b9 + Math.floor(performance.now())) >>> 0;
       const res = deps.saplings.plant(deps.world, tx, tz, seed);
-      if (res.ok) deps.onVoxelEdit();
-      // Plant orders complete win-or-lose; remove the board entry.
+      if (res.ok) deps.onVoxelEdit(tx, u.y, tz);
       completeClaimedOrder(u, deps);
       u.task = { kind: 'idle' };
-      return;
+      return false;
     }
 
     case 'farm': {
@@ -231,20 +286,20 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
       if (!farm || farm.destroyed || farm.spec.kind !== 'farm') {
         completeClaimedOrder(u, deps);
         u.task = { kind: 'idle' };
-        return;
+        return false;
       }
       farm.farmerId = u.id;
       const cxw = farmCenterX(farm);
       const czw = farmCenterZ(farm);
       const inside = pointInFarm(farm, u.x, u.z);
       if (!inside && u.path.length === 0) {
-        deps.routeWorker(u, cxw, u.y, czw);
-        return;
+        routeIfDue(u, deps, cxw, u.y, czw);
+        return false;
       }
       if (inside && farm.cropReady && (farm.harvesterClaimId === null || farm.harvesterClaimId === u.id)) {
         deps.buildings.collectFarm(farm, u.id);
       }
-      return;
+      return false;
     }
 
     case 'harvestFarm': {
@@ -253,30 +308,28 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
         if (farm && farm.harvesterClaimId === u.id) farm.harvesterClaimId = null;
         completeClaimedOrder(u, deps);
         u.task = { kind: 'idle' };
-        return;
+        return false;
       }
       const cxw = farmCenterX(farm);
       const czw = farmCenterZ(farm);
       const dx = cxw - u.x, dz = czw - u.z;
       if (dx * dx + dz * dz > INTERACT_REACH_M * INTERACT_REACH_M) {
-        if (u.path.length === 0) deps.routeWorker(u, cxw, u.y, czw);
-        return;
+        if (u.path.length === 0) routeIfDue(u, deps, cxw, u.y, czw);
+        return false;
       }
       deps.buildings.collectFarm(farm, u.id);
       completeClaimedOrder(u, deps);
       u.task = { kind: 'idle' };
-      return;
+      return false;
     }
 
     case 'deliver': {
-      // Empty-handed deliver state shouldn't happen, but if it does drop to
-      // idle so the next tick re-picks real work.
       if (total === 0) {
         u.task = { kind: 'idle' };
-        return;
+        return false;
       }
       const storage = deps.buildings.nearestStorage(u.x, u.z);
-      if (!storage) return;
+      if (!storage) return false;
       const dpos = doorWorldPos(storage);
       const dx = dpos.x - u.x, dz = dpos.z - u.z;
       if (dx * dx + dz * dz <= INTERACT_REACH_M * INTERACT_REACH_M) {
@@ -285,63 +338,67 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps): void {
         u.carrying.wood = 0;
         u.carrying.metals = 0;
         u.task = { kind: 'idle' };
-        return;
+        return false;
       }
-      if (u.path.length === 0) deps.routeWorker(u, dpos.x, dpos.y, dpos.z);
-      return;
+      if (u.path.length === 0) routeIfDue(u, deps, dpos.x, dpos.y, dpos.z);
+      return false;
     }
   }
+  return false;
 }
 
-/**
- * Pick the next task for an idle harvester. The board is checked first so
- * player-issued plant orders and ripe farms (auto-published) get picked up
- * before any local scan-for-trees work. If the board has nothing for us,
- * fall back to scanning for the nearest exposed metal or wood voxel within
- * `SCAN_RADIUS_M`.
- */
-function assignNextHarvestTask(u: Unit, deps: WorkerDeps): void {
-  const order = deps.taskBoard.claim(u.id, isHarvesterOrder);
+/** Returns true if a voxel scan fired. */
+function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boolean): boolean {
+  const focus = u.workerFocus;
+
+  // Board claims are cheap — always check for fresh orders every tick.
+  const order = deps.taskBoard.claim(u.id, (o) => isHarvesterOrderForFocus(o, focus));
   if (order) {
     u.claimedOrderId = order.id;
+    u.workerScanCooldown = 0;
+    u.workerRouteCooldown = 0;
     applyOrderToHarvester(u, order, deps);
-    return;
+    return false;
   }
-  // No board work — fall back to the local voxel scan. Ore beats wood
-  // because metal is the rarer resource in the early economy.
-  const ore = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_METAL);
-  if (ore) {
-    u.task = {
-      kind: 'mine',
-      wx: (ore.vx + 0.5) * VOXEL_SIZE,
-      wy: (ore.vy + 0.5) * VOXEL_SIZE,
-      wz: (ore.vz + 0.5) * VOXEL_SIZE,
-    };
-    deps.routeWorker(u, u.task.wx, u.task.wy, u.task.wz);
-    return;
+  if (focus === 'farm') return false;
+
+  // Voxel scans are expensive (~19M iterations each). Rate-limit per worker
+  // AND globally: at most one scan fires per tickWorkers call so that when an
+  // entire cluster depletes and every worker goes idle simultaneously, they
+  // don't all scan in the same JS frame (which would freeze the main thread
+  // for several seconds).
+  if (u.workerScanCooldown > 0 || scanFiredThisTick) return false;
+  u.workerScanCooldown = SCAN_COOLDOWN_SECS;
+
+  if (focus !== 'chop') {
+    const ore = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_METAL);
+    if (ore) {
+      u.task = { kind: 'mine', wx: (ore.vx + 0.5) * VOXEL_SIZE, wy: (ore.vy + 0.5) * VOXEL_SIZE, wz: (ore.vz + 0.5) * VOXEL_SIZE };
+      u.workerRouteCooldown = 0;
+      deps.routeWorker(u, u.task.wx, u.task.wy, u.task.wz);
+      return true;
+    }
   }
-  const wood = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_WOOD);
-  if (wood) {
-    u.task = {
-      kind: 'chop',
-      wx: (wood.vx + 0.5) * VOXEL_SIZE,
-      wy: (wood.vy + 0.5) * VOXEL_SIZE,
-      wz: (wood.vz + 0.5) * VOXEL_SIZE,
-    };
-    deps.routeWorker(u, u.task.wx, u.task.wy, u.task.wz);
+
+  if (focus !== 'mine') {
+    const wood = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_WOOD);
+    if (wood) {
+      u.task = { kind: 'chop', wx: (wood.vx + 0.5) * VOXEL_SIZE, wy: (wood.vy + 0.5) * VOXEL_SIZE, wz: (wood.vz + 0.5) * VOXEL_SIZE };
+      const ap = approachPos(u.x, u.z, u.task.wx, u.task.wz, 3);
+      u.workerRouteCooldown = 0;
+      deps.routeWorker(u, ap.x, u.task.wy, ap.z);
+      return true;
+    }
   }
+  return true; // scan ran, found nothing — still counts as fired so we don't pile on
 }
 
-/** Order kinds a harvester is willing to take from the board. */
-function isHarvesterOrder(o: WorkOrder): boolean {
+function isHarvesterOrderForFocus(o: WorkOrder, focus: WorkerFocus): boolean {
+  if (focus === 'farm') return o.kind === 'farmTend' || o.kind === 'harvestFarm';
+  if (focus === 'mine' || focus === 'chop') return false;
   return o.kind === 'plant' || o.kind === 'farmTend' || o.kind === 'harvestFarm';
 }
 
-/**
- * Translate a freshly-claimed `WorkOrder` into the matching per-worker
- * task and kick a route. Keeps the harvester switch happy with the same
- * task shape the rest of the file already understands.
- */
 function applyOrderToHarvester(u: Unit, order: WorkOrder, deps: WorkerDeps): void {
   switch (order.kind) {
     case 'plant':
@@ -366,20 +423,36 @@ function applyOrderToHarvester(u: Unit, order: WorkOrder, deps: WorkerDeps): voi
   }
 }
 
-/** Drop the unit's claimed order from the board (if any). */
 function completeClaimedOrder(u: Unit, deps: WorkerDeps): void {
   if (u.claimedOrderId === 0) return;
   deps.taskBoard.remove(u.claimedOrderId);
   u.claimedOrderId = 0;
 }
 
-/** Release the unit's claim on its order back to the pool, but leave the
- *  order on the board so another worker can pick it up. */
 function releaseClaimedOrder(u: Unit, deps: WorkerDeps): void {
   if (u.claimedOrderId === 0) return;
   const o = deps.taskBoard.byId(u.claimedOrderId);
   if (o && o.claimedBy === u.id) o.claimedBy = 0;
   u.claimedOrderId = 0;
+}
+
+// --------------------------- Geometry helpers --------------------------------
+
+/**
+ * A point N voxels away from (tx, tz) in the direction of the caller at (ux, uz).
+ * When the caller is at the target already, returns the target unchanged — the
+ * path planner's nearestPassable will find adjacent terrain.
+ */
+export function approachPos(
+  ux: number, uz: number,
+  tx: number, tz: number,
+  voxels: number,
+): { x: number; z: number } {
+  const dx = ux - tx, dz = uz - tz;
+  const dist = Math.sqrt(dx * dx + dz * dz);
+  if (dist < 1e-3) return { x: tx, z: tz };
+  const offsetM = voxels * VOXEL_SIZE;
+  return { x: tx + (dx / dist) * offsetM, z: tz + (dz / dist) * offsetM };
 }
 
 // --------------------------- Voxel scan helpers ------------------------------
@@ -396,18 +469,19 @@ function findNearestExposed(
   const cy = Math.floor(wy / VOXEL_SIZE);
   const cz = Math.floor(wz / VOXEL_SIZE);
   const x0 = Math.max(0, cx - radiusVoxels);
-  const y0 = Math.max(0, cy - radiusVoxels);
-  const z0 = Math.max(0, cz - radiusVoxels);
   const x1 = Math.min(WORLD_X - 1, cx + radiusVoxels);
-  const y1 = Math.min(WORLD_Y - 1, cy + radiusVoxels);
+  const z0 = Math.max(0, cz - radiusVoxels);
   const z1 = Math.min(WORLD_Z - 1, cz + radiusVoxels);
+  // Metal and wood only spawn on the surface — thin Y band avoids a full 3D sphere scan.
+  const y0 = Math.max(0, cy - 4);
+  const y1 = Math.min(WORLD_Y - 1, cy + 16);
 
   let best: VoxelHit | null = null;
   let bestD2 = Infinity;
-  const STRIDE = 2;
+  const STRIDE = 3;
   const reachM2 = SCAN_R2 / (VOXEL_SIZE * VOXEL_SIZE);
 
-  for (let y = y0; y <= y1; y += STRIDE) {
+  for (let y = y0; y <= y1; y++) {
     const dyV = y - cy;
     for (let z = z0; z <= z1; z += STRIDE) {
       const dzV = z - cz;
@@ -441,7 +515,7 @@ function readVoxel(voxels: Uint8Array, vx: number, vy: number, vz: number): numb
   return voxels[worldIndex(vx, vy, vz)]!;
 }
 
-export { findNearestExposed, isExposed };
+export { findNearestExposed };
 export type { Building };
 
 function farmCenterX(b: Building): number {

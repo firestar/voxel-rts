@@ -3,7 +3,7 @@
 // list from the current selection, renders it as a side panel, and dispatches
 // `pressed` keys through it.
 
-import { Unit, UnitKind } from '../sim/Units';
+import { Unit, UnitKind, WorkerFocus } from '../sim/Units';
 import { Building } from '../sim/Buildings';
 
 /**
@@ -16,6 +16,7 @@ export interface ActionContext {
   enterBuildMode(): void;
   enterPlantMode(): void;
   cancelMode(): void;
+  enterWaypointMode(stance: 'aggressive' | 'defensive'): void;
 }
 
 export interface UnitAction {
@@ -82,6 +83,30 @@ export const UNIT_ACTIONS: UnitAction[] = [
     applicable: (u) => u.kind === 'worker',
     run: (_units, ctx): void => ctx.enterPlantMode(),
   },
+  // Worker focus buttons — restrict which resource type the worker auto-picks.
+  ...(['auto', 'mine', 'chop', 'farm'] as WorkerFocus[]).map((focus) => {
+    const meta: Record<WorkerFocus, { label: string; key: string; keyLabel: string }> = {
+      auto:  { label: 'Focus: Auto',   key: 'KeyZ', keyLabel: 'Z' },
+      mine:  { label: 'Focus: Mining', key: 'KeyM', keyLabel: 'M' },
+      chop:  { label: 'Focus: Wood',   key: 'KeyL', keyLabel: 'L' },
+      farm:  { label: 'Focus: Farming',key: 'KeyG', keyLabel: 'G' },
+    };
+    const m = meta[focus];
+    return {
+      id: `focus-${focus}`,
+      label: m.label,
+      key: m.key,
+      keyLabel: m.keyLabel,
+      applicable: (u: Unit) => u.kind === 'worker',
+      run: (units: Unit[]): void => {
+        for (const u of units) {
+          if (u.kind !== 'worker') continue;
+          u.workerFocus = focus;
+          u.task = { kind: 'idle' };
+        }
+      },
+    } satisfies UnitAction;
+  }),
   {
     id: 'hold-fire',
     label: 'Hold fire',
@@ -137,6 +162,8 @@ export function unitActionsFor(units: Unit[]): UnitAction[] {
 /** Per-kind keybind table for "Train X" actions on a barracks. */
 const TRAIN_KEYS: Record<UnitKind, { key: string; keyLabel: string }> = {
   soldier:      { key: 'KeyQ', keyLabel: 'Q' },
+  sniper:       { key: 'KeyA', keyLabel: 'A' },
+  gunner:       { key: 'KeyS', keyLabel: 'S' },
   tank:         { key: 'KeyR', keyLabel: 'R' },
   tunneler:     { key: 'KeyT', keyLabel: 'T' },
   worm:         { key: 'KeyY', keyLabel: 'Y' },
@@ -162,6 +189,8 @@ function trainAction(kind: UnitKind): BuildingAction {
 
 export const BUILDING_ACTIONS: BuildingAction[] = [
   trainAction('soldier'),
+  trainAction('sniper'),
+  trainAction('gunner'),
   trainAction('tank'),
   trainAction('tunneler'),
   trainAction('worm'),
@@ -175,6 +204,30 @@ export const BUILDING_ACTIONS: BuildingAction[] = [
     keyLabel: 'X',
     applicable: (b) => b.spec.produces.length > 0,
     run: (b): void => { b.trainQueue.length = 0; },
+  },
+  {
+    id: 'waypoint-aggressive',
+    label: 'Set waypoint: Aggressive',
+    key: 'KeyW',
+    keyLabel: 'W',
+    applicable: (b) => b.spec.produces.length > 0,
+    run: (_b, ctx): void => { ctx.enterWaypointMode('aggressive'); },
+  },
+  {
+    id: 'waypoint-defensive',
+    label: 'Set waypoint: Defensive',
+    key: 'KeyE',
+    keyLabel: 'E',
+    applicable: (b) => b.spec.produces.length > 0,
+    run: (_b, ctx): void => { ctx.enterWaypointMode('defensive'); },
+  },
+  {
+    id: 'clear-waypoint',
+    label: 'Clear waypoint',
+    key: 'KeyZ',
+    keyLabel: 'Z',
+    applicable: (b) => b.spec.produces.length > 0 && b.rallyPoint !== null,
+    run: (b): void => { b.rallyPoint = null; },
   },
 ];
 

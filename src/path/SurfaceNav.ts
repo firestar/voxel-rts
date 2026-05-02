@@ -1,6 +1,6 @@
 import { WORLD_X, WORLD_Y, WORLD_Z, VOXEL_SIZE, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
-import { M_WOOD, M_LEAF, M_PATH, M_DIRT_ROAD } from '../voxel/Materials';
+import { M_WOOD, M_LEAF, M_PATH, M_DIRT_ROAD, M_METAL } from '../voxel/Materials';
 
 // 1 m surface cells = 8 voxels (at 0.125 m).
 export const NAV_CELL_VOXELS = 8;
@@ -97,7 +97,8 @@ function recomputeCellPass1(voxels: Uint8Array, nav: SurfaceNavBuffers, cx: numb
     }
   }
   nav.treeBlocked[i] = treeBlocked;
-  nav.blocked[i] = (top < 0 || treeBlocked) ? 1 : 0;
+  // Metal surface voxels (ore clusters) are impassable — units path around them.
+  nav.blocked[i] = (top < 0 || treeBlocked || mat === M_METAL) ? 1 : 0;
   nav.road[i] = mat === M_PATH ? 200 : (mat === M_DIRT_ROAD ? 120 : 0);
   // Headroom: count contiguous air voxels above the walkable topY at the cell's
   // CENTRE column. Centre-only sampling keeps cells next to a tree walkable

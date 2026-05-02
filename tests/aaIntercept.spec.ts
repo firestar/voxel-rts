@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { ProjectileManager } from '../src/sim/Projectiles';
 
 /**
- * Coverage for the anti-air intercept behaviour driven by a flak shell's
+ * Coverage for the anti-air intercept behaviour driven by an aa_missile's
  * detonation. We deterministically seed `Math.random()` so each outcome
  * (silent kill / divert / detonate / miss) is exercised in isolation.
  */
@@ -58,11 +58,11 @@ describe('ProjectileManager.applyAaIntercept', () => {
     expect(target.vy).toBe(vyBefore);
   });
 
-  it('skips flak shells (no friendly-fire on the AA itself)', () => {
+  it('skips aa_missiles (no friendly-fire on the AA itself)', () => {
     nextRandom = 0;
-    const flak = pm.spawn('flak_shell', 10, 5, 0, 1, 0, 0, -1000);
+    const missile = pm.spawn('aa_missile', 10, 5, 0, 1, 0, 0, -1000);
     pm.applyAaIntercept(10, 5, 0, 8);
-    expect(flak.dead).toBe(false);
+    expect(missile.dead).toBe(false);
   });
 
   it('only affects projectiles inside the burst sphere', () => {

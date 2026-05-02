@@ -12,6 +12,7 @@ import {
   buildCornStalkGeometry, buildWheatStalkGeometry,
   FARM_CORN_PER_FARM, FARM_WHEAT_PER_FARM,
   buildTurretHeadGeometry, TURRET_HEAD_Y_M,
+  buildAALauncherGeometry, AA_LAUNCHER_HEAD_Y_M,
   buildDepotCraneGeometry, VEHICLE_DEPOT_CRANE_Y_M, VEHICLE_DEPOT_CRANE_SLIDE_M,
   buildSolarPanelGeometry, POWER_PLANT_SOLAR_Y_M, POWER_PLANT_SOLAR_COUNT,
 } from './BuildingModels';
@@ -38,6 +39,7 @@ export class BuildingRenderer {
   private cornStalk: THREE.InstancedMesh;
   private wheatStalk: THREE.InstancedMesh;
   private turretHead: THREE.InstancedMesh;
+  private aaLauncher: THREE.InstancedMesh;
   private depotCrane: THREE.InstancedMesh;
   private solarPanel: THREE.InstancedMesh;
 
@@ -66,6 +68,7 @@ export class BuildingRenderer {
     this.cornStalk = makeIM(buildCornStalkGeometry(), lit, capacity * FARM_CORN_PER_FARM);
     this.wheatStalk = makeIM(buildWheatStalkGeometry(), lit, capacity * FARM_WHEAT_PER_FARM);
     this.turretHead = makeIM(buildTurretHeadGeometry(), lit, capacity);
+    this.aaLauncher = makeIM(buildAALauncherGeometry(), lit, capacity);
     this.depotCrane = makeIM(buildDepotCraneGeometry(), lit, capacity);
     this.solarPanel = makeIM(buildSolarPanelGeometry(), lit, capacity * POWER_PLANT_SOLAR_COUNT);
 
@@ -74,14 +77,14 @@ export class BuildingRenderer {
       this.smoke,
       this.satDish, this.pulseCore,
       this.cornStalk, this.wheatStalk,
-      this.turretHead,
+      this.turretHead, this.aaLauncher,
       this.depotCrane, this.solarPanel,
     );
   }
 
   update(buildings: Building[]): void {
     let nHub = 0, nBlade = 0, nSmoke = 0, nDish = 0, nCore = 0, nCorn = 0, nWheat = 0, nTurret = 0;
-    let nCrane = 0, nSolar = 0;
+    let nAALauncher = 0, nCrane = 0, nSolar = 0;
     const t = performance.now() / 1000;
 
     // Pulse colour modulation for the tech-lab core (shared across all labs).
@@ -122,9 +125,15 @@ export class BuildingRenderer {
           nWheat += FARM_WHEAT_PER_FARM;
           break;
         case 'turret':
-          if (nTurret >= this.capacity) break;
-          this.placeTurretHead(b, cx, cz, floorTopY, nTurret);
-          nTurret++;
+          if (b.spec.weapon === 'aa_turret') {
+            if (nAALauncher >= this.capacity) break;
+            this.placeAALauncher(b, cx, cz, floorTopY, nAALauncher);
+            nAALauncher++;
+          } else {
+            if (nTurret >= this.capacity) break;
+            this.placeTurretHead(b, cx, cz, floorTopY, nTurret);
+            nTurret++;
+          }
           break;
         case 'vehicle_depot':
           if (nCrane >= this.capacity) break;
@@ -146,6 +155,7 @@ export class BuildingRenderer {
     this.cornStalk.count = nCorn;
     this.wheatStalk.count = nWheat;
     this.turretHead.count = nTurret;
+    this.aaLauncher.count = nAALauncher;
     this.depotCrane.count = nCrane;
     this.solarPanel.count = nSolar;
     for (const m of [
@@ -153,7 +163,7 @@ export class BuildingRenderer {
       this.smoke,
       this.satDish, this.pulseCore,
       this.cornStalk, this.wheatStalk,
-      this.turretHead,
+      this.turretHead, this.aaLauncher,
       this.depotCrane, this.solarPanel,
     ]) {
       m.instanceMatrix.needsUpdate = true;
@@ -207,12 +217,27 @@ export class BuildingRenderer {
   }
 
   /**
+   * Position + yaw the 10-tube AA missile launcher rack on top of the AA
+   * missile launcher building. Yaws to `weaponTurretYaw` to face the
+   * assigned target; pitch is unused (missiles launch nearly vertical anyway).
+   */
+  private placeAALauncher(
+    b: Building,
+    cx: number, cz: number, floorTopY: number,
+    slot: number,
+  ): void {
+    this.tmpEuler.set(b.weaponTurretPitch * 0.3, b.weaponTurretYaw, 0, 'YXZ');
+    this.tmpQ.setFromEuler(this.tmpEuler);
+    this.tmpV.set(cx, floorTopY + AA_LAUNCHER_HEAD_Y_M, cz);
+    this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+    this.aaLauncher.setMatrixAt(slot, this.tmpM);
+  }
+
+  /**
    * Position + yaw the rotating cannon head on top of a turret. Pivot sits at
    * the top of the building's pintle column (TURRET_HEAD_Y_M above the floor
    * top) and yaws to `weaponTurretYaw` so the visible barrel points at the
-   * current target. The AA flak turret also drives `weaponTurretPitch` to
-   * tilt the barrel down while reloading; non-AA buildings leave pitch at 0
-   * so this is a no-op for them.
+   * current target.
    */
   private placeTurretHead(
     b: Building,

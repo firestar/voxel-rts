@@ -49,11 +49,12 @@ export function findPathHPA(
   ws: AStarWorkspace,
   opts: HPAOptions = {},
 ): PathResult {
+  const t0 = performance.now();
   if (!isPassable(grid, start.cx, start.cy, start.cz)) {
-    return { cells: [], reached: false, expanded: 0 };
+    return { cells: [], reached: false, expanded: 0, timings: { algorithm: 'hpa', durationMs: performance.now() - t0 } };
   }
   if (!isPassable(grid, goal.cx, goal.cy, goal.cz)) {
-    return { cells: [], reached: false, expanded: 0 };
+    return { cells: [], reached: false, expanded: 0, timings: { algorithm: 'hpa', durationMs: performance.now() - t0 } };
   }
 
   const startCell = (start.cy * GRID_Z + start.cz) * GRID_X + start.cx;
@@ -68,11 +69,13 @@ export function findPathHPA(
   // Same cluster + component: a plain in-cluster A* on the unit grid is
   // already as good as it gets — no portals to hop through.
   if (startComp === goalComp) {
-    return runFindPath(grid, start, goal, ws, {
+    const inner = runFindPath(grid, start, goal, ws, {
       maxExpansions: opts.maxExpansionsPerSegment,
       heuristicWeight: opts.heuristicWeight,
       volume: opts.volume,
     });
+    if (inner.timings) inner.timings.algorithm = 'hpa';
+    return inner;
   }
 
   // Build virtual start/goal nodes connected to portals in their components.
@@ -81,8 +84,10 @@ export function findPathHPA(
   const startBounds = clusterBounds(startCluster);
   const goalBounds = clusterBounds(goalCluster);
 
+  const tDijkstra0 = performance.now();
   const startDist = dijkstraInCluster(grid.passable, startCell, startBounds);
   const goalDist = dijkstraInCluster(grid.passable, goalCell, goalBounds);
+  const hpaDijkstraMs = performance.now() - tDijkstra0;
 
   const startPortals = graph.componentPortals[startComp]!;
   const goalPortals = graph.componentPortals[goalComp]!;
@@ -138,6 +143,7 @@ export function findPathHPA(
     return { cx, cy, cz };
   }
 
+  const tAbstract0 = performance.now();
   while (open.length > 0) {
     const node = open.pop();
     if (closed[node]!) continue;
@@ -164,6 +170,7 @@ export function findPathHPA(
       }
     }
   }
+  const hpaAbstractMs = performance.now() - tAbstract0;
 
   // Reconstruct the abstract path as a list of node indices VIRT_START..VIRT_GOAL.
   const endNode = reached ? VIRT_GOAL : bestPartial;
@@ -186,6 +193,7 @@ export function findPathHPA(
   // (and the virtual start/goal hops) require a per-cluster A* call.
   const refined: PathNode[] = [];
   let totalExpansions = expanded;
+  const tRefine0 = performance.now();
   for (let i = 0; i + 1 < waypoints.length; i++) {
     const a = waypoints[i]!;
     const b = waypoints[i + 1]!;
@@ -196,13 +204,20 @@ export function findPathHPA(
       // partial chain to the closest cell. Caller still gets a usable lead.
       if (refined.length === 0) refined.push(a);
       for (let k = 1; k < segPath.cells.length; k++) refined.push(segPath.cells[k]!);
-      return { cells: refined, reached: false, expanded: totalExpansions };
+      return {
+        cells: refined, reached: false, expanded: totalExpansions,
+        timings: { algorithm: 'hpa', durationMs: performance.now() - t0, hpaDijkstraMs, hpaAbstractMs, hpaRefineMs: performance.now() - tRefine0, hpaSegments: i + 1 },
+      };
     }
     if (refined.length === 0) refined.push(segPath.cells[0]!);
     for (let k = 1; k < segPath.cells.length; k++) refined.push(segPath.cells[k]!);
   }
+  const hpaRefineMs = performance.now() - tRefine0;
 
-  return { cells: refined, reached, expanded: totalExpansions };
+  return {
+    cells: refined, reached, expanded: totalExpansions,
+    timings: { algorithm: 'hpa', durationMs: performance.now() - t0, hpaDijkstraMs, hpaAbstractMs, hpaRefineMs, hpaSegments: waypoints.length - 1 },
+  };
 }
 
 /**

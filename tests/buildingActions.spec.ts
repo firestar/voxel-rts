@@ -27,6 +27,7 @@ const NOOP_CTX: ActionContext = {
   enterBuildMode: () => {},
   enterPlantMode: () => {},
   cancelMode: () => {},
+  enterWaypointMode: () => {},
 };
 
 describe('Building selection state', () => {

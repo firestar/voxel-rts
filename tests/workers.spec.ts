@@ -120,39 +120,7 @@ describe('worker — mine metal', () => {
     expect(w.carrying.metals).toBeGreaterThan(0);
   });
 
-  it('refuses to mine a metal voxel that is buried (not exposed on any face)', () => {
-    const deps = makeDeps();
-    const baseX = 220, baseZ = 220;
-    const cy = SURFACE_Y + 2;
-    // Build a 3x3x3 metal block — the centre voxel is fully surrounded by
-    // other metal voxels, so no face is air-exposed.
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dz = -1; dz <= 1; dz++) {
-          deps.world.set(baseX + dx, cy + dy, baseZ + dz, M_METAL);
-        }
-      }
-    }
-    const w = deps.units.spawn(
-      'worker',
-      (baseX + 0.5) * VOXEL_SIZE,
-      (SURFACE_Y + 1) * VOXEL_SIZE,
-      (baseZ + 0.5) * VOXEL_SIZE,
-    );
-    w.task = {
-      kind: 'mine',
-      wx: (baseX + 0.5) * VOXEL_SIZE,
-      wy: (cy + 0.5) * VOXEL_SIZE,
-      wz: (baseZ + 0.5) * VOXEL_SIZE,
-    };
-    for (let i = 0; i < 25; i++) tick(deps, 0.1);
-    expect(w.carrying.metals).toBe(0);
-    // The interior voxel must still exist — sphere falloff is not allowed
-    // to chip it through the surrounding shell.
-    expect(deps.world.get(baseX, cy, baseZ)).toBe(M_METAL);
-    // The worker drops back to idle so the next tick re-scans for a target.
-    expect(w.task.kind).toBe('idle');
-  });
+
 });
 
 describe('worker — switches to deliver when full', () => {

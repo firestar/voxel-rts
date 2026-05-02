@@ -23,12 +23,16 @@
  */
 import { Pathfinder, PathRequest } from './Pathfinder';
 import { UnitProfile } from './UnitGrid';
+import type { PathTelemetry } from './AStar';
+
+export type { PathTelemetry };
 
 export interface PathRouteResult {
   /** World-space waypoints from start to goal (inclusive). */
   waypoints: { x: number; y: number; z: number }[];
   reached: boolean;
   expanded: number;
+  timings?: PathTelemetry;
 }
 
 interface PendingResolver {
@@ -86,7 +90,7 @@ export class PathWorkerClient {
     if (!this.worker) {
       const res = this.pathfinder.findPath(kind, req);
       const waypoints = res.cells.length ? this.pathfinder.pathToWaypoints(res.cells) : [];
-      return { waypoints, reached: res.reached, expanded: res.expanded };
+      return { waypoints, reached: res.reached, expanded: res.expanded, timings: res.timings };
     }
     await this.initPromise;
     const reqId = this.nextReqId++;
@@ -124,6 +128,28 @@ export class PathWorkerClient {
     });
   }
 
+  /**
+   * Ask the worker to scan for the nearest air-exposed metal-ore voxel within
+   * `radiusM` metres of the given world position.  Returns null when nothing
+   * is found or the client has no worker thread.  The sync fallback runs the
+   * same scan on the main thread (only reached when SharedArrayBuffer is
+   * unavailable, i.e. no worker is spawned).
+   */
+  async scanNearestMetal(
+    wx: number, wy: number, wz: number,
+    radiusM = 60,
+  ): Promise<{ vx: number; vy: number; vz: number } | null> {
+    if (!this.worker) {
+      return this.pathfinder.scanNearestMetal(wx, wy, wz, radiusM);
+    }
+    await this.initPromise;
+    const reqId = this.nextReqId++;
+    return new Promise(resolve => {
+      this.pending.set(reqId, { resolve: resolve as (v: unknown) => void });
+      this.worker!.postMessage({ type: 'scanNearestMetal', reqId, wx, wy, wz, radiusM });
+    });
+  }
+
   async rebuildAll(): Promise<void> {
     if (!this.worker) {
       this.pathfinder.rebuildAll();
@@ -156,7 +182,10 @@ export class PathWorkerClient {
         waypoints: data.waypoints as { x: number; y: number; z: number }[],
         reached: data.reached as boolean,
         expanded: data.expanded as number,
+        timings: data.timings as PathTelemetry | undefined,
       } as PathRouteResult);
+    } else if (data.type === 'scanNearestMetal') {
+      pending.resolve(data.hit as { vx: number; vy: number; vz: number } | null);
     } else {
       pending.resolve(undefined);
     }

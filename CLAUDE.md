@@ -1,27 +1,22 @@
 # Project rules
 
-## Never run the Vite dev server
+## Verifying changes
 
-`npx vite`, `npm run dev`, `vite preview`, anything that boots the live
-browser server — **don't**. Booting it, hitting it with `curl`, then
-killing it just slows the loop down without telling us anything that
-isn't already covered by typecheck + tests.
-
-To verify a change:
+Always run these three checks after any code change:
 
 1. `npx tsc --noEmit` — types must be clean.
 2. `npx vitest run` — all tests in `tests/**/*.spec.ts` must pass.
-3. `npx vite build` — production build must succeed (this is a
-   one-shot compile, not the dev server, and is fine).
+3. `npx vite build` — production build must succeed.
 
 If a behavior isn't covered by an existing test and you want to confirm
-it works, **add a test in `tests/**/*.spec.ts`**. Pathfinding, voxel
-edits, the cutter carve, unit ticks — all run headless against the
-in-memory world. Don't ask the user to load the page in their browser
-to confirm something we could have asserted programmatically.
+it works headlessly, **add a test in `tests/**/*.spec.ts`**.
 
-The user can run the dev server themselves when they want to look at
-things visually. Our job is to keep typecheck + tests + build green.
+## Running the dev server
+
+`npm run dev` (or `npx vite`) is allowed when visual or browser
+verification is needed — e.g. checking rendering, UI, or live
+pathfinding behaviour. Start it, do the verification, then stop it.
+Don't leave it running unnecessarily.
 
 ## Don't use sub agents
 

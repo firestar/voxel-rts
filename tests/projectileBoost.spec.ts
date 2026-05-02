@@ -88,6 +88,6 @@ describe('Projectile terrain damage scale', () => {
       if (pm.pendingImpacts.length > 0) break;
     }
     expect(pm.pendingImpacts.length).toBeGreaterThan(0);
-    expect(pm.pendingImpacts[0]!.terrainDamageScale).toBeCloseTo(0.2);
+    expect(pm.pendingImpacts[0]!.terrainDamageScale).toBeCloseTo(0.033);
   });
 });

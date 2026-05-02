@@ -28,6 +28,7 @@ export type ProjectileKind =
   | 'tank_shell'
   | 'turret_shell'
   | 'flak_shell'
+  | 'aa_missile'
   | 'silo_missile';
 
 export interface ProjectileConfig {
@@ -80,6 +81,15 @@ export interface ProjectileConfig {
   clusterSubmunitions: number;
   /** Time-to-live in seconds. The projectile is removed even if it never hits anything. */
   maxLifeSeconds: number;
+  /**
+   * Fraction of `PROJECTILE_GRAVITY` applied to this projectile each tick.
+   * Defaults to 1.0 (full gravity). Slow-moving rockets and missiles (those
+   * whose muzzle velocity was reduced 4× for visual readability) use 0.25 so
+   * they maintain roughly ¼ of their original max range despite the lower
+   * muzzle speed — the lower gravity keeps the arc shape similar while the
+   * slow motion gives the player time to watch the flight.
+   */
+  gravityScale?: number;
   /** RGB tint (0..1 each) used by the projectile renderer for tracers / rocket bodies. */
   colorR: number; colorG: number; colorB: number;
   /** Visual length and radius in meters. Bullets are slim; rockets are chunkier. */
@@ -143,6 +153,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     dragPerSecond: 0.08,
     hitDamage: 60, hitRadiusMeters: 0.4,
     explosive: true, explosionPeak: 180, explosionRadiusMeters: 2.4,
+    terrainDamageScale: 0.17,
     clusterSubmunitions: 0,
     maxLifeSeconds: 5.0,
     colorR: 1.00, colorG: 0.45, colorB: 0.20,
@@ -152,12 +163,14 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   heavy_rocket: {
     kind: 'heavy_rocket',
     massKg: 65,
-    muzzleVelocity: 50,
+    muzzleVelocity: 12.5,
     dragPerSecond: 0.05,
     hitDamage: 80, hitRadiusMeters: 0.5,
     explosive: true, explosionPeak: 220, explosionRadiusMeters: 4.0,
+    terrainDamageScale: 0.17,
     clusterSubmunitions: 0,
-    maxLifeSeconds: 8.0,
+    maxLifeSeconds: 32.0,
+    gravityScale: 0.25,
     colorR: 1.00, colorG: 0.55, colorB: 0.28,
     visualLengthMeters: 1.4, visualRadiusMeters: 0.18,
     hasTrail: true,
@@ -165,12 +178,14 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   cluster_rocket: {
     kind: 'cluster_rocket',
     massKg: 80,
-    muzzleVelocity: 48,
+    muzzleVelocity: 12,
     dragPerSecond: 0.06,
     hitDamage: 30, hitRadiusMeters: 0.4,
     explosive: true, explosionPeak: 100, explosionRadiusMeters: 1.6,
+    terrainDamageScale: 0.17,
     clusterSubmunitions: 8,
-    maxLifeSeconds: 8.0,
+    maxLifeSeconds: 32.0,
+    gravityScale: 0.25,
     colorR: 1.00, colorG: 0.65, colorB: 0.30,
     visualLengthMeters: 1.2, visualRadiusMeters: 0.16,
     hasTrail: true,
@@ -184,12 +199,14 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   cluster_submunition: {
     kind: 'cluster_submunition',
     massKg: 6,
-    muzzleVelocity: 22,
+    muzzleVelocity: 5.5,
     dragPerSecond: 0.10,
     hitDamage: 30, hitRadiusMeters: 0.3,
     explosive: true, explosionPeak: 90, explosionRadiusMeters: 1.4,
+    terrainDamageScale: 0.17,
     clusterSubmunitions: 0,
-    maxLifeSeconds: 4.0,
+    maxLifeSeconds: 16.0,
+    gravityScale: 0.25,
     colorR: 1.00, colorG: 0.70, colorB: 0.30,
     visualLengthMeters: 0.5, visualRadiusMeters: 0.08,
     hasTrail: true,
@@ -201,6 +218,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     dragPerSecond: 0.03,
     hitDamage: 80, hitRadiusMeters: 0.5,
     explosive: true, explosionPeak: 240, explosionRadiusMeters: 2.8,
+    terrainDamageScale: 0.17,
     clusterSubmunitions: 0,
     maxLifeSeconds: 4.0,
     colorR: 1.00, colorG: 0.80, colorB: 0.45,
@@ -223,7 +241,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     // them carve craters at full peak chews up the base wall every salvo.
     // Scale the terrain damage to a fifth of the unit damage so the round
     // still stings enemies but spares the surrounding voxel structure.
-    terrainDamageScale: 0.2,
+    terrainDamageScale: 0.033,
     clusterSubmunitions: 0,
     maxLifeSeconds: 5.0,
     colorR: 0.95, colorG: 0.75, colorB: 0.40,
@@ -247,7 +265,7 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     explosive: true, explosionPeak: 60, explosionRadiusMeters: 4.0,
     // Defensive shell, fired near our own buildings — keep terrain damage low
     // so a busy AA salvo doesn't grind craters into the base.
-    terrainDamageScale: 0.05,
+    terrainDamageScale: 0.008,
     clusterSubmunitions: 0,
     maxLifeSeconds: 4.0,
     colorR: 1.00, colorG: 0.95, colorB: 0.55,
@@ -263,21 +281,46 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
   silo_missile: {
     kind: 'silo_missile',
     massKg: 350,
-    muzzleVelocity: 90,
+    muzzleVelocity: 22.5,
     dragPerSecond: 0.025,
     // Damage tuned down from a previous high-peak revision: silos are still
     // the heaviest single shot on the map, but a hit is no longer instant
     // map deletion. Both direct and explosion damage are scaled together.
     hitDamage: 47, hitRadiusMeters: 0.7,
     explosive: true, explosionPeak: 127, explosionRadiusMeters: 6.0,
+    terrainDamageScale: 0.17,
     // Vertical liftoff: the silo cluster fires straight up for 10 m before
     // tipping over toward the target. Reads visually as a launch silo, and
     // gives nearby friendlies a beat to clear the muzzle wash.
     boostMetersDefault: 10,
     clusterSubmunitions: 0,
-    maxLifeSeconds: 18.0,
+    maxLifeSeconds: 72.0,
+    gravityScale: 0.25,
     colorR: 1.00, colorG: 0.40, colorB: 0.20,
     visualLengthMeters: 2.4, visualRadiusMeters: 0.32,
+    hasTrail: true,
+  },
+  /**
+   * AA interceptor missile — replaces the flak shell. A single large guided
+   * missile that flies slowly toward an incoming rocket or shell and detonates
+   * with the same burst radius as the old flak shell. One shot every 10 s;
+   * the slow muzzle velocity (¼ of the old flak) means the lead computation
+   * must account for a longer time-of-flight but the large explosion sphere
+   * still covers the intercept window.
+   */
+  aa_missile: {
+    kind: 'aa_missile',
+    massKg: 45,
+    muzzleVelocity: 23.75,
+    dragPerSecond: 0.04,
+    hitDamage: 12, hitRadiusMeters: 0.25,
+    explosive: true, explosionPeak: 60, explosionRadiusMeters: 4.0,
+    terrainDamageScale: 0.008,
+    clusterSubmunitions: 0,
+    maxLifeSeconds: 16.0,
+    gravityScale: 0.25,
+    colorR: 0.40, colorG: 0.80, colorB: 1.00,
+    visualLengthMeters: 1.8, visualRadiusMeters: 0.20,
     hasTrail: true,
   },
 };
@@ -558,11 +601,12 @@ export class ProjectileManager {
           // launch speed and current gravity. Lobs over distance instead of
           // diving directly at the target like a flat-fire round, which is
           // why the silo missile reads as a real artillery shot.
+          const gScaleBoost = PROJECTILES[p.kind].gravityScale ?? 1;
           const dir = solveBallisticDirection(
             p.x, p.y, p.z,
             p.boostTargetX, p.boostTargetY, p.boostTargetZ,
             p.postBoostSpeed,
-            PROJECTILE_GRAVITY,
+            PROJECTILE_GRAVITY * gScaleBoost,
           );
           p.vx = dir.x * p.postBoostSpeed;
           p.vy = dir.y * p.postBoostSpeed;
@@ -580,7 +624,8 @@ export class ProjectileManager {
       const px = p.x, py = p.y, pz = p.z;
 
       // Gravity is applied to vertical velocity; horizontal components only see drag.
-      p.vy -= PROJECTILE_GRAVITY * dt;
+      const gScale = PROJECTILES[p.kind].gravityScale ?? 1;
+      p.vy -= PROJECTILE_GRAVITY * gScale * dt;
       const dragScale = Math.exp(-p.dragPerSecond * dt);
       p.vx *= dragScale;
       p.vy *= dragScale;
@@ -654,7 +699,7 @@ export class ProjectileManager {
         }
       }
     }
-    // Anti-air intercept pass. Each flak-shell impact emitted this tick
+    // Anti-air intercept pass. Each aa_missile impact emitted this tick
     // disrupts any other live projectile inside its blast radius. The total
     // chance of disruption is 90%; the outcome rolls between three flavors:
     //
@@ -663,9 +708,9 @@ export class ProjectileManager {
     //   - blow up where hit (immediate detonation; explosive rounds emit
     //     an impact at their current position)
     //
-    // Non-flak impacts pass through unchanged.
+    // Non-AA-missile impacts pass through unchanged.
     for (const imp of this.pendingImpacts) {
-      if (imp.kind !== 'flak_shell') continue;
+      if (imp.kind !== 'aa_missile') continue;
       this.applyAaIntercept(imp.x, imp.y, imp.z, imp.explosionRadiusMeters);
     }
     // Sweep dead.
@@ -693,7 +738,7 @@ export class ProjectileManager {
     let affected = 0;
     for (const q of this.projectiles) {
       if (q.dead) continue;
-      if (q.kind === 'flak_shell') continue;
+      if (q.kind === 'aa_missile') continue;
       const dxq = q.x - x, dyq = q.y - y, dzq = q.z - z;
       if (dxq * dxq + dyq * dyq + dzq * dzq > r2) continue;
       affected++;
@@ -770,6 +815,7 @@ export class ProjectileManager {
       bTx = boost.targetX; bTy = boost.targetY; bTz = boost.targetZ;
     }
     const drag = cfg.dragPerSecond;
+    const grav = PROJECTILE_GRAVITY * (cfg.gravityScale ?? 1);
     const out: { x: number; y: number; z: number }[] = [{ x, y, z }];
     let cx = x, cy = y, cz = z;
     for (let i = 0; i < samples; i++) {
@@ -785,14 +831,14 @@ export class ProjectileManager {
             px, py, pz,
             bTx, bTy, bTz,
             speed,
-            PROJECTILE_GRAVITY,
+            grav,
           );
           vx = dir.x * speed;
           vy = dir.y * speed;
           vz = dir.z * speed;
         }
       } else {
-        vy -= PROJECTILE_GRAVITY * sampleDt;
+        vy -= grav * sampleDt;
         const dragScale = Math.exp(-drag * sampleDt);
         vx *= dragScale; vy *= dragScale; vz *= dragScale;
         sx = vx * sampleDt; sy = vy * sampleDt; sz = vz * sampleDt;
@@ -842,6 +888,7 @@ export class ProjectileManager {
     let vx = p.vx, vy = p.vy, vz = p.vz;
     let boostRemaining = p.boostMetersRemaining;
     const drag = cfg.dragPerSecond;
+    const grav = PROJECTILE_GRAVITY * (cfg.gravityScale ?? 1);
     const out: { x: number; y: number; z: number }[] = [{ x: p.x, y: p.y, z: p.z }];
     let cx = p.x, cy = p.y, cz = p.z;
     for (let i = 0; i < samples; i++) {
@@ -857,14 +904,14 @@ export class ProjectileManager {
             px, py, pz,
             p.boostTargetX, p.boostTargetY, p.boostTargetZ,
             p.postBoostSpeed,
-            PROJECTILE_GRAVITY,
+            grav,
           );
           vx = dir.x * p.postBoostSpeed;
           vy = dir.y * p.postBoostSpeed;
           vz = dir.z * p.postBoostSpeed;
         }
       } else {
-        vy -= PROJECTILE_GRAVITY * sampleDt;
+        vy -= grav * sampleDt;
         const dragScale = Math.exp(-drag * sampleDt);
         vx *= dragScale; vy *= dragScale; vz *= dragScale;
         sx = vx * sampleDt; sy = vy * sampleDt; sz = vz * sampleDt;

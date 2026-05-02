@@ -2,7 +2,7 @@ import { WORLD_X, WORLD_Z } from './types';
 import { VoxelWorld } from './VoxelWorld';
 import { placeTrees } from './Trees';
 import { placeRoads, clearAboveRoads } from './Roads';
-import { placeMetals } from './Metals';
+import { placeMetals, MetalCluster } from './Metals';
 
 import WorldgenWorker from '../workers/worldgen.worker?worker';
 
@@ -15,7 +15,7 @@ export async function generateWorld(
   world: VoxelWorld,
   seed: number,
   onProgress?: (p: GenProgress) => void,
-): Promise<void> {
+): Promise<MetalCluster[]> {
   const cores = Math.max(2, Math.min((navigator.hardwareConcurrency ?? 4) - 1, 8));
   const slabs = cores;
   const slabZ = Math.ceil(WORLD_Z / slabs);
@@ -67,10 +67,11 @@ export async function generateWorld(
   const roadStats = placeRoads(world.buffers.voxels, seed);
   // Metals before trees: trees skip non-grass surfaces, so a metal blob that
   // happens to break the surface naturally keeps that column tree-free.
-  placeMetals(world.buffers.voxels, seed);
+  const metalStats = placeMetals(world.buffers.voxels, seed);
   placeTrees(world.buffers.voxels, seed);
   // Trim any tree canopy that drifted across a road column so the road
   // surface stays open to the sky.
   clearAboveRoads(world.buffers.voxels, roadStats.columnMask);
   world.markAllDirty();
+  return metalStats.clusters;
 }

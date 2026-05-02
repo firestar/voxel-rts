@@ -2,14 +2,15 @@ import * as THREE from 'three';
 import { Renderer } from '../render/Renderer';
 import { RTSCamera } from '../render/Camera';
 import { Input } from './Input';
-import { VoxelWorld } from '../voxel/VoxelWorld';
+import { VoxelWorld, worldIndex } from '../voxel/VoxelWorld';
 import { ChunkMeshRegistry } from '../render/ChunkMeshRegistry';
 import { generateWorld } from '../voxel/WorldGen';
 import { raycastVoxel } from '../voxel/Raycast';
-import { VOXEL_SIZE, WORLD_Y } from '../voxel/types';
+import { VOXEL_SIZE, WORLD_Y, WORLD_X, WORLD_Z, AIR } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
 import { Pathfinder, profileFromUnit } from '../path/Pathfinder';
 import { PathWorkerClient } from '../path/PathWorkerClient';
+import type { PathTelemetry } from '../path/PathWorkerClient';
 import { sharedBuffersAvailable } from '../util/Shared';
 import {
   SurfaceNavBuffers, allocateNav, buildSurfaceNav, refreshSurfaceNavBox,
@@ -20,13 +21,13 @@ import {
   worldToVolumeCell, vnavIndex, getBit,
 } from '../path/VolumeNav';
 import {
-  UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest,
+  UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest, TrampleRequest,
   unitConfig, UNIT_KINDS,
 } from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
 import {
   trackDamageFor,
-  M_DIRT, M_WOOD, M_METAL,
+  M_DIRT, M_WOOD, M_METAL, M_FARM,
   M_GRASS, M_STONE, M_PATH, M_MUD,
 } from '../voxel/Materials';
 import type { MaterialId } from '../voxel/types';
@@ -36,10 +37,12 @@ import { BuildingRenderer } from '../render/BuildingRenderer';
 import { BuildingRangeIndicator } from '../render/BuildingRangeIndicator';
 import { UnitRangeIndicator } from '../render/UnitRangeIndicator';
 import { PathPreview } from '../render/PathPreview';
+import { PendingPathPreview } from '../render/PendingPathPreview';
+import { ProcessingBoxOverlay, ProcessBox } from '../render/ProcessingBoxOverlay';
 import { TargetMarker } from '../render/TargetMarker';
 import { Resources } from '../sim/Resources';
 import { SaplingManager } from '../sim/Saplings';
-import { tickWorkers } from '../sim/Workers';
+import { tickWorkers, approachPos } from '../sim/Workers';
 import { WorkerTaskBoard, describeOrder } from '../sim/WorkerTasks';
 import { ProjectileManager, PROJECTILES, muzzleOrigin, ProjectileImpact } from '../sim/Projectiles';
 import { WEAPONS, WeaponKind } from '../sim/Weapons';
@@ -49,6 +52,8 @@ import {
   ProjectileArcPool,
 } from '../render/ProjectileRenderer';
 import { HealthBarRenderer } from '../render/HealthBarRenderer';
+import { RallyMarkerRenderer } from '../render/RallyMarker';
+import { MetalCluster, METAL_PER_VOXEL } from '../voxel/Metals';
 import {
   ActionContext, BuildingAction, UnitAction,
   buildingActionsFor, unitActionsFor,
@@ -61,7 +66,7 @@ import {
  * paints a sphere of the active material onto the world (shift-LMB carves
  * one out). `play` is everything else.
  */
-type Mode = 'play' | 'build' | 'plant' | 'terrain';
+type Mode = 'play' | 'build' | 'plant' | 'terrain' | 'waypoint';
 
 /**
  * Material palette the terrain editor cycles through. Order maps to
@@ -100,6 +105,23 @@ export class Game {
   /** The spec the user will place next while in build mode. Cycled via 1..N keys. */
   private buildSpec: BuildingSpec = BARRACKS;
   readonly pathPreview = new PathPreview();
+  readonly pendingPathPreview = new PendingPathPreview();
+  readonly processingBoxOverlay = new ProcessingBoxOverlay();
+  /** Pending path requests by unit id: start + goal for the blue routing indicator. */
+  private readonly pendingPathRequests = new Map<number, { start: { x: number; y: number; z: number }; goal: { x: number; y: number; z: number } }>();
+  /** In-flight nav-rebuild regions (yellow boxes). Key is a monotonic id. */
+  private readonly navRebuildRegions = new Map<number, ProcessBox>();
+  private nextNavRebuildId = 0;
+  /**
+   * Pending nav-rebuild boxes accumulated within the current tick.
+   * Each entry is an AABB that will become one `executeNavRebuildAround` call.
+   * Incoming boxes are merged into an existing entry only if they overlap
+   * (or are within NAV_MERGE_PAD metres), so distant clusters stay separate
+   * and we never rebuild a giant merged region spanning multiple ore sites.
+   */
+  private readonly pendingNavBoxes: Array<{ minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number; replan: boolean }> = [];
+  /** Last completed path stats per unit id, for the path-info debug panel. */
+  private readonly lastPathStatsByUnit = new Map<number, { kind: string; start: { cx: number; cy: number; cz: number }; goal: { cx: number; cy: number; cz: number }; reached: boolean; expanded: number; waypointCount: number; timings: PathTelemetry | undefined; timestamp: number }>();
   readonly target = new TargetMarker();
   readonly resources = new Resources();
   readonly saplings = new SaplingManager();
@@ -113,6 +135,13 @@ export class Game {
   readonly projectileArcs = new ProjectileArcPool(64, 96);
   readonly impactMarker = new ImpactMarker();
   readonly healthBars = new HealthBarRenderer();
+  readonly rallyMarkers = new RallyMarkerRenderer();
+  private metalClusters: MetalCluster[] = [];
+  // Remaining metal per voxel (worldIndex → count). Defaults to METAL_PER_VOXEL on first access.
+  private metalVoxelRemaining = new Map<number, number>();
+  // Per-surface-column trample counter (2D: vx * WORLD_Z + vz). Grass converts to
+  // dirt once the count reaches the kind-specific threshold.
+  private readonly trampleCounts = new Uint8Array(WORLD_X * WORLD_Z);
   pathfinder: Pathfinder | null = null;
   pathWorker: PathWorkerClient | null = null;
   surfaceNav: SurfaceNavBuffers | null = null;
@@ -143,7 +172,10 @@ export class Game {
   private tasksEl: HTMLElement | null = null;
   /** Last rendered task-panel signature. Same purpose as `actionsRenderedKey`. */
   private tasksRenderedKey = '';
+  private pathInfoEl: HTMLElement | null = null;
   private mode: Mode = 'play';
+  /** Stance to assign when the next LMB click commits a rally waypoint. */
+  private pendingWaypointStance: 'aggressive' | 'defensive' = 'aggressive';
   /** Active terrain-editor material (palette index). Persists across mode toggles. */
   private terrainPaletteIdx = 0;
   /** Active terrain-editor brush radius, in voxels. */
@@ -183,6 +215,8 @@ export class Game {
     this.renderer.scene.add(this.unitRange.group);
     this.renderer.scene.add(this.ghost.group);
     this.renderer.scene.add(this.pathPreview.object);
+    this.renderer.scene.add(this.pendingPathPreview.object);
+    this.renderer.scene.add(this.processingBoxOverlay.group);
     this.renderer.scene.add(this.target.group);
     this.renderer.scene.add(this.projectileRenderer.mesh);
     this.renderer.scene.add(this.muzzleFlashes.mesh);
@@ -192,9 +226,16 @@ export class Game {
     this.renderer.scene.add(this.projectileArcs.group);
     this.renderer.scene.add(this.impactMarker.object);
     this.renderer.scene.add(this.healthBars.group);
+    this.renderer.scene.add(this.rallyMarkers.group);
     this.ghost.setSpec(this.buildSpec);
 
     this.buildings.spawner = (kind, x, y, z): Unit | null => this.spawnUnit(kind, x, y, z);
+    this.buildings.afterSpawn = (unit, building): void => {
+      if (!building.rallyPoint) return;
+      const rp = building.rallyPoint;
+      if (unit.weapon !== null) unit.stance = building.rallyStance;
+      void this.routePath(unit, rp.x, rp.y, rp.z, { forceSurface: true });
+    };
     // Farms feed the resource counter via the manager's foodSink hook so the
     // sim doesn't have to know about Resources directly.
     this.buildings.foodSink = (amount): void => { this.resources.food += amount; };
@@ -211,13 +252,14 @@ export class Game {
     this.selBoxEl = document.getElementById('selbox');
     this.actionsEl = document.getElementById('actions');
     this.tasksEl = document.getElementById('tasks');
+    this.pathInfoEl = document.getElementById('pathinfo');
 
     this.onResize();
     window.addEventListener('resize', this.onResize);
   }
 
   async generate(seed: number, onProgress?: (done: number, total: number) => void): Promise<void> {
-    await generateWorld(this.world, seed, p => onProgress?.(p.done, p.total));
+    this.metalClusters = await generateWorld(this.world, seed, p => onProgress?.(p.done, p.total));
     const useShared = sharedBuffersAvailable();
     // Surface projection — used by buildings, render code, Y-snap. Independent
     // of the per-unit-type 3D pathfinding grids below.
@@ -313,7 +355,14 @@ export class Game {
       const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, STORAGE, ox, oz);
       if (fp.ok) {
         this.buildings.place(this.world, STORAGE, ox, oz, fp.floorY);
-        this.requestNavRebuild(false);
+        const pad = NAV_CELL_METERS;
+        const bx0 = ox * NAV_CELL_METERS;
+        const bz0 = oz * NAV_CELL_METERS;
+        const bx1 = (ox + STORAGE.cellsW) * NAV_CELL_METERS;
+        const bz1 = (oz + STORAGE.cellsD) * NAV_CELL_METERS;
+        const by0 = fp.floorY * VOXEL_SIZE;
+        const by1 = (fp.floorY + STORAGE.headroomVoxels + 4) * VOXEL_SIZE;
+        this.requestNavRebuildAround(bx0 - pad, by0 - pad, bz0 - pad, bx1 + pad, by1 + pad, bz1 + pad, false);
         break;
       }
     }
@@ -438,13 +487,15 @@ export class Game {
     //   Shift+E       → enemy tank (cannon)
     //   Alt+E         → enemy rocket truck (cluster pod)
     //   Shift+Alt+E   → enemy rocket truck (heavy rocket pod)
+    //   Ctrl+E        → enemy RPG soldier (rpg_launcher)
     // Used to test friendly-fire gating + selection rules without needing an
     // AI opponent. The new unit appears immediately at the picked surface
     // voxel and idles in place.
     if (this.input.pressed.has('KeyE')) {
       const shift = this.input.keys.has('ShiftLeft') || this.input.keys.has('ShiftRight');
       const alt = this.input.keys.has('AltLeft') || this.input.keys.has('AltRight');
-      this.spawnEnemyAtCursor(w, h, shift, alt);
+      const ctrl = this.input.keys.has('ControlLeft') || this.input.keys.has('ControlRight');
+      this.spawnEnemyAtCursor(w, h, shift, alt, ctrl);
     }
 
     if (isBuildMode(this.mode)) {
@@ -528,13 +579,29 @@ export class Game {
         resources: this.resources,
         taskBoard: this.taskBoard,
         routeWorker: (u, wx, wy, wz): void => { void this.routePath(u, wx, wy, wz); },
-        onVoxelEdit: (): void => { this.requestNavRebuild(false); },
+        onVoxelEdit: (wx: number, wy: number, wz: number): void => {
+          // Use incremental rebuild around the edited voxel rather than a
+          // full world rescan — a single mine event only affects a small region.
+          const r = 2;
+          this.requestNavRebuildAround(wx - r, wy - r, wz - r, wx + r, wy + r, wz + r, false);
+        },
+        findMetalCluster: (vx, vy, vz) => this.findMetalCluster(vx, vy, vz),
+        onClusterVoxelChipped: (c, wx, wz) => this.onClusterVoxelChipped(c, wx, wz),
+        tryClaimClusterSlot: (c, uid) => this.tryClaimClusterSlot(c, uid),
+        releaseClusterSlot: (cid, uid) => this.releaseClusterSlot(cid, uid),
+        clusterSlotPos: (c, si) => this.clusterSlotPos(c, si),
+        findAlternateClusterTarget: (excl, fx, fz) => this.findAlternateClusterTarget(excl, fx, fz),
       });
       const grow = this.saplings.tick(dt, this.world);
       if (grow.matured > 0) this.requestNavRebuild(false);
+      // Drain the per-tick accumulated nav-rebuild AABB: one sync main-thread
+      // refresh + one applyDamage to the worker, regardless of how many
+      // impacts / tracks triggered requestNavRebuildAround this frame.
+      this.flushNavRebuild();
     }
     this.unitRenderer.update(this.units);
-    this.healthBars.update(this.units.units, this.buildings.buildings);
+    this.healthBars.update(this.units.units, this.buildings.buildings, this.metalClusters);
+    this.rallyMarkers.update(this.buildings.buildings);
     this.buildingRenderer.update(this.buildings.buildings);
     this.buildingRange.show(this.buildings.getSelected());
     this.unitRange.show(this.units.units);
@@ -550,6 +617,22 @@ export class Game {
       this.pathPreview.update({ x: sel.x, y: sel.y, z: sel.z }, sel.path);
     } else {
       this.pathPreview.update(null, []);
+    }
+
+    // Blue pending-route indicators for all in-flight path requests.
+    if (this.pendingPathRequests.size > 0) {
+      this.pendingPathPreview.update(Array.from(this.pendingPathRequests.values()));
+    } else {
+      this.pendingPathPreview.update([]);
+    }
+
+    // Pulsing wireframe boxes: yellow = nav rebuild, cyan = chunk remesh.
+    {
+      const t = performance.now() / 1000;
+      const boxes: ProcessBox[] = [];
+      for (const b of this.navRebuildRegions.values()) boxes.push(b);
+      for (const key of this.meshes.getInflightChunks()) boxes.push(ProcessingBoxOverlay.chunkToBox(key));
+      this.processingBoxOverlay.update(boxes, t);
     }
     this.debris.update(dt);
     this.meshes.pump(8);
@@ -576,7 +659,7 @@ export class Game {
       const weaponDesc = sel && selected.length === 1 && sel.weapon !== null
         ? ` weapon: ${WEAPONS[sel.weapon].label} (RMB to fire, drag Y for altitude)`
         : sel && selected.length === 1 && sel.canDig
-          ? ' (LMB walks on surface, RMB hold + drag Y to dig)'
+          ? ' (LMB digs toward click, RMB hold + drag Y to set depth)'
           : '';
       const buildDesc = this.mode === 'build'
         ? `MODE: BUILD ${this.buildSpec.label} (LMB place, B/1-${ALL_BUILDINGS.length} cycle, Esc cancel)`
@@ -589,24 +672,30 @@ export class Game {
     }
     this.renderActionPanel();
     this.renderTaskPanel();
+    this.renderPathInfo();
   }
 
   /**
    * Sandbox helper: spawn an enemy unit at the surface voxel under the
-   * cursor. Picks soldier by default; shift swaps to a tank, alt swaps to a
-   * rocket truck (shift+alt = heavy rocket pod variant). The new unit is
-   * given the standard weapon for its kind so it shows up red AND armed,
-   * and starts in aggressive stance so it auto-fires at player units in
-   * range — the friendly-fire gate has something meaningful to gate on, and
-   * the player has someone shooting back to react to.
+   * cursor. Modifier keys select the unit type:
+   *   (none)        → soldier (rifle)
+   *   Shift         → tank (cannon)
+   *   Alt           → rocket truck (cluster pod)
+   *   Shift+Alt     → rocket truck (heavy rocket pod)
+   *   Ctrl          → RPG soldier (rpg_launcher) — anti-armour infantry
+   * All enemies start in aggressive stance so they auto-fire at player units.
    */
-  private spawnEnemyAtCursor(w: number, h: number, shift: boolean, alt: boolean): void {
+  private spawnEnemyAtCursor(w: number, h: number, shift: boolean, alt: boolean, ctrl: boolean): void {
     if (this.input.mouseX < 0) return;
     const r = this.resolveTarget(this.input.mouseX, this.input.mouseY, w, h, 0);
     if (!r) return;
+    if (ctrl) {
+      this.units.spawn('soldier', r.surface.x, r.surface.y, r.surface.z, {
+        team: 'enemy', stance: 'aggressive', weapon: 'rpg_launcher',
+      });
+      return;
+    }
     if (alt) {
-      // Heavy single-warhead pod when shift is also held; cluster pod (the
-      // rocket_truck default) otherwise.
       const weapon: WeaponKind = shift ? 'rocket_pod' : 'cluster_pod';
       this.units.spawn('rocket_truck', r.surface.x, r.surface.y, r.surface.z, {
         team: 'enemy', stance: 'aggressive', weapon,
@@ -968,6 +1057,17 @@ export class Game {
       return;
     }
 
+    if (this.mode === 'waypoint') {
+      const b = this.buildings.getSelected();
+      const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
+      if (b && r) {
+        b.rallyPoint = { x: r.target.x, y: r.target.y, z: r.target.z };
+        b.rallyStance = this.pendingWaypointStance;
+      }
+      this.mode = 'play';
+      return;
+    }
+
     // Click in play mode. First check if the cursor landed on a unit — a
     // hit selects that unit (replacing the current selection unless shift
     // is held, in which case it toggles).
@@ -999,7 +1099,7 @@ export class Game {
     // selection issues a formation move and skips per-unit task pickers.
     // LMB never carries a vertical-drag dig altitude — that gesture lives
     // on RMB now (see handleDigRelease). Tunnelers/worms commanded via LMB
-    // surface-walk to the click instead of digging down.
+    // dig straight toward the click; they never surface-walk.
     const selected = this.units.units.filter(u => u.selected);
     if (selected.length === 0) {
       // Bare-terrain click with no units selected → drop any building
@@ -1012,7 +1112,13 @@ export class Game {
     if (!r) return;
 
     if (selected.length === 1) {
-      this.commandSingle(lead, r, lead.canDig);
+      this.commandSingle(lead, r);
+      return;
+    }
+    const workers = selected.filter(u => u.kind === 'worker');
+    if (workers.length > 0 && this.tryCommandWorkersOnTarget(workers, r)) {
+      const nonWorkers = selected.filter(u => u.kind !== 'worker');
+      if (nonWorkers.length > 0) this.commandFormation(nonWorkers, r.target.x, r.target.z);
       return;
     }
     this.commandFormation(selected, r.target.x, r.target.z);
@@ -1028,33 +1134,73 @@ export class Game {
     forceSurface = false,
   ): void {
     if (selected.kind === 'worker') {
-      const m = this.world.get(r.voxelXYZ.x, r.voxelXYZ.y, r.voxelXYZ.z);
-      if (m === M_WOOD) {
-        selected.task = {
-          kind: 'chop',
-          wx: (r.voxelXYZ.x + 0.5) * VOXEL_SIZE,
-          wy: (r.voxelXYZ.y + 0.5) * VOXEL_SIZE,
-          wz: (r.voxelXYZ.z + 0.5) * VOXEL_SIZE,
-        };
-        void this.routePath(selected, selected.task.wx, selected.task.wy, selected.task.wz);
-        return;
-      }
-      if (m === M_METAL) {
-        selected.task = {
-          kind: 'mine',
-          wx: (r.voxelXYZ.x + 0.5) * VOXEL_SIZE,
-          wy: (r.voxelXYZ.y + 0.5) * VOXEL_SIZE,
-          wz: (r.voxelXYZ.z + 0.5) * VOXEL_SIZE,
-        };
-        void this.routePath(selected, selected.task.wx, selected.task.wy, selected.task.wz);
-        return;
-      }
+      if (this.tryCommandWorkersOnTarget([selected], r)) return;
       selected.task = { kind: 'idle' };
     }
     if (selected.kind === 'dozer') {
       selected.levelTargetY = r.voxelXYZ.y;
     }
     void this.routePath(selected, r.target.x, r.target.y, r.target.z, { forceSurface });
+  }
+
+  /**
+   * If the click landed on a resource or farm, assign matching focus + task to
+   * all supplied workers and return true. Returns false when the click has no
+   * worker-specific meaning (bare terrain, building wall, etc.).
+   */
+  private tryCommandWorkersOnTarget(
+    workers: Unit[],
+    r: { surface: THREE.Vector3; target: THREE.Vector3; voxelXYZ: { x: number; y: number; z: number; nx: number; ny: number; nz: number } },
+  ): boolean {
+    const m = this.world.get(r.voxelXYZ.x, r.voxelXYZ.y, r.voxelXYZ.z);
+    if (m === M_WOOD) {
+      const wx = (r.voxelXYZ.x + 0.5) * VOXEL_SIZE;
+      const wy = (r.voxelXYZ.y + 0.5) * VOXEL_SIZE;
+      const wz = (r.voxelXYZ.z + 0.5) * VOXEL_SIZE;
+      for (const u of workers) {
+        u.workerFocus = 'chop';
+        u.task = { kind: 'chop', wx, wy, wz };
+        const ap = approachPos(u.x, u.z, wx, wz, 3);
+        void this.routePath(u, ap.x, wy, ap.z);
+      }
+      return true;
+    }
+    if (m === M_METAL) {
+      const wx = (r.voxelXYZ.x + 0.5) * VOXEL_SIZE;
+      const wy = (r.voxelXYZ.y + 0.5) * VOXEL_SIZE;
+      const wz = (r.voxelXYZ.z + 0.5) * VOXEL_SIZE;
+      for (const u of workers) {
+        u.workerFocus = 'mine';
+        u.task = { kind: 'mine', wx, wy, wz };
+        const ap = approachPos(u.x, u.z, wx, wz, 2);
+        void this.routePath(u, ap.x, wy, ap.z);
+      }
+      return true;
+    }
+    const farm = this.farmAtVoxel(r.voxelXYZ.x, r.voxelXYZ.z);
+    if (farm) {
+      const fcx = (farm.ox + farm.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const fcz = (farm.oz + farm.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      for (const u of workers) {
+        u.workerFocus = 'farm';
+        u.task = { kind: 'farm', buildingId: farm.id };
+        u.path = [];
+        void this.routePath(u, fcx, u.y, fcz);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private farmAtVoxel(vx: number, vz: number): Building | null {
+    for (const b of this.buildings.buildings) {
+      if (b.spec.kind !== 'farm' || b.destroyed) continue;
+      if (vx >= b.ox * NAV_CELL_VOXELS && vx < (b.ox + b.spec.cellsW) * NAV_CELL_VOXELS &&
+          vz >= b.oz * NAV_CELL_VOXELS && vz < (b.oz + b.spec.cellsD) * NAV_CELL_VOXELS) {
+        return b;
+      }
+    }
+    return null;
   }
 
   /**
@@ -1085,7 +1231,14 @@ export class Game {
     const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz);
     if (!fp.ok) return;
     this.buildings.place(this.world, spec, ox, oz, fp.floorY);
-    this.requestNavRebuild();
+    const pad = NAV_CELL_METERS;
+    const bx0 = ox * NAV_CELL_METERS;
+    const bz0 = oz * NAV_CELL_METERS;
+    const bx1 = (ox + spec.cellsW) * NAV_CELL_METERS;
+    const bz1 = (oz + spec.cellsD) * NAV_CELL_METERS;
+    const by0 = fp.floorY * VOXEL_SIZE;
+    const by1 = (fp.floorY + spec.headroomVoxels + 4) * VOXEL_SIZE;
+    this.requestNavRebuildAround(bx0 - pad, by0 - pad, bz0 - pad, bx1 + pad, by1 + pad, bz1 + pad, true);
   }
 
   private detonateAt(hit: { x: number; y: number; z: number; nx: number; ny: number; nz: number }): void {
@@ -1153,6 +1306,23 @@ export class Game {
     switch (req.kind) {
       case 'carve': this.handleCarve(req); return;
       case 'level': this.handleLevel(req); return;
+      case 'trample': this.handleTrample(req); return;
+    }
+  }
+
+  private handleTrample(req: TrampleRequest): void {
+    if (this.world.buffers.voxels[worldIndex(req.vx, req.vy, req.vz)] !== M_GRASS) return;
+    const isVehicle = req.unitKind === 'tank' || req.unitKind === 'dozer'
+      || req.unitKind === 'rocket_truck' || req.unitKind === 'tunneler';
+    const threshold = isVehicle ? 2 : 6;
+    const ci = req.vx * WORLD_Z + req.vz;
+    // Emit only once per frame per cell (counter may be bumped multiple times
+    // if a unit straddles a cell edge). Cap at threshold to avoid overflow.
+    const next = Math.min(this.trampleCounts[ci]! + 1, threshold);
+    this.trampleCounts[ci] = next;
+    if (next >= threshold) {
+      this.world.set(req.vx, req.vy, req.vz, M_DIRT);
+      this.trampleCounts[ci] = 0;
     }
   }
 
@@ -1305,6 +1475,42 @@ export class Game {
     maxX: number, maxY: number, maxZ: number,
     replan = false,
   ): void {
+    if (!this.pathfinder) return;
+    // Merge into an existing pending box only when the incoming box overlaps or
+    // is within NAV_MERGE_PAD metres of it.  Boxes from distant clusters (e.g.
+    // workers mining at different ore sites) stay separate so we never rebuild
+    // one giant AABB that spans the whole map.  `flushNavRebuild` drains the
+    // list at the end of each tick.
+    const pad = NAV_MERGE_PAD;
+    for (const b of this.pendingNavBoxes) {
+      if (minX <= b.maxX + pad && maxX >= b.minX - pad &&
+          minZ <= b.maxZ + pad && maxZ >= b.minZ - pad) {
+        if (minX < b.minX) b.minX = minX;
+        if (minY < b.minY) b.minY = minY;
+        if (minZ < b.minZ) b.minZ = minZ;
+        if (maxX > b.maxX) b.maxX = maxX;
+        if (maxY > b.maxY) b.maxY = maxY;
+        if (maxZ > b.maxZ) b.maxZ = maxZ;
+        if (replan) b.replan = true;
+        return;
+      }
+    }
+    this.pendingNavBoxes.push({ minX, minY, minZ, maxX, maxY, maxZ, replan });
+  }
+
+  /** Execute all accumulated nav-rebuild boxes from this tick, then clear them. */
+  private flushNavRebuild(): void {
+    for (const b of this.pendingNavBoxes) {
+      this.executeNavRebuildAround(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ, b.replan);
+    }
+    this.pendingNavBoxes.length = 0;
+  }
+
+  private executeNavRebuildAround(
+    minX: number, minY: number, minZ: number,
+    maxX: number, maxY: number, maxZ: number,
+    replan = false,
+  ): void {
     if (!this.pathfinder || !this.surfaceNav || !this.vnav) return;
     const voxels = this.world.buffers.voxels;
     // Surface nav: 2-D box of NAV_CELL_METERS-sized cells.
@@ -1328,8 +1534,12 @@ export class Game {
     // when SAB is available (zero-copy on the shared bitmaps). FIFO ordering
     // on the worker queue means a follow-up findPath posted after this call
     // observes the rebuilt grid even though we don't await here.
-    if (this.pathWorker) void this.pathWorker.applyDamage(minX, minY, minZ, maxX, maxY, maxZ);
-    else this.pathfinder.applyDamage(minX, minY, minZ, maxX, maxY, maxZ);
+    const rid = this.nextNavRebuildId++;
+    this.navRebuildRegions.set(rid, { minX, minY, minZ, maxX, maxY, maxZ, color: 0xffdd00 });
+    const navDone = this.pathWorker
+      ? this.pathWorker.applyDamage(minX, minY, minZ, maxX, maxY, maxZ)
+      : Promise.resolve(this.pathfinder.applyDamage(minX, minY, minZ, maxX, maxY, maxZ));
+    void navDone.then(() => this.navRebuildRegions.delete(rid));
     if (replan) this.replanMovingUnits();
   }
 
@@ -1397,12 +1607,11 @@ export class Game {
     const startUnderground = unit.y < startSurfaceY - 0.5;
     const allowSurface = opts?.forceSurface && !startUnderground;
 
-    // Diggers with a clear line to the goal skip the graph search — saves
-    // ~5 K cell expansions on the common "tell my tunneler to go grind over
-    // there" command. The straight-line check rejects routes that would
-    // need a steeper pitch than the chassis articulates, or that pass
-    // through any bedrock cell.
-    if (unit.canDig && !allowSurface && this.tunnelerCanGoStraight(unit, wx, wy, wz)) {
+    // Diggers head straight to the goal whenever the unit has solid ground
+    // underfoot — it can simply cut through whatever terrain is in the way
+    // at any angle. If there is no ground underneath (cliff edge, open air
+    // below) fall through to A* so the unit navigates around the void.
+    if (unit.canDig && !allowSurface && this.hasGroundUnder(unit)) {
       this.units.setPath(unit, [{ x: wx, y: wy, z: wz }]);
       return;
     }
@@ -1426,6 +1635,11 @@ export class Game {
     const reqId = (this.latestPathReqByUnit.get(unit.id) ?? 0) + 1;
     this.latestPathReqByUnit.set(unit.id, reqId);
 
+    this.pendingPathRequests.set(unit.id, {
+      start: { x: unit.x, y: unit.y, z: unit.z },
+      goal: { x: wx, y: wy, z: wz },
+    });
+
     const res = await this.pathWorker.findPath(unit.kind, {
       start, goal,
       // Theta* shortcuts only fire for single-cell footprints; wider chassis
@@ -1434,7 +1648,20 @@ export class Game {
       anyAngle: unit.footprintRadius <= 1,
       maxExpansions: 30000,
     });
+    this.pendingPathRequests.delete(unit.id);
     if (this.latestPathReqByUnit.get(unit.id) !== reqId) return;
+
+    this.lastPathStatsByUnit.set(unit.id, {
+      kind: unit.kind,
+      start,
+      goal,
+      reached: res.reached,
+      expanded: res.expanded,
+      waypointCount: res.waypoints.length,
+      timings: res.timings,
+      timestamp: Date.now(),
+    });
+
     if (res.waypoints.length === 0 || !res.reached) return;
     this.units.setPath(unit, res.waypoints);
   }
@@ -1551,40 +1778,152 @@ export class Game {
   }
 
   /**
-   * Validate a straight-line route for a tunneler from its current position to the
-   * world-space goal. Returns true when:
-   *   - the climb/dive pitch is within the unit's maxPitchRad, AND
-   *   - no volume cell along the line is marked bedrock.
-   *
-   * Anything else is fair game — the cutter chews through dirt, stone, and walks
-   * through air with the same path. This is what lets the tunneler ignore the volume
-   * A* on the common case where the user just wants it to head toward a target.
+   * True when there is solid terrain within 3 voxels directly below the
+   * unit's feet. Used by the tunneler routing decision: a unit with ground
+   * underfoot can drive a straight diagonal line to any target (cutting
+   * through whatever is in the way); a unit over a void needs A* instead.
    */
-  private tunnelerCanGoStraight(unit: { x: number; y: number; z: number; maxPitchRad: number }, wx: number, wy: number, wz: number): boolean {
-    if (!this.pathfinder) return false;
+  private hasGroundUnder(unit: { x: number; y: number; z: number }): boolean {
+    const voxels = this.world.buffers.voxels;
+    const vx = Math.floor(unit.x / VOXEL_SIZE);
+    const vz = Math.floor(unit.z / VOXEL_SIZE);
+    if (vx < 0 || vx >= WORLD_X || vz < 0 || vz >= WORLD_Z) return false;
+    const vyFeet = Math.floor(unit.y / VOXEL_SIZE);
+    // Probe 20 voxels below — enough to see a tunnel floor even when the
+    // cutter has carved a tall open shaft above a solid ledge.
+    for (let dy = 1; dy <= 20; dy++) {
+      const vy = vyFeet - dy;
+      if (vy < 0) return false;
+      if (vy >= WORLD_Y) continue;
+      if (voxels[worldIndex(vx, vy, vz)] !== AIR) return true;
+    }
+    return false;
+  }
+
+  /** True when the straight-line climb/dive to the goal is within the unit's pitch limit. */
+  private findMetalCluster(vx: number, vy: number, vz: number): MetalCluster | null {
+    for (const c of this.metalClusters) {
+      if (c.destroyed) continue;
+      if (Math.abs(vx - c.vx) > c.rxz) continue;
+      if (Math.abs(vz - c.vz) > c.rxz) continue;
+      if (vy < c.surfaceTop + 1 || vy > c.surfaceTop + 1 + c.ry * 2) continue;
+      return c;
+    }
+    return null;
+  }
+
+  /**
+   * Find the nearest live M_METAL voxel in `cluster` to the worker standing
+   * at (workerX, workerZ), chip 1 metal from it, and destroy it if exhausted.
+   * Returns true if a voxel was destroyed, false if chipped, null if no voxel
+   * was found within the cluster bounds.
+   */
+  private onClusterVoxelChipped(
+    cluster: MetalCluster,
+    workerX: number, workerZ: number,
+  ): boolean | null {
+    const { vx: cx, vz: cz, rxz, ry, surfaceTop } = cluster;
+    const yMin = surfaceTop + 1;
+    const yMax = surfaceTop + 1 + ry * 2;
+    const voxels = this.world.buffers.voxels;
+    let bestKey = -1, bestVx = 0, bestVy = 0, bestVz = 0, bestDist2 = Infinity;
+    const workerVx = workerX / VOXEL_SIZE;
+    const workerVz = workerZ / VOXEL_SIZE;
+    for (let y = yMin; y <= yMax; y++) {
+      for (let z = cz - rxz; z <= cz + rxz; z++) {
+        for (let x = cx - rxz; x <= cx + rxz; x++) {
+          if (x < 0 || x >= WORLD_X || z < 0 || z >= WORLD_Z) continue;
+          if (voxels[worldIndex(x, y, z)] !== M_METAL) continue;
+          const dx = x - workerVx, dz = z - workerVz;
+          const d2 = dx * dx + dz * dz;
+          if (d2 < bestDist2) { bestDist2 = d2; bestKey = worldIndex(x, y, z); bestVx = x; bestVy = y; bestVz = z; }
+        }
+      }
+    }
+    if (bestKey < 0) return null;
+    cluster.totalMetal = Math.max(0, cluster.totalMetal - 1);
+    const remaining = (this.metalVoxelRemaining.get(bestKey) ?? METAL_PER_VOXEL) - 1;
+    if (remaining <= 0) {
+      this.metalVoxelRemaining.delete(bestKey);
+      this.world.set(bestVx, bestVy, bestVz, AIR);
+      const wx = (bestVx + 0.5) * VOXEL_SIZE;
+      const wy = (bestVy + 0.5) * VOXEL_SIZE;
+      const wz = (bestVz + 0.5) * VOXEL_SIZE;
+      this.requestNavRebuildAround(wx - 1, wy - 1, wz - 1, wx + 1, wy + 1, wz + 1);
+      if (cluster.totalMetal <= 0) cluster.destroyed = true;
+      return true;
+    }
+    this.metalVoxelRemaining.set(bestKey, remaining);
+    return false;
+  }
+
+  private tryClaimClusterSlot(cluster: MetalCluster, unitId: number): number | null {
+    // If this unit already holds a slot, return it (re-entry after deliver).
+    for (let i = 0; i < cluster.workerSlots.length; i++) {
+      if (cluster.workerSlots[i] === unitId) return i;
+    }
+    for (let i = 0; i < cluster.workerSlots.length; i++) {
+      if (cluster.workerSlots[i] === 0) {
+        cluster.workerSlots[i] = unitId;
+        return i;
+      }
+    }
+    return null; // cluster full
+  }
+
+  private releaseClusterSlot(clusterId: number, unitId: number): void {
+    const cluster = this.metalClusters.find(c => c.id === clusterId);
+    if (!cluster) return;
+    for (let i = 0; i < cluster.workerSlots.length; i++) {
+      if (cluster.workerSlots[i] === unitId) { cluster.workerSlots[i] = 0; return; }
+    }
+  }
+
+  private clusterSlotPos(cluster: MetalCluster, slotIndex: number): { x: number; y: number; z: number } {
+    const angle = (slotIndex / cluster.maxWorkers) * Math.PI * 2;
+    const radius = (cluster.rxz + 2.5) * VOXEL_SIZE;
+    return {
+      x: cluster.worldX + Math.cos(angle) * radius,
+      y: (cluster.surfaceTop + 1) * VOXEL_SIZE,
+      z: cluster.worldZ + Math.sin(angle) * radius,
+    };
+  }
+
+  /** Nearest live cluster with a free worker slot, excluding `excludeId`. Returns a metal voxel target in it. */
+  private findAlternateClusterTarget(
+    excludeId: number, fromX: number, fromZ: number,
+  ): { wx: number; wy: number; wz: number } | null {
+    let best: MetalCluster | null = null;
+    let bestDist2 = Infinity;
+    for (const c of this.metalClusters) {
+      if (c.id === excludeId || c.destroyed) continue;
+      if (!c.workerSlots.some(s => s === 0)) continue;
+      const dx = c.worldX - fromX, dz = c.worldZ - fromZ;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < bestDist2) { bestDist2 = d2; best = c; }
+    }
+    if (!best) return null;
+    const voxels = this.world.buffers.voxels;
+    const yMin = best.surfaceTop + 1;
+    const yMax = best.surfaceTop + 1 + best.ry * 2;
+    for (let y = yMin; y <= yMax; y++) {
+      for (let z = best.vz - best.rxz; z <= best.vz + best.rxz; z++) {
+        for (let x = best.vx - best.rxz; x <= best.vx + best.rxz; x++) {
+          if (x < 0 || x >= WORLD_X || z < 0 || z >= WORLD_Z) continue;
+          if (voxels[worldIndex(x, y, z)] === M_METAL) {
+            return { wx: (x + 0.5) * VOXEL_SIZE, wy: (y + 0.5) * VOXEL_SIZE, wz: (z + 0.5) * VOXEL_SIZE };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  private tunnelerPitchOk(unit: { x: number; y: number; z: number; maxPitchRad: number }, wx: number, wy: number, wz: number): boolean {
     const dx = wx - unit.x, dy = wy - unit.y, dz = wz - unit.z;
     const horiz = Math.hypot(dx, dz);
     const pitch = horiz < 1e-4 ? Math.PI / 2 : Math.atan2(Math.abs(dy), horiz);
-    if (pitch > unit.maxPitchRad) return false;
-
-    const dist = Math.hypot(dx, dy, dz);
-    if (dist < 1e-3) return true;
-    // One sample per metre — volume cells are 1 m so this hits every cell on the line.
-    const steps = Math.max(1, Math.ceil(dist));
-    const vnav = this.vnav!;
-    let lastIdx = -1;
-    for (let i = 0; i <= steps; i++) {
-      const t = i / steps;
-      const sx = unit.x + dx * t;
-      const sy = unit.y + dy * t;
-      const sz = unit.z + dz * t;
-      const cell = worldToVolumeCell(sx, sy, sz);
-      const idx = vnavIndex(cell.cx, cell.cy, cell.cz);
-      if (idx === lastIdx) continue;
-      lastIdx = idx;
-      if (getBit(vnav.bedrock, idx)) return false;
-    }
-    return true;
+    return pitch <= unit.maxPitchRad;
   }
 
   /**
@@ -1966,6 +2305,11 @@ export class Game {
         this.mode = 'play';
         this.ghost.hide();
       },
+      enterWaypointMode: (stance): void => {
+        this.pendingWaypointStance = stance;
+        this.mode = 'waypoint';
+        this.ghost.hide();
+      },
     };
   }
 
@@ -2034,9 +2378,12 @@ export class Game {
       const sub = this.actionsEl.querySelector('.actions-sub');
       if (sub) {
         const q = selBuilding.trainQueue;
-        sub.textContent = q.length > 0
-          ? `Building · queue: ${q.join(', ')}`
-          : 'Building';
+        const qStr = q.length > 0 ? ` · queue: ${q.join(', ')}` : '';
+        const wpStr = selBuilding.rallyPoint
+          ? ` · waypoint: ${selBuilding.rallyStance}`
+          : '';
+        const modeStr = this.mode === 'waypoint' ? ' · click map to set waypoint' : '';
+        sub.textContent = `Building${qStr}${wpStr}${modeStr}`;
       }
       this.actionsEl.style.display = 'block';
       return;
@@ -2065,13 +2412,19 @@ export class Game {
       const sub = this.actionsEl.querySelector('.actions-sub');
       if (sub) {
         const armed = selUnits.filter(u => u.weapon !== null);
-        if (armed.length === 0) {
-          sub.textContent = 'Unit';
-        } else {
+        const workers = selUnits.filter(u => u.kind === 'worker');
+        if (armed.length > 0) {
           const all = armed.every(u => u.stance === armed[0]!.stance);
           sub.textContent = all
             ? `Unit · stance: ${armed[0]!.stance}`
             : 'Unit · stance: mixed';
+        } else if (workers.length > 0) {
+          const allSameFocus = workers.every(u => u.workerFocus === workers[0]!.workerFocus);
+          sub.textContent = allSameFocus
+            ? `Unit · focus: ${workers[0]!.workerFocus}`
+            : 'Unit · focus: mixed';
+        } else {
+          sub.textContent = 'Unit';
         }
       }
       this.actionsEl.style.display = 'block';
@@ -2167,6 +2520,35 @@ export class Game {
       row.appendChild(c);
       this.tasksEl.appendChild(row);
     }
+  }
+
+  private renderPathInfo(): void {
+    if (!this.pathInfoEl) return;
+    const sel = this.units.units.find(u => u.selected);
+    if (!sel) { this.pathInfoEl.style.display = 'none'; return; }
+    const stats = this.lastPathStatsByUnit.get(sel.id);
+    if (!stats) { this.pathInfoEl.style.display = 'none'; return; }
+    const t = stats.timings;
+    const ageS = Math.floor((Date.now() - stats.timestamp) / 1000);
+    const algo = t?.algorithm ?? '?';
+    const dur = t ? t.durationMs.toFixed(1) : '?';
+    let key = `${sel.id}|${algo}|${dur}|${stats.expanded}|${stats.waypointCount}|${stats.reached}|${ageS}`;
+    if (t?.hpaDijkstraMs !== undefined) key += `|${t.hpaDijkstraMs.toFixed(1)}`;
+    if (key === (this.pathInfoEl.dataset.key ?? '')) return;
+    this.pathInfoEl.dataset.key = key;
+
+    let html = `<b>PATH</b> ${algo} | ${dur}ms | ${stats.expanded} cells | ${stats.waypointCount} wp | ${stats.reached ? 'reached' : 'partial'}`;
+    html += `<br>(${stats.start.cx},${stats.start.cy},${stats.start.cz})&rarr;(${stats.goal.cx},${stats.goal.cy},${stats.goal.cz})`;
+    if (t?.hpaDijkstraMs !== undefined) {
+      html += `<br>dijkstra ${t.hpaDijkstraMs.toFixed(1)}ms &middot; abstract ${(t.hpaAbstractMs ?? 0).toFixed(1)}ms &middot; refine ${(t.hpaRefineMs ?? 0).toFixed(1)}ms (${t.hpaSegments ?? '?'} seg)`;
+    }
+    if (this.pendingPathRequests.has(sel.id)) {
+      html += `<br><span style="color:#4488ff">&#9679; routing&hellip;</span>`;
+    } else {
+      html += `<br><span style="color:#888">${ageS}s ago</span>`;
+    }
+    this.pathInfoEl.innerHTML = html;
+    this.pathInfoEl.style.display = 'block';
   }
 
   /**
@@ -2351,20 +2733,27 @@ export class Game {
         u.autoEngageCooldown = 0.25;
         continue;
       }
-      // Trajectory blocked — walk closer.
+      // Trajectory blocked — reposition to a clear firing spot.
       u.autoEngageCooldown = 0.6;
       if (u.path.length > 0) continue;
       const stopRange = w.rangeMeters * AUTO_ENGAGE_STOP_FRACTION;
-      const dxBack = u.x - tx;
-      const dzBack = u.z - tz;
-      const distBack = Math.hypot(dxBack, dzBack);
-      let goalX = tx;
-      let goalZ = tz;
-      if (distBack > 1e-3 && distBack > stopRange) {
-        goalX = tx + (dxBack / distBack) * stopRange;
-        goalZ = tz + (dzBack / distBack) * stopRange;
+      const dxToTarget = tx - u.x;
+      const dzToTarget = tz - u.z;
+      const distToTarget = Math.hypot(dxToTarget, dzToTarget);
+      let goalX: number, goalZ: number;
+      if (distToTarget > stopRange) {
+        // Beyond firing range — advance toward the target, stopping at stopRange.
+        const scale = (distToTarget - stopRange) / distToTarget;
+        goalX = u.x + dxToTarget * scale;
+        goalZ = u.z + dzToTarget * scale;
+      } else {
+        // Already within firing range but blocked (e.g. around a corner) —
+        // route straight to the target so the path system navigates around
+        // the obstruction rather than retreating away from the enemy.
+        goalX = tx;
+        goalZ = tz;
       }
-      void this.routePath(u, goalX, ty, goalZ);
+      void this.routePath(u, goalX, u.y, goalZ);
     }
   }
 
@@ -2422,6 +2811,7 @@ export class Game {
     const w = window.innerWidth, h = window.innerHeight;
     this.renderer.resize(w, h);
     this.camera.resize(w, h);
+    this.pendingPathPreview.setResolution(w, h);
   };
 }
 
@@ -2454,6 +2844,15 @@ const TERRAIN_DAMAGE_GLOBAL_SCALE = 0.2;
  * weapon.
  */
 const NAV_REFRESH_HALF_EXTENT_METERS = 4.0;
+/**
+ * Two pending nav-rebuild boxes are merged into one only when they are within
+ * this many metres of each other (XZ plane).  Larger values coalesce more
+ * boxes (fewer `executeNavRebuildAround` calls) but risk producing a giant
+ * merged AABB when workers mine at widely separated ore clusters.  16 m is
+ * large enough to group adjacent workers at the same cluster but small enough
+ * to keep distant clusters' rebuilds independent.
+ */
+const NAV_MERGE_PAD = 16;
 
 /**
  * When an aggressive-stance unit decides to walk closer to its target (because

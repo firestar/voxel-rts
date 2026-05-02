@@ -13,8 +13,9 @@
  *   - cellAt(wx, wy, wz)                  — meters → cell.
  *   - nearestPassable(profile, target)    — search outward from a goal until passable.
  */
-import { VOXEL_SIZE, AIR } from '../voxel/types';
+import { VOXEL_SIZE, AIR, WORLD_X, WORLD_Y, WORLD_Z } from '../voxel/types';
 import { worldIndex, VoxelWorld } from '../voxel/VoxelWorld';
+import { M_METAL } from '../voxel/Materials';
 import { M_WOOD, M_LEAF } from '../voxel/Materials';
 import {
   GRID_X, GRID_Y, GRID_Z, NAV_CELL_VOXELS, NAV_CELL_METERS,
@@ -277,6 +278,59 @@ export class Pathfinder {
       if (isPassable(grid, cx, cy, cz)) return { cx, cy, cz };
     }
     return null;
+  }
+
+  /**
+   * Synchronous fallback used by PathWorkerClient when no worker thread is
+   * available. Scans the raw voxel buffer for the nearest metal-ore voxel
+   * within `radiusM` metres that has at least one air-adjacent face.
+   */
+  scanNearestMetal(
+    wx: number, wy: number, wz: number,
+    radiusM = 60,
+  ): { vx: number; vy: number; vz: number } | null {
+    if (!this.voxels) return null;
+    const voxels = this.voxels;
+    const radiusVoxels = Math.ceil(radiusM / VOXEL_SIZE);
+    const cx = Math.floor(wx / VOXEL_SIZE);
+    const cy = Math.floor(wy / VOXEL_SIZE);
+    const cz = Math.floor(wz / VOXEL_SIZE);
+    const x0 = Math.max(0, cx - radiusVoxels);
+    const y0 = Math.max(0, cy - radiusVoxels);
+    const z0 = Math.max(0, cz - radiusVoxels);
+    const x1 = Math.min(WORLD_X - 1, cx + radiusVoxels);
+    const y1 = Math.min(WORLD_Y - 1, cy + radiusVoxels);
+    const z1 = Math.min(WORLD_Z - 1, cz + radiusVoxels);
+    const r2vox = radiusVoxels * radiusVoxels;
+    const STRIDE = 2;
+    let best: { vx: number; vy: number; vz: number } | null = null;
+    let bestD2 = Infinity;
+    for (let y = y0; y <= y1; y += STRIDE) {
+      const dyV = y - cy;
+      for (let z = z0; z <= z1; z += STRIDE) {
+        const dzV = z - cz;
+        for (let x = x0; x <= x1; x += STRIDE) {
+          const dxV = x - cx;
+          const d2 = dxV * dxV + dyV * dyV + dzV * dzV;
+          if (d2 >= bestD2 || d2 > r2vox) continue;
+          if (voxels[worldIndex(x, y, z)] !== M_METAL) continue;
+          if (!this.isVoxelExposed(voxels, x, y, z)) continue;
+          bestD2 = d2;
+          best = { vx: x, vy: y, vz: z };
+        }
+      }
+    }
+    return best;
+  }
+
+  private isVoxelExposed(voxels: Uint8Array, vx: number, vy: number, vz: number): boolean {
+    if (vx > 0           && voxels[worldIndex(vx - 1, vy, vz)] === AIR) return true;
+    if (vx < WORLD_X - 1 && voxels[worldIndex(vx + 1, vy, vz)] === AIR) return true;
+    if (vy > 0           && voxels[worldIndex(vx, vy - 1, vz)] === AIR) return true;
+    if (vy < WORLD_Y - 1 && voxels[worldIndex(vx, vy + 1, vz)] === AIR) return true;
+    if (vz > 0           && voxels[worldIndex(vx, vy, vz - 1)] === AIR) return true;
+    if (vz < WORLD_Z - 1 && voxels[worldIndex(vx, vy, vz + 1)] === AIR) return true;
+    return false;
   }
 
   cellAt(wx: number, wy: number, wz: number): PathNode {

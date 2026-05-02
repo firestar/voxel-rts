@@ -7,16 +7,21 @@
  *
  * Message protocol — see `PathWorkerClient` for the typed wrappers.
  *
- *   init             → wire up shared buffers + register every unit profile.
- *   findPath         → run A* / Theta* against the shared grids.
- *   applyDamage      → rebuild volume + per-kind unit cells inside an AABB.
- *   rebuildAll       → full rebuild from the live voxel buffer.
+ *   init                  → wire up shared buffers + register every unit profile.
+ *   findPath              → run A* / Theta* against the shared grids.
+ *   applyDamage           → rebuild volume + per-kind unit cells inside an AABB.
+ *   rebuildAll            → full rebuild from the live voxel buffer.
+ *   scanNearestMetal      → scan for the nearest air-exposed metal voxel near
+ *                           the given world position (may return null).
  *
  * Ordering: postMessage delivers in FIFO order, and the worker processes
  * messages serially, so an `applyDamage` posted before a `findPath` is
  * guaranteed to have completed before the search runs.
  */
 import { GRID_X, GRID_Y, GRID_Z, NAV_CELL_METERS, cellCenter, worldToCell } from '../path/Nav';
+import { WORLD_X, WORLD_Y, WORLD_Z, AIR, VOXEL_SIZE } from '../voxel/types';
+import { worldIndex } from '../voxel/VoxelWorld';
+import { M_METAL } from '../voxel/Materials';
 import {
   VolumeGrid, buildVolumeGrid, rebuildCell,
 } from '../path/VolumeGrid';
@@ -57,7 +62,16 @@ interface RebuildAllMsg {
   reqId: number;
 }
 
-type InMsg = InitMsg | FindPathMsg | ApplyDamageMsg | RebuildAllMsg;
+interface ScanNearestMetalMsg {
+  type: 'scanNearestMetal';
+  reqId: number;
+  /** World-meters position of the requesting worker unit. */
+  wx: number; wy: number; wz: number;
+  /** Search radius in world meters. */
+  radiusM: number;
+}
+
+type InMsg = InitMsg | FindPathMsg | ApplyDamageMsg | RebuildAllMsg | ScanNearestMetalMsg;
 
 let voxels: Uint8Array | null = null;
 let volume: VolumeGrid | null = null;
@@ -84,6 +98,9 @@ self.onmessage = (ev: MessageEvent<InMsg>): void => {
       return;
     case 'rebuildAll':
       handleRebuildAll(msg);
+      return;
+    case 'scanNearestMetal':
+      handleScanNearestMetal(msg);
       return;
   }
 };
@@ -115,6 +132,7 @@ function handleFindPath(msg: FindPathMsg): void {
     waypoints,
     reached: res.reached,
     expanded: res.expanded,
+    timings: res.timings,
   });
 }
 
@@ -152,6 +170,62 @@ function handleRebuildAll(msg: RebuildAllMsg): void {
   buildVolumeGrid(voxels, volume);
   for (const grid of grids.values()) buildUnitGrid(volume, grid);
   (self as unknown as Worker).postMessage({ type: 'rebuildAll', reqId: msg.reqId });
+}
+
+/**
+ * Scan the voxel buffer for the nearest metal-ore voxel within `radiusM`
+ * metres of `(wx, wy, wz)` that has at least one air-adjacent face (i.e. is
+ * "exposed" to some open void the worker can dig toward).  Runs entirely on
+ * the path-worker thread so it cannot stall the main thread's render loop.
+ */
+function handleScanNearestMetal(msg: ScanNearestMetalMsg): void {
+  if (!voxels) {
+    (self as unknown as Worker).postMessage({ type: 'scanNearestMetal', reqId: msg.reqId, hit: null });
+    return;
+  }
+  const radiusVoxels = Math.ceil(msg.radiusM / VOXEL_SIZE);
+  const cx = Math.floor(msg.wx / VOXEL_SIZE);
+  const cy = Math.floor(msg.wy / VOXEL_SIZE);
+  const cz = Math.floor(msg.wz / VOXEL_SIZE);
+  const x0 = Math.max(0, cx - radiusVoxels);
+  const y0 = Math.max(0, cy - radiusVoxels);
+  const z0 = Math.max(0, cz - radiusVoxels);
+  const x1 = Math.min(WORLD_X - 1, cx + radiusVoxels);
+  const y1 = Math.min(WORLD_Y - 1, cy + radiusVoxels);
+  const z1 = Math.min(WORLD_Z - 1, cz + radiusVoxels);
+  const r2vox = radiusVoxels * radiusVoxels;
+  const STRIDE = 2;
+  let best: { vx: number; vy: number; vz: number } | null = null;
+  let bestD2 = Infinity;
+  for (let y = y0; y <= y1; y += STRIDE) {
+    const dyV = y - cy;
+    for (let z = z0; z <= z1; z += STRIDE) {
+      const dzV = z - cz;
+      for (let x = x0; x <= x1; x += STRIDE) {
+        const dxV = x - cx;
+        const d2 = dxV * dxV + dyV * dyV + dzV * dzV;
+        if (d2 >= bestD2 || d2 > r2vox) continue;
+        if (voxels[worldIndex(x, y, z)] !== M_METAL) continue;
+        if (!isVoxelExposed(voxels, x, y, z)) continue;
+        bestD2 = d2;
+        best = { vx: x, vy: y, vz: z };
+      }
+    }
+  }
+  (self as unknown as Worker).postMessage({
+    type: 'scanNearestMetal', reqId: msg.reqId, hit: best,
+  });
+}
+
+/** True when at least one of the 6 face-neighbours of (vx, vy, vz) is air. */
+function isVoxelExposed(voxels: Uint8Array, vx: number, vy: number, vz: number): boolean {
+  if (vx > 0           && voxels[worldIndex(vx - 1, vy, vz)] === AIR) return true;
+  if (vx < WORLD_X - 1 && voxels[worldIndex(vx + 1, vy, vz)] === AIR) return true;
+  if (vy > 0           && voxels[worldIndex(vx, vy - 1, vz)] === AIR) return true;
+  if (vy < WORLD_Y - 1 && voxels[worldIndex(vx, vy + 1, vz)] === AIR) return true;
+  if (vz > 0           && voxels[worldIndex(vx, vy, vz - 1)] === AIR) return true;
+  if (vz < WORLD_Z - 1 && voxels[worldIndex(vx, vy, vz + 1)] === AIR) return true;
+  return false;
 }
 
 // Silence "unused" — exported names aren't part of the worker protocol but

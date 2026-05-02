@@ -88,11 +88,11 @@ describe('unit-vs-unit surface collision', () => {
     expect(Math.hypot(parked.x - startedAt.x, parked.z - startedAt.z)).toBeGreaterThan(0.8);
   });
 
-  it('falls back to the give-up timer when the parked unit has nowhere to step aside', () => {
+  it('keeps retrying when the parked unit has nowhere to step aside', () => {
     // Walls fill nav cells flanking the parked soldier on +Z and -Z so the
-    // sidestep nudge has no valid foothold; with the mover approaching along
-    // +X, both perpendicular candidates land on stone. The existing give-up
-    // timer must then drop the mover's path so it stops grinding.
+    // sidestep nudge has no valid foothold. With the mover approaching along
+    // +X, both perpendicular candidates land on stone. The mover must keep
+    // its path (continuous reroute) and must not teleport through the parked unit.
     const world = buildGrassPlane();
     const v = world.buffers.voxels;
     for (const cellDz of [-1, 1]) {
@@ -122,12 +122,13 @@ describe('unit-vs-unit surface collision', () => {
     um.setPath(mover, [{ x: parked.x, y: parked.y, z: parked.z }]);
 
     const dt = 1 / 60;
-    let dropped = false;
-    for (let i = 0; i < 1200; i++) {
+    // Run well past the old give-up window (240 frames). The mover must keep
+    // its path and not clip through the parked unit.
+    for (let i = 0; i < 600; i++) {
       um.tick(dt, nav, vnav, world.buffers.voxels, () => {});
-      if (mover.path.length === 0) { dropped = true; break; }
     }
-    expect(dropped).toBe(true);
+    // Mover still has a path — continuously rerouting, not abandoned.
+    expect(mover.path.length).toBeGreaterThan(0);
     // Parked soldier had no walkable sidestep — must still be where it started.
     expect(parked.x).toBeCloseTo((60 * 8 + 4) * VOXEL_SIZE, 5);
     expect(parked.z).toBeCloseTo((60 * 8 + 4) * VOXEL_SIZE, 5);

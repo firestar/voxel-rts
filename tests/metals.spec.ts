@@ -6,8 +6,8 @@ import { M_GRASS, M_DIRT, M_STONE, M_METAL, M_BEDROCK } from '../src/voxel/Mater
 
 /**
  * Build a layered world: bedrock floor + thick stone column + dirt cap +
- * grass surface. placeMetals should only convert stone/dirt voxels and leave
- * grass/bedrock untouched.
+ * grass surface. placeMetals stamps surface piles (AIR voxels above the
+ * surface become metal); it never modifies grass, bedrock, stone, or dirt.
  */
 function buildLayeredWorld(): VoxelWorld {
   const world = VoxelWorld.create(false);
@@ -41,7 +41,7 @@ describe('placeMetals', () => {
     expect(countMetal(world.buffers.voxels)).toBe(stats.voxels);
   });
 
-  it('only replaces stone and dirt — never grass or bedrock', () => {
+  it('only fills air — never overwrites grass or bedrock', () => {
     const world = buildLayeredWorld();
     placeMetals(world.buffers.voxels, 7777);
     const v = world.buffers.voxels;
@@ -56,16 +56,14 @@ describe('placeMetals', () => {
     }
   });
 
-  it('produces large patches — at least one cluster has many voxels', () => {
+  it('produces multiple patches with a reasonable total voxel count', () => {
     const world = buildLayeredWorld();
     const stats = placeMetals(world.buffers.voxels, 12345);
-    // Each patch is an ellipsoid of radius 4..11 xz × 3..6 y. The smallest is
-    // ~4/3 π × 4×4×3 ≈ 200 voxels, the largest several thousand. Total over
-    // many patches should land well above 200 even after stone-only filter.
+    // Surface piles: rxz 3..6, ry 2..3 → half-ellipsoid of ~30–120 voxels each
+    // before jitter. Total across many candidates should exceed 200 easily.
     expect(stats.voxels).toBeGreaterThan(200);
     if (stats.patches > 0) {
-      // Average patch size sanity bound.
-      expect(stats.voxels / stats.patches).toBeGreaterThan(20);
+      expect(stats.voxels / stats.patches).toBeGreaterThan(10);
     }
   });
 

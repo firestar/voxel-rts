@@ -1,7 +1,7 @@
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_METERS } from '../path/SurfaceNav';
 import { VOXEL_SIZE, WORLD_X, WORLD_Y, WORLD_Z, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
-import { digSpeedMultiplier, groundSpeedMultiplier, M_WOOD, M_LEAF } from '../voxel/Materials';
+import { digSpeedMultiplier, groundSpeedMultiplier, M_WOOD, M_LEAF, M_GRASS } from '../voxel/Materials';
 import {
   worldToVolumeCell, getBit, vnavIndex, VolumeNavBuffers,
 } from '../path/VolumeNav';
@@ -13,11 +13,18 @@ import {
 import { WeaponKind, WEAPONS, defaultWeaponFor } from './Weapons';
 import { ProjectileKind } from './Projectiles';
 
-export type UnitKind = 'soldier' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'rocket_truck';
+export type UnitKind = 'soldier' | 'sniper' | 'gunner' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'rocket_truck';
+
+/**
+ * Which resource type a worker should prioritise when idle. 'auto' = current
+ * default (ore > wood > buried ore scan). Other values restrict the worker to
+ * a single resource category so the player can field dedicated roles.
+ */
+export type WorkerFocus = 'auto' | 'mine' | 'chop' | 'farm';
 
 /** Every unit kind in spawn-order. Useful for iterating over the catalog. */
 export const UNIT_KINDS: UnitKind[] = [
-  'soldier', 'tank', 'tunneler', 'worm', 'worker', 'dozer', 'rocket_truck',
+  'soldier', 'sniper', 'gunner', 'tank', 'tunneler', 'worm', 'worker', 'dozer', 'rocket_truck',
 ];
 
 /**
@@ -158,6 +165,52 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         // outranges them every time.
         launcherMaxStrength: 80,
       };
+    case 'sniper':
+      // Light infantry — no armour plate, slower than a rifleman due to the
+      // heavier rifle and spotting kit, but the high launcherMaxStrength lets
+      // the sniper weapon fire at full catalogue velocity. Low HP rewards
+      // careful positioning; the player must protect them from contact.
+      return {
+        footprintRadius: 1, widthMeters: 0.75,
+        maxStepVoxels: 6, slopePenalty: 0.18,
+        bodyHalfCells: 0, bodyRoughnessVoxels: 999,
+        turnRateRadPerSec: 5.0,                  // slower to turn while aiming
+        maxPitchRad: Math.PI / 2,
+        heightVoxels: 14,
+        canDig: false, requiresGround: true,
+        speed: 3.8, speedDigging: 0,
+        hp: 55,                                  // fragile — no armour
+        massKg: 85,
+        terminalFallSpeed: 28,
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
+        launcherMaxStrength: 130,                // high — sniper bullet travels at full speed
+      };
+    case 'gunner':
+      // Heavy infantry carrying a belt-fed machine gun. Slower than a rifle
+      // soldier due to the weapon weight, but significantly more durable and
+      // pours out far more rounds per second. Strong against infantry swarms;
+      // weaker against armoured vehicles that can take the hits.
+      return {
+        footprintRadius: 1, widthMeters: 0.80,
+        maxStepVoxels: 6, slopePenalty: 0.22,
+        bodyHalfCells: 0, bodyRoughnessVoxels: 999,
+        turnRateRadPerSec: 4.5,                  // heavier weapon slows pivoting
+        maxPitchRad: Math.PI / 2,
+        heightVoxels: 14,
+        canDig: false, requiresGround: true,
+        speed: 3.0, speedDigging: 0,
+        hp: 130,                                 // armoured vest + more mass
+        massKg: 110,
+        terminalFallSpeed: 30,
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
+        launcherMaxStrength: 100,
+      };
     case 'tank':
       // Tanks are restricted to small hills only — anything past a gentle grade
       // forces a detour around it.
@@ -175,7 +228,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         heightVoxels: 18,                        // ~2.25 m turret + antenna clearance
         canDig: false, requiresGround: true,
         speed: 3.5, speedDigging: 0,
-        hp: 220,
+        hp: 600,
         massKg: 50_000,                          // ~50 t — main battle tank
         terminalFallSpeed: 45,                   // heavier shell, drags less per kg
         cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
@@ -400,18 +453,47 @@ export interface Unit {
    * worker drops the task and releases any TaskBoard claim.
    */
   taskStallTimer: number;
+  /** Seconds the unit has had an active path but made no measurable forward progress.
+   *  When it crosses STUCK_TELEPORT_SECS the unit is nudged to a random clear nearby cell. */
+  stuckTimer: number;
+  /** Remaining cooldown before the next expensive voxel scan (findNearestExposed).
+   *  Counts down only while the worker is idle; reset to SCAN_COOLDOWN_SECS after each scan. */
+  workerScanCooldown: number;
+  /** Remaining cooldown before the worker can post another routeWorker request.
+   *  Prevents flooding the pathWorker queue with 60 identical requests per second
+   *  while waiting for an async path to arrive. */
+  workerRouteCooldown: number;
   /**
    * Cached previous progress signal — `path.length`, `carrying.wood`,
-   * `carrying.metals` packed into a single key. Used by stall detection to
-   * tell when something tangible advanced.
+   * `carrying.metals`, and `miningTicks` packed into a single key. Used by
+   * stall detection to tell when something tangible advanced.
    */
   taskProgressKey: number;
+  /**
+   * Incremented each frame a worker successfully deals damage to a metal
+   * cluster. Included in the stall-detection key so the worker doesn't time
+   * out between swing intervals.
+   */
+  miningTicks: number;
+  /** Accumulated dt toward the next mine-swing against a cluster voxel. */
+  mineSwingTimer: number;
+  /** ID of the MetalCluster this worker has claimed a slot on, or -1 if none. */
+  claimedClusterId: number;
+  /** Index into cluster.workerSlots, or -1 when no slot is held. */
+  claimedSlotIndex: number;
   /**
    * TaskBoard order id this worker has claimed, or 0 when none. Cleared on
    * task completion, on stall, and when the worker dies — `releaseDead`
    * sweeps both the unit list and the board through this id.
    */
   claimedOrderId: number;
+  /**
+   * Resource focus for this worker. Restricts which task types
+   * `assignNextHarvestTask` will auto-pick. 'auto' = default priority order
+   * (ore > wood > buried ore scan). Non-workers carry 'auto' but it has no
+   * effect on them since they never enter the harvester state machine.
+   */
+  workerFocus: WorkerFocus;
   /**
    * Trailing body segments for chain-bodied diggers (worm). Empty for everyone else.
    * Element 0 is the segment closest to the head; each subsequent segment trails
@@ -578,7 +660,14 @@ export interface LevelRequest {
   targetVoxY: number;
 }
 
-export type WorldEditRequest = CarveRequest | LevelRequest;
+/** Single-voxel grass-to-dirt trample emitted by surface units as they walk. */
+export interface TrampleRequest {
+  kind: 'trample';
+  vx: number; vy: number; vz: number;
+  unitKind: UnitKind;
+}
+
+export type WorldEditRequest = CarveRequest | LevelRequest | TrampleRequest;
 
 
 export class UnitManager {
@@ -653,7 +742,15 @@ export class UnitManager {
       carrying: { wood: 0, metals: 0 },
       taskStallTimer: 0,
       taskProgressKey: 0,
+      miningTicks: 0,
+      stuckTimer: 0,
+      workerScanCooldown: Math.random() * 0.5,
+      workerRouteCooldown: 0,
+      mineSwingTimer: 0,
+      claimedClusterId: -1,
+      claimedSlotIndex: -1,
       claimedOrderId: 0,
+      workerFocus: 'auto',
       segments,
       pathHistory,
       spoilLoad: 0,
@@ -728,6 +825,7 @@ export class UnitManager {
     for (const u of this.units) {
       const underground = isUnderground(u, nav);
       if (u.path.length === 0) {
+        u.stuckTimer = 0;
         // Idle: surface-follow only when actually on the surface; underground tunnelers
         // (and any unit caught in a cave) just relax pitch/roll instead of snapping Y up.
         if (!underground) {
@@ -751,10 +849,28 @@ export class UnitManager {
       // path cleared after 6 frames. The result was paths planned correctly but
       // canceled mid-stride on any climb.
       const tgtSurfaceY = surfaceWorldY(nav, tgt.x, tgt.z);
-      const tgtUnderground = tgt.y < tgtSurfaceY - 0.5;
+      const tgtTolerance = u.canDig ? 0.0 : 0.5;
+      const tgtUnderground = tgt.y < tgtSurfaceY - tgtTolerance;
       const using3D = u.canDig || underground || tgtUnderground;
+      const prevDist = u.distanceWalked;
       if (using3D) this.tickVolume(u, dt, nav, vnav, worldEdit);
       else this.tickSurface(u, dt, nav, worldEdit);
+
+      if (u.distanceWalked - prevDist < 0.001) {
+        u.stuckTimer += dt;
+        if (u.stuckTimer >= STUCK_TELEPORT_SECS) {
+          if (u.kind === 'worker') {
+            this.tryUnstuck(u, nav);
+          } else {
+            // Non-worker units don't teleport — just request a reroute so the
+            // harness can find a path around whatever is blocking them.
+            u.needsRepath = true;
+          }
+          u.stuckTimer = 0;
+        }
+      } else {
+        u.stuckTimer = 0;
+      }
     }
     // Body-segment chain: runs after every unit has had its head step this frame, so
     // segments always trail the post-tick head position. Only worms (segmentCount > 0)
@@ -765,6 +881,8 @@ export class UnitManager {
       recordPathBreadcrumb(u);
       tickWormChain(u);
     }
+
+    this.separateOverlappingUnits(nav);
   }
 
   /**
@@ -827,10 +945,9 @@ export class UnitManager {
       // a fresh route is in hand.
       if (u.blockedFrames === BLOCKED_REPATH_FRAMES) u.needsRepath = true;
       if (u.blockedFrames > BLOCKED_GIVE_UP_FRAMES) {
-        u.path = [];
+        // Retry: reset the counter and request a fresh route rather than giving up.
         u.blockedFrames = 0;
-        u.needsRepath = false;
-        if (u.kind === 'dozer') u.levelTargetY = null;
+        u.needsRepath = true;
       }
     } else {
       u.x = nx; u.z = nz;
@@ -840,6 +957,15 @@ export class UnitManager {
     }
     sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
     u.distanceWalked += moved;
+    // Trample grass to dirt under the unit's feet as it walks.
+    if (moved > 1e-4) {
+      const tvx = Math.floor(u.x / VOXEL_SIZE);
+      const tvy = Math.floor(u.y / VOXEL_SIZE) - 1;
+      const tvz = Math.floor(u.z / VOXEL_SIZE);
+      if (tvy >= 0 && this.lastVoxels[worldIndex(tvx, tvy, tvz)] === M_GRASS) {
+        worldEdit({ kind: 'trample', vx: tvx, vy: tvy, vz: tvz, unitKind: u.kind });
+      }
+    }
     // Dozer: each frame the unit is moving, emit a level request covering the
     // strip ahead of the blade. The handler iterates voxel columns inside the
     // oriented rectangle and edits each to the unit's target Y. Levelling only
@@ -941,9 +1067,8 @@ export class UnitManager {
       // for a fresh route, and the resulting setPath() resets blockedFrames.
       if (u.blockedFrames === BLOCKED_REPATH_FRAMES) u.needsRepath = true;
       if (u.blockedFrames > BLOCKED_GIVE_UP_FRAMES) {
-        u.path = [];
         u.blockedFrames = 0;
-        u.needsRepath = false;
+        u.needsRepath = true;
       }
     } else {
       u.x = nextX; u.y = nextY; u.z = nextZ;
@@ -956,12 +1081,17 @@ export class UnitManager {
     }
     applyPathOrientation(u, dx, dy, dz, dt);
     // Vertical positioning. Three regimes:
-    //   1. Above the local surface — surface nav drives the snap (handles hills).
+    //   1. Above the local surface heading to a surface target — surface nav drives the
+    //      snap (handles hills). We skip this when the destination is underground so a
+    //      tunneler drilling downward isn't yanked back to the surface mid-dig.
     //   2. Underground in air with solid below (a tunnel floor) — snap to that floor so
     //      the tunneler walks the floor instead of floating at cell center.
     //   3. Underground in air with no solid within reach — leave the path Y alone (the
     //      unit is genuinely in the middle of an open volume, e.g. mid-jump into a cave).
-    if (!isUnderground(u, nav)) {
+    const tgtSurfaceY = surfaceWorldY(nav, tgt.x, tgt.z);
+    const tgtTolerance = u.canDig ? 0.0 : 0.5;
+    const tgtIsUnderground = tgt.y < tgtSurfaceY - tgtTolerance;
+    if (!isUnderground(u, nav) && !tgtIsUnderground) {
       sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
     } else {
       // Probe deep enough that a fast-falling unit (tunneler at terminal velocity)
@@ -1132,6 +1262,106 @@ export class UnitManager {
     }
     return false;
   }
+  /**
+   * Teleport a stuck unit to a random unblocked cell within ~2 body-radii. Tries
+   * eight evenly-spaced angles starting from a random offset and picks the first
+   * unoccupied, nav-passable position. Does nothing for diggers (they carve their
+   * own way out). After the teleport the unit requests a fresh route from the new
+   * position.
+   */
+  private tryUnstuck(u: Unit, nav: SurfaceNavBuffers): void {
+    if (u.canDig) return;
+    const r = Math.max(unitCollisionRadius(u) * 2.5, 1.2);
+    const startAngle = Math.random() * Math.PI * 2;
+    for (let i = 0; i < 8; i++) {
+      const angle = startAngle + i * (Math.PI * 2 / 8);
+      const cx = u.x + Math.cos(angle) * r;
+      const cz = u.z + Math.sin(angle) * r;
+      if (!separatePosOk(nav, cx, cz)) continue;
+      let blocked = false;
+      for (const other of this.units) {
+        if (other === u || other.hp <= 0) continue;
+        if (Math.hypot(other.x - cx, other.z - cz) < unitCollisionRadius(u) + unitCollisionRadius(other)) {
+          blocked = true;
+          break;
+        }
+      }
+      if (blocked) continue;
+      u.x = cx;
+      u.z = cz;
+      u.y = surfaceWorldY(nav, cx, cz);
+      u.blockedFrames = 0;
+      u.needsRepath = true;
+      return;
+    }
+  }
+
+  /**
+   * Post-move separation pass. Any two units whose body cylinders overlap after
+   * the tick are pushed apart along the horizontal separation vector. Each unit
+   * moves half the penetration depth unless its side of the push lands in a
+   * nav-blocked cell or outside world bounds — in that case the other unit
+   * absorbs the full push. Surface units are kept above the terrain after the
+   * move. Underground diggers skip the surface clamp (their Y is managed by the
+   * volume tick).
+   */
+  private separateOverlappingUnits(nav: SurfaceNavBuffers): void {
+    const units = this.units;
+    for (let i = 0; i < units.length; i++) {
+      const a = units[i]!;
+      if (a.hp <= 0) continue;
+      for (let j = i + 1; j < units.length; j++) {
+        const b = units[j]!;
+        if (b.hp <= 0) continue;
+        if (Math.abs(a.y - b.y) > 2.0) continue;
+        const ra = unitCollisionRadius(a);
+        const rb = unitCollisionRadius(b);
+        const minDist = ra + rb;
+        const dx = b.x - a.x;
+        const dz = b.z - a.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 >= minDist * minDist) continue;
+
+        const d = Math.sqrt(d2);
+        const overlap = minDist - d;
+        // Normalised separation vector from a toward b.
+        let nx: number, nz: number;
+        if (d < 1e-4) {
+          // Coincident units: use a stable fallback direction derived from IDs.
+          const angle = ((a.id * 2654435761) >>> 0) * (2 * Math.PI / 0x100000000);
+          nx = Math.cos(angle); nz = Math.sin(angle);
+        } else {
+          nx = dx / d; nz = dz / d;
+        }
+
+        // Try to push each unit half the overlap; fall back to full push on the
+        // other unit when a half-step lands in terrain.
+        const half = overlap * 0.5;
+        const aOk = separatePosOk(nav, a.x - nx * half, a.z - nz * half);
+        const bOk = separatePosOk(nav, b.x + nx * half, b.z + nz * half);
+
+        if (aOk && bOk) {
+          a.x -= nx * half; a.z -= nz * half;
+          b.x += nx * half; b.z += nz * half;
+        } else if (aOk) {
+          a.x -= nx * overlap; a.z -= nz * overlap;
+        } else if (bOk) {
+          b.x += nx * overlap; b.z += nz * overlap;
+        }
+        // Snap surface units to terrain so a push toward a rise doesn't bury
+        // their feet. Diggers handle their own vertical positioning in tickVolume.
+        if (aOk && !a.canDig) {
+          const sy = surfaceWorldY(nav, a.x, a.z);
+          if (a.y < sy) { a.y = sy; a.vy = 0; }
+        }
+        if (bOk && !b.canDig) {
+          const sy = surfaceWorldY(nav, b.x, b.z);
+          if (b.y < sy) { b.y = sy; b.vy = 0; }
+        }
+      }
+    }
+  }
+
   private lastSurfaceNav!: SurfaceNavBuffers;
   private lastVoxels!: Uint8Array;
 }
@@ -1147,6 +1377,8 @@ export function unitCollisionRadius(u: Unit): number {
 
 /** Frames a unit can be blocked by a peer before its path is dropped. */
 const BLOCKED_GIVE_UP_FRAMES = 240;
+/** Seconds with an active path but zero measurable movement before the unit is teleported to a clear nearby cell. */
+const STUCK_TELEPORT_SECS = 2.0;
 /**
  * Frames a unit must stay collision-blocked before it asks the harness to
  * recompute its route around the offending peer. Smaller than the give-up
@@ -1156,11 +1388,15 @@ const BLOCKED_GIVE_UP_FRAMES = 240;
 export const BLOCKED_REPATH_FRAMES = 30;
 
 /**
- * True when the unit is meaningfully below the local surface — used to suppress the
- * surface-follow Y snap (which otherwise yanks underground units up to the ceiling).
+ * True when the unit is below the terrain surface.
+ * Surface units get 0.5 m of tolerance so brief ledge-crossing doesn't trigger the
+ * underground branch. Diggers (tunneler/worm) use a strict threshold of 0 — any
+ * depth below the terrain counts as underground, preventing surface-follow from
+ * yanking a freshly-submerged digger back up when it's only 1-3 voxels deep.
  */
 function isUnderground(u: Unit, nav: SurfaceNavBuffers): boolean {
-  return u.y < surfaceWorldY(nav, u.x, u.z) - 0.5;
+  const tolerance = u.canDig ? 0.0 : 0.5;
+  return u.y < surfaceWorldY(nav, u.x, u.z) - tolerance;
 }
 
 function applyPathOrientation(u: Unit, dx: number, dy: number, dz: number, dt: number): void {
@@ -1319,6 +1555,19 @@ function relaxOrientation(u: Unit, dt: number): void {
  *  - Climb between the blocker's current cell and the candidate cell stays
  *    within its maxStepVoxels so a tank doesn't sidestep off a ledge.
  */
+/**
+ * Quick nav check for the separation pass: the candidate position must be in
+ * bounds and not in a hard-blocked nav cell (wall, tree, etc.). We don't gate
+ * on headroom or climb-step here — the separation push is small and the full
+ * terrain snap runs immediately after.
+ */
+function separatePosOk(nav: SurfaceNavBuffers, wx: number, wz: number): boolean {
+  const cx = Math.floor(wx / NAV_CELL_METERS);
+  const cz = Math.floor(wz / NAV_CELL_METERS);
+  if (cx < 0 || cz < 0 || cx >= NAV_W || cz >= NAV_H) return false;
+  return nav.blocked[navIndex(cx, cz)] === 0;
+}
+
 function sidestepCellOk(nav: SurfaceNavBuffers, u: Unit, wx: number, wz: number): boolean {
   const cx = Math.floor(wx / NAV_CELL_METERS);
   const cz = Math.floor(wz / NAV_CELL_METERS);

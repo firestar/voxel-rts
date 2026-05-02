@@ -2,18 +2,24 @@ import * as THREE from 'three';
 import { Unit, UnitManager } from '../sim/Units';
 import {
   buildSoldierBodyGeometry, buildSoldierLegGeometry, SOLDIER_HIP_Y, SOLDIER_LEG_X,
+  buildSniperBodyGeometry, buildSniperLegGeometry,
+  buildGunnerBodyGeometry, buildGunnerLegGeometry,
   buildTankHullGeometry, buildTankTurretGeometry, TANK_TURRET_PIVOT_Y, TANK_TURRET_PIVOT_Z,
   buildTunnelerHullGeometry, buildTunnelerDrillGeometry,
   TUNNELER_DRILL_PIVOT_Y, TUNNELER_DRILL_PIVOT_Z,
   buildWormHeadGeometry, buildWormSegmentGeometry, buildWormDrillGeometry,
   WORM_DRILL_PIVOT_Y, WORM_DRILL_PIVOT_Z, WORM_SEGMENT_COUNT,
-  buildWorkerBodyGeometry, buildWorkerLegGeometry, buildWorkerCrateGeometry,
-  WORKER_HIP_Y, WORKER_LEG_X,
+  buildWorkerBodyGeometry, buildWorkerLegGeometry, buildWorkerArmGeometry,
+  buildWorkerCrateGeometry, WorkerVariant,
+  WORKER_HIP_Y, WORKER_LEG_X, WORKER_SHOULDER_X, WORKER_SHOULDER_Y,
   buildDozerHullGeometry, buildDozerBladeGeometry,
   DOZER_BLADE_PIVOT_Y, DOZER_BLADE_PIVOT_Z,
   buildRocketTruckHullGeometry, buildRocketTruckPodGeometry,
   ROCKET_TRUCK_POD_PIVOT_Y, ROCKET_TRUCK_POD_PIVOT_Z,
 } from './UnitModels';
+
+const WORKER_VARIANTS: WorkerVariant[] = ['auto', 'mine', 'chop', 'farm'];
+const WORKER_VARIANT_IDX: Record<string, number> = { auto: 0, mine: 1, chop: 2, farm: 3 };
 
 /**
  * Per-kind, per-part InstancedMesh renderer.
@@ -28,6 +34,12 @@ export class UnitRenderer {
   private soldierBody: THREE.InstancedMesh;
   private soldierLegL: THREE.InstancedMesh;
   private soldierLegR: THREE.InstancedMesh;
+  private sniperBody: THREE.InstancedMesh;
+  private sniperLegL: THREE.InstancedMesh;
+  private sniperLegR: THREE.InstancedMesh;
+  private gunnerBody: THREE.InstancedMesh;
+  private gunnerLegL: THREE.InstancedMesh;
+  private gunnerLegR: THREE.InstancedMesh;
   private tankHull: THREE.InstancedMesh;
   private tankTurret: THREE.InstancedMesh;
   private tunnelerHull: THREE.InstancedMesh;
@@ -35,9 +47,10 @@ export class UnitRenderer {
   private wormHead: THREE.InstancedMesh;
   private wormDrill: THREE.InstancedMesh;
   private wormSegment: THREE.InstancedMesh;
-  private workerBody: THREE.InstancedMesh;
-  private workerLegL: THREE.InstancedMesh;
-  private workerLegR: THREE.InstancedMesh;
+  private workerBody: THREE.InstancedMesh[] = [];
+  private workerLegL: THREE.InstancedMesh[] = [];
+  private workerLegR: THREE.InstancedMesh[] = [];
+  private workerArm: THREE.InstancedMesh[] = [];
   private workerCrateWood: THREE.InstancedMesh;
   private workerCrateMetal: THREE.InstancedMesh;
   private dozerHull: THREE.InstancedMesh;
@@ -81,6 +94,12 @@ export class UnitRenderer {
     this.soldierBody = makeIM(buildSoldierBodyGeometry(), mat, capacity);
     this.soldierLegL = makeIM(buildSoldierLegGeometry(), mat, capacity);
     this.soldierLegR = makeIM(buildSoldierLegGeometry(), mat, capacity);
+    this.sniperBody = makeIM(buildSniperBodyGeometry(), mat, capacity);
+    this.sniperLegL = makeIM(buildSniperLegGeometry(), mat, capacity);
+    this.sniperLegR = makeIM(buildSniperLegGeometry(), mat, capacity);
+    this.gunnerBody = makeIM(buildGunnerBodyGeometry(), mat, capacity);
+    this.gunnerLegL = makeIM(buildGunnerLegGeometry(), mat, capacity);
+    this.gunnerLegR = makeIM(buildGunnerLegGeometry(), mat, capacity);
     this.tankHull = makeIM(buildTankHullGeometry(), mat, capacity);
     this.tankTurret = makeIM(buildTankTurretGeometry(), mat, capacity);
     this.tunnelerHull = makeIM(buildTunnelerHullGeometry(), mat, capacity);
@@ -90,9 +109,12 @@ export class UnitRenderer {
     // The body-segment mesh holds capacity * SEGMENT_COUNT instances — one per
     // (worm, segment) pair — so a roomful of worms doesn't run out of slots.
     this.wormSegment = makeIM(buildWormSegmentGeometry(), mat, capacity * WORM_SEGMENT_COUNT);
-    this.workerBody = makeIM(buildWorkerBodyGeometry(), mat, capacity);
-    this.workerLegL = makeIM(buildWorkerLegGeometry(), mat, capacity);
-    this.workerLegR = makeIM(buildWorkerLegGeometry(), mat, capacity);
+    for (const v of WORKER_VARIANTS) {
+      this.workerBody.push(makeIM(buildWorkerBodyGeometry(v), mat, capacity));
+      this.workerLegL.push(makeIM(buildWorkerLegGeometry(),   mat, capacity));
+      this.workerLegR.push(makeIM(buildWorkerLegGeometry(),   mat, capacity));
+      this.workerArm.push( makeIM(buildWorkerArmGeometry(v),  mat, capacity));
+    }
     this.workerCrateWood  = makeIM(buildWorkerCrateGeometry(false), mat, capacity);
     this.workerCrateMetal = makeIM(buildWorkerCrateGeometry(true),  mat, capacity);
     this.dozerHull = makeIM(buildDozerHullGeometry(), mat, capacity);
@@ -102,16 +124,20 @@ export class UnitRenderer {
 
     this.group.add(
       this.soldierBody, this.soldierLegL, this.soldierLegR,
+      this.sniperBody, this.sniperLegL, this.sniperLegR,
+      this.gunnerBody, this.gunnerLegL, this.gunnerLegR,
       this.tankHull, this.tankTurret,
       this.tunnelerHull, this.tunnelerDrill,
       this.wormHead, this.wormDrill, this.wormSegment,
-      this.workerBody, this.workerLegL, this.workerLegR,
+      ...this.workerBody, ...this.workerLegL, ...this.workerLegR, ...this.workerArm,
       this.workerCrateWood, this.workerCrateMetal,
       this.dozerHull, this.dozerBlade,
       this.rocketTruckHull, this.rocketTruckPod,
     );
 
     this.ringTemplates.set('soldier',      { radius: 0.6,  color: 0x00ff88 });
+    this.ringTemplates.set('sniper',       { radius: 0.6,  color: 0x88cc44 });
+    this.ringTemplates.set('gunner',       { radius: 0.65, color: 0x44ddaa });
     this.ringTemplates.set('tank',         { radius: 1.6,  color: 0xffaa33 });
     this.ringTemplates.set('tunneler',     { radius: 0.7,  color: 0xffe066 });
     this.ringTemplates.set('worm',         { radius: 0.9,  color: 0xc266ff });
@@ -134,8 +160,10 @@ export class UnitRenderer {
   }
 
   update(units: UnitManager): void {
-    let nSold = 0, nTank = 0, nTun = 0, nWorm = 0, nWormSeg = 0;
-    let nWork = 0, nCrateW = 0, nCrateM = 0;
+    let nSold = 0, nSnip = 0, nGun = 0;
+    let nTank = 0, nTun = 0, nWorm = 0, nWormSeg = 0;
+    const nWorkV = [0, 0, 0, 0];
+    let nCrateW = 0, nCrateM = 0;
     let nDoz = 0, nRkt = 0;
     const ringCounts = new Map<string, number>();
     const now = performance.now() / 1000;
@@ -162,6 +190,8 @@ export class UnitRenderer {
       // the static feet position; the renderer must never draw the model lower
       // than that. Amplitude doubled to keep the same visual lift.
       const bobFreq = u.kind === 'soldier' ? 6.0
+        : u.kind === 'sniper' ? 5.0           // deliberate pace
+        : u.kind === 'gunner' ? 4.5           // heavy, plodding gait
         : u.kind === 'tank' ? 3.0
         : u.kind === 'tunneler' ? 4.0
         : u.kind === 'worm' ? 5.0
@@ -169,6 +199,8 @@ export class UnitRenderer {
         : u.kind === 'dozer' ? 3.5
         : 3.5; // rocket_truck
       const bobAmp  = u.kind === 'soldier' ? 0.08
+        : u.kind === 'sniper' ? 0.06
+        : u.kind === 'gunner' ? 0.06
         : u.kind === 'tank' ? 0.04
         : u.kind === 'tunneler' ? 0.05
         : u.kind === 'worm' ? 0.03
@@ -186,6 +218,8 @@ export class UnitRenderer {
       //            to u.y (was 5 cm of ground clearance which read as floating).
       //   Tunneler: tread bottom at body-local y = 0.0 already → no offset.
       const feetOffset = u.kind === 'soldier' ? 0.05
+        : u.kind === 'sniper' ? 0.05
+        : u.kind === 'gunner' ? 0.05
         : u.kind === 'tank' ? -0.05
         : u.kind === 'worker' ? 0.05
         : 0.0;
@@ -203,20 +237,54 @@ export class UnitRenderer {
         this.applyLegMatrix(nSold, this.soldierLegL, swing,  +SOLDIER_LEG_X);
         this.applyLegMatrix(nSold, this.soldierLegR, -swing, -SOLDIER_LEG_X);
         nSold++;
+      } else if (u.kind === 'sniper') {
+        if (nSnip >= this.capacity) continue;
+        this.sniperBody.setMatrixAt(nSnip, this.bodyM);
+        this.sniperBody.setColorAt(nSnip, tint);
+        this.sniperLegL.setColorAt(nSnip, tint);
+        this.sniperLegR.setColorAt(nSnip, tint);
+        const swing = isMoving ? Math.sin(u.distanceWalked * 4.0 + u.id) * 0.55 : 0;
+        this.applyLegMatrix(nSnip, this.sniperLegL, swing,  +SOLDIER_LEG_X);
+        this.applyLegMatrix(nSnip, this.sniperLegR, -swing, -SOLDIER_LEG_X);
+        nSnip++;
+      } else if (u.kind === 'gunner') {
+        if (nGun >= this.capacity) continue;
+        this.gunnerBody.setMatrixAt(nGun, this.bodyM);
+        this.gunnerBody.setColorAt(nGun, tint);
+        this.gunnerLegL.setColorAt(nGun, tint);
+        this.gunnerLegR.setColorAt(nGun, tint);
+        const swing = isMoving ? Math.sin(u.distanceWalked * 3.5 + u.id) * 0.50 : 0;
+        this.applyLegMatrix(nGun, this.gunnerLegL, swing,  +SOLDIER_LEG_X);
+        this.applyLegMatrix(nGun, this.gunnerLegR, -swing, -SOLDIER_LEG_X);
+        nGun++;
       } else if (u.kind === 'worker') {
-        if (nWork >= this.capacity) continue;
-        this.workerBody.setMatrixAt(nWork, this.bodyM);
-        this.workerBody.setColorAt(nWork, tint);
-        this.workerLegL.setColorAt(nWork, tint);
-        this.workerLegR.setColorAt(nWork, tint);
-        // Same gait as soldier — counter-swinging legs around the same hip
-        // pivot. Workers reuse the soldier hip constants since the geometry
-        // is identical except for colour and the toolbelt.
+        const vi = WORKER_VARIANT_IDX[u.workerFocus] ?? 0;
+        const nW = nWorkV[vi]!;
+        if (nW >= this.capacity) continue;
+        const wBody = this.workerBody[vi]!;
+        const wArm  = this.workerArm[vi]!;
+        const wLegL = this.workerLegL[vi]!;
+        const wLegR = this.workerLegR[vi]!;
+        wBody.setMatrixAt(nW, this.bodyM);
+        wBody.setColorAt(nW, tint);
+        wLegL.setColorAt(nW, tint);
+        wLegR.setColorAt(nW, tint);
+        wArm.setColorAt(nW, tint);
         const swing = isMoving ? Math.sin(u.distanceWalked * 4.5 + u.id) * 0.55 : 0;
-        this.applyWorkerLegMatrix(nWork, this.workerLegL, swing,  +WORKER_LEG_X);
-        this.applyWorkerLegMatrix(nWork, this.workerLegR, -swing, -WORKER_LEG_X);
-        // Carry crate — appears on the back when the worker is hauling. We
-        // pick the variant by which payload is heavier; ties go to wood.
+        this.applyWorkerLegMatrix(nW, wLegL, swing,  +WORKER_LEG_X);
+        this.applyWorkerLegMatrix(nW, wLegR, -swing, -WORKER_LEG_X);
+        const isDigging = !isMoving && (
+          u.task.kind === 'chop' || u.task.kind === 'mine'
+        );
+        const armAngle = isDigging
+          ? Math.sin(now * 6.0 + u.id * 0.37) * 0.75 - 0.25
+          : 0;
+        const armRotM = new THREE.Matrix4().makeRotationX(armAngle);
+        const armLocal = new THREE.Matrix4()
+          .makeTranslation(WORKER_SHOULDER_X, WORKER_SHOULDER_Y, 0)
+          .multiply(armRotM);
+        this.partM.multiplyMatrices(this.bodyM, armLocal);
+        wArm.setMatrixAt(nW, this.partM);
         const carryW = u.carrying.wood;
         const carryM = u.carrying.metals;
         if (carryW + carryM > 0) {
@@ -232,7 +300,7 @@ export class UnitRenderer {
             nCrateW++;
           }
         }
-        nWork++;
+        nWorkV[vi]++;
       } else if (u.kind === 'tank') {
         if (nTank >= this.capacity) continue;
         this.tankHull.setMatrixAt(nTank, this.bodyM);
@@ -354,6 +422,12 @@ export class UnitRenderer {
     this.soldierBody.count = nSold;
     this.soldierLegL.count = nSold;
     this.soldierLegR.count = nSold;
+    this.sniperBody.count = nSnip;
+    this.sniperLegL.count = nSnip;
+    this.sniperLegR.count = nSnip;
+    this.gunnerBody.count = nGun;
+    this.gunnerLegL.count = nGun;
+    this.gunnerLegR.count = nGun;
     this.tankHull.count = nTank;
     this.tankTurret.count = nTank;
     this.tunnelerHull.count = nTun;
@@ -361,9 +435,12 @@ export class UnitRenderer {
     this.wormHead.count = nWorm;
     this.wormDrill.count = nWorm;
     this.wormSegment.count = nWormSeg;
-    this.workerBody.count = nWork;
-    this.workerLegL.count = nWork;
-    this.workerLegR.count = nWork;
+    for (let i = 0; i < 4; i++) {
+      this.workerBody[i]!.count = nWorkV[i]!;
+      this.workerLegL[i]!.count = nWorkV[i]!;
+      this.workerLegR[i]!.count = nWorkV[i]!;
+      this.workerArm[i]!.count  = nWorkV[i]!;
+    }
     this.workerCrateWood.count = nCrateW;
     this.workerCrateMetal.count = nCrateM;
     this.dozerHull.count = nDoz;
@@ -372,10 +449,12 @@ export class UnitRenderer {
     this.rocketTruckPod.count = nRkt;
     for (const m of [
       this.soldierBody, this.soldierLegL, this.soldierLegR,
+      this.sniperBody, this.sniperLegL, this.sniperLegR,
+      this.gunnerBody, this.gunnerLegL, this.gunnerLegR,
       this.tankHull, this.tankTurret,
       this.tunnelerHull, this.tunnelerDrill,
       this.wormHead, this.wormDrill, this.wormSegment,
-      this.workerBody, this.workerLegL, this.workerLegR,
+      ...this.workerBody, ...this.workerLegL, ...this.workerLegR, ...this.workerArm,
       this.workerCrateWood, this.workerCrateMetal,
       this.dozerHull, this.dozerBlade,
       this.rocketTruckHull, this.rocketTruckPod,

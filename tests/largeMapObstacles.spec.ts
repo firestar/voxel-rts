@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { Pathfinder, profileFromUnit } from '../src/path/Pathfinder';
+import { Pathfinder, profileFromUnit, GRID_X } from '../src/path/Pathfinder';
 import { VoxelWorld, worldIndex } from '../src/voxel/VoxelWorld';
 import { WORLD_X, WORLD_Z } from '../src/voxel/types';
 import { M_GRASS, M_DIRT, M_STONE, M_BEDROCK } from '../src/voxel/Materials';
@@ -188,7 +188,5 @@ describe('largeMapObstacles', () => {
   });
 });
 
-// Wall covering the full grid width (less the very edges so there's still
-// border padding for footprints). Hardcoded here to avoid extra imports — the
-// grid is 128 cells wide.
-const GRID_X_END = 127;
+// Wall covering the full grid width, less the very edges so footprint padding works.
+const GRID_X_END = GRID_X - 1;

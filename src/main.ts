@@ -12,6 +12,8 @@ async function boot(): Promise<void> {
   const progressEl = document.getElementById('progress')!;
 
   const game = new Game(canvas, statsEl);
+  // Expose for browser automation / perftest (harmless in prod — just a ref).
+  (window as unknown as Record<string, unknown>).__game = game;
 
   if (!(globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated) {
     progressEl.textContent = 'Note: not cross-origin-isolated (SharedArrayBuffer disabled). Falling back to ArrayBuffer.';

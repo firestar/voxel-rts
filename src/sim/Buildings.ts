@@ -51,6 +51,13 @@ export interface BuildingSpec {
   /** Voxel stamper for this building. Returns the wall-voxel count for liveness math. */
   stamp: (world: VoxelWorld, ox: number, oz: number, floorY: number) => number;
   /**
+   * Extra nav-cell columns reserved in the +X direction for the spawn pad.
+   * These cells are validated by `checkFootprint` (same floor height, not
+   * blocked, adequate headroom) so a building can never be placed where its
+   * pad would be obstructed. 0 for non-producer buildings.
+   */
+  spawnPadCells: number;
+  /**
    * Optional weapon mounted on this building. Buildings with a weapon
    * auto-target the nearest enemy unit within the weapon's `rangeMeters` and
    * fire on its cooldown. Aim mount is always treated as 'turret' regardless
@@ -96,8 +103,9 @@ export const BARRACKS: BuildingSpec = {
   productionInterval: 6.0,
   // Infantry only — vehicles come out of the dedicated VEHICLE_DEPOT now so a
   // barracks reads as the personnel facility (soldier + worker bunks).
-  produces: ['soldier', 'worker'],
+  produces: ['soldier', 'sniper', 'gunner', 'worker'],
   stamp: stampBarracks,
+  spawnPadCells: 2,
 };
 
 /**
@@ -117,6 +125,7 @@ export const VEHICLE_DEPOT: BuildingSpec = {
   productionInterval: 9.0,
   produces: ['tank', 'dozer', 'tunneler', 'worm', 'rocket_truck'],
   stamp: stampVehicleDepot,
+  spawnPadCells: 3,
 };
 
 /**
@@ -136,6 +145,7 @@ export const FARM: BuildingSpec = {
   productionInterval: 5.0,      // food tick interval (seconds)
   produces: [],
   stamp: stampFarm,
+  spawnPadCells: 0,
 };
 
 /**
@@ -155,6 +165,7 @@ export const STORAGE: BuildingSpec = {
   productionInterval: 0,        // no timer-driven behaviour
   produces: [],
   stamp: stampStorage,
+  spawnPadCells: 0,
 };
 
 export const POWER_PLANT: BuildingSpec = {
@@ -170,6 +181,7 @@ export const POWER_PLANT: BuildingSpec = {
   productionInterval: Infinity,
   produces: [],
   stamp: stampPowerPlant,
+  spawnPadCells: 0,
 };
 
 export const REFINERY: BuildingSpec = {
@@ -183,6 +195,7 @@ export const REFINERY: BuildingSpec = {
   productionInterval: Infinity,
   produces: [],
   stamp: stampRefinery,
+  spawnPadCells: 0,
 };
 
 export const TECH_LAB: BuildingSpec = {
@@ -196,6 +209,7 @@ export const TECH_LAB: BuildingSpec = {
   productionInterval: Infinity,
   produces: [],
   stamp: stampTechLab,
+  spawnPadCells: 0,
 };
 
 /**
@@ -222,20 +236,21 @@ export const TURRET: BuildingSpec = {
   // sits on. Matches the visual mount point so projectiles come out the
   // barrel, not the floor.
   weaponMuzzleHeight: (12 + 4) * VOXEL_SIZE,
+  spawnPadCells: 0,
 };
 
 /**
- * Anti-air flak turret. Same chassis as the regular turret but its weapon
- * targets airborne projectiles instead of ground units. The firing pipeline
- * leads the target so the flak shell detonates just below the projectile on
- * its way through — `tickAntiAir` in BuildingManager owns that logic.
+ * Anti-air missile launcher. Same chassis as the regular turret but its
+ * weapon targets airborne projectiles instead of ground units. Fires a single
+ * large slow interceptor missile (aa_missile) every 10 s — one shot per
+ * engagement, no magazine cycle.
  *
  * Reuses `stampTurret` for the visible model (small stone emplacement). The
  * AA-specific behaviour is keyed off the spec's `weapon === 'aa_turret'`.
  */
 export const AA_TURRET: BuildingSpec = {
   kind: 'turret',
-  label: 'Anti-air Turret',
+  label: 'Anti-air Missile Launcher',
   cellsW: 2,
   cellsD: 2,
   headroomVoxels: 12,
@@ -247,11 +262,7 @@ export const AA_TURRET: BuildingSpec = {
   weapon: 'aa_turret',
   launcherMaxStrength: 130,
   weaponMuzzleHeight: (12 + 4) * VOXEL_SIZE,
-  // 12-round magazine, 30 s reload. While reloading the turret tilts its
-  // barrel down (see BuildingRenderer) and refuses to engage — a saturation
-  // attack can punch a hole in the AA umbrella by emptying the magazine.
-  weaponMagazineSize: 12,
-  weaponReloadSeconds: 30,
+  spawnPadCells: 0,
 };
 
 /**
@@ -278,6 +289,7 @@ export const SILO: BuildingSpec = {
   launcherMaxStrength: 220,
   // Top of the missile cluster sits ~6 voxels above the parapet.
   weaponMuzzleHeight: (32 + 6) * VOXEL_SIZE,
+  spawnPadCells: 0,
 };
 
 /** All building specs in the order they appear on the build-mode hotkeys (1..N). */
@@ -384,6 +396,24 @@ export interface Building {
    * magazine refills to `weaponMagazineSize` and the turret comes back online.
    */
   weaponReloadTimer: number;
+  /**
+   * World-space position units walk to after spawning from this building.
+   * Null means newly spawned units have no rally destination and just idle
+   * at the door. Only meaningful for producer buildings (barracks, depot).
+   */
+  rallyPoint: { x: number; y: number; z: number } | null;
+  /**
+   * Stance assigned to units that reach the rally point. 'aggressive' makes
+   * them auto-engage enemies in range; 'defensive' keeps them idle until
+   * ordered. Defaults to 'aggressive'.
+   */
+  rallyStance: 'aggressive' | 'defensive';
+  /**
+   * Rolling counter used to spread successive spawns across pad cells so
+   * units don't stack at the same world position. Incremented after each
+   * spawn; wraps via modulo against the pad area.
+   */
+  spawnSlot: number;
 }
 
 /**
@@ -400,30 +430,30 @@ export function checkFootprint(
   spec: BuildingSpec,
   ox: number, oz: number,
 ): FootprintHit {
-  if (ox < 0 || oz < 0 || ox + spec.cellsW > NAV_W || oz + spec.cellsD > NAV_H) {
+  const totalW = spec.cellsW + spec.spawnPadCells;
+  if (ox < 0 || oz < 0 || ox + totalW > NAV_W || oz + spec.cellsD > NAV_H) {
     return { ok: false, reason: 'out of bounds', floorY: -1, ox, oz };
   }
   const i0 = navIndex(ox, oz);
   if (nav.blocked[i0]) return { ok: false, reason: 'no surface', floorY: -1, ox, oz };
   const baseY = nav.topY[i0]!;
 
+  // Validate building footprint + pad cells together for floor evenness.
   for (let dz = 0; dz < spec.cellsD; dz++) {
-    for (let dx = 0; dx < spec.cellsW; dx++) {
+    for (let dx = 0; dx < totalW; dx++) {
       const i = navIndex(ox + dx, oz + dz);
       if (nav.blocked[i]) return { ok: false, reason: 'blocked cell', floorY: baseY, ox, oz };
       const y = nav.topY[i]!;
       if (Math.abs(y - baseY) > FLAT_TOLERANCE_VOXELS) {
         return { ok: false, reason: 'uneven floor', floorY: baseY, ox, oz };
       }
-      // Don't require flatnessRadius here — we directly check the rectangle.
     }
   }
 
-  // Headroom: scan voxels above each footprint column. Use 2 sample voxels per cell to be quick
-  // (cell center + opposite corner).
+  // Headroom: check above both building and pad cells (units need to walk out).
   const headroom = spec.headroomVoxels;
   for (let dz = 0; dz < spec.cellsD; dz++) {
-    for (let dx = 0; dx < spec.cellsW; dx++) {
+    for (let dx = 0; dx < totalW; dx++) {
       const i = navIndex(ox + dx, oz + dz);
       const y = nav.topY[i]!;
       const wxMid = (ox + dx) * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
@@ -503,74 +533,203 @@ export function stampBarracks(
   ox: number, oz: number,
   floorY: number,
 ): number {
-  let count = stampHollowBox(world, BARRACKS, ox, oz, floorY);
-  // Detail pass: window cuts on the side walls, a stone foundation strip at
-  // the base, and a stout flag pole over the door so the building reads as a
-  // garrison, not just a wood box.
+  // Garrison barracks: wood walls with a 4-voxel stone foundation, four corner
+  // battle towers rising above the parapet, arched slot windows, covered porch,
+  // and a flag pole over the rear corner.
+  const spec = BARRACKS;
   const wxStart = ox * NAV_CELL_VOXELS;
   const wzStart = oz * NAV_CELL_VOXELS;
-  const wxEnd = wxStart + BARRACKS.cellsW * NAV_CELL_VOXELS;
-  const wzEnd = wzStart + BARRACKS.cellsD * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS; // +32
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS; // +32
   const yFloor = floorY + 1;
-  const yRoof = floorY + BARRACKS.headroomVoxels;
-  // Stone foundation: re-stamp the bottom 2 voxels of every perimeter column
-  // as M_STONE for a darker base — purely cosmetic, doesn't change wallCount
-  // (those voxels were wood already, we're replacing them).
-  const baseH = 2;
-  for (let y = yFloor + 1; y <= yFloor + baseH && y <= yRoof - 1; y++) {
+  const yRoof  = floorY + spec.headroomVoxels;
+
+  // Wide door on +X face (4 voxels wide, 10 tall).
+  const doorWz0 = ((wzStart + wzEnd) >> 1) - 2;
+  const doorWz1 = doorWz0 + 3;
+  const doorYTop = yFloor + 10;
+
+  let count = 0;
+
+  // 1. Floor — packed earth path.
+  for (let z = wzStart; z < wzEnd; z++) {
     for (let x = wxStart; x < wxEnd; x++) {
-      const onZSide = true;
-      void onZSide;
-      // -Z face
-      world.set(x, y, wzStart, M_STONE);
-      // +Z face
-      world.set(x, y, wzEnd - 1, M_STONE);
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      world.set(x, yFloor, z, M_PATH);
+      count++;
     }
+  }
+
+  // 2. Perimeter walls (stone base 4 voxels, then wood).
+  for (let y = yFloor + 1; y <= yRoof; y++) {
+    if (y >= WORLD_Y) break;
     for (let z = wzStart; z < wzEnd; z++) {
-      // -X face
-      world.set(wxStart, y, z, M_STONE);
+      for (let x = wxStart; x < wxEnd; x++) {
+        if (x >= WORLD_X || z >= WORLD_Z) continue;
+        const onPerim = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+        if (!onPerim) continue;
+        const isDoor = x === wxEnd - 1 && z >= doorWz0 && z <= doorWz1 && y < doorYTop;
+        if (isDoor) { world.set(x, y, z, AIR); continue; }
+        const mat = (y - yFloor) <= 4 ? M_STONE : M_WOOD;
+        world.set(x, y, z, mat);
+        count++;
+      }
     }
   }
-  // Window cuts on the -Z and +Z faces — pairs of single-voxel air gaps at
-  // mid-height. The countLivingWalls liveness check tolerates them (it just
-  // counts perimeter voxels; we'll lose a handful but stay above the 25%
-  // threshold by a wide margin).
-  const winY = yFloor + 8;
-  if (winY < yRoof) {
-    const winXs = [wxStart + 6, wxStart + 14, wxStart + 22];
-    for (const wx of winXs) {
-      if (wx >= wxEnd - 1) continue;
-      world.set(wx, winY, wzStart, AIR);
-      world.set(wx + 1, winY, wzStart, AIR);
-      world.set(wx, winY, wzEnd - 1, AIR);
-      world.set(wx + 1, winY, wzEnd - 1, AIR);
-      count -= 4;
+
+  // 3. Roof — solid wood planking.
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      world.set(x, yRoof, z, M_WOOD);
+      count++;
     }
   }
-  // Flag pole at the front-right corner — stone column + metal flag.
-  const poleX = wxEnd - 2;
-  const poleZ = wzEnd - 2;
-  for (let dy = 1; dy <= 8; dy++) {
+
+  // 4. Crenellated parapet: alternating merlons (2-high) and gaps around the
+  //    roof perimeter, inset 1 voxel so the merlons sit on the wall top.
+  for (let dy = 1; dy <= 3; dy++) {
+    const py = yRoof + dy;
+    if (py >= WORLD_Y) break;
+    // -Z and +Z parapet strips.
+    for (let x = wxStart + 1; x < wxEnd - 1; x++) {
+      // Merlon every 4 voxels, gap in between.
+      const isMerlon = ((x - wxStart) % 4) < 2;
+      if (dy <= 2 || isMerlon) {
+        world.set(x, py, wzStart, M_STONE);      count++;
+        world.set(x, py, wzEnd - 1, M_STONE);   count++;
+      }
+    }
+    // -X and +X parapet strips.
+    for (let z = wzStart + 1; z < wzEnd - 1; z++) {
+      const isMerlon = ((z - wzStart) % 4) < 2;
+      if (dy <= 2 || isMerlon) {
+        world.set(wxStart, py, z, M_STONE);      count++;
+      }
+    }
+  }
+
+  // 5. Corner battle towers: 4×4 stone hollow columns rising 8 voxels above roof.
+  const towerCorners: [number, number][] = [
+    [wxStart - 2,    wzStart - 2],
+    [wxEnd  - 2,    wzStart - 2],
+    [wxStart - 2,    wzEnd  - 2],
+    [wxEnd  - 2,    wzEnd  - 2],
+  ];
+  for (const [tcx, tcz] of towerCorners) {
+    for (let y = yFloor + 1; y <= yRoof + 8; y++) {
+      if (y >= WORLD_Y) break;
+      for (let xo = 0; xo < 4; xo++) {
+        for (let zo = 0; zo < 4; zo++) {
+          const tx = tcx + xo, tz = tcz + zo;
+          if (tx < 0 || tx >= WORLD_X || tz < 0 || tz >= WORLD_Z) continue;
+          const onWall = xo === 0 || xo === 3 || zo === 0 || zo === 3;
+          if (!onWall) continue;
+          world.set(tx, y, tz, M_STONE);
+          count++;
+        }
+      }
+    }
+    // Tower roof cap + small merlon.
+    for (let xo = 0; xo < 4; xo++) {
+      for (let zo = 0; zo < 4; zo++) {
+        const tx = tcx + xo, tz = tcz + zo;
+        if (tx < 0 || tx >= WORLD_X || tz < 0 || tz >= WORLD_Z) continue;
+        const capY = yRoof + 9;
+        if (capY < WORLD_Y) { world.set(tx, capY, tz, M_STONE); count++; }
+      }
+    }
+  }
+
+  // 6. Slot windows on -Z, +Z and -X faces — 2-wide, 4-tall, at mid-height.
+  const winY0 = yFloor + 8;
+  const winH  = 4;
+  for (let wx = wxStart + 6; wx < wxEnd - 5; wx += 8) {
+    for (let dy = 0; dy < winH; dy++) {
+      const py = winY0 + dy;
+      if (py >= yRoof) break;
+      if (wx >= wxEnd - 1 || wx + 1 >= wxEnd - 1) continue;
+      // -Z face
+      world.set(wx, py, wzStart, AIR);      count--;
+      world.set(wx + 1, py, wzStart, AIR);  count--;
+      // +Z face
+      world.set(wx, py, wzEnd - 1, AIR);    count--;
+      world.set(wx + 1, py, wzEnd - 1, AIR); count--;
+    }
+  }
+  // -X face windows.
+  for (let wz = wzStart + 6; wz < wzEnd - 5; wz += 8) {
+    for (let dy = 0; dy < winH; dy++) {
+      const py = winY0 + dy;
+      if (py >= yRoof) break;
+      world.set(wxStart, py, wz, AIR);     count--;
+      world.set(wxStart, py, wz + 1, AIR); count--;
+    }
+  }
+
+  // 7. Entrance porch: 3-voxel-deep wood canopy above the door on +X face.
+  const porchZ0 = doorWz0 - 1, porchZ1 = doorWz1 + 1;
+  const porchTopY = yFloor + doorYTop + 1;
+  if (porchTopY < WORLD_Y) {
+    // Canopy slab.
+    for (let pz = porchZ0; pz <= porchZ1; pz++) {
+      if (pz < 0 || pz >= WORLD_Z) continue;
+      for (let dx = 0; dx < 4; dx++) {
+        const px = wxEnd + dx;
+        if (px >= WORLD_X) break;
+        world.set(px, porchTopY, pz, M_WOOD);
+        count++;
+      }
+    }
+    // Two support posts at the outer edge.
+    for (const pz of [porchZ0, porchZ1]) {
+      if (pz < 0 || pz >= WORLD_Z) continue;
+      const px = wxEnd + 3;
+      if (px >= WORLD_X) continue;
+      for (let y = yFloor + 1; y <= porchTopY; y++) {
+        if (y >= WORLD_Y) break;
+        world.set(px, y, pz, M_WOOD);
+        count++;
+      }
+    }
+  }
+
+  // 8. Flag pole — tall wood column at rear corner with a small metal banner.
+  const poleX = wxEnd - 3;
+  const poleZ = wzStart + 2;
+  for (let dy = 1; dy <= 12; dy++) {
     const py = yRoof + dy;
     if (py >= WORLD_Y) break;
     world.set(poleX, py, poleZ, M_WOOD);
     count++;
   }
-  // Flag triangle (3 voxels of metal pointing in +X).
-  const flagBaseY = yRoof + 6;
-  for (let i = 0; i < 3; i++) {
-    if (poleX + 1 + i >= WORLD_X) break;
-    if (flagBaseY + i >= WORLD_Y) break;
-    world.set(poleX + 1, flagBaseY + i, poleZ, M_METAL);
+  for (let i = 0; i < 4; i++) {
+    const py = yRoof + 8 + i;
+    if (py >= WORLD_Y) break;
+    const flagX = poleX + 1 + (3 - i > 0 ? 3 - i : 0);
+    if (flagX >= WORLD_X) break;
+    world.set(flagX, py, poleZ, M_METAL);
     count++;
   }
+
+  // 9. Spawn pad.
+  const padX0 = wxEnd;
+  const padX1 = padX0 + spec.spawnPadCells * NAV_CELL_VOXELS;
+  for (let px = padX0; px < padX1; px++) {
+    if (px >= WORLD_X) break;
+    for (let pz = wzStart; pz < wzEnd; pz++) {
+      if (pz < 0 || pz >= WORLD_Z) continue;
+      world.set(px, yFloor, pz, M_PATH);
+    }
+  }
+
   return count;
 }
 
 /**
- * Vehicle depot — wide hangar with a rolling-door cutout on the +X face,
- * angled metal roof trusses, and a maintenance crane spine running down the
- * inside. Larger than the barracks so a tank can drive out cleanly.
+ * Vehicle depot — wide industrial hangar with corrugated metal walls, a large
+ * arched gable over the rolling door, lateral buttress ribs, a ridge lantern,
+ * and a concrete apron in front.
  */
 export function stampVehicleDepot(
   world: VoxelWorld,
@@ -580,83 +739,139 @@ export function stampVehicleDepot(
   const spec = VEHICLE_DEPOT;
   const wxStart = ox * NAV_CELL_VOXELS;
   const wzStart = oz * NAV_CELL_VOXELS;
-  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
-  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS; // +40
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS; // +32
   const yFloor = floorY + 1;
-  const yRoof = floorY + spec.headroomVoxels;
-  // Wide hangar door — 6 voxels wide, 14 tall — centred on the +X face.
-  const doorWz0 = ((wzStart + wzEnd) >> 1) - 3;
-  const doorWz1 = doorWz0 + 5;
-  const doorYTop = yFloor + 14;
+  const yRoof  = floorY + spec.headroomVoxels;
 
-  let wallCount = 0;
+  // Wide hangar door — 8 voxels wide, 16 tall, centered on +X face.
+  const doorWz0 = ((wzStart + wzEnd) >> 1) - 4;
+  const doorWz1 = doorWz0 + 7;
+  const doorYTop = yFloor + 16;
+
+  let count = 0;
+
+  // 1. Concrete floor.
   for (let z = wzStart; z < wzEnd; z++) {
     for (let x = wxStart; x < wxEnd; x++) {
-      // Concrete-stone floor (vehicles roll on stone, not wood).
-      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
-        world.set(x, yFloor, z, M_STONE);
-        wallCount++;
-      }
-      for (let y = yFloor + 1; y <= yRoof; y++) {
-        if (y >= WORLD_Y) break;
-        const onPerimeter =
-          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
-        if (y === yRoof) {
-          // Corrugated metal roof.
-          world.set(x, y, z, M_METAL);
-          wallCount++;
-        } else if (onPerimeter) {
-          const isDoor = (x === wxEnd - 1 && z >= doorWz0 && z <= doorWz1 && y < doorYTop);
-          if (!isDoor) {
-            world.set(x, y, z, spec.wall);
-            wallCount++;
-          } else {
-            world.set(x, y, z, AIR);
-          }
-        } else {
-          world.set(x, y, z, AIR);
-        }
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      world.set(x, yFloor, z, M_STONE);
+      count++;
+    }
+  }
+
+  // 2. Perimeter walls — metal with stone corner anchor columns.
+  for (let y = yFloor + 1; y <= yRoof; y++) {
+    if (y >= WORLD_Y) break;
+    for (let z = wzStart; z < wzEnd; z++) {
+      for (let x = wxStart; x < wxEnd; x++) {
+        if (x >= WORLD_X || z >= WORLD_Z) continue;
+        const onPerim = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+        if (!onPerim) continue;
+        const isDoor = x === wxEnd - 1 && z >= doorWz0 && z <= doorWz1 && y < doorYTop;
+        if (isDoor) { world.set(x, y, z, AIR); continue; }
+        // Stone corner columns (2 voxels wide), metal everywhere else.
+        const isCorner = (x <= wxStart + 1 || x >= wxEnd - 2) && (z <= wzStart + 1 || z >= wzEnd - 2);
+        world.set(x, y, z, isCorner ? M_STONE : spec.wall);
+        count++;
       }
     }
   }
-  // Concrete pad strip just outside the door so the chassis rolls onto a
-  // levelled apron. Two voxels of M_PATH for visual continuity with roads.
-  for (let s = 0; s < 4; s++) {
-    const px = wxEnd + s;
-    if (px >= WORLD_X) break;
-    for (let z = doorWz0; z <= doorWz1; z++) {
-      if (z < 0 || z >= WORLD_Z) continue;
-      world.set(px, yFloor, z, M_PATH);
+
+  // 3. Corrugated metal roof.
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      world.set(x, yRoof, z, M_METAL);
+      count++;
     }
   }
-  // Roof trusses — 3 metal beams running across the hangar at the ridges.
-  const ridgeXs = [wxStart + 6, wxStart + 18, wxStart + 30];
-  for (const rx of ridgeXs) {
-    if (rx <= wxStart || rx >= wxEnd - 1) continue;
-    for (let z = wzStart + 1; z < wzEnd - 1; z++) {
-      const py = yRoof + 1;
-      if (py >= WORLD_Y) break;
-      world.set(rx, py, z, M_METAL);
-      wallCount++;
+
+  // 4. Lateral buttress ribs on -Z and +Z faces (every 8 voxels, 2-wide, full height).
+  for (let rx = wxStart + 8; rx < wxEnd - 1; rx += 8) {
+    for (let y = yFloor + 1; y <= yRoof; y++) {
+      if (y >= WORLD_Y) break;
+      // -Z face rib (protrudes 1 outward).
+      const rz0 = wzStart - 1;
+      if (rz0 >= 0) { world.set(rx, y, rz0, M_STONE); count++; }
+      world.set(rx, y, wzStart, M_STONE); count++;
+      // +Z face rib.
+      const rz1 = wzEnd;
+      if (rz1 < WORLD_Z) { world.set(rx, y, rz1, M_STONE); count++; }
+      world.set(rx, y, wzEnd - 1, M_STONE); count++;
     }
   }
-  // Vent stacks above the roof (two short metal columns) so the silhouette
-  // reads as industrial, not just a flat box.
-  const ventBases: [number, number][] = [
-    [wxStart + 8, wzStart + 6],
-    [wxStart + 24, wzStart + 18],
-  ];
-  for (const [vx, vz] of ventBases) {
-    if (vx <= wxStart || vx >= wxEnd - 1) continue;
-    if (vz <= wzStart || vz >= wzEnd - 1) continue;
+
+  // 5. Arched front gable over the door — stepped stone arch in the XZ plane
+  //    on the +X face, sitting above the doorYTop.
+  const archCz = (doorWz0 + doorWz1) >> 1;
+  const archHalfW = (doorWz1 - doorWz0) / 2 + 1;
+  for (let dy = 0; dy <= 6; dy++) {
+    const py = yFloor + doorYTop + dy;
+    if (py >= WORLD_Y) break;
+    // Fill solid across the gable width minus how much the arch has progressed.
+    const halfFilled = Math.max(0, archHalfW - dy);
+    for (let zo = -Math.ceil(archHalfW); zo <= Math.ceil(archHalfW); zo++) {
+      const pz = archCz + zo;
+      if (pz < wzStart || pz >= wzEnd) continue;
+      if (Math.abs(zo) <= halfFilled) {
+        world.set(wxEnd - 1, py, pz, M_STONE);
+        count++;
+      }
+    }
+  }
+
+  // 6. Ridge lantern — a narrow metal skylight tower along the roof centre.
+  const ridgeMidX = (wxStart + wxEnd) >> 1;
+  for (let x = ridgeMidX - 4; x <= ridgeMidX + 3; x++) {
+    if (x <= wxStart || x >= wxEnd - 1) continue;
     for (let dy = 1; dy <= 5; dy++) {
       const py = yRoof + dy;
       if (py >= WORLD_Y) break;
-      world.set(vx, py, vz, M_METAL);
-      wallCount++;
+      // Hollow lantern walls on Z sides.
+      world.set(x, py, wzStart + 4, M_METAL);  count++;
+      world.set(x, py, wzEnd  - 5, M_METAL);  count++;
+    }
+    // Cap.
+    const capY = yRoof + 6;
+    if (capY < WORLD_Y) { world.set(x, capY, wzStart + 4, M_METAL); count++; }
+  }
+  // Lantern Z columns.
+  for (let z = wzStart + 4; z <= wzEnd - 5; z++) {
+    for (let dy = 1; dy <= 5; dy++) {
+      const py = yRoof + dy;
+      if (py >= WORLD_Y) break;
+      world.set(ridgeMidX - 4, py, z, M_METAL); count++;
+      world.set(ridgeMidX + 3, py, z, M_METAL); count++;
     }
   }
-  return wallCount;
+
+  // 7. Exhaust vent stacks on the rear (-X) side.
+  const ventZs = [wzStart + 8, wzEnd - 10];
+  for (const vz of ventZs) {
+    for (let dy = 1; dy <= 8; dy++) {
+      const py = yRoof + dy;
+      if (py >= WORLD_Y) break;
+      for (let xo = 0; xo < 2; xo++) {
+        const px = wxStart + 1 + xo;
+        if (px >= WORLD_X) continue;
+        world.set(px, py, vz, M_METAL); count++;
+      }
+    }
+  }
+
+  // 8. Spawn pad.
+  const padX0 = wxEnd;
+  const padX1 = padX0 + spec.spawnPadCells * NAV_CELL_VOXELS;
+  for (let px = padX0; px < padX1; px++) {
+    if (px >= WORLD_X) break;
+    for (let pz = wzStart; pz < wzEnd; pz++) {
+      if (pz < 0 || pz >= WORLD_Z) continue;
+      world.set(px, yFloor, pz, M_PATH);
+    }
+  }
+
+  return count;
 }
 
 export function stampStorage(
@@ -664,32 +879,142 @@ export function stampStorage(
   ox: number, oz: number,
   floorY: number,
 ): number {
-  let count = stampHollowBox(world, STORAGE, ox, oz, floorY);
-  // Detail pass — storage gets stacked-crate accents on the roof and a sign
-  // strip above the door so it doesn't read as a plain box.
+  // Fortified storehouse: wood walls with stone corner towers, a flat roof
+  // with crenels, a covered loading platform, and visible crate stacks on
+  // the roof deck.
+  const spec = STORAGE;
   const wxStart = ox * NAV_CELL_VOXELS;
   const wzStart = oz * NAV_CELL_VOXELS;
-  const wxEnd = wxStart + STORAGE.cellsW * NAV_CELL_VOXELS;
-  const wzEnd = wzStart + STORAGE.cellsD * NAV_CELL_VOXELS;
-  const yRoof = floorY + STORAGE.headroomVoxels;
-  // Two crate stacks on the roof — tight 2x2 wood blocks at opposite corners.
-  const crateOffsets: [number, number][] = [
-    [wxStart + 3, wzStart + 3],
-    [wxEnd - 5, wzEnd - 5],
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS; // +24
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS; // +24
+  const yFloor = floorY + 1;
+  const yRoof  = floorY + spec.headroomVoxels;
+
+  // Entry door on +X face — 2 wide, 6 tall, centered.
+  const doorWz0 = ((wzStart + wzEnd) >> 1) - 1;
+  const doorWz1 = doorWz0 + 1;
+  const doorYTop = yFloor + 6;
+
+  let count = 0;
+
+  // 1. Wood floor.
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      world.set(x, yFloor, z, M_WOOD);
+      count++;
+    }
+  }
+
+  // 2. Perimeter walls (stone base 3 voxels, then wood).
+  for (let y = yFloor + 1; y <= yRoof; y++) {
+    if (y >= WORLD_Y) break;
+    for (let z = wzStart; z < wzEnd; z++) {
+      for (let x = wxStart; x < wxEnd; x++) {
+        if (x >= WORLD_X || z >= WORLD_Z) continue;
+        const onPerim = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+        if (!onPerim) continue;
+        const isDoor = x === wxEnd - 1 && (z === doorWz0 || z === doorWz1) && y < doorYTop;
+        if (isDoor) { world.set(x, y, z, AIR); continue; }
+        world.set(x, y, z, M_WOOD);
+        count++;
+      }
+    }
+  }
+
+  // 3. Roof.
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      world.set(x, yRoof, z, M_WOOD);
+      count++;
+    }
+  }
+
+  // 4. Corner towers — 3×3 stone hollow columns rising 5 voxels above roof.
+  const towerCorners: [number, number][] = [
+    [wxStart, wzStart], [wxEnd - 3, wzStart],
+    [wxStart, wzEnd - 3], [wxEnd - 3, wzEnd - 3],
   ];
-  for (const [bx, bz] of crateOffsets) {
+  for (const [tcx, tcz] of towerCorners) {
+    for (let y = yRoof; y <= yRoof + 5; y++) {
+      if (y >= WORLD_Y) break;
+      for (let xo = 0; xo < 3; xo++) {
+        for (let zo = 0; zo < 3; zo++) {
+          const tx = tcx + xo, tz = tcz + zo;
+          if (tx < 0 || tx >= WORLD_X || tz < 0 || tz >= WORLD_Z) continue;
+          const onWall = xo === 0 || xo === 2 || zo === 0 || zo === 2;
+          if (!onWall) continue;
+          world.set(tx, y, tz, M_STONE);
+          count++;
+        }
+      }
+    }
+    // Tower cap.
+    for (let xo = 0; xo < 3; xo++) {
+      for (let zo = 0; zo < 3; zo++) {
+        const tx = tcx + xo, tz = tcz + zo;
+        if (tx < 0 || tx >= WORLD_X || tz < 0 || tz >= WORLD_Z) continue;
+        const capY = yRoof + 6;
+        if (capY < WORLD_Y) { world.set(tx, capY, tz, M_STONE); count++; }
+      }
+    }
+  }
+
+  // 5. Covered loading platform in front of door.
+  const platY = yFloor;
+  for (let dx = 0; dx < 4; dx++) {
+    const px = wxEnd + dx;
+    if (px >= WORLD_X) break;
+    for (let pz = doorWz0 - 1; pz <= doorWz1 + 1; pz++) {
+      if (pz < 0 || pz >= WORLD_Z) continue;
+      world.set(px, platY, pz, M_PATH);
+    }
+  }
+  // Platform roof.
+  const platRoofY = yFloor + doorYTop;
+  if (platRoofY < WORLD_Y) {
+    for (let dx = 0; dx < 5; dx++) {
+      const px = wxEnd + dx;
+      if (px >= WORLD_X) break;
+      for (let pz = doorWz0 - 1; pz <= doorWz1 + 1; pz++) {
+        if (pz < 0 || pz >= WORLD_Z) continue;
+        world.set(px, platRoofY, pz, M_WOOD);
+        count++;
+      }
+    }
+    // Platform roof posts.
+    for (const pz of [doorWz0 - 1, doorWz1 + 1]) {
+      const px = wxEnd + 4;
+      if (px >= WORLD_X || pz < 0 || pz >= WORLD_Z) continue;
+      for (let y = yFloor + 1; y < platRoofY; y++) {
+        if (y >= WORLD_Y) break;
+        world.set(px, y, pz, M_WOOD);
+        count++;
+      }
+    }
+  }
+
+  // 6. Crate stacks on the roof — 2×2×3 wood piles at two diagonal positions.
+  const cratePositions: [number, number][] = [
+    [wxStart + 4, wzStart + 4],
+    [wxEnd  - 8, wzEnd  - 8],
+  ];
+  for (const [bx, bz] of cratePositions) {
     for (let dy = 1; dy <= 3; dy++) {
       const py = yRoof + dy;
       if (py >= WORLD_Y) break;
       for (let xo = 0; xo < 2; xo++) {
         for (let zo = 0; zo < 2; zo++) {
-          if (bx + xo >= WORLD_X || bz + zo >= WORLD_Z) continue;
-          world.set(bx + xo, py, bz + zo, M_WOOD);
+          const tx = bx + xo, tz = bz + zo;
+          if (tx >= WORLD_X || tz >= WORLD_Z) continue;
+          world.set(tx, py, tz, M_WOOD);
           count++;
         }
       }
     }
   }
+
   return count;
 }
 
@@ -743,9 +1068,8 @@ export function stampFarm(
 export const POWER_PLANT_MAST_VOXELS = 30;
 
 /**
- * Power plant: small substation hut with a tall windmill mast rising from the
- * centre. The mast is a 2x2 metal column that climbs much higher than the
- * hut itself; the renderer mounts the rotating turbine at the top.
+ * Power plant: stone substation with chamfered corner buttresses, transformer
+ * pods flanking the mast, and a tall lattice windmill mast in the centre.
  */
 export function stampPowerPlant(
   world: VoxelWorld,
@@ -759,82 +1083,121 @@ export function stampPowerPlant(
   const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
   const yFloor = floorY + 1;
   const yRoof = floorY + spec.headroomVoxels;
-  // Door on +X face.
   const doorWz0 = ((wzStart + wzEnd) >> 1) - 1;
   const doorWz1 = doorWz0 + 1;
   const doorYTop = yFloor + 6;
 
   let wallCount = 0;
+
+  // Floor: stone tiles.
   for (let z = wzStart; z < wzEnd; z++) {
     for (let x = wxStart; x < wxEnd; x++) {
-      // Floor: dirt-road tiles for visual contrast vs barracks wood floor.
-      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
-        world.set(x, yFloor, z, M_DIRT_ROAD);
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      world.set(x, yFloor, z, M_STONE);
+      wallCount++;
+    }
+  }
+
+  // Perimeter walls.
+  for (let y = yFloor + 1; y <= yRoof; y++) {
+    if (y >= WORLD_Y) break;
+    for (let z = wzStart; z < wzEnd; z++) {
+      for (let x = wxStart; x < wxEnd; x++) {
+        if (x >= WORLD_X || z >= WORLD_Z) continue;
+        const onPerim = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+        if (!onPerim) continue;
+        const isDoor = x === wxEnd - 1 && (z === doorWz0 || z === doorWz1) && y < doorYTop;
+        if (isDoor) { world.set(x, y, z, AIR); continue; }
+        world.set(x, y, z, spec.wall);
         wallCount++;
       }
-      for (let y = yFloor + 1; y <= yRoof; y++) {
-        if (y >= WORLD_Y) break;
-        const onPerimeter =
-          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
-        if (y === yRoof) {
-          world.set(x, y, z, spec.wall);
+    }
+  }
+
+  // Solid flat roof.
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      world.set(x, yRoof, z, spec.wall);
+      wallCount++;
+    }
+  }
+
+  // Corner buttress pilasters — 2×2 stone blocks at each corner climbing
+  // 4 voxels above the roof.
+  const corners: [number, number][] = [
+    [wxStart - 1, wzStart - 1], [wxEnd - 1, wzStart - 1],
+    [wxStart - 1, wzEnd - 1],   [wxEnd - 1, wzEnd - 1],
+  ];
+  for (const [bcx, bcz] of corners) {
+    for (let y = yFloor + 1; y <= yRoof + 4; y++) {
+      if (y >= WORLD_Y) break;
+      for (let xo = 0; xo < 2; xo++) {
+        for (let zo = 0; zo < 2; zo++) {
+          const tx = bcx + xo, tz = bcz + zo;
+          if (tx < 0 || tx >= WORLD_X || tz < 0 || tz >= WORLD_Z) continue;
+          world.set(tx, y, tz, M_STONE);
           wallCount++;
-        } else if (onPerimeter) {
-          const isDoor = (x === wxEnd - 1 && (z === doorWz0 || z === doorWz1) && y < doorYTop);
-          if (!isDoor) {
-            world.set(x, y, z, spec.wall);
-            wallCount++;
-          } else {
-            world.set(x, y, z, AIR);
-          }
-        } else {
-          world.set(x, y, z, AIR);
         }
       }
     }
   }
 
-  // Crown parapet: a 2-voxel-tall ring of M_STONE on top of the roof, inset 2
-  // voxels from each edge. Reads as a flat-roofed industrial building.
-  const parapetInset = 2;
-  const parapetH = 2;
-  for (let dy = 1; dy <= parapetH; dy++) {
-    const py = yRoof + dy;
-    if (py >= WORLD_Y) break;
-    for (let z = wzStart + parapetInset; z < wzEnd - parapetInset; z++) {
-      for (let x = wxStart + parapetInset; x < wxEnd - parapetInset; x++) {
-        const onParapet =
-          x === wxStart + parapetInset || x === wxEnd - parapetInset - 1 ||
-          z === wzStart + parapetInset || z === wzEnd - parapetInset - 1;
-        if (!onParapet) continue;
-        world.set(x, py, z, spec.wall);
-        wallCount++;
+  // Transformer pods flanking the mast on the roof (4 voxels tall, 4×4 footprint).
+  const cxv = (wxStart + wxEnd) >> 1;
+  const czv = (wzStart + wzEnd) >> 1;
+  const podOffsets: [number, number][] = [
+    [cxv - 10, czv - 3], [cxv + 8, czv - 3],
+  ];
+  for (const [px0, pz0] of podOffsets) {
+    for (let dy = 1; dy <= 4; dy++) {
+      const py = yRoof + dy;
+      if (py >= WORLD_Y) break;
+      for (let xo = 0; xo < 4; xo++) {
+        for (let zo = 0; zo < 4; zo++) {
+          const tx = px0 + xo, tz = pz0 + zo;
+          if (tx < 0 || tx >= WORLD_X || tz < 0 || tz >= WORLD_Z) continue;
+          const onWall = xo === 0 || xo === 3 || zo === 0 || zo === 3 || dy === 4;
+          if (!onWall) continue;
+          world.set(tx, py, tz, M_METAL);
+          wallCount++;
+        }
       }
+    }
+    // Insulator post on top.
+    const topY = yRoof + 5;
+    if (topY < WORLD_Y) {
+      world.set(px0 + 1, topY, pz0 + 1, M_STONE);
+      world.set(px0 + 2, topY, pz0 + 2, M_STONE);
+      wallCount += 2;
     }
   }
 
-  // Tall windmill mast at the centre — a 2x2 column climbing well above the
-  // hut so the turbine reads as a real wind tower at distance. Bottom half is
-  // M_STONE (lattice base), upper half M_METAL (slim mast). The renderer's
-  // turbine head bolts onto the top.
-  const cxv = (wxStart + wxEnd) >> 1;
-  const czv = (wzStart + wzEnd) >> 1;
+  // Mast — wider lattice base (4×4) for the first 6 voxels then 2×2 metal.
   const mastH = POWER_PLANT_MAST_VOXELS;
   for (let dy = 1; dy <= mastH; dy++) {
     const py = yRoof + dy;
     if (py >= WORLD_Y) break;
-    const mat = dy <= 4 ? M_STONE : M_METAL;
-    for (let xo = -1; xo <= 0; xo++) {
-      for (let zo = -1; zo <= 0; zo++) {
-        world.set(cxv + xo, py, czv + zo, mat);
-        wallCount++;
+    if (dy <= 6) {
+      // Solid lattice base: 4×4 stone block tapering to 2×2 above.
+      for (let xo = -2; xo <= 1; xo++) {
+        for (let zo = -2; zo <= 1; zo++) {
+          world.set(cxv + xo, py, czv + zo, M_STONE);
+          wallCount++;
+        }
+      }
+    } else {
+      const mat = dy <= 10 ? M_STONE : M_METAL;
+      for (let xo = -1; xo <= 0; xo++) {
+        for (let zo = -1; zo <= 0; zo++) {
+          world.set(cxv + xo, py, czv + zo, mat);
+          wallCount++;
+        }
       }
     }
   }
-  // Cabling: thin wood lattice (single-voxel bracing) at four height bands so
-  // the mast doesn't read as a featureless column from afar. Each brace is a
-  // single voxel offset diagonally from the mast core.
-  for (const dy of [6, 12, 18, 24]) {
+  // Stay cables (wood lattice bracing at 4 height bands).
+  for (const dy of [8, 14, 20, 26]) {
     if (dy > mastH) break;
     const py = yRoof + dy;
     if (py >= WORLD_Y) break;
@@ -847,9 +1210,9 @@ export function stampPowerPlant(
 }
 
 /**
- * Metal refinery: a long rectangular hall with a stepped chimney rising above the
- * back-left corner. The chimney is a 2x2 stone column; visible smoke is drawn by the
- * BuildingRenderer.
+ * Metal refinery: a long processing hall with three tall chimneys, buttress ribs,
+ * horizontal pipe runs on the roof, and a stepped loading hopper on the door face.
+ * Footprint: 6W × 4D nav cells = 48 × 32 voxels, headroom 28.
  */
 export function stampRefinery(
   world: VoxelWorld,
@@ -859,37 +1222,46 @@ export function stampRefinery(
   const spec = REFINERY;
   const wxStart = ox * NAV_CELL_VOXELS;
   const wzStart = oz * NAV_CELL_VOXELS;
-  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
-  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;   // +48
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;   // +32
   const yFloor = floorY + 1;
   const yRoof = floorY + spec.headroomVoxels;
-  const doorWz0 = ((wzStart + wzEnd) >> 1) - 1;
-  const doorWz1 = doorWz0 + 1;
-  const doorYTop = yFloor + 6;
+  const doorWz0 = ((wzStart + wzEnd) >> 1) - 2;
+  const doorWz1 = doorWz0 + 3;
+  const doorYTop = yFloor + 10;
+  const cxv = (wxStart + wxEnd) >> 1;
+  const czv = (wzStart + wzEnd) >> 1;
 
   let wallCount = 0;
+
+  // Stone floor slab (2 voxels thick for weight).
   for (let z = wzStart; z < wzEnd; z++) {
     for (let x = wxStart; x < wxEnd; x++) {
-      // Stone floor.
-      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
-        world.set(x, yFloor, z, M_STONE);
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      for (let dy = 0; dy <= 1; dy++) {
+        const py = yFloor - dy;
+        if (py < 0) continue;
+        world.set(x, py, z, M_STONE);
         wallCount++;
       }
+    }
+  }
+
+  // Perimeter walls — lower 6 voxels stone, upper section metal cladding.
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      const onPerimeter = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
       for (let y = yFloor + 1; y <= yRoof; y++) {
         if (y >= WORLD_Y) break;
-        const onPerimeter =
-          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
         if (y === yRoof) {
-          world.set(x, y, z, spec.wall);
+          world.set(x, y, z, M_STONE);
           wallCount++;
         } else if (onPerimeter) {
-          const isDoor = (x === wxEnd - 1 && (z === doorWz0 || z === doorWz1) && y < doorYTop);
-          if (!isDoor) {
-            world.set(x, y, z, spec.wall);
-            wallCount++;
-          } else {
-            world.set(x, y, z, AIR);
-          }
+          const isDoor = x === wxEnd - 1 && z >= doorWz0 && z <= doorWz1 && y < doorYTop;
+          if (isDoor) { world.set(x, y, z, AIR); continue; }
+          const mat = (y - yFloor) <= 8 ? M_STONE : M_METAL;
+          world.set(x, y, z, mat);
+          wallCount++;
         } else {
           world.set(x, y, z, AIR);
         }
@@ -897,70 +1269,126 @@ export function stampRefinery(
     }
   }
 
-  // Chimney: a 2x2 stone column rising 24 voxels (~3 m) above the roof, planted at
-  // the back-left corner of the building (interior side of the perimeter so the column
-  // doesn't poke out of the wall).
-  const chimX0 = wxStart + 2;
-  const chimZ0 = wzStart + 2;
-  const chimH = 24;
-  const chimBaseY = yRoof + 1;
-  for (let dy = 0; dy < chimH; dy++) {
-    const py = chimBaseY + dy;
-    if (py >= WORLD_Y) break;
-    for (let xo = 0; xo < 2; xo++) {
-      for (let zo = 0; zo < 2; zo++) {
-        world.set(chimX0 + xo, py, chimZ0 + zo, M_STONE);
-        wallCount++;
+  // Buttress ribs — 2-voxel-wide stone columns projecting 2 voxels from the long
+  // -Z and +Z walls at regular intervals, from floor to roof. Breaks the flat facade.
+  const ribXPositions = [wxStart + 8, wxStart + 16, wxStart + 24, wxStart + 32, wxStart + 40];
+  for (const ribX of ribXPositions) {
+    if (ribX + 1 >= wxEnd) continue;
+    for (let y = yFloor + 1; y <= yRoof; y++) {
+      if (y >= WORLD_Y) break;
+      // South rib (-Z face, protrudes toward -Z)
+      world.set(ribX, y, wzStart - 1, M_STONE); wallCount++;
+      world.set(ribX + 1, y, wzStart - 1, M_STONE); wallCount++;
+      // North rib (+Z face, protrudes toward +Z)
+      if (wzEnd < WORLD_Z) {
+        world.set(ribX, y, wzEnd, M_STONE); wallCount++;
+        world.set(ribX + 1, y, wzEnd, M_STONE); wallCount++;
+      }
+    }
+    // Cap each rib at roof height
+    for (let dy = 1; dy <= 2; dy++) {
+      const py = yRoof + dy; if (py >= WORLD_Y) break;
+      world.set(ribX, py, wzStart - 1, M_STONE); wallCount++;
+      world.set(ribX + 1, py, wzStart - 1, M_STONE); wallCount++;
+      if (wzEnd < WORLD_Z) {
+        world.set(ribX, py, wzEnd, M_STONE); wallCount++;
+        world.set(ribX + 1, py, wzEnd, M_STONE); wallCount++;
       }
     }
   }
 
-  // Loading-bay style hopper: a low wood ramp on the +X side of the building (just
-  // outside the wall, below door height). It's purely cosmetic — just a stack of
-  // M_WOOD voxels making a stepped ramp on the door face.
-  const rampSteps = 4;
-  for (let s = 0; s < rampSteps; s++) {
-    const px = wxEnd + s;
-    if (px >= WORLD_X) break;
-    for (let dy = 0; dy < rampSteps - s; dy++) {
-      const py = yFloor + dy;
-      if (py >= WORLD_Y) break;
-      for (let zo = -1; zo <= 1; zo++) {
-        const pz = ((wzStart + wzEnd) >> 1) + zo;
-        if (pz < 0 || pz >= WORLD_Z) continue;
-        world.set(px, py, pz, M_WOOD);
-        wallCount++;
+  // Three chimneys — 2×2 stone columns rising 20 voxels above the roof.
+  // Spaced across the -X half of the building.
+  const chimPositions: [number, number][] = [
+    [wxStart + 2, wzStart + 2],   // back-left corner stack
+    [wxStart + 16, czv - 1],      // centre-left stack
+    [wxStart + 30, czv - 1],      // centre-right stack
+  ];
+  const chimH = 20;
+  const chimBaseY = yRoof + 1;
+  for (const [cx, cz] of chimPositions) {
+    for (let dy = 0; dy < chimH; dy++) {
+      const py = chimBaseY + dy; if (py >= WORLD_Y) break;
+      for (let xo = 0; xo < 2; xo++) {
+        for (let zo = 0; zo < 2; zo++) {
+          if (cx + xo >= WORLD_X || cz + zo >= WORLD_Z) continue;
+          world.set(cx + xo, py, cz + zo, M_STONE);
+          wallCount++;
+        }
+      }
+    }
+    // Metal chimney cap (top 2 voxels are metal)
+    for (let dy = chimH - 2; dy < chimH; dy++) {
+      const py = chimBaseY + dy; if (py >= WORLD_Y) break;
+      for (let xo = 0; xo < 2; xo++) {
+        for (let zo = 0; zo < 2; zo++) {
+          if (cx + xo >= WORLD_X || cz + zo >= WORLD_Z) continue;
+          world.set(cx + xo, py, cz + zo, M_METAL);
+        }
       }
     }
   }
-  // Window strip — pairs of single-voxel cuts on each long side wall at
-  // mid-height so the hall reads less like a featureless box. We deliberately
-  // re-cut these AFTER stamping the perimeter so they punch through the
-  // existing stone walls.
-  const winY = yFloor + 12;
-  if (winY < yRoof) {
-    for (let wx = wxStart + 4; wx < wxEnd - 3; wx += 6) {
-      world.set(wx, winY, wzStart, AIR);
-      world.set(wx, winY, wzEnd - 1, AIR);
-      wallCount -= 2;
-    }
-  }
-  // Pipe accent — a metal pipe running from the chimney base out across the
-  // roof to a small stub on the +X side. Reads as plumbing at a glance.
+
+  // Roof pipe network — metal pipes connecting the chimney bases horizontally.
   const pipeY = yRoof + 1;
   if (pipeY < WORLD_Y) {
-    for (let x = chimX0 + 2; x < wxEnd - 1; x++) {
-      world.set(x, pipeY, chimZ0 + 1, M_METAL);
-      wallCount++;
+    // Main east-west spine along the centre.
+    for (let x = chimPositions[0]![0] + 1; x < chimPositions[2]![0]; x++) {
+      if (x >= WORLD_X) break;
+      world.set(x, pipeY, czv, M_METAL); wallCount++;
+    }
+    // Spur from each chimney down to +X wall (collector header).
+    for (const [cx] of chimPositions) {
+      for (let x = cx + 2; x < wxEnd - 2; x++) {
+        if (x >= WORLD_X) break;
+        world.set(x, pipeY, czv - 1, M_METAL); wallCount++;
+      }
     }
   }
+
+  // Wide arched window strips — 3-tall × 2-wide cuts on each long wall at two heights.
+  for (const winY of [yFloor + 10, yFloor + 18]) {
+    if (winY + 2 >= yRoof) continue;
+    for (let wx = wxStart + 6; wx < wxEnd - 5; wx += 10) {
+      for (let dy = 0; dy < 3; dy++) {
+        const py = winY + dy; if (py >= yRoof) break;
+        if (wx >= wxStart && wx < WORLD_X) {
+          world.set(wx, py, wzStart, AIR);
+          world.set(wx + 1, py, wzStart, AIR);
+        }
+        if (wx >= wxStart && wx + 1 < WORLD_X && wzEnd - 1 < WORLD_Z) {
+          world.set(wx, py, wzEnd - 1, AIR);
+          world.set(wx + 1, py, wzEnd - 1, AIR);
+        }
+      }
+    }
+  }
+
+  // Stepped loading hopper on the +X face — a 4-step stone staircase flanking the door.
+  for (let s = 0; s < 4; s++) {
+    const px = wxEnd + s; if (px >= WORLD_X) break;
+    const stepH = 4 - s;
+    for (let dy = 0; dy < stepH; dy++) {
+      const py = yFloor + dy; if (py >= WORLD_Y) break;
+      for (let z = wzStart + 2; z < doorWz0 - 1; z++) {
+        if (z < 0 || z >= WORLD_Z) continue;
+        world.set(px, py, z, M_STONE); wallCount++;
+      }
+      for (let z = doorWz1 + 2; z < wzEnd - 2; z++) {
+        if (z < 0 || z >= WORLD_Z) continue;
+        world.set(px, py, z, M_STONE); wallCount++;
+      }
+    }
+  }
+
   return wallCount;
 }
 
 /**
- * Tech lab: small square hall with a stepped pyramidal dome on top and a slim wood
- * antenna mast at the dome's apex. The renderer mounts a sweeping satellite dish
- * and a pulsing core on the mast.
+ * Tech lab: a main research hall with an octagonal observation drum at the centre of
+ * the roof and a slim antenna mast above it. Four corner sensor pods flank the drum.
+ * The renderer mounts a sweeping satellite dish and a pulsing core on the mast.
+ * Footprint: 4W × 4D nav cells = 32 × 32 voxels, headroom 20.
  */
 export function stampTechLab(
   world: VoxelWorld,
@@ -970,37 +1398,42 @@ export function stampTechLab(
   const spec = TECH_LAB;
   const wxStart = ox * NAV_CELL_VOXELS;
   const wzStart = oz * NAV_CELL_VOXELS;
-  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
-  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;   // +32
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;   // +32
   const yFloor = floorY + 1;
   const yRoof = floorY + spec.headroomVoxels;
-  const doorWz0 = ((wzStart + wzEnd) >> 1) - 1;
-  const doorWz1 = doorWz0 + 1;
-  const doorYTop = yFloor + 6;
+  const doorWz0 = ((wzStart + wzEnd) >> 1) - 2;
+  const doorWz1 = doorWz0 + 3;
+  const doorYTop = yFloor + 8;
+  const cxv = (wxStart + wxEnd) >> 1;
+  const czv = (wzStart + wzEnd) >> 1;
 
   let wallCount = 0;
+
+  // Raised stone plinth — 2-voxel-tall foundation slab wider than the hall by 1 voxel.
+  for (let z = wzStart - 1; z <= wzEnd; z++) {
+    for (let x = wxStart - 1; x <= wxEnd; x++) {
+      if (x < 0 || x >= WORLD_X || z < 0 || z >= WORLD_Z) continue;
+      for (let dy = 0; dy <= 1; dy++) {
+        const py = yFloor - dy; if (py < 0) continue;
+        world.set(x, py, z, M_STONE); wallCount++;
+      }
+    }
+  }
+
+  // Main hall — stone base 6v, metal upper cladding, solid roof slab.
   for (let z = wzStart; z < wzEnd; z++) {
     for (let x = wxStart; x < wxEnd; x++) {
-      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
-        world.set(x, yFloor, z, M_PATH);
-        wallCount++;
-      }
+      const onPerimeter = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
       for (let y = yFloor + 1; y <= yRoof; y++) {
         if (y >= WORLD_Y) break;
-        const onPerimeter =
-          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
         if (y === yRoof) {
-          // Roof level — fill solid (this is the base of the dome).
-          world.set(x, y, z, spec.wall);
-          wallCount++;
+          world.set(x, y, z, M_STONE); wallCount++;
         } else if (onPerimeter) {
-          const isDoor = (x === wxEnd - 1 && (z === doorWz0 || z === doorWz1) && y < doorYTop);
-          if (!isDoor) {
-            world.set(x, y, z, spec.wall);
-            wallCount++;
-          } else {
-            world.set(x, y, z, AIR);
-          }
+          const isDoor = x === wxEnd - 1 && z >= doorWz0 && z <= doorWz1 && y < doorYTop;
+          if (isDoor) { world.set(x, y, z, AIR); continue; }
+          const mat = (y - yFloor) <= 6 ? M_STONE : M_METAL;
+          world.set(x, y, z, mat); wallCount++;
         } else {
           world.set(x, y, z, AIR);
         }
@@ -1008,61 +1441,111 @@ export function stampTechLab(
     }
   }
 
-  // Stepped dome: 3 tiers of stone, each one voxel taller and with a smaller footprint.
-  const tiers = 3;
-  for (let t = 1; t <= tiers; t++) {
-    const inset = t * 4; // 4-voxel inset per tier (half a nav cell)
-    const py = yRoof + t * 2;
-    if (py >= WORLD_Y) break;
-    const x0 = wxStart + inset;
-    const x1 = wxEnd - inset;
-    const z0 = wzStart + inset;
-    const z1 = wzEnd - inset;
-    if (x1 <= x0 || z1 <= z0) break;
-    for (let z = z0; z < z1; z++) {
-      for (let x = x0; x < x1; x++) {
-        // Two-voxel-tall tier so the stepping reads at distance.
-        for (let dy = -1; dy <= 0; dy++) {
-          const yy = py + dy;
-          if (yy >= WORLD_Y) continue;
-          world.set(x, yy, z, spec.wall);
-          wallCount++;
+  // Tall arched windows — 2-wide × 8-tall on each face (-X, +X, -Z, +Z), centred.
+  const archH = 8;
+  const archY0 = yFloor + 7;
+  // -X face
+  for (let dy = 0; dy < archH; dy++) {
+    const py = archY0 + dy; if (py >= yRoof) break;
+    world.set(wxStart, py, czv - 1, AIR);
+    world.set(wxStart, py, czv, AIR);
+  }
+  // +X face (skip over door columns)
+  for (let dy = 0; dy < archH; dy++) {
+    const py = archY0 + dy; if (py >= yRoof) break;
+    world.set(wxEnd - 1, py, czv - 5, AIR);
+    world.set(wxEnd - 1, py, czv - 4, AIR);
+  }
+  // -Z face
+  for (let dy = 0; dy < archH; dy++) {
+    const py = archY0 + dy; if (py >= yRoof) break;
+    world.set(cxv - 1, py, wzStart, AIR);
+    world.set(cxv, py, wzStart, AIR);
+  }
+  // +Z face
+  for (let dy = 0; dy < archH; dy++) {
+    const py = archY0 + dy; if (py >= yRoof) break;
+    world.set(cxv - 1, py, wzEnd - 1, AIR);
+    world.set(cxv, py, wzEnd - 1, AIR);
+  }
+
+  // Octagonal drum — sits centred on the roof, 10-voxel radius, 6 voxels tall.
+  // We approximate an octagon by cutting the 4 corners of a 20×20 bounding square.
+  const drumR = 9;
+  const drumH = 6;
+  const drumBaseY = yRoof + 1;
+  for (let dy = 0; dy < drumH; dy++) {
+    const py = drumBaseY + dy; if (py >= WORLD_Y) break;
+    for (let dz = -drumR; dz <= drumR; dz++) {
+      for (let dx = -drumR; dx <= drumR; dx++) {
+        const ax = Math.abs(dx); const az = Math.abs(dz);
+        // Octagonal mask: cut corners where dx+dz > drumR*1.4
+        if (ax + az > Math.round(drumR * 1.4)) continue;
+        const px = cxv + dx; const pz = czv + dz;
+        if (px < 0 || px >= WORLD_X || pz < 0 || pz >= WORLD_Z) continue;
+        world.set(px, py, pz, M_STONE); wallCount++;
+      }
+    }
+  }
+  // Drum cap ring (one solid ring on top of drum).
+  for (let dz = -(drumR - 1); dz <= drumR - 1; dz++) {
+    for (let dx = -(drumR - 1); dx <= drumR - 1; dx++) {
+      const ax = Math.abs(dx); const az = Math.abs(dz);
+      if (ax + az > Math.round(drumR * 1.35)) continue;
+      const px = cxv + dx; const pz = czv + dz;
+      if (px < 0 || px >= WORLD_X || pz < 0 || pz >= WORLD_Z) continue;
+      const capY = drumBaseY + drumH; if (capY >= WORLD_Y) continue;
+      world.set(px, capY, pz, M_STONE); wallCount++;
+    }
+  }
+
+  // Corner sensor pods — 3×3 metal cubes at each corner of the roof.
+  const podCorners: [number, number][] = [
+    [wxStart + 1, wzStart + 1],
+    [wxEnd - 4, wzStart + 1],
+    [wxStart + 1, wzEnd - 4],
+    [wxEnd - 4, wzEnd - 4],
+  ];
+  const podH = 4;
+  for (const [px0, pz0] of podCorners) {
+    for (let dy = 0; dy <= podH; dy++) {
+      const py = yRoof + dy; if (py >= WORLD_Y) break;
+      for (let xo = 0; xo < 3; xo++) {
+        for (let zo = 0; zo < 3; zo++) {
+          const px = px0 + xo; const pz = pz0 + zo;
+          if (px >= WORLD_X || pz >= WORLD_Z) continue;
+          if (dy === podH || xo === 0 || xo === 2 || zo === 0 || zo === 2) {
+            world.set(px, py, pz, M_METAL); wallCount++;
+          }
         }
       }
     }
   }
 
-  // Antenna mast: a single-voxel wood column rising 6 voxels above the dome.
-  const cxv = (wxStart + wxEnd) >> 1;
-  const czv = (wzStart + wzEnd) >> 1;
-  const mastBaseY = yRoof + tiers * 2 + 1;
-  const mastH = 6;
-  for (let dy = 0; dy < mastH; dy++) {
-    const py = mastBaseY + dy;
-    if (py >= WORLD_Y) break;
-    world.set(cxv, py, czv, M_WOOD);
-    wallCount++;
-  }
-  // Tall narrow window cuts on each side of the lab — single-voxel slits at
-  // mid-height. Reads as a research building, not a featureless box.
-  const slitYBase = yFloor + 8;
+  // Antenna mast — 2-voxel-wide metal base then single-voxel wood column.
+  const mastBaseY = drumBaseY + drumH + 1;
   for (let dy = 0; dy < 4; dy++) {
-    const py = slitYBase + dy;
-    if (py >= yRoof) break;
-    for (const wx of [wxStart + 6, wxStart + 14, wxStart + 22]) {
-      if (wx >= wxEnd - 1) continue;
-      world.set(wx, py, wzStart, AIR);
-      world.set(wx, py, wzEnd - 1, AIR);
-      wallCount -= 2;
+    const py = mastBaseY + dy; if (py >= WORLD_Y) break;
+    for (let xo = 0; xo < 2; xo++) {
+      for (let zo = 0; zo < 2; zo++) {
+        world.set(cxv + xo - 1, py, czv + zo - 1, M_METAL); wallCount++;
+      }
     }
   }
+  const mastTopBase = mastBaseY + 4;
+  for (let dy = 0; dy < 8; dy++) {
+    const py = mastTopBase + dy; if (py >= WORLD_Y) break;
+    world.set(cxv, py, czv, M_WOOD); wallCount++;
+  }
+
   return wallCount;
 }
 
 /**
- * Defensive turret: a 2x2 stone emplacement with a stout pintle column at the
- * centre. The renderer mounts the rotating cannon head on top of the column;
- * the stamp here only lays out the static base + pintle.
+ * Defensive turret emplacement: a sunken octagonal fighting position with a raised
+ * stone parapet, corner armour plates, and a heavy pintle pedestal at the centre.
+ * The renderer mounts the rotating cannon head on top of the pedestal.
+ * Footprint: 2W × 2D nav cells = 16 × 16 voxels, headroom 12.
  */
 export function stampTurret(
   world: VoxelWorld,
@@ -1072,69 +1555,105 @@ export function stampTurret(
   const spec = TURRET;
   const wxStart = ox * NAV_CELL_VOXELS;
   const wzStart = oz * NAV_CELL_VOXELS;
-  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
-  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;   // +16
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;   // +16
   const yFloor = floorY + 1;
   const yRoof = floorY + spec.headroomVoxels;
+  const cxv = (wxStart + wxEnd) >> 1;
+  const czv = (wzStart + wzEnd) >> 1;
 
   let wallCount = 0;
+
+  // Concentric stone foundation — 2-voxel-tall slab covering the full footprint.
   for (let z = wzStart; z < wzEnd; z++) {
     for (let x = wxStart; x < wxEnd; x++) {
-      // Stone floor.
-      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
-        world.set(x, yFloor, z, spec.wall);
-        wallCount++;
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      for (let dy = 0; dy <= 1; dy++) {
+        const py = yFloor - dy; if (py < 0) continue;
+        world.set(x, py, z, M_STONE); wallCount++;
       }
+    }
+  }
+
+  // Octagonal parapet walls — approximate octagon by masking corners of the 16×16
+  // bounding square. Walls are 3 voxels thick and rise from yFloor+1 to yRoof.
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      const dx = Math.min(x - wxStart, wxEnd - 1 - x);
+      const dz = Math.min(z - wzStart, wzEnd - 1 - z);
+      const minDim = Math.min(dx, dz);
+      // Cut octagonal corners: where both dx and dz are both < 2, skip (corner cut).
+      if (dx < 2 && dz < 2) continue;
+      const onWall = minDim < 3; // 3-voxel-thick wall ring
       for (let y = yFloor + 1; y <= yRoof; y++) {
         if (y >= WORLD_Y) break;
-        const onPerimeter =
-          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
-        if (onPerimeter) {
-          world.set(x, y, z, spec.wall);
-          wallCount++;
+        if (onWall) {
+          world.set(x, y, z, M_STONE); wallCount++;
         } else {
           world.set(x, y, z, AIR);
         }
       }
     }
   }
-  // Pintle column at the centre — a 2x2 metal column 4 voxels tall sitting on
-  // top of the perimeter wall. The renderer's turret head bolts to the top of
-  // this column.
-  const cxv = (wxStart + wxEnd) >> 1;
-  const czv = (wzStart + wzEnd) >> 1;
-  const pintleH = 4;
-  for (let dy = 1; dy <= pintleH; dy++) {
-    const py = yRoof + dy;
-    if (py >= WORLD_Y) break;
-    for (let xo = -1; xo <= 0; xo++) {
-      for (let zo = -1; zo <= 0; zo++) {
-        world.set(cxv + xo, py, czv + zo, M_METAL);
-        wallCount++;
+
+  // Parapet crenellations — alternate merlons every 2 voxels along the outer ring.
+  const parapetY = yRoof + 1;
+  if (parapetY < WORLD_Y) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      for (let z = wzStart; z < wzEnd; z++) {
+        if (x >= WORLD_X || z >= WORLD_Z) continue;
+        const dx = Math.min(x - wxStart, wxEnd - 1 - x);
+        const dz = Math.min(z - wzStart, wzEnd - 1 - z);
+        if (dx < 2 && dz < 2) continue; // skip octagonal corners
+        const onOuterRing = dx === 0 || dz === 0;
+        if (!onOuterRing) continue;
+        // Merlon every 2 voxels along the ring.
+        const pos = (x - wxStart) + (z - wzStart);
+        if (pos % 2 === 0) {
+          world.set(x, parapetY, z, M_STONE); wallCount++;
+        }
       }
     }
   }
-  // Sandbag-style accent — a single ring of M_DIRT_ROAD voxels around the
-  // base perimeter so the emplacement reads as fortified, not just a stone
-  // box. We re-write the bottom voxel of the perimeter columns.
-  const accentY = yFloor + 1;
-  if (accentY < yRoof) {
-    for (let x = wxStart; x < wxEnd; x++) {
-      world.set(x, accentY, wzStart, M_DIRT_ROAD);
-      world.set(x, accentY, wzEnd - 1, M_DIRT_ROAD);
-    }
-    for (let z = wzStart; z < wzEnd; z++) {
-      world.set(wxStart, accentY, z, M_DIRT_ROAD);
-      world.set(wxEnd - 1, accentY, z, M_DIRT_ROAD);
+
+  // Sandbag row (dirt-road) at the base of the inner wall face — adds visual texture.
+  const sandbagY = yFloor + 1;
+  if (sandbagY <= yRoof) {
+    for (let x = wxStart + 2; x < wxEnd - 2; x++) {
+      for (let z = wzStart + 2; z < wzEnd - 2; z++) {
+        if (x >= WORLD_X || z >= WORLD_Z) continue;
+        const dx = Math.min(x - wxStart, wxEnd - 1 - x);
+        const dz = Math.min(z - wzStart, wzEnd - 1 - z);
+        if (dx === 2 || dz === 2) {
+          world.set(x, sandbagY, z, M_DIRT_ROAD);
+        }
+      }
     }
   }
+
+  // Pedestal — a stout 4×4 metal column rising from the floor to above the parapet.
+  const pedBaseY = yFloor + 1;
+  const pedTopY = yRoof + 5;
+  for (let y = pedBaseY; y <= pedTopY; y++) {
+    if (y >= WORLD_Y) break;
+    for (let xo = -2; xo <= 1; xo++) {
+      for (let zo = -2; zo <= 1; zo++) {
+        const px = cxv + xo; const pz = czv + zo;
+        if (px < 0 || px >= WORLD_X || pz < 0 || pz >= WORLD_Z) continue;
+        world.set(px, y, pz, M_METAL); wallCount++;
+      }
+    }
+  }
+
   return wallCount;
 }
 
 /**
- * Heavy silo launcher: a 3x3 stone fortress with a tall parapet and a tight
- * cluster of three missile tubes on the roof. The renderer doesn't add any
- * animated accessories — the missile tubes are part of the static stamp.
+ * Heavy silo launcher: a thick-walled bunker fortress with angled corner bastions,
+ * a reinforced blast door, and five missile tubes arranged in an X pattern on the
+ * hardened roof. The whole structure reads as a heavy military fortification.
+ * Footprint: 3W × 3D nav cells = 24 × 24 voxels, headroom 32.
  */
 export function stampSilo(
   world: VoxelWorld,
@@ -1144,87 +1663,129 @@ export function stampSilo(
   const spec = SILO;
   const wxStart = ox * NAV_CELL_VOXELS;
   const wzStart = oz * NAV_CELL_VOXELS;
-  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;
-  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const wxEnd = wxStart + spec.cellsW * NAV_CELL_VOXELS;   // +24
+  const wzEnd = wzStart + spec.cellsD * NAV_CELL_VOXELS;   // +24
   const yFloor = floorY + 1;
   const yRoof = floorY + spec.headroomVoxels;
-  // Door on +X face (matches barracks/refinery convention).
-  const doorWz0 = ((wzStart + wzEnd) >> 1) - 1;
-  const doorWz1 = doorWz0 + 1;
-  const doorYTop = yFloor + 6;
+  const doorWz0 = ((wzStart + wzEnd) >> 1) - 2;
+  const doorWz1 = doorWz0 + 3;
+  const doorYTop = yFloor + 8;
+  const cxv = (wxStart + wxEnd) >> 1;
+  const czv = (wzStart + wzEnd) >> 1;
 
   let wallCount = 0;
+
+  // 4-voxel-thick stone perimeter walls (heavy fortification) + solid roof.
+  const wallThick = 4;
   for (let z = wzStart; z < wzEnd; z++) {
     for (let x = wxStart; x < wxEnd; x++) {
-      if (yFloor < WORLD_Y && x < WORLD_X && z < WORLD_Z) {
-        world.set(x, yFloor, z, M_STONE);
-        wallCount++;
-      }
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      // Floor slab.
+      if (yFloor < WORLD_Y) { world.set(x, yFloor, z, M_STONE); wallCount++; }
       for (let y = yFloor + 1; y <= yRoof; y++) {
         if (y >= WORLD_Y) break;
-        const onPerimeter =
-          x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+        const dx = Math.min(x - wxStart, wxEnd - 1 - x);
+        const dz = Math.min(z - wzStart, wzEnd - 1 - z);
+        const inWall = dx < wallThick || dz < wallThick;
         if (y === yRoof) {
-          world.set(x, y, z, spec.wall);
-          wallCount++;
-        } else if (onPerimeter) {
-          const isDoor = (x === wxEnd - 1 && (z === doorWz0 || z === doorWz1) && y < doorYTop);
-          if (!isDoor) {
-            world.set(x, y, z, spec.wall);
-            wallCount++;
-          } else {
-            world.set(x, y, z, AIR);
-          }
+          world.set(x, y, z, M_STONE); wallCount++;
+        } else if (inWall) {
+          const isDoor = x >= wxEnd - wallThick && z >= doorWz0 && z <= doorWz1 && y < doorYTop;
+          if (isDoor) { world.set(x, y, z, AIR); continue; }
+          world.set(x, y, z, M_STONE); wallCount++;
         } else {
           world.set(x, y, z, AIR);
         }
       }
     }
   }
-  // Parapet — 2-voxel-tall ring of stone inset 1 from the perimeter.
-  const parapetInset = 1;
-  for (let dy = 1; dy <= 2; dy++) {
-    const py = yRoof + dy;
-    if (py >= WORLD_Y) break;
-    for (let z = wzStart + parapetInset; z < wzEnd - parapetInset; z++) {
-      for (let x = wxStart + parapetInset; x < wxEnd - parapetInset; x++) {
-        const onParapet =
-          x === wxStart + parapetInset || x === wxEnd - parapetInset - 1 ||
-          z === wzStart + parapetInset || z === wzEnd - parapetInset - 1;
-        if (!onParapet) continue;
-        world.set(x, py, z, spec.wall);
-        wallCount++;
-      }
-    }
-  }
-  // Missile tubes — 3 single-column launchers in a tight triangular cluster
-  // on the roof. The 3x3 footprint (24 voxels per side) only fits a small
-  // cluster, so we place a 2x2 metal column at three offsets centred on the
-  // roof. Each tube is 6 voxels tall capped with a red-tinted M_METAL
-  // warhead voxel.
-  const tubeBaseY = yRoof + 3; // sits above the parapet
-  const tubeHeight = 6;
-  const cxv = (wxStart + wxEnd) >> 1;
-  const czv = (wzStart + wzEnd) >> 1;
-  const tubeOffsets: [number, number][] = [
-    [cxv - 4, czv - 4],
-    [cxv + 2, czv - 4],
-    [cxv - 1, czv + 2],
+
+  // Diagonal corner bastions — 4×4 stone wedge blocks at each corner, angled to
+  // deflect blasts. They protrude 3 voxels beyond the building footprint.
+  const bastionOffsets: [number, number, number, number][] = [
+    // [startX, startZ, dirX, dirZ]
+    [wxStart, wzStart, -1, -1],
+    [wxEnd - 4, wzStart, +1, -1],
+    [wxStart, wzEnd - 4, -1, +1],
+    [wxEnd - 4, wzEnd - 4, +1, +1],
   ];
-  for (const [baseX, baseZ] of tubeOffsets) {
-    for (let dy = 0; dy < tubeHeight; dy++) {
-      const py = tubeBaseY + dy;
-      if (py >= WORLD_Y) break;
-      for (let xo = 0; xo < 2; xo++) {
-        for (let zo = 0; zo < 2; zo++) {
-          if (baseX + xo < 0 || baseX + xo >= WORLD_X) continue;
-          if (baseZ + zo < 0 || baseZ + zo >= WORLD_Z) continue;
-          world.set(baseX + xo, py, baseZ + zo, M_METAL);
-          wallCount++;
+  for (const [bx, bz, dx, dz] of bastionOffsets) {
+    for (let step = 0; step < 3; step++) {
+      const shrink = step;
+      const x0 = bx + (dx < 0 ? dx * (step + 1) : shrink);
+      const x1 = bx + 4 + (dx > 0 ? dx * (step + 1) : -shrink);
+      const z0 = bz + (dz < 0 ? dz * (step + 1) : shrink);
+      const z1 = bz + 4 + (dz > 0 ? dz * (step + 1) : -shrink);
+      const maxY = yRoof - step * 4;
+      for (let y = yFloor; y <= maxY; y++) {
+        if (y >= WORLD_Y) break;
+        for (let xv = x0; xv < x1; xv++) {
+          for (let zv = z0; zv < z1; zv++) {
+            if (xv < 0 || xv >= WORLD_X || zv < 0 || zv >= WORLD_Z) continue;
+            world.set(xv, y, zv, M_STONE); wallCount++;
+          }
         }
       }
     }
   }
+
+  // Blast-door lintel — a 2-voxel-thick metal arch above the door opening.
+  for (let dy = doorYTop; dy <= doorYTop + 3; dy++) {
+    const py = yFloor + dy; if (py >= WORLD_Y || py > yRoof) break;
+    for (let z = doorWz0; z <= doorWz1; z++) {
+      if (z < 0 || z >= WORLD_Z) continue;
+      world.set(wxEnd - 1, py, z, M_METAL); wallCount++;
+      world.set(wxEnd - 2, py, z, M_METAL); wallCount++;
+    }
+  }
+
+  // Parapet walkway — 3-voxel-tall solid ring inset 2 voxels from the outer face.
+  for (let dy = 1; dy <= 3; dy++) {
+    const py = yRoof + dy; if (py >= WORLD_Y) break;
+    for (let z = wzStart + 2; z < wzEnd - 2; z++) {
+      for (let x = wxStart + 2; x < wxEnd - 2; x++) {
+        if (x >= WORLD_X || z >= WORLD_Z) continue;
+        const dx = Math.min(x - (wxStart + 2), (wxEnd - 3) - x);
+        const dz = Math.min(z - (wzStart + 2), (wzEnd - 3) - z);
+        if (dx === 0 || dz === 0) {
+          world.set(x, py, z, M_STONE); wallCount++;
+        }
+      }
+    }
+  }
+
+  // Missile tubes — 5 in an X pattern on the roof (4 corners + centre).
+  // Each tube is a 2×2 metal column, 10 voxels tall with a metal nosecone cap.
+  const tubeBaseY = yRoof + 4;
+  const tubeH = 10;
+  const tubePositions: [number, number][] = [
+    [cxv - 1, czv - 1],       // centre
+    [cxv - 6, czv - 6],       // NW quad
+    [cxv + 4, czv - 6],       // NE quad
+    [cxv - 6, czv + 4],       // SW quad
+    [cxv + 4, czv + 4],       // SE quad
+  ];
+  for (const [tx, tz] of tubePositions) {
+    for (let dy = 0; dy < tubeH; dy++) {
+      const py = tubeBaseY + dy; if (py >= WORLD_Y) break;
+      for (let xo = 0; xo < 2; xo++) {
+        for (let zo = 0; zo < 2; zo++) {
+          const px = tx + xo; const pz = tz + zo;
+          if (px < 0 || px >= WORLD_X || pz < 0 || pz >= WORLD_Z) continue;
+          world.set(px, py, pz, M_METAL); wallCount++;
+        }
+      }
+    }
+    // Reinforcing collar band at mid-height.
+    const bandY = tubeBaseY + (tubeH >> 1); if (bandY < WORLD_Y) {
+      world.set(tx - 1, bandY, tz, M_STONE);
+      world.set(tx + 2, bandY, tz, M_STONE);
+      world.set(tx, bandY, tz - 1, M_STONE);
+      world.set(tx, bandY, tz + 2, M_STONE);
+      wallCount += 4;
+    }
+  }
+
   return wallCount;
 }
 
@@ -1265,11 +1826,38 @@ export function doorWorldPos(b: Building): DoorWorldPos {
   };
 }
 
+/**
+ * World-space spawn position for a unit produced by building `b`. Distributes
+ * successive spawns across the pad cells (in +X beyond the building wall) so
+ * units don't all appear at the same point. The slot is advanced by the caller
+ * after each use.
+ */
+export function padSpawnPos(b: Building): DoorWorldPos {
+  const pad = b.spec.spawnPadCells;
+  if (pad <= 0) return doorWorldPos(b);
+
+  const slots = pad * b.spec.cellsD;
+  const slot = b.spawnSlot % slots;
+  const dx = slot % pad;            // 0..pad-1
+  const dz = Math.floor(slot / pad); // 0..cellsD-1
+
+  // Place the unit at the centre of the chosen pad cell.
+  const cellX = b.ox + b.spec.cellsW + dx;
+  const cellZ = b.oz + dz;
+  return {
+    x: (cellX * NAV_CELL_VOXELS + NAV_CELL_VOXELS / 2) * VOXEL_SIZE,
+    y: (b.floorY + 1) * VOXEL_SIZE,
+    z: (cellZ * NAV_CELL_VOXELS + NAV_CELL_VOXELS / 2) * VOXEL_SIZE,
+  };
+}
+
 export class BuildingManager {
   buildings: Building[] = [];
   private nextId = 1;
   /** Called when a building wants to spawn a unit. Returns true if accepted. */
   spawner: ((kind: UnitKind, x: number, y: number, z: number) => Unit | null) | null = null;
+  /** Called immediately after a unit spawns, with the new unit and the producing building. */
+  afterSpawn: ((unit: Unit, building: Building) => void) | null = null;
   /**
    * Food sink. A farm calls this every `productionInterval` seconds while
    * alive. The Game wires it to its Resources counter. If null, farms tick
@@ -1291,6 +1879,14 @@ export class BuildingManager {
     | ((x: number, y: number, z: number, radiusMeters: number, lifeSeconds: number,
         color: { r: number; g: number; b: number }) => void)
     | null = null;
+  /**
+   * Per-tick AA network assignment: maps projectile.id → the building.id of
+   * the nearest live AA turret in range. Populated by `buildAAAssignments`
+   * at the start of each tick before the per-building loop runs. Each AA
+   * turret then only intercepts projectiles assigned to it, so a single
+   * incoming round is engaged by exactly one turret — the closest one.
+   */
+  private readonly aaAssignments = new Map<number, number>();
 
   place(
     world: VoxelWorld,
@@ -1321,6 +1917,9 @@ export class BuildingManager {
       weaponTurretPitch: 0,
       weaponAmmo: spec.weaponMagazineSize ?? 0,
       weaponReloadTimer: 0,
+      rallyPoint: null,
+      rallyStance: 'aggressive',
+      spawnSlot: 0,
     };
     this.buildings.push(b);
     return b;
@@ -1363,7 +1962,62 @@ export class BuildingManager {
     }
   }
 
+  /**
+   * Build the per-tick AA network assignment table.
+   *
+   * For every enemy projectile that is inside the range of at least one live
+   * (non-reloading) AA turret, find the turret closest to that projectile and
+   * mark it as the sole interceptor.  This is called once per tick before the
+   * per-building loop so each `tickAntiAir` call can cheaply check whether it
+   * owns a given threat instead of firing redundantly at the same round.
+   */
+  private buildAAAssignments(units: UnitManager): void {
+    this.aaAssignments.clear();
+    const pm = this.projectiles;
+    if (!pm) return;
+
+    // Collect live, non-reloading AA turrets and cache their world positions.
+    type AAEntry = { b: Building; cxw: number; czw: number; muzzleY: number; range2: number };
+    const aaTurrets: AAEntry[] = [];
+    for (const b of this.buildings) {
+      if (b.destroyed) continue;
+      if (b.spec.weapon !== 'aa_turret') continue;
+      if (b.weaponReloadTimer > 0) continue;
+      const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const floorTopMeters = (b.floorY + 1) * VOXEL_SIZE;
+      const muzzleY = floorTopMeters + (b.spec.weaponMuzzleHeight ?? 1.0);
+      const range = WEAPONS[b.spec.weapon].rangeMeters;
+      aaTurrets.push({ b, cxw, czw, muzzleY, range2: range * range });
+    }
+    if (aaTurrets.length === 0) return;
+
+    // For each incoming enemy projectile, assign it to the nearest AA in range.
+    for (const p of pm.projectiles) {
+      if (p.dead) continue;
+      if (p.kind === 'aa_missile') continue;
+      // Friendly-fire check (mirrors tickAntiAir).
+      if (p.ownerId >= 0) {
+        const owner = lookupUnit(units, p.ownerId);
+        if (owner && owner.team !== 'enemy') continue;
+      } else if (p.ownerId !== -1) {
+        continue; // negative non-(-1) = friendly building
+      }
+
+      let nearestAA: Building | null = null;
+      let nearestD2 = Infinity;
+      for (const { b, cxw, czw, muzzleY, range2 } of aaTurrets) {
+        const dx = p.x - cxw, dy = p.y - muzzleY, dz = p.z - czw;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > range2) continue;
+        if (d2 < nearestD2) { nearestD2 = d2; nearestAA = b; }
+      }
+      if (nearestAA) this.aaAssignments.set(p.id, nearestAA.id);
+    }
+  }
+
   tick(dt: number, world: VoxelWorld, units: UnitManager): void {
+    this.buildAAAssignments(units);
     for (const b of this.buildings) {
       if (b.destroyed) continue;
 
@@ -1413,9 +2067,11 @@ export class BuildingManager {
       // gated on `trainQueue.length > 0` above, so the queue can't be empty
       // here for a producer building.
       if (b.spec.produces.length > 0 && this.spawner && b.trainQueue.length > 0) {
-        const door = doorWorldPos(b);
+        const pos = padSpawnPos(b);
+        b.spawnSlot++;
         const kind = b.trainQueue.shift()!;
-        this.spawner(kind, door.x, door.y, door.z);
+        const spawned = this.spawner(kind, pos.x, pos.y, pos.z);
+        if (spawned) this.afterSpawn?.(spawned, b);
       }
     }
   }
@@ -1480,7 +2136,8 @@ export class BuildingManager {
       // short of the target every time.
       const targetTY = u.y + Math.max(0.7, u.widthMeters * 0.6);
       const launchSpeed = Math.min(PROJECTILES[w.projectile].muzzleVelocity * w.velocityScale, launcherCap);
-      const ballistic = solveBallisticDirection(cxw, muzzleY, czw, u.x, targetTY, u.z, launchSpeed, PROJECTILE_GRAVITY);
+      const projGrav = PROJECTILE_GRAVITY * (PROJECTILES[w.projectile].gravityScale ?? 1);
+      const ballistic = solveBallisticDirection(cxw, muzzleY, czw, u.x, targetTY, u.z, launchSpeed, projGrav);
       const dirX = ballistic.x, dirY = ballistic.y, dirZ = ballistic.z;
       const boost = boostMeters > 0
         ? { meters: boostMeters, targetX: u.x, targetY: targetTY, targetZ: u.z }
@@ -1514,7 +2171,8 @@ export class BuildingManager {
     // re-normalising.
     const targetTorsoY = bestU.y + Math.max(0.7, bestU.widthMeters * 0.6);
     const launchSpeed = Math.min(PROJECTILES[w.projectile].muzzleVelocity * w.velocityScale, b.spec.launcherMaxStrength ?? Infinity);
-    const ballistic = solveBallisticDirection(cxw, muzzleY, czw, bestU.x, targetTorsoY, bestU.z, launchSpeed, PROJECTILE_GRAVITY);
+    const projGravFire = PROJECTILE_GRAVITY * (PROJECTILES[w.projectile].gravityScale ?? 1);
+    const ballistic = solveBallisticDirection(cxw, muzzleY, czw, bestU.x, targetTorsoY, bestU.z, launchSpeed, projGravFire);
     const dirX = ballistic.x;
     const dirY = ballistic.y;
     const dirZ = ballistic.z;
@@ -1627,32 +2285,21 @@ export class BuildingManager {
       b.spec.launcherMaxStrength ?? Infinity,
     );
 
-    // Pick the closest live projectile inside the AA dome that the AA didn't
-    // fire itself. Skipping the AA's own shells stops a turret from chasing
-    // the shell it just lobbed.
+    // Pick the highest-priority assigned projectile. The AA network assignment
+    // (built once per tick in `buildAAAssignments`) guarantees that each
+    // incoming round is owned by exactly one turret — the nearest one in
+    // range. Turrets only fire at their assigned rounds, so multiple AAs
+    // never waste ammo on the same target.
     let bestP: Projectile | null = null;
     let bestD2 = range2;
     for (const p of pm.projectiles) {
       if (p.dead) continue;
-      // Skip our own kind — AA never chases friendly flak shells.
-      if (p.kind === 'flak_shell') continue;
-      // Skip rounds owned by friendly units / buildings. Buildings carry a
-      // negative owner id (we can't easily resolve their team here, but the
-      // player owns every building today) so treat negative ids as friendly.
-      // Positive ids are units; check the unit's team to decide.
-      if (p.ownerId >= 0) {
-        const owner = lookupUnit(units, p.ownerId);
-        if (owner && owner.team !== 'enemy') continue;
-      } else if (p.ownerId !== -1) {
-        // -1 is anonymous (e.g. cluster submunition). Anything else negative
-        // is a friendly building — skip.
-        continue;
-      }
+      if (p.kind === 'aa_missile') continue;
+      // Only engage rounds assigned to this turret by the network.
+      if (this.aaAssignments.get(p.id) !== b.id) continue;
       const dx = p.x - cxw, dy = p.y - muzzleY, dz = p.z - czw;
       const d2 = dx * dx + dy * dy + dz * dz;
       if (d2 > range2) continue;
-      // Prefer the round closest to the AA so we always engage the most
-      // immediate threat.
       if (d2 < bestD2) { bestD2 = d2; bestP = p; }
     }
     if (!bestP) return;
@@ -1666,8 +2313,9 @@ export class BuildingManager {
     const dzNow = bestP.z - czw;
     const distNow = Math.hypot(dxNow, dyNow, dzNow);
     const tof = Math.max(0.05, distNow / Math.max(20, flakSpeed));
+    const targetGrav = PROJECTILE_GRAVITY * (PROJECTILES[bestP.kind].gravityScale ?? 1);
     let leadX = bestP.x + bestP.vx * tof;
-    let leadY = bestP.y + bestP.vy * tof - 0.5 * PROJECTILE_GRAVITY * tof * tof;
+    let leadY = bestP.y + bestP.vy * tof - 0.5 * targetGrav * tof * tof;
     let leadZ = bestP.z + bestP.vz * tof;
     // Aim slightly below the lead point so the upward-biased flak burst goes
     // off just under the round on its way through. ~1 m below puts the
