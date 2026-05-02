@@ -53,6 +53,7 @@ import {
 } from '../render/ProjectileRenderer';
 import { HealthBarRenderer } from '../render/HealthBarRenderer';
 import { RallyMarkerRenderer } from '../render/RallyMarker';
+import { MinimapRenderer } from '../render/MinimapRenderer';
 import { MetalCluster, METAL_PER_VOXEL } from '../voxel/Metals';
 import {
   ActionContext, BuildingAction, UnitAction,
@@ -136,6 +137,7 @@ export class Game {
   readonly impactMarker = new ImpactMarker();
   readonly healthBars = new HealthBarRenderer();
   readonly rallyMarkers = new RallyMarkerRenderer();
+  readonly minimap = new MinimapRenderer();
   private metalClusters: MetalCluster[] = [];
   // Remaining metal per voxel (worldIndex → count). Defaults to METAL_PER_VOXEL on first access.
   private metalVoxelRemaining = new Map<number, number>();
@@ -253,6 +255,8 @@ export class Game {
     this.actionsEl = document.getElementById('actions');
     this.tasksEl = document.getElementById('tasks');
     this.pathInfoEl = document.getElementById('pathinfo');
+    document.body.appendChild(this.minimap.canvas);
+    this.minimap.onPan((wx, wz) => { this.camera.target.set(wx, 0, wz); });
 
     this.onResize();
     window.addEventListener('resize', this.onResize);
@@ -299,6 +303,7 @@ export class Game {
       useShared,
     );
     await this.pathWorker.ready();
+    this.minimap.buildTerrain(this.world.buffers.voxels);
     this.spawnInitialUnits();
   }
 
@@ -603,6 +608,7 @@ export class Game {
     this.unitRenderer.update(this.units);
     this.healthBars.update(this.units.units, this.buildings.buildings, this.metalClusters);
     this.rallyMarkers.update(this.buildings.buildings);
+    this.minimap.update(this.units.units, this.buildings.buildings, this.metalClusters, this.camera);
     this.buildingRenderer.update(this.buildings.buildings);
     this.buildingRange.show(this.buildings.getSelected());
     this.unitRange.show(this.units.units);
