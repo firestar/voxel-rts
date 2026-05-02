@@ -31,7 +31,7 @@ import {
   M_GRASS, M_STONE, M_PATH, M_MUD,
 } from '../voxel/Materials';
 import type { MaterialId } from '../voxel/types';
-import { BuildingManager, BARRACKS, STORAGE, ALL_BUILDINGS, BuildingSpec, Building, checkFootprint } from '../sim/Buildings';
+import { BuildingManager, BARRACKS, STORAGE, HQ, ALL_BUILDINGS, BuildingSpec, Building, checkFootprint } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { BuildingRenderer } from '../render/BuildingRenderer';
 import { BuildingRangeIndicator } from '../render/BuildingRangeIndicator';
@@ -54,6 +54,7 @@ import {
 import { HealthBarRenderer } from '../render/HealthBarRenderer';
 import { RallyMarkerRenderer } from '../render/RallyMarker';
 import { MinimapRenderer } from '../render/MinimapRenderer';
+import { PowerLineRenderer } from '../render/PowerLineRenderer';
 import { MetalCluster, METAL_PER_VOXEL } from '../voxel/Metals';
 import {
   ActionContext, BuildingAction, UnitAction,
@@ -138,6 +139,7 @@ export class Game {
   readonly healthBars = new HealthBarRenderer();
   readonly rallyMarkers = new RallyMarkerRenderer();
   readonly minimap = new MinimapRenderer();
+  readonly powerLines = new PowerLineRenderer();
   private metalClusters: MetalCluster[] = [];
   // Remaining metal per voxel (worldIndex → count). Defaults to METAL_PER_VOXEL on first access.
   private metalVoxelRemaining = new Map<number, number>();
@@ -229,6 +231,7 @@ export class Game {
     this.renderer.scene.add(this.impactMarker.object);
     this.renderer.scene.add(this.healthBars.group);
     this.renderer.scene.add(this.rallyMarkers.group);
+    this.renderer.scene.add(this.powerLines.group);
     this.ghost.setSpec(this.buildSpec);
 
     this.buildings.spawner = (kind, x, y, z): Unit | null => this.spawnUnit(kind, x, y, z);
@@ -371,6 +374,26 @@ export class Game {
         break;
       }
     }
+    // Place the HQ. Try a ring of offsets further out so it doesn't overlap units.
+    const hqOffsets: [number, number][] = [[-8, 0], [8, 0], [0, -8], [0, 8], [-8, -8], [8, 8]];
+    for (const [dx, dz] of hqOffsets) {
+      const ox = Math.max(0, Math.min(NAV_W - HQ.cellsW, startCx + dx - (HQ.cellsW >> 1)));
+      const oz = Math.max(0, Math.min(NAV_H - HQ.cellsD, startCz + dz - (HQ.cellsD >> 1)));
+      const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, HQ, ox, oz);
+      if (fp.ok) {
+        this.buildings.place(this.world, HQ, ox, oz, fp.floorY);
+        const pad = NAV_CELL_METERS;
+        const bx0 = ox * NAV_CELL_METERS;
+        const bz0 = oz * NAV_CELL_METERS;
+        const bx1 = (ox + HQ.cellsW) * NAV_CELL_METERS;
+        const bz1 = (oz + HQ.cellsD) * NAV_CELL_METERS;
+        const by0 = fp.floorY * VOXEL_SIZE;
+        const by1 = (fp.floorY + HQ.headroomVoxels + 4) * VOXEL_SIZE;
+        this.requestNavRebuildAround(bx0 - pad, by0 - pad, bz0 - pad, bx1 + pad, by1 + pad, bz1 + pad, false);
+        break;
+      }
+    }
+
     this.camera.target.set(c.x, 0, c.z);
   }
 
@@ -610,6 +633,7 @@ export class Game {
     this.rallyMarkers.update(this.buildings.buildings);
     this.minimap.update(this.units.units, this.buildings.buildings, this.metalClusters, this.camera);
     this.buildingRenderer.update(this.buildings.buildings);
+    this.powerLines.update(this.buildings.buildings);
     this.buildingRange.show(this.buildings.getSelected());
     this.unitRange.show(this.units.units);
     this.projectileRenderer.update(this.projectiles);
@@ -1240,6 +1264,19 @@ export class Game {
     const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
     const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz);
     if (!fp.ok) return;
+
+    // Enforce HQ build range: proposed center must be within range of a live HQ.
+    const liveHQs = this.buildings.buildings.filter(b => b.spec.kind === 'hq' && !b.destroyed);
+    if (liveHQs.length > 0) {
+      const propCx = (ox + spec.cellsW * 0.5) * NAV_CELL_METERS;
+      const propCz = (oz + spec.cellsD * 0.5) * NAV_CELL_METERS;
+      const inRange = liveHQs.some(hq => {
+        const hqCx = (hq.ox + hq.spec.cellsW * 0.5) * NAV_CELL_METERS;
+        const hqCz = (hq.oz + hq.spec.cellsD * 0.5) * NAV_CELL_METERS;
+        return Math.hypot(propCx - hqCx, propCz - hqCz) <= hq.spec.buildRangeMeters!;
+      });
+      if (!inRange) return;
+    }
     this.buildings.place(this.world, spec, ox, oz, fp.floorY);
     const pad = NAV_CELL_METERS;
     const bx0 = ox * NAV_CELL_METERS;

@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { buildVoxelModel, VoxelBlock } from './UnitModels';
-import { POWER_PLANT, REFINERY, TECH_LAB, TURRET, VEHICLE_DEPOT, POWER_PLANT_MAST_VOXELS } from '../sim/Buildings';
+import { POWER_PLANT, REFINERY, TECH_LAB, TURRET, VEHICLE_DEPOT, POWER_PLANT_MAST_VOXELS, HQ } from '../sim/Buildings';
 import { VOXEL_SIZE } from '../voxel/types';
 import { NAV_CELL_VOXELS } from '../path/SurfaceNav';
 
@@ -292,3 +292,56 @@ export function buildSolarPanelGeometry(): THREE.BufferGeometry {
 
 export const POWER_PLANT_SOLAR_Y_M = (POWER_PLANT.headroomVoxels + 1) * VOXEL_SIZE;
 export const POWER_PLANT_SOLAR_COUNT = 4;
+
+// ---------- HQ — large satellite dish + whip antennas -----------------------
+
+const HQ_DISH_OUTER = { r: 0.82, g: 0.82, b: 0.86 };
+const HQ_DISH_INNER = { r: 0.60, g: 0.60, b: 0.68 };
+const HQ_DISH_RIM   = { r: 0.30, g: 0.30, b: 0.34 };
+const HQ_DISH_FEED  = { r: 0.90, g: 0.90, b: 0.92 };
+const HQ_ANT_SHAFT  = { r: 0.40, g: 0.40, b: 0.44 };
+const HQ_ANT_TIP    = { r: 0.72, g: 0.36, b: 0.18 };  // rust-orange blink tip
+
+export function buildHQDishGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Pedestal / swivel base.
+  blocks.push({ x: 0, y: 0.10, z: 0, sx: 0.22, sy: 0.22, sz: 0.22, ...HQ_DISH_RIM });
+  // Elevation arm.
+  blocks.push({ x: 0, y: 0.36, z: 0, sx: 0.10, sy: 0.48, sz: 0.10, ...HQ_DISH_RIM });
+  // Dish face — three concentric layers for depth.
+  blocks.push({ x: 0, y: 0.68, z:  0.00, sx: 1.60, sy: 1.60, sz: 0.10, ...HQ_DISH_OUTER });
+  blocks.push({ x: 0, y: 0.68, z: -0.10, sx: 1.22, sy: 1.22, sz: 0.10, ...HQ_DISH_INNER });
+  blocks.push({ x: 0, y: 0.68, z: -0.20, sx: 0.82, sy: 0.82, sz: 0.10, ...HQ_DISH_INNER });
+  blocks.push({ x: 0, y: 0.68, z: -0.30, sx: 0.44, sy: 0.44, sz: 0.10, ...HQ_DISH_RIM });
+  // Feed arm — thin rod pointing from dish centre outward.
+  blocks.push({ x: 0, y: 0.68, z: -0.68, sx: 0.06, sy: 0.06, sz: 0.68, ...HQ_DISH_RIM });
+  // Feed horn.
+  blocks.push({ x: 0, y: 0.68, z: -1.05, sx: 0.18, sy: 0.18, sz: 0.12, ...HQ_DISH_FEED });
+  return buildVoxelModel(blocks);
+}
+
+export function buildHQAntennaGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [
+    // Lower shaft (square cross-section).
+    { x: 0, y: 0.30, z: 0, sx: 0.12, sy: 0.60, sz: 0.12, ...HQ_ANT_SHAFT },
+    // Mid shaft (slightly tapered).
+    { x: 0, y: 0.80, z: 0, sx: 0.08, sy: 0.40, sz: 0.08, ...HQ_ANT_SHAFT },
+    // Upper shaft.
+    { x: 0, y: 1.12, z: 0, sx: 0.06, sy: 0.32, sz: 0.06, ...HQ_ANT_SHAFT },
+    // Tip / beacon.
+    { x: 0, y: 1.32, z: 0, sx: 0.10, sy: 0.08, sz: 0.10, ...HQ_ANT_TIP },
+    { x: 0, y: 1.40, z: 0, sx: 0.06, sy: 0.04, sz: 0.06, ...HQ_ANT_TIP },
+    // Cross-bar at mid height.
+    { x: 0, y: 0.70, z: 0, sx: 0.42, sy: 0.04, sz: 0.06, ...HQ_ANT_SHAFT },
+    { x: 0, y: 0.90, z: 0, sx: 0.28, sy: 0.04, sz: 0.06, ...HQ_ANT_SHAFT },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+// Y above floorTop where the rotating dish sits (atop the central command ridge).
+export const HQ_DISH_Y_M       = (HQ.headroomVoxels + 5) * VOXEL_SIZE;
+// Antenna Y above floorTop (corner towers are antH=14 voxels above roof).
+export const HQ_ANTENNA_Y_M    = (HQ.headroomVoxels + 14) * VOXEL_SIZE;
+// Number of instances.
+export const HQ_DISH_COUNT     = 3;   // 1 large central + 2 side dishes
+export const HQ_ANTENNA_COUNT  = 4;   // one per corner

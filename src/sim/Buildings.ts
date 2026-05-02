@@ -16,7 +16,8 @@ export type BuildingKind =
   | 'refinery'
   | 'tech_lab'
   | 'turret'
-  | 'silo';
+  | 'silo'
+  | 'hq';
 
 /**
  * Faction the building belongs to. Mirrors the unit `Team` type — buildings
@@ -90,6 +91,17 @@ export interface BuildingSpec {
    * the turret head to a stowed pose so the reload is visually obvious.
    */
   weaponReloadSeconds?: number;
+  /**
+   * Maximum distance in meters from this building within which other buildings
+   * may be placed. Only meaningful for the HQ — all other specs leave this
+   * undefined (no placement restriction).
+   */
+  buildRangeMeters?: number;
+  /**
+   * When true, the renderer draws a power line from this building to the
+   * nearest live HQ. Used for power plants.
+   */
+  isEnergySource?: boolean;
 }
 
 export const BARRACKS: BuildingSpec = {
@@ -182,6 +194,7 @@ export const POWER_PLANT: BuildingSpec = {
   produces: [],
   stamp: stampPowerPlant,
   spawnPadCells: 0,
+  isEnergySource: true,
 };
 
 export const REFINERY: BuildingSpec = {
@@ -290,6 +303,26 @@ export const SILO: BuildingSpec = {
   // Top of the missile cluster sits ~6 voxels above the parapet.
   weaponMuzzleHeight: (32 + 6) * VOXEL_SIZE,
   spawnPadCells: 0,
+};
+
+/**
+ * Headquarters — the player's command center. Auto-placed near spawn; not in
+ * the build menu. Defines the "build range" (nothing can be placed farther than
+ * `buildRangeMeters` from any live HQ). Energy buildings draw power lines to it.
+ */
+export const HQ: BuildingSpec = {
+  kind: 'hq',
+  label: 'Headquarters',
+  cellsW: 6,
+  cellsD: 5,
+  headroomVoxels: 14,
+  wall: M_STONE,
+  maxHp: 3000,
+  productionInterval: Infinity,
+  produces: [],
+  stamp: stampHQ,
+  spawnPadCells: 0,
+  buildRangeMeters: 60,
 };
 
 /** All building specs in the order they appear on the build-mode hotkeys (1..N). */
@@ -1783,6 +1816,145 @@ export function stampSilo(
       world.set(tx, bandY, tz - 1, M_STONE);
       world.set(tx, bandY, tz + 2, M_STONE);
       wallCount += 4;
+    }
+  }
+
+  return wallCount;
+}
+
+export function stampHQ(
+  world: VoxelWorld,
+  ox: number, oz: number,
+  floorY: number,
+): number {
+  const spec = HQ;
+  const wxStart = ox * NAV_CELL_VOXELS;
+  const wzStart = oz * NAV_CELL_VOXELS;
+  const wxEnd   = wxStart + spec.cellsW * NAV_CELL_VOXELS; // +48
+  const wzEnd   = wzStart + spec.cellsD * NAV_CELL_VOXELS; // +40
+  const yFloor  = floorY + 1;
+  const yRoof   = floorY + spec.headroomVoxels;
+  const cxv     = (wxStart + wxEnd) >> 1;  // 24 voxels from start
+  const czv     = (wzStart + wzEnd) >> 1;  // 20 voxels from start
+
+  let wallCount = 0;
+  const wallThick = 3;
+
+  // Door opening on the +X (east) face: 8 wide, 10 tall.
+  const doorZ0 = czv - 4;
+  const doorZ1 = czv + 4;
+  const doorYTop = yFloor + 10;
+
+  // ---- Main building volume (walls + roof) ----
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      // Floor slab.
+      if (yFloor < WORLD_Y) { world.set(x, yFloor, z, M_STONE); wallCount++; }
+      for (let y = yFloor + 1; y <= yRoof; y++) {
+        if (y >= WORLD_Y) break;
+        const dx = Math.min(x - wxStart, wxEnd - 1 - x);
+        const dz = Math.min(z - wzStart, wzEnd - 1 - z);
+        const inWall = dx < wallThick || dz < wallThick;
+        if (y === yRoof) {
+          world.set(x, y, z, M_STONE); wallCount++;
+        } else if (inWall) {
+          const isDoor = x >= wxEnd - wallThick && z >= doorZ0 && z <= doorZ1 && y < doorYTop;
+          if (isDoor) { world.set(x, y, z, AIR); continue; }
+          world.set(x, y, z, M_STONE); wallCount++;
+        } else {
+          world.set(x, y, z, AIR);
+        }
+      }
+    }
+  }
+
+  // ---- Parapet: 2-voxel ring above the roof edge ----
+  for (let dy = 1; dy <= 2; dy++) {
+    const py = yRoof + dy; if (py >= WORLD_Y) break;
+    for (let z = wzStart; z < wzEnd; z++) {
+      for (let x = wxStart; x < wxEnd; x++) {
+        if (x >= WORLD_X || z >= WORLD_Z) continue;
+        const dx = Math.min(x - wxStart, wxEnd - 1 - x);
+        const dz = Math.min(z - wzStart, wzEnd - 1 - z);
+        if (dx < 2 || dz < 2) {
+          world.set(x, py, z, M_STONE); wallCount++;
+        }
+      }
+    }
+  }
+
+  // ---- Raised central command section on the roof: 12×10, 3 voxels tall ----
+  const ridgeX0 = cxv - 6; const ridgeX1 = cxv + 6;
+  const ridgeZ0 = czv - 5; const ridgeZ1 = czv + 5;
+  for (let dy = 1; dy <= 3; dy++) {
+    const py = yRoof + dy; if (py >= WORLD_Y) break;
+    for (let z = ridgeZ0; z < ridgeZ1; z++) {
+      for (let x = ridgeX0; x < ridgeX1; x++) {
+        if (x < 0 || x >= WORLD_X || z < 0 || z >= WORLD_Z) continue;
+        world.set(x, py, z, M_STONE); wallCount++;
+      }
+    }
+  }
+
+  // ---- Four corner antenna towers: 2×2 metal columns, 14 voxels above roof ----
+  const antH = 14;
+  const antCorners: [number, number][] = [
+    [wxStart + 2, wzStart + 2],
+    [wxEnd - 4,   wzStart + 2],
+    [wxStart + 2, wzEnd - 4  ],
+    [wxEnd - 4,   wzEnd - 4  ],
+  ];
+  for (const [ax, az] of antCorners) {
+    for (let dy = 1; dy <= antH; dy++) {
+      const py = yRoof + dy; if (py >= WORLD_Y) break;
+      for (let xo = 0; xo < 2; xo++) {
+        for (let zo = 0; zo < 2; zo++) {
+          const px = ax + xo; const pz = az + zo;
+          if (px >= 0 && px < WORLD_X && pz >= 0 && pz < WORLD_Z) {
+            world.set(px, py, pz, M_METAL); wallCount++;
+          }
+        }
+      }
+    }
+    // Antenna cap — single metal spike at top.
+    const capY = yRoof + antH + 1; if (capY < WORLD_Y) {
+      if (ax >= 0 && ax < WORLD_X && az >= 0 && az < WORLD_Z)
+        world.set(ax, capY, az, M_METAL);
+    }
+  }
+
+  // ---- Central dish mount platform: 6×6 metal pad atop the command section ----
+  const dishY = yRoof + 4; if (dishY < WORLD_Y) {
+    for (let z = czv - 3; z < czv + 3; z++) {
+      for (let x = cxv - 3; x < cxv + 3; x++) {
+        if (x < 0 || x >= WORLD_X || z < 0 || z >= WORLD_Z) continue;
+        world.set(x, dishY, z, M_METAL); wallCount++;
+      }
+    }
+  }
+
+  // ---- Side dish mount platforms: smaller 4×4 pads mid-way along north/south walls ----
+  const sideDishY = yRoof + 3; if (sideDishY < WORLD_Y) {
+    for (const [sdx, sdz] of [[cxv - 2, wzStart + 2], [cxv - 2, wzEnd - 6]] as [number, number][]) {
+      for (let xo = 0; xo < 4; xo++) {
+        for (let zo = 0; zo < 4; zo++) {
+          const px = sdx + xo; const pz = sdz + zo;
+          if (px >= 0 && px < WORLD_X && pz >= 0 && pz < WORLD_Z) {
+            world.set(px, sideDishY, pz, M_METAL); wallCount++;
+          }
+        }
+      }
+    }
+  }
+
+  // ---- Blast door lintel above the entry gap ----
+  for (let dy = doorYTop; dy <= doorYTop + 2; dy++) {
+    const py = yFloor + dy; if (py >= WORLD_Y || py > yRoof) break;
+    for (let z = doorZ0; z <= doorZ1; z++) {
+      if (z < 0 || z >= WORLD_Z) continue;
+      world.set(wxEnd - 1, py, z, M_METAL); wallCount++;
+      world.set(wxEnd - 2, py, z, M_METAL); wallCount++;
     }
   }
 

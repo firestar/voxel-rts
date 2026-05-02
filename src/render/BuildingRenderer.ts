@@ -15,6 +15,8 @@ import {
   buildAALauncherGeometry, AA_LAUNCHER_HEAD_Y_M,
   buildDepotCraneGeometry, VEHICLE_DEPOT_CRANE_Y_M, VEHICLE_DEPOT_CRANE_SLIDE_M,
   buildSolarPanelGeometry, POWER_PLANT_SOLAR_Y_M, POWER_PLANT_SOLAR_COUNT,
+  buildHQDishGeometry, buildHQAntennaGeometry,
+  HQ_DISH_Y_M, HQ_ANTENNA_Y_M, HQ_DISH_COUNT, HQ_ANTENNA_COUNT,
 } from './BuildingModels';
 
 /**
@@ -42,6 +44,8 @@ export class BuildingRenderer {
   private aaLauncher: THREE.InstancedMesh;
   private depotCrane: THREE.InstancedMesh;
   private solarPanel: THREE.InstancedMesh;
+  private hqDish: THREE.InstancedMesh;
+  private hqAntenna: THREE.InstancedMesh;
 
   private capacity: number;
   private tmpM = new THREE.Matrix4();
@@ -71,6 +75,8 @@ export class BuildingRenderer {
     this.aaLauncher = makeIM(buildAALauncherGeometry(), lit, capacity);
     this.depotCrane = makeIM(buildDepotCraneGeometry(), lit, capacity);
     this.solarPanel = makeIM(buildSolarPanelGeometry(), lit, capacity * POWER_PLANT_SOLAR_COUNT);
+    this.hqDish    = makeIM(buildHQDishGeometry(), lit, capacity * HQ_DISH_COUNT);
+    this.hqAntenna = makeIM(buildHQAntennaGeometry(), lit, capacity * HQ_ANTENNA_COUNT);
 
     this.group.add(
       this.turbineHub, this.turbineBlade,
@@ -79,12 +85,13 @@ export class BuildingRenderer {
       this.cornStalk, this.wheatStalk,
       this.turretHead, this.aaLauncher,
       this.depotCrane, this.solarPanel,
+      this.hqDish, this.hqAntenna,
     );
   }
 
   update(buildings: Building[]): void {
     let nHub = 0, nBlade = 0, nSmoke = 0, nDish = 0, nCore = 0, nCorn = 0, nWheat = 0, nTurret = 0;
-    let nAALauncher = 0, nCrane = 0, nSolar = 0;
+    let nAALauncher = 0, nCrane = 0, nSolar = 0, nHQDish = 0, nHQAnt = 0;
     const t = performance.now() / 1000;
 
     // Pulse colour modulation for the tech-lab core (shared across all labs).
@@ -140,6 +147,11 @@ export class BuildingRenderer {
           this.placeDepotCrane(b, cx, cz, floorTopY, t + phase, nCrane);
           nCrane++;
           break;
+        case 'hq':
+          this.placeHQAccessories(b, cx, cz, floorTopY, t + phase, nHQDish, nHQAnt);
+          nHQDish += HQ_DISH_COUNT;
+          nHQAnt  += HQ_ANTENNA_COUNT;
+          break;
         default:
           // Barracks / storage / silo: no rotating accessories. The silo's
           // missile cluster is part of the static voxel stamp.
@@ -158,6 +170,8 @@ export class BuildingRenderer {
     this.aaLauncher.count = nAALauncher;
     this.depotCrane.count = nCrane;
     this.solarPanel.count = nSolar;
+    this.hqDish.count = nHQDish;
+    this.hqAntenna.count = nHQAnt;
     for (const m of [
       this.turbineHub, this.turbineBlade,
       this.smoke,
@@ -165,6 +179,7 @@ export class BuildingRenderer {
       this.cornStalk, this.wheatStalk,
       this.turretHead, this.aaLauncher,
       this.depotCrane, this.solarPanel,
+      this.hqDish, this.hqAntenna,
     ]) {
       m.instanceMatrix.needsUpdate = true;
     }
@@ -381,6 +396,64 @@ export class BuildingRenderer {
     for (; cornI < totalCorn; cornI++) this.cornStalk.setMatrixAt(cornStart + cornI, this.tmpM);
     for (; wheatI < totalWheat; wheatI++) this.wheatStalk.setMatrixAt(wheatStart + wheatI, this.tmpM);
     this.tmpScale.set(1, 1, 1); // restore for other branches
+  }
+
+  /**
+   * Place HQ accessories: 3 satellite dishes (1 large central + 2 side) and
+   * 4 corner antennas. The central dish slowly scans; the two side dishes are
+   * angled outward and rotate at a different speed for visual variety.
+   */
+  private placeHQAccessories(
+    b: Building,
+    cx: number, cz: number, floorTopY: number,
+    t: number,
+    dishStart: number, antStart: number,
+  ): void {
+    const halfW = b.spec.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE * 0.5;
+    const halfD = b.spec.cellsD * NAV_CELL_VOXELS * VOXEL_SIZE * 0.5;
+    const dishBaseY = floorTopY + HQ_DISH_Y_M;
+
+    // Central large dish — slow scan sweep ±75°.
+    const yaw0 = Math.sin(t * 0.22) * (Math.PI * 5 / 12);
+    this.tmpEuler.set(-0.4, yaw0, 0, 'YXZ');
+    this.tmpQ.setFromEuler(this.tmpEuler);
+    this.tmpV.set(cx, dishBaseY, cz);
+    this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+    this.hqDish.setMatrixAt(dishStart + 0, this.tmpM);
+
+    // North side dish — fixed outward tilt, faster rotation.
+    const yaw1 = Math.sin(t * 0.38 + 1.1) * (Math.PI / 4) + Math.PI * 0.5;
+    this.tmpEuler.set(-0.3, yaw1, 0, 'YXZ');
+    this.tmpQ.setFromEuler(this.tmpEuler);
+    this.tmpV.set(cx, floorTopY + HQ_DISH_Y_M - 0.4, cz - halfD * 0.55);
+    this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+    this.hqDish.setMatrixAt(dishStart + 1, this.tmpM);
+
+    // South side dish.
+    const yaw2 = Math.sin(t * 0.31 + 2.4) * (Math.PI / 4) - Math.PI * 0.5;
+    this.tmpEuler.set(-0.3, yaw2, 0, 'YXZ');
+    this.tmpQ.setFromEuler(this.tmpEuler);
+    this.tmpV.set(cx, floorTopY + HQ_DISH_Y_M - 0.4, cz + halfD * 0.55);
+    this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+    this.hqDish.setMatrixAt(dishStart + 2, this.tmpM);
+
+    // 4 corner antennas — static, one per corner of the building.
+    const antY = floorTopY + HQ_ANTENNA_Y_M;
+    const corners: [number, number][] = [
+      [cx - halfW + 0.5, cz - halfD + 0.5],
+      [cx + halfW - 0.5, cz - halfD + 0.5],
+      [cx - halfW + 0.5, cz + halfD - 0.5],
+      [cx + halfW - 0.5, cz + halfD - 0.5],
+    ];
+    this.tmpEuler.set(0, 0, 0, 'YXZ');
+    this.tmpQ.setFromEuler(this.tmpEuler);
+    for (let i = 0; i < HQ_ANTENNA_COUNT; i++) {
+      const [ax, az] = corners[i]!;
+      this.tmpV.set(ax, antY, az);
+      this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpScale);
+      this.hqAntenna.setMatrixAt(antStart + i, this.tmpM);
+    }
+    void b;
   }
 
   private placeTechLabAccessories(
