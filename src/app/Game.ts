@@ -591,6 +591,7 @@ export class Game {
         releaseClusterSlot: (cid, uid) => this.releaseClusterSlot(cid, uid),
         clusterSlotPos: (c, si) => this.clusterSlotPos(c, si),
         findAlternateClusterTarget: (excl, fx, fz) => this.findAlternateClusterTarget(excl, fx, fz),
+        findBestMineTarget: (fx, fz) => this.findBestMineTarget(fx, fz),
       });
       const grow = this.saplings.tick(dt, this.world);
       if (grow.matured > 0) this.requestNavRebuild(false);
@@ -1889,26 +1890,28 @@ export class Game {
     };
   }
 
-  /** Nearest live cluster with a free worker slot, excluding `excludeId`. Returns a metal voxel target in it. */
-  private findAlternateClusterTarget(
-    excludeId: number, fromX: number, fromZ: number,
-  ): { wx: number; wy: number; wz: number } | null {
-    let best: MetalCluster | null = null;
-    let bestDist2 = Infinity;
-    for (const c of this.metalClusters) {
-      if (c.id === excludeId || c.destroyed) continue;
-      if (!c.workerSlots.some(s => s === 0)) continue;
-      const dx = c.worldX - fromX, dz = c.worldZ - fromZ;
-      const d2 = dx * dx + dz * dz;
-      if (d2 < bestDist2) { bestDist2 = d2; best = c; }
-    }
-    if (!best) return null;
+  /**
+   * Score function shared by initial and fallback cluster selection.
+   * Balances occupancy (spread workers evenly) against distance (avoid huge detours).
+   * occupancy weight 0.65 means we strongly prefer emptier clusters while still
+   * penalising very distant ones.
+   */
+  private clusterScore(c: MetalCluster, fromX: number, fromZ: number): number {
+    const REF_DIST = 100.0; // metres — normalises distance into [0,~2] for typical maps
+    const OCC_W = 0.65;
+    const occupancy = 1 - c.workerSlots.filter(s => s === 0).length / c.maxWorkers;
+    const dx = c.worldX - fromX, dz = c.worldZ - fromZ;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    return occupancy * OCC_W + (dist / REF_DIST) * (1 - OCC_W);
+  }
+
+  private clusterVoxelTarget(c: MetalCluster): { wx: number; wy: number; wz: number } | null {
     const voxels = this.world.buffers.voxels;
-    const yMin = best.surfaceTop + 1;
-    const yMax = best.surfaceTop + 1 + best.ry * 2;
+    const yMin = c.surfaceTop + 1;
+    const yMax = c.surfaceTop + 1 + c.ry * 2;
     for (let y = yMin; y <= yMax; y++) {
-      for (let z = best.vz - best.rxz; z <= best.vz + best.rxz; z++) {
-        for (let x = best.vx - best.rxz; x <= best.vx + best.rxz; x++) {
+      for (let z = c.vz - c.rxz; z <= c.vz + c.rxz; z++) {
+        for (let x = c.vx - c.rxz; x <= c.vx + c.rxz; x++) {
           if (x < 0 || x >= WORLD_X || z < 0 || z >= WORLD_Z) continue;
           if (voxels[worldIndex(x, y, z)] === M_METAL) {
             return { wx: (x + 0.5) * VOXEL_SIZE, wy: (y + 0.5) * VOXEL_SIZE, wz: (z + 0.5) * VOXEL_SIZE };
@@ -1917,6 +1920,41 @@ export class Game {
       }
     }
     return null;
+  }
+
+  /**
+   * Load-balanced initial mine assignment. Called by idle workers before they
+   * have walked anywhere. Picks the cluster that minimises the combined
+   * occupancy+distance score so workers naturally spread across all mines rather
+   * than piling onto the nearest one.
+   */
+  private findBestMineTarget(
+    fromX: number, fromZ: number,
+  ): { wx: number; wy: number; wz: number } | null {
+    let best: MetalCluster | null = null;
+    let bestScore = Infinity;
+    for (const c of this.metalClusters) {
+      if (c.destroyed) continue;
+      if (!c.workerSlots.some(s => s === 0)) continue;
+      const score = this.clusterScore(c, fromX, fromZ);
+      if (score < bestScore) { bestScore = score; best = c; }
+    }
+    return best ? this.clusterVoxelTarget(best) : null;
+  }
+
+  /** Load-balanced fallback when a worker reaches a full cluster and needs redirection. */
+  private findAlternateClusterTarget(
+    excludeId: number, fromX: number, fromZ: number,
+  ): { wx: number; wy: number; wz: number } | null {
+    let best: MetalCluster | null = null;
+    let bestScore = Infinity;
+    for (const c of this.metalClusters) {
+      if (c.id === excludeId || c.destroyed) continue;
+      if (!c.workerSlots.some(s => s === 0)) continue;
+      const score = this.clusterScore(c, fromX, fromZ);
+      if (score < bestScore) { bestScore = score; best = c; }
+    }
+    return best ? this.clusterVoxelTarget(best) : null;
   }
 
   private tunnelerPitchOk(unit: { x: number; y: number; z: number; maxPitchRad: number }, wx: number, wy: number, wz: number): boolean {

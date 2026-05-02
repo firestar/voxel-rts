@@ -69,6 +69,13 @@ export interface WorkerDeps {
    * cluster has capacity.
    */
   findAlternateClusterTarget?: (excludeClusterId: number, fromX: number, fromZ: number) => { wx: number; wy: number; wz: number } | null;
+  /**
+   * Load-balanced initial mine assignment. Scores clusters by occupancy fraction
+   * and distance so idle workers spread across all mines rather than piling onto
+   * the nearest one. Returns a voxel target in the best cluster, or null when no
+   * cluster has a free slot.
+   */
+  findBestMineTarget?: (fromX: number, fromZ: number) => { wx: number; wy: number; wz: number } | null;
 }
 
 export function tickWorkers(dt: number, deps: WorkerDeps): void {
@@ -371,12 +378,25 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
   u.workerScanCooldown = SCAN_COOLDOWN_SECS;
 
   if (focus !== 'chop') {
-    const ore = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_METAL);
-    if (ore) {
-      u.task = { kind: 'mine', wx: (ore.vx + 0.5) * VOXEL_SIZE, wy: (ore.vy + 0.5) * VOXEL_SIZE, wz: (ore.vz + 0.5) * VOXEL_SIZE };
-      u.workerRouteCooldown = 0;
-      deps.routeWorker(u, u.task.wx, u.task.wy, u.task.wz);
-      return true;
+    if (deps.findBestMineTarget) {
+      // Cluster-aware load-balanced assignment: cheap, so multiple workers can
+      // be assigned in the same tick without triggering scanFiredThisTick.
+      const target = deps.findBestMineTarget(u.x, u.z);
+      if (target) {
+        u.task = { kind: 'mine', wx: target.wx, wy: target.wy, wz: target.wz };
+        u.workerRouteCooldown = 0;
+        deps.routeWorker(u, target.wx, target.wy, target.wz);
+        return false; // cheap — don't block other workers from assigning this tick
+      }
+    } else {
+      // Fallback: expensive full-world voxel scan when cluster metadata is absent.
+      const ore = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_METAL);
+      if (ore) {
+        u.task = { kind: 'mine', wx: (ore.vx + 0.5) * VOXEL_SIZE, wy: (ore.vy + 0.5) * VOXEL_SIZE, wz: (ore.vz + 0.5) * VOXEL_SIZE };
+        u.workerRouteCooldown = 0;
+        deps.routeWorker(u, u.task.wx, u.task.wy, u.task.wz);
+        return true; // expensive scan fired — suppress further scans this tick
+      }
     }
   }
 
