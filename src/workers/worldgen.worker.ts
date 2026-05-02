@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { warpedFbm2, fbm3, worley3 } from '../util/Noise';
+import { warpedFbm2 } from '../util/Noise';
 import {
   WORLD_X, WORLD_Y, WORLD_Z, CHUNK_COUNT,
 } from '../voxel/types';
@@ -45,11 +45,6 @@ function generate(job: GenJob): void {
   // mountains a rocky look that contrasts with the grass plain.
   const stoneCapTop = baseHeight + heightAmp + 16; // 124 voxels = 15.5 m
 
-  // Cave parameters (noise periods scaled to keep similar feature sizes).
-  const caveStartY = 8;
-  const caveEndY = WORLD_Y - 8;
-  const worleyFreq = 1 / 28;
-  const fbmFreq = 1 / 44;
 
   for (let z = zStart; z < zEnd; z++) {
     for (let x = 0; x < WORLD_X; x++) {
@@ -114,20 +109,6 @@ function generate(job: GenJob): void {
       }
 
       // Above terrain: air (already zero).
-
-      // Caves: carve from stone/dirt where worley distance is small AND fbm threshold met.
-      // Use the cheaper test first to short-circuit.
-      for (let y = caveStartY; y < Math.min(caveEndY, top); y++) {
-        // Bedrock layer is sacred.
-        if (y < 5) continue;
-        // Quick reject via fbm threshold.
-        const f = fbm3(x * fbmFreq, y * fbmFreq, z * fbmFreq, seed + 7919, 2);
-        if (f < 0.18) continue;
-        // Confirm with worley closeness — caves run along cell boundaries.
-        const wd = worley3(x * worleyFreq, y * worleyFreq, z * worleyFreq, seed + 1031);
-        if (wd > 0.55) continue;
-        voxels[worldIndex(x, y, z)] = M_AIR;
-      }
 
       // Bump progress (atomically — multiple workers may race).
       Atomics.add(progress, 0, 1);

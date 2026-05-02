@@ -675,7 +675,10 @@ export class Game {
           : this.mode === 'terrain'
             ? `MODE: TERRAIN EDIT — ${TERRAIN_PALETTE[this.terrainPaletteIdx]!.label} r=${this.terrainBrushRadius} (LMB paint, shift+LMB carve, 1-${TERRAIN_PALETTE.length} material, ,/. brush, G/Esc exit)`
             : 'MODE: PLAY';
-      this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}${weaponDesc}`;
+      const cutDesc = isFinite(this.hideAboveY)
+        ? ` | Y-cutoff: ${this.hideAboveY.toFixed(1)} m ([/] adjust, \\ reset)`
+        : '';
+      this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}${weaponDesc}${cutDesc}`;
     }
     this.renderActionPanel();
     this.renderTaskPanel();
