@@ -23,6 +23,8 @@ import { WEAPONS } from '../sim/Weapons';
  */
 const COLOR = 0x33ff66;
 const OPACITY = 0.40;
+const HQ_RING_COLOR = 0xff8833;
+const HQ_RING_OPACITY = 0.50;
 
 /** AA cone half-angle. 45° gives a square cone-base radius that matches its height. */
 const AA_CONE_HALF_ANGLE = Math.PI / 4;
@@ -38,6 +40,11 @@ export class BuildingRangeIndicator {
   private coneMat: THREE.MeshBasicMaterial;
   private cone: THREE.Mesh;
 
+  // Flat ground ring shown when an HQ is selected — indicates build range.
+  private hqRingGeo: THREE.RingGeometry;
+  private hqRingMat: THREE.MeshBasicMaterial;
+  private hqRing: THREE.Mesh;
+
   constructor() {
     this.domeMat = new THREE.MeshBasicMaterial({
       color: COLOR, transparent: true, opacity: OPACITY,
@@ -49,22 +56,52 @@ export class BuildingRangeIndicator {
     });
     this.dome = new THREE.Mesh(this.domeGeo, this.domeMat);
     this.cone = new THREE.Mesh(this.coneGeo, this.coneMat);
-    // Render the indicator after the world geometry so the alpha blend reads
-    // correctly even when other transparent elements (path preview, ghost)
-    // are drawn the same frame.
     this.dome.renderOrder = 998;
     this.cone.renderOrder = 998;
     this.dome.visible = false;
     this.cone.visible = false;
-    this.group.add(this.dome, this.cone);
+
+    // HQ build-range ring: lies flat in the XZ plane, radius = 1 (scaled at render time).
+    this.hqRingGeo = new THREE.RingGeometry(0.97, 1.0, 96);
+    this.hqRingGeo.rotateX(-Math.PI / 2); // lay flat on XZ
+    this.hqRingMat = new THREE.MeshBasicMaterial({
+      color: HQ_RING_COLOR, transparent: true, opacity: HQ_RING_OPACITY,
+      side: THREE.DoubleSide, depthWrite: false,
+    });
+    this.hqRing = new THREE.Mesh(this.hqRingGeo, this.hqRingMat);
+    this.hqRing.renderOrder = 997;
+    this.hqRing.visible = false;
+
+    this.group.add(this.dome, this.cone, this.hqRing);
   }
 
   /**
-   * Show the range volume for `b` if it carries a weapon, otherwise hide
-   * everything. Pass `null` to hide.
+   * Show the range volume for `b`. HQ buildings show a flat ground ring at
+   * `buildRangeMeters`; weapon buildings show the dome/cone. Pass `null` to hide.
    */
   show(b: Building | null): void {
-    if (!b || !b.spec.weapon) {
+    this.hqRing.visible = false;
+
+    if (!b) {
+      this.dome.visible = false;
+      this.cone.visible = false;
+      return;
+    }
+
+    if (b.spec.kind === 'hq' && b.spec.buildRangeMeters) {
+      const range = b.spec.buildRangeMeters;
+      const cx = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const cz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const groundY = (b.floorY + 1) * VOXEL_SIZE + 0.15;
+      this.hqRing.position.set(cx, groundY, cz);
+      this.hqRing.scale.set(range, range, range);
+      this.hqRing.visible = true;
+      this.dome.visible = false;
+      this.cone.visible = false;
+      return;
+    }
+
+    if (!b.spec.weapon) {
       this.dome.visible = false;
       this.cone.visible = false;
       return;

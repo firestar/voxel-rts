@@ -395,6 +395,8 @@ export class Game {
     }
 
     this.camera.target.set(c.x, 0, c.z);
+    // Compute power-line routes now that HQ is placed.
+    this.recomputePowerLinePaths();
   }
 
   private spawnUnit(kind: UnitKind, x: number, y: number, z: number): Unit | null {
@@ -633,7 +635,7 @@ export class Game {
     this.rallyMarkers.update(this.buildings.buildings);
     this.minimap.update(this.units.units, this.buildings.buildings, this.metalClusters, this.camera);
     this.buildingRenderer.update(this.buildings.buildings);
-    this.powerLines.update(this.buildings.buildings);
+    // Power lines are recomputed lazily (on building place/destroy), not every frame.
     this.buildingRange.show(this.buildings.getSelected());
     this.unitRange.show(this.units.units);
     this.projectileRenderer.update(this.projectiles);
@@ -1286,6 +1288,8 @@ export class Game {
     const by0 = fp.floorY * VOXEL_SIZE;
     const by1 = (fp.floorY + spec.headroomVoxels + 4) * VOXEL_SIZE;
     this.requestNavRebuildAround(bx0 - pad, by0 - pad, bz0 - pad, bx1 + pad, by1 + pad, bz1 + pad, true);
+    // Recompute power-line routes so new buildings that are energy sources or HQs appear.
+    this.recomputePowerLinePaths();
   }
 
   private detonateAt(hit: { x: number; y: number; z: number; nx: number; ny: number; nz: number }): void {
@@ -1916,6 +1920,59 @@ export class Game {
       }
     }
     return null; // cluster full
+  }
+
+  /**
+   * Compute A*-based surface paths from every live power plant to its nearest
+   * live HQ, then pass the resulting waypoints to the power-line renderer so
+   * lines follow the terrain rather than cutting straight through hills.
+   * Called once after world gen and again whenever a building is placed.
+   */
+  private recomputePowerLinePaths(): void {
+    if (!this.pathfinder) return;
+    const hqs = this.buildings.buildings.filter(b => b.spec.kind === 'hq' && !b.destroyed);
+    if (hqs.length === 0) { this.powerLines.setRoutes([]); return; }
+
+    const routes: { waypoints: { x: number; y: number; z: number }[] }[] = [];
+
+    for (const src of this.buildings.buildings) {
+      if (!src.spec.isEnergySource || src.destroyed) continue;
+
+      const sx = (src.ox + src.spec.cellsW * 0.5) * NAV_CELL_METERS;
+      const sz = (src.oz + src.spec.cellsD * 0.5) * NAV_CELL_METERS;
+      const sy = this.surfaceWorldY(sx, sz);
+
+      let nearest = hqs[0]!;
+      let nearestDist = Infinity;
+      for (const hq of hqs) {
+        const hx = (hq.ox + hq.spec.cellsW * 0.5) * NAV_CELL_METERS;
+        const hz = (hq.oz + hq.spec.cellsD * 0.5) * NAV_CELL_METERS;
+        const d = Math.hypot(sx - hx, sz - hz);
+        if (d < nearestDist) { nearestDist = d; nearest = hq; }
+      }
+
+      const hx = (nearest.ox + nearest.spec.cellsW * 0.5) * NAV_CELL_METERS;
+      const hz = (nearest.oz + nearest.spec.cellsD * 0.5) * NAV_CELL_METERS;
+      const hy = this.surfaceWorldY(hx, hz);
+
+      const rawStart = this.pathfinder.cellAt(sx, sy, sz);
+      const rawGoal  = this.pathfinder.cellAt(hx, hy, hz);
+      const start = this.pathfinder.nearestPassable('soldier', rawStart, 8);
+      const goal  = this.pathfinder.nearestPassable('soldier', rawGoal, 8);
+
+      const res = this.pathfinder.findPath('soldier', {
+        start, goal, anyAngle: false, maxExpansions: 10000,
+      });
+
+      if (res.cells.length > 0) {
+        routes.push({ waypoints: this.pathfinder.pathToWaypoints(res.cells) });
+      } else {
+        // Fallback: straight line if pathfinding fails (isolated terrain).
+        routes.push({ waypoints: [{ x: sx, y: sy, z: sz }, { x: hx, y: hy, z: hz }] });
+      }
+    }
+
+    this.powerLines.setRoutes(routes);
   }
 
   private releaseClusterSlot(clusterId: number, unitId: number): void {

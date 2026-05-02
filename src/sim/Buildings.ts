@@ -315,7 +315,7 @@ export const HQ: BuildingSpec = {
   label: 'Headquarters',
   cellsW: 6,
   cellsD: 5,
-  headroomVoxels: 14,
+  headroomVoxels: 12,
   wall: M_STONE,
   maxHp: 3000,
   productionInterval: Infinity,
@@ -1827,135 +1827,197 @@ export function stampHQ(
   ox: number, oz: number,
   floorY: number,
 ): number {
-  const spec = HQ;
+  // 6×5 nav cells = 48 wide (X) × 40 deep (Z)
   const wxStart = ox * NAV_CELL_VOXELS;
   const wzStart = oz * NAV_CELL_VOXELS;
-  const wxEnd   = wxStart + spec.cellsW * NAV_CELL_VOXELS; // +48
-  const wzEnd   = wzStart + spec.cellsD * NAV_CELL_VOXELS; // +40
+  const wxEnd   = wxStart + HQ.cellsW * NAV_CELL_VOXELS; // +48
+  const wzEnd   = wzStart + HQ.cellsD * NAV_CELL_VOXELS; // +40
   const yFloor  = floorY + 1;
-  const yRoof   = floorY + spec.headroomVoxels;
-  const cxv     = (wxStart + wxEnd) >> 1;  // 24 voxels from start
-  const czv     = (wzStart + wzEnd) >> 1;  // 20 voxels from start
+  // Main lower building rises 12 voxels (matches headroomVoxels).
+  const yRoof   = yFloor + HQ.headroomVoxels; // main roof slab
+  const cxv     = (wxStart + wxEnd) >> 1;     // X centre
+  const czv     = (wzStart + wzEnd) >> 1;     // Z centre
 
   let wallCount = 0;
-  const wallThick = 3;
 
-  // Door opening on the +X (east) face: 8 wide, 10 tall.
-  const doorZ0 = czv - 4;
-  const doorZ1 = czv + 4;
-  const doorYTop = yFloor + 10;
+  const set = (x: number, y: number, z: number, m: number): void => {
+    if (x < 0 || x >= WORLD_X || z < 0 || z >= WORLD_Z || y < 0 || y >= WORLD_Y) return;
+    world.set(x, y, z, m); wallCount++;
+  };
 
-  // ---- Main building volume (walls + roof) ----
+  // ---- Floor slab ----
+  for (let z = wzStart; z < wzEnd; z++)
+    for (let x = wxStart; x < wxEnd; x++)
+      set(x, yFloor, z, M_STONE);
+
+  // ---- Main lower shell (3-voxel-thick stone walls, open interior) ----
+  // East (+X) entrance: 12-voxel-wide opening centred on Z, 10 voxels tall.
+  const doorZ0 = czv - 6; const doorZ1 = czv + 6;
+  const doorTop = yFloor + 10;
+
   for (let z = wzStart; z < wzEnd; z++) {
     for (let x = wxStart; x < wxEnd; x++) {
-      if (x >= WORLD_X || z >= WORLD_Z) continue;
-      // Floor slab.
-      if (yFloor < WORLD_Y) { world.set(x, yFloor, z, M_STONE); wallCount++; }
+      const dx = Math.min(x - wxStart, wxEnd - 1 - x);
+      const dz = Math.min(z - wzStart, wzEnd - 1 - z);
+      const inWall = dx < 3 || dz < 3;
+      if (!inWall) continue;
+
       for (let y = yFloor + 1; y <= yRoof; y++) {
-        if (y >= WORLD_Y) break;
-        const dx = Math.min(x - wxStart, wxEnd - 1 - x);
-        const dz = Math.min(z - wzStart, wzEnd - 1 - z);
-        const inWall = dx < wallThick || dz < wallThick;
-        if (y === yRoof) {
-          world.set(x, y, z, M_STONE); wallCount++;
-        } else if (inWall) {
-          const isDoor = x >= wxEnd - wallThick && z >= doorZ0 && z <= doorZ1 && y < doorYTop;
-          if (isDoor) { world.set(x, y, z, AIR); continue; }
-          world.set(x, y, z, M_STONE); wallCount++;
-        } else {
-          world.set(x, y, z, AIR);
+        // East wall door gap.
+        const isEastFace = x >= wxEnd - 3;
+        if (isEastFace && z >= doorZ0 && z <= doorZ1 && y < doorTop) continue;
+
+        // North / south wall window slots (3 per side: left/center/right sections).
+        const isNS = z < wzStart + 3 || z >= wzEnd - 3;
+        if (isNS) {
+          const inWindow = (x >= wxStart + 6 && x <= wxStart + 10 ||
+                            x >= cxv - 2    && x <= cxv + 2      ||
+                            x >= wxEnd - 11 && x <= wxEnd - 7)
+                        && y >= yFloor + 3 && y <= yFloor + 7;
+          if (inWindow) continue;
         }
+
+        if (y === yRoof) set(x, y, z, M_STONE);
+        else             set(x, y, z, M_STONE);
       }
     }
   }
 
-  // ---- Parapet: 2-voxel ring above the roof edge ----
-  for (let dy = 1; dy <= 2; dy++) {
-    const py = yRoof + dy; if (py >= WORLD_Y) break;
-    for (let z = wzStart; z < wzEnd; z++) {
-      for (let x = wxStart; x < wxEnd; x++) {
-        if (x >= WORLD_X || z >= WORLD_Z) continue;
-        const dx = Math.min(x - wxStart, wxEnd - 1 - x);
-        const dz = Math.min(z - wzStart, wzEnd - 1 - z);
-        if (dx < 2 || dz < 2) {
-          world.set(x, py, z, M_STONE); wallCount++;
-        }
-      }
+  // ---- Blast-door lintel (metal cap above entrance) ----
+  for (let z = doorZ0; z <= doorZ1; z++) {
+    for (let dy = 0; dy < 3; dy++) {
+      const py = doorTop + dy; if (py > yRoof) break;
+      set(wxEnd - 1, py, z, M_METAL);
+      set(wxEnd - 2, py, z, M_METAL);
     }
   }
 
-  // ---- Raised central command section on the roof: 12×10, 3 voxels tall ----
-  const ridgeX0 = cxv - 6; const ridgeX1 = cxv + 6;
-  const ridgeZ0 = czv - 5; const ridgeZ1 = czv + 5;
-  for (let dy = 1; dy <= 3; dy++) {
-    const py = yRoof + dy; if (py >= WORLD_Y) break;
-    for (let z = ridgeZ0; z < ridgeZ1; z++) {
-      for (let x = ridgeX0; x < ridgeX1; x++) {
-        if (x < 0 || x >= WORLD_X || z < 0 || z >= WORLD_Z) continue;
-        world.set(x, py, z, M_STONE); wallCount++;
-      }
+  // ---- Crenellated parapet on main roof ----
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      const dx = Math.min(x - wxStart, wxEnd - 1 - x);
+      const dz = Math.min(z - wzStart, wzEnd - 1 - z);
+      if (dx >= 2 && dz >= 2) continue; // not on edge
+      // Alternating merlons (3 high) and crenels (1 high): period of 5.
+      const pos = (x + z) % 5;
+      const merlon = pos < 3;
+      const topDy = merlon ? 3 : 1;
+      for (let dy = 1; dy <= topDy; dy++) set(x, yRoof + dy, z, M_STONE);
     }
   }
 
-  // ---- Four corner antenna towers: 2×2 metal columns, 14 voxels above roof ----
-  const antH = 14;
-  const antCorners: [number, number][] = [
-    [wxStart + 2, wzStart + 2],
-    [wxEnd - 4,   wzStart + 2],
-    [wxStart + 2, wzEnd - 4  ],
-    [wxEnd - 4,   wzEnd - 4  ],
+  // ---- Four corner watchtowers (8×8 each, 8 voxels above main roof) ----
+  const wtW = 8;
+  const wtH = 8;
+  const wtCorners: [number, number][] = [
+    [wxStart, wzStart],
+    [wxEnd - wtW, wzStart],
+    [wxStart, wzEnd - wtW],
+    [wxEnd - wtW, wzEnd - wtW],
   ];
-  for (const [ax, az] of antCorners) {
+  const wtBase = yRoof + 1; const wtTop = wtBase + wtH;
+
+  for (const [tx, tz] of wtCorners) {
+    for (let z = tz; z < tz + wtW; z++) {
+      for (let x = tx; x < tx + wtW; x++) {
+        const dx = Math.min(x - tx, tx + wtW - 1 - x);
+        const dz = Math.min(z - tz, tz + wtW - 1 - z);
+        const inWall = dx < 2 || dz < 2;
+        if (!inWall) continue;
+        for (let y = wtBase; y <= wtTop; y++) set(x, y, z, M_STONE);
+      }
+    }
+    // Battlement cap on watchtower roof.
+    const wxC = tx + wtW; const wzC = tz + wtW;
+    for (let z = tz; z < wzC; z++) {
+      for (let x = tx; x < wxC; x++) {
+        const dx = Math.min(x - tx, wxC - 1 - x);
+        const dz = Math.min(z - tz, wzC - 1 - z);
+        if (dx >= 2 && dz >= 2) continue;
+        // Solid stone top on watchtowers (no crenels — they're circular).
+        set(x, wtTop + 1, z, M_STONE);
+      }
+    }
+  }
+
+  // ---- Diagonal blast-wall fins at each corner (staircase pattern) ----
+  // 4 steps outward diagonally, each step 1 shorter in height.
+  const fins: [number, number, number, number][] = [
+    [wxStart + 2, wzStart + 2, -1, -1],
+    [wxEnd - 3, wzStart + 2, +1, -1],
+    [wxStart + 2, wzEnd - 3, -1, +1],
+    [wxEnd - 3, wzEnd - 3, +1, +1],
+  ];
+  for (const [bx, bz, dx, dz] of fins) {
+    for (let step = 0; step < 4; step++) {
+      const px = bx + dx * (step + 1);
+      const pz = bz + dz * (step + 1);
+      const topY = yRoof - step * 3;
+      for (let y = yFloor; y <= topY; y++) set(px, y, pz, M_STONE);
+    }
+  }
+
+  // ---- Central raised command block (on main roof, 26×18, 6 tall) ----
+  const cmdX0 = cxv - 13; const cmdX1 = cxv + 13;
+  const cmdZ0 = czv - 9;  const cmdZ1 = czv + 9;
+  const cmdBase = yRoof + 1; const cmdTop = cmdBase + 6;
+
+  for (let z = cmdZ0; z < cmdZ1; z++) {
+    for (let x = cmdX0; x < cmdX1; x++) {
+      const dx = Math.min(x - cmdX0, cmdX1 - 1 - x);
+      const dz = Math.min(z - cmdZ0, cmdZ1 - 1 - z);
+      const inWall = dx < 2 || dz < 2;
+
+      for (let y = cmdBase; y <= cmdTop; y++) {
+        if (y === cmdTop) { set(x, y, z, M_STONE); continue; }
+        if (!inWall) continue;
+
+        // Window slots on north/south faces of command block.
+        const isNS = z < cmdZ0 + 2 || z >= cmdZ1 - 2;
+        if (isNS) {
+          const inWin = x >= cxv - 4 && x <= cxv + 4 && y >= cmdBase + 2 && y <= cmdBase + 4;
+          if (inWin) continue;
+        }
+        set(x, y, z, M_STONE);
+      }
+    }
+  }
+
+  // ---- Antenna towers: 2×2 metal pillars from watchtower roof up ----
+  const antH = 18;
+  for (const [tx, tz] of wtCorners) {
+    const ax = tx + 3; const az = tz + 3; // 2×2 centred in 8×8 tower
     for (let dy = 1; dy <= antH; dy++) {
-      const py = yRoof + dy; if (py >= WORLD_Y) break;
-      for (let xo = 0; xo < 2; xo++) {
-        for (let zo = 0; zo < 2; zo++) {
-          const px = ax + xo; const pz = az + zo;
-          if (px >= 0 && px < WORLD_X && pz >= 0 && pz < WORLD_Z) {
-            world.set(px, py, pz, M_METAL); wallCount++;
-          }
-        }
-      }
-    }
-    // Antenna cap — single metal spike at top.
-    const capY = yRoof + antH + 1; if (capY < WORLD_Y) {
-      if (ax >= 0 && ax < WORLD_X && az >= 0 && az < WORLD_Z)
-        world.set(ax, capY, az, M_METAL);
+      const py = wtTop + 1 + dy; if (py >= WORLD_Y) break;
+      for (let xo = 0; xo < 2; xo++)
+        for (let zo = 0; zo < 2; zo++)
+          set(ax + xo, py, az + zo, M_METAL);
     }
   }
 
-  // ---- Central dish mount platform: 6×6 metal pad atop the command section ----
-  const dishY = yRoof + 4; if (dishY < WORLD_Y) {
-    for (let z = czv - 3; z < czv + 3; z++) {
-      for (let x = cxv - 3; x < cxv + 3; x++) {
-        if (x < 0 || x >= WORLD_X || z < 0 || z >= WORLD_Z) continue;
-        world.set(x, dishY, z, M_METAL); wallCount++;
-      }
-    }
+  // ---- Central dish mount pad: 4×4 metal on top of command block ----
+  for (let z = czv - 2; z < czv + 2; z++)
+    for (let x = cxv - 2; x < cxv + 2; x++)
+      set(x, cmdTop + 1, z, M_METAL);
+
+  // ---- Side dish pads: 4×4 metal on north/south ends of command block ----
+  for (const sdz of [cmdZ0 + 1, cmdZ1 - 5]) {
+    for (let z = sdz; z < sdz + 4; z++)
+      for (let x = cxv - 2; x < cxv + 2; x++)
+        set(x, cmdTop + 1, z, M_METAL);
   }
 
-  // ---- Side dish mount platforms: smaller 4×4 pads mid-way along north/south walls ----
-  const sideDishY = yRoof + 3; if (sideDishY < WORLD_Y) {
-    for (const [sdx, sdz] of [[cxv - 2, wzStart + 2], [cxv - 2, wzEnd - 6]] as [number, number][]) {
-      for (let xo = 0; xo < 4; xo++) {
-        for (let zo = 0; zo < 4; zo++) {
-          const px = sdx + xo; const pz = sdz + zo;
-          if (px >= 0 && px < WORLD_X && pz >= 0 && pz < WORLD_Z) {
-            world.set(px, sideDishY, pz, M_METAL); wallCount++;
-          }
-        }
-      }
+  // ---- Guard booths flanking the entrance (east face, outside footprint) ----
+  for (const gz of [doorZ0 - 4, doorZ1 + 1]) {
+    for (let dy = 1; dy <= 8; dy++) {
+      const py = yFloor + dy; if (py >= WORLD_Y) break;
+      for (let xo = 0; xo < 4; xo++) set(wxEnd + xo, py, gz, M_STONE);
+      for (let zo = 0; zo < 4; zo++) set(wxEnd, py, gz + zo, M_STONE);
+      for (let zo = 0; zo < 4; zo++) set(wxEnd + 3, py, gz + zo, M_STONE);
     }
-  }
-
-  // ---- Blast door lintel above the entry gap ----
-  for (let dy = doorYTop; dy <= doorYTop + 2; dy++) {
-    const py = yFloor + dy; if (py >= WORLD_Y || py > yRoof) break;
-    for (let z = doorZ0; z <= doorZ1; z++) {
-      if (z < 0 || z >= WORLD_Z) continue;
-      world.set(wxEnd - 1, py, z, M_METAL); wallCount++;
-      world.set(wxEnd - 2, py, z, M_METAL); wallCount++;
-    }
+    // Guard booth roof.
+    for (let xo = 0; xo < 4; xo++)
+      for (let zo = 0; zo < 4; zo++) set(wxEnd + xo, yFloor + 8, gz + zo, M_STONE);
   }
 
   return wallCount;
