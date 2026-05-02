@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Bash(grep --line-buffered -E \"t=[0-9]{3,}s|SPIKES|PASS|FAIL|FINAL|boost|spike|Frames|Workers|Duration\")",
+      "Bash(grep --line-buffered -E \"t=[0-9]{3,}s.*SPIKES|PASS|FAIL|FINAL|Frames|Workers|Duration|Spikes\")"
+    ]
+  }
+}

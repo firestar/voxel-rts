@@ -776,3 +776,51 @@ export function buildRocketTruckPodGeometry(): THREE.BufferGeometry {
 /** Pod pivot in unit-local coords — sits in the centre of the rear deck. */
 export const ROCKET_TRUCK_POD_PIVOT_Y = 1.00;
 export const ROCKET_TRUCK_POD_PIVOT_Z = 0.55;
+
+// ---------- Supply truck -------------------------------------------------
+// Unarmed logistics flatbed. Uses a similar chassis to the rocket truck but
+// replaces the weapon pod with an open cargo bed carrying stacked crates.
+
+const SUPPLY_HULL      = { r: 0.55, g: 0.50, b: 0.30 }; // tan/sand camouflage
+const SUPPLY_HULL_DARK = { r: 0.38, g: 0.34, b: 0.20 };
+const SUPPLY_HULL_HI   = { r: 0.72, g: 0.66, b: 0.42 };
+const SUPPLY_TIRE      = { r: 0.08, g: 0.08, b: 0.10 };
+const SUPPLY_HUB       = { r: 0.50, g: 0.50, b: 0.50 };
+const SUPPLY_GLASS     = { r: 0.20, g: 0.45, b: 0.55 };
+const SUPPLY_CRATE     = { r: 0.50, g: 0.38, b: 0.18 }; // wooden crate brown
+const SUPPLY_CRATE_RIM = { r: 0.30, g: 0.22, b: 0.10 };
+
+export function buildSupplyTruckGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Wheels: six tires (two axles at rear for load bearing).
+  for (const sx of [-0.82, 0.82]) {
+    for (const sz of [-1.05, 0.40, 1.20]) {
+      blocks.push({ x: sx, y: 0.34, z: sz, sx: 0.32, sy: 0.68, sz: 0.68, ...SUPPLY_TIRE });
+      blocks.push({ x: sx, y: 0.34, z: sz, sx: 0.24, sy: 0.36, sz: 0.36, ...SUPPLY_HUB });
+    }
+  }
+  // Lower frame / chassis.
+  blocks.push({ x: 0.0, y: 0.44, z: 0.05, sx: 1.50, sy: 0.24, sz: 2.60, ...SUPPLY_HULL_DARK });
+  // Cab over front axle.
+  blocks.push({ x: 0.0, y: 0.88, z: -1.00, sx: 1.30, sy: 0.80, sz: 0.90, ...SUPPLY_HULL });
+  blocks.push({ x: 0.0, y: 1.35, z: -1.00, sx: 1.32, sy: 0.08, sz: 0.92, ...SUPPLY_HULL_DARK });
+  // Windscreen.
+  blocks.push({ x: 0.0, y: 1.05, z: -1.45, sx: 1.00, sy: 0.40, sz: 0.05, ...SUPPLY_GLASS });
+  // Side windows.
+  blocks.push({ x: -0.68, y: 1.05, z: -1.00, sx: 0.05, sy: 0.36, sz: 0.65, ...SUPPLY_GLASS });
+  blocks.push({ x:  0.68, y: 1.05, z: -1.00, sx: 0.05, sy: 0.36, sz: 0.65, ...SUPPLY_GLASS });
+  // Flatbed floor.
+  blocks.push({ x: 0.0, y: 0.70, z: 0.72, sx: 1.38, sy: 0.10, sz: 1.58, ...SUPPLY_HULL_HI });
+  // Flatbed side rails.
+  blocks.push({ x: -0.72, y: 0.90, z: 0.72, sx: 0.06, sy: 0.32, sz: 1.58, ...SUPPLY_HULL_DARK });
+  blocks.push({ x:  0.72, y: 0.90, z: 0.72, sx: 0.06, sy: 0.32, sz: 1.58, ...SUPPLY_HULL_DARK });
+  // Rear gate.
+  blocks.push({ x: 0.0, y: 0.88, z: 1.49, sx: 1.44, sy: 0.34, sz: 0.06, ...SUPPLY_HULL_DARK });
+  // Cargo: two stacked crates on the flatbed.
+  blocks.push({ x: -0.28, y: 0.90, z: 0.60, sx: 0.52, sy: 0.38, sz: 0.60, ...SUPPLY_CRATE });
+  blocks.push({ x: -0.28, y: 0.90, z: 0.60, sx: 0.56, sy: 0.40, sz: 0.64, ...SUPPLY_CRATE_RIM });
+  blocks.push({ x:  0.28, y: 0.90, z: 0.60, sx: 0.52, sy: 0.38, sz: 0.60, ...SUPPLY_CRATE });
+  blocks.push({ x:  0.28, y: 0.90, z: 0.60, sx: 0.56, sy: 0.40, sz: 0.64, ...SUPPLY_CRATE_RIM });
+  blocks.push({ x:  0.00, y: 1.30, z: 0.80, sx: 0.60, sy: 0.36, sz: 0.56, ...SUPPLY_CRATE });
+  return buildVoxelModel(blocks);
+}

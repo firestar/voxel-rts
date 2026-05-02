@@ -16,6 +16,7 @@ import {
   DOZER_BLADE_PIVOT_Y, DOZER_BLADE_PIVOT_Z,
   buildRocketTruckHullGeometry, buildRocketTruckPodGeometry,
   ROCKET_TRUCK_POD_PIVOT_Y, ROCKET_TRUCK_POD_PIVOT_Z,
+  buildSupplyTruckGeometry,
 } from './UnitModels';
 
 const WORKER_VARIANTS: WorkerVariant[] = ['auto', 'mine', 'chop', 'farm'];
@@ -57,6 +58,7 @@ export class UnitRenderer {
   private dozerBlade: THREE.InstancedMesh;
   private rocketTruckHull: THREE.InstancedMesh;
   private rocketTruckPod: THREE.InstancedMesh;
+  private supplyTruckHull: THREE.InstancedMesh;
 
   private capacity: number;
   private bodyM = new THREE.Matrix4();
@@ -121,6 +123,7 @@ export class UnitRenderer {
     this.dozerBlade = makeIM(buildDozerBladeGeometry(), mat, capacity);
     this.rocketTruckHull = makeIM(buildRocketTruckHullGeometry(), mat, capacity);
     this.rocketTruckPod = makeIM(buildRocketTruckPodGeometry(), mat, capacity);
+    this.supplyTruckHull = makeIM(buildSupplyTruckGeometry(), mat, capacity);
 
     this.group.add(
       this.soldierBody, this.soldierLegL, this.soldierLegR,
@@ -133,6 +136,7 @@ export class UnitRenderer {
       this.workerCrateWood, this.workerCrateMetal,
       this.dozerHull, this.dozerBlade,
       this.rocketTruckHull, this.rocketTruckPod,
+      this.supplyTruckHull,
     );
 
     this.ringTemplates.set('soldier',      { radius: 0.6,  color: 0x00ff88 });
@@ -144,6 +148,7 @@ export class UnitRenderer {
     this.ringTemplates.set('worker',       { radius: 0.55, color: 0x33ccff });
     this.ringTemplates.set('dozer',        { radius: 1.7,  color: 0xffc044 });
     this.ringTemplates.set('rocket_truck', { radius: 1.55, color: 0xff8855 });
+    this.ringTemplates.set('supply_truck', { radius: 1.30, color: 0xffdd44 });
     for (const kind of this.ringTemplates.keys()) this.ringPools.set(kind, []);
   }
 
@@ -164,7 +169,7 @@ export class UnitRenderer {
     let nTank = 0, nTun = 0, nWorm = 0, nWormSeg = 0;
     const nWorkV = [0, 0, 0, 0];
     let nCrateW = 0, nCrateM = 0;
-    let nDoz = 0, nRkt = 0;
+    let nDoz = 0, nRkt = 0, nSup = 0;
     const ringCounts = new Map<string, number>();
     const now = performance.now() / 1000;
 
@@ -408,6 +413,11 @@ export class UnitRenderer {
         this.partM.multiplyMatrices(this.bodyM, podLocal);
         this.rocketTruckPod.setMatrixAt(nRkt, this.partM);
         nRkt++;
+      } else if (u.kind === 'supply_truck') {
+        if (nSup >= this.capacity) continue;
+        this.supplyTruckHull.setMatrixAt(nSup, this.bodyM);
+        this.supplyTruckHull.setColorAt(nSup, tint);
+        nSup++;
       }
 
       if (u.selected) {
@@ -447,6 +457,7 @@ export class UnitRenderer {
     this.dozerBlade.count = nDoz;
     this.rocketTruckHull.count = nRkt;
     this.rocketTruckPod.count = nRkt;
+    this.supplyTruckHull.count = nSup;
     for (const m of [
       this.soldierBody, this.soldierLegL, this.soldierLegR,
       this.sniperBody, this.sniperLegL, this.sniperLegR,
@@ -458,6 +469,7 @@ export class UnitRenderer {
       this.workerCrateWood, this.workerCrateMetal,
       this.dozerHull, this.dozerBlade,
       this.rocketTruckHull, this.rocketTruckPod,
+      this.supplyTruckHull,
     ]) {
       m.instanceMatrix.needsUpdate = true;
       // instanceColor only exists once setColorAt has been called at least

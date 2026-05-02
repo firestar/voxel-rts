@@ -43,6 +43,7 @@ import { TargetMarker } from '../render/TargetMarker';
 import { Resources } from '../sim/Resources';
 import { SaplingManager } from '../sim/Saplings';
 import { tickWorkers, approachPos } from '../sim/Workers';
+import { tickSupplyTrucks } from '../sim/SupplyTrucks';
 import { WorkerTaskBoard, describeOrder } from '../sim/WorkerTasks';
 import { ProjectileManager, PROJECTILES, muzzleOrigin, ProjectileImpact } from '../sim/Projectiles';
 import { WEAPONS, WeaponKind } from '../sim/Weapons';
@@ -623,6 +624,13 @@ export class Game {
         findAlternateClusterTarget: (excl, fx, fz) => this.findAlternateClusterTarget(excl, fx, fz),
         findBestMineTarget: (fx, fz) => this.findBestMineTarget(fx, fz),
       });
+      tickSupplyTrucks(dt, {
+        units: this.units,
+        buildings: this.buildings,
+        resources: this.resources,
+        spawnTruck: (x, y, z) => this.units.spawn('supply_truck', x, y, z),
+        routeTruck: (u, wx, wy, wz) => { void this.routePath(u, wx, wy, wz); },
+      });
       const grow = this.saplings.tick(dt, this.world);
       if (grow.matured > 0) this.requestNavRebuild(false);
       // Drain the per-tick accumulated nav-rebuild AABB: one sync main-thread
@@ -767,10 +775,10 @@ export class Game {
   }
 
   private cycleSelection(): void {
-    const arr = this.units.units;
+    const arr = this.units.units.filter(u => u.kind !== 'supply_truck');
     if (arr.length === 0) return;
     const idx = arr.findIndex(u => u.selected);
-    arr.forEach(u => u.selected = false);
+    this.units.units.forEach(u => u.selected = false);
     const next = (idx + 1) % arr.length;
     arr[next]!.selected = true;
     this.buildings.deselectAll();
@@ -925,6 +933,7 @@ export class Game {
     for (const u of this.units.units) {
       if (u.hp <= 0) continue;
       if (u.team !== 'player') continue;
+      if (u.kind === 'supply_truck') continue; // fully automated, not player-controlled
       const radius = u.widthMeters * 0.55 + 0.35;
       const cx = u.x;
       const cy = u.y + Math.max(0.7, u.widthMeters * 0.6);
@@ -967,6 +976,7 @@ export class Game {
     for (const u of this.units.units) {
       if (u.hp <= 0) continue;
       if (u.team !== 'player') continue;
+      if (u.kind === 'supply_truck') continue; // fully automated
       v.set(u.x, u.y + Math.max(0.5, u.widthMeters * 0.5), u.z);
       v.project(this.camera.cam);
       // project() returns NDC (−1..+1) in x/y and a z that is < −1 / > +1

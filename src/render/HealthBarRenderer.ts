@@ -254,6 +254,7 @@ function hpBarYOffset(u: Unit): number {
     case 'worm':         return 2.4;
     case 'dozer':        return 3.0;
     case 'rocket_truck': return 3.6;
+    case 'supply_truck': return 2.8;
   }
 }
 

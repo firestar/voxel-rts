@@ -162,7 +162,11 @@ describe('worker — delivers carried resources to storage', () => {
     tick(deps, 0.1);
     expect(w.carrying.wood).toBe(0);
     expect(w.carrying.metals).toBe(0);
-    expect(deps.resources.wood).toBe(3);
-    expect(deps.resources.metals).toBe(2);
+    // Workers now deposit into storage.stockpile (trucks carry it to HQ).
+    expect(storage.stockpile.wood).toBe(3);
+    expect(storage.stockpile.metals).toBe(2);
+    // Global resources unchanged until a truck delivers from storage → HQ.
+    expect(deps.resources.wood).toBe(0);
+    expect(deps.resources.metals).toBe(0);
   });
 });

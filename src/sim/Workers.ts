@@ -340,8 +340,8 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
       const dpos = doorWorldPos(storage);
       const dx = dpos.x - u.x, dz = dpos.z - u.z;
       if (dx * dx + dz * dz <= INTERACT_REACH_M * INTERACT_REACH_M) {
-        deps.resources.wood += u.carrying.wood;
-        deps.resources.metals += u.carrying.metals;
+        storage.stockpile.wood += u.carrying.wood;
+        storage.stockpile.metals += u.carrying.metals;
         u.carrying.wood = 0;
         u.carrying.metals = 0;
         u.task = { kind: 'idle' };

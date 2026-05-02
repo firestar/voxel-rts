@@ -170,6 +170,7 @@ const TRAIN_KEYS: Record<UnitKind, { key: string; keyLabel: string }> = {
   dozer:        { key: 'KeyU', keyLabel: 'U' },
   worker:       { key: 'KeyO', keyLabel: 'O' },
   rocket_truck: { key: 'KeyN', keyLabel: 'N' },
+  supply_truck: { key: 'KeyM', keyLabel: 'M' },
 };
 
 function trainAction(kind: UnitKind): BuildingAction {

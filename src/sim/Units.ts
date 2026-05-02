@@ -13,7 +13,7 @@ import {
 import { WeaponKind, WEAPONS, defaultWeaponFor } from './Weapons';
 import { ProjectileKind } from './Projectiles';
 
-export type UnitKind = 'soldier' | 'sniper' | 'gunner' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'rocket_truck';
+export type UnitKind = 'soldier' | 'sniper' | 'gunner' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'rocket_truck' | 'supply_truck';
 
 /**
  * Which resource type a worker should prioritise when idle. 'auto' = current
@@ -24,7 +24,7 @@ export type WorkerFocus = 'auto' | 'mine' | 'chop' | 'farm';
 
 /** Every unit kind in spawn-order. Useful for iterating over the catalog. */
 export const UNIT_KINDS: UnitKind[] = [
-  'soldier', 'sniper', 'gunner', 'tank', 'tunneler', 'worm', 'worker', 'dozer', 'rocket_truck',
+  'soldier', 'sniper', 'gunner', 'tank', 'tunneler', 'worm', 'worker', 'dozer', 'rocket_truck', 'supply_truck',
 ];
 
 /**
@@ -62,7 +62,15 @@ export type WorkerTask =
   | { kind: 'farm'; buildingId: number }
   /** Worker is collecting a ripe crop from a specific farm — auto-picked
    *  in `assignNextHarvestTask` when a `cropReady` farm is in range. */
-  | { kind: 'harvestFarm'; buildingId: number };
+  | { kind: 'harvestFarm'; buildingId: number }
+  /** Supply truck en route to a storage building to pick up resources. */
+  | { kind: 'truck_fetch'; storageId: number }
+  /** Supply truck returning to HQ carrying harvested resources. */
+  | { kind: 'truck_deliver_hq'; payload: { metals: number; wood: number } }
+  /** Supply truck en route to a production building carrying unit-build materials. */
+  | { kind: 'truck_resupply'; buildingId: number; payload: { food: number; metals: number; wood: number } }
+  /** Supply truck returning to HQ after delivering a resupply load. */
+  | { kind: 'truck_return' };
 
 /** Downward acceleration in m/s². Slightly snappier than real-world 9.81 — units feel
  *  "weighty" without dragging out the fall arc. Per-unit terminal velocity then sets
@@ -382,6 +390,28 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         // Rocket truck pod: rockets are heavy / slow, so the cap sits above
         // the catalog rocket muzzle speed but well below tank-cannon levels.
         launcherMaxStrength: 70,
+      };
+    case 'supply_truck':
+      // Unarmed logistics flatbed. Lighter and faster than combat trucks —
+      // its job is to shuttle resources between storage depots, the HQ, and
+      // production buildings as fast as the road allows.
+      return {
+        footprintRadius: 2, widthMeters: 2.0,
+        maxStepVoxels: 3, slopePenalty: 0.35,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 4,
+        turnRateRadPerSec: 1.8,
+        maxPitchRad: Math.PI / 6,
+        heightVoxels: 14,
+        canDig: false, requiresGround: true,
+        speed: 5.0, speedDigging: 0,
+        hp: 80,
+        massKg: 10_000,
+        terminalFallSpeed: 38,
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
+        launcherMaxStrength: 0,
       };
   }
 }

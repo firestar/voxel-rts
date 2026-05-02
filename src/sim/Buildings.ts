@@ -102,6 +102,11 @@ export interface BuildingSpec {
    * nearest live HQ. Used for power plants.
    */
   isEnergySource?: boolean;
+  /**
+   * Maximum number of supply trucks the HQ may have active simultaneously.
+   * Only meaningful for HQ buildings.
+   */
+  maxTrucks?: number;
 }
 
 export const BARRACKS: BuildingSpec = {
@@ -323,10 +328,25 @@ export const HQ: BuildingSpec = {
   stamp: stampHQ,
   spawnPadCells: 0,
   buildRangeMeters: 60,
+  maxTrucks: 5,
 };
 
 /** All building specs in the order they appear on the build-mode hotkeys (1..N). */
 export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, VEHICLE_DEPOT, FARM, STORAGE, POWER_PLANT, REFINERY, TECH_LAB, TURRET, AA_TURRET, SILO];
+
+/** Resource cost to train each unit kind. Deducted when HQ dispatches a supply truck. */
+export const UNIT_TRAIN_COST: Record<UnitKind, { food: number; metals: number; wood: number }> = {
+  soldier:      { food: 40,  metals: 10,  wood: 10  },
+  sniper:       { food: 50,  metals: 20,  wood: 15  },
+  gunner:       { food: 60,  metals: 30,  wood: 0   },
+  tank:         { food: 20,  metals: 80,  wood: 0   },
+  tunneler:     { food: 20,  metals: 120, wood: 0   },
+  worm:         { food: 20,  metals: 100, wood: 0   },
+  worker:       { food: 30,  metals: 0,   wood: 10  },
+  dozer:        { food: 20,  metals: 60,  wood: 0   },
+  rocket_truck: { food: 20,  metals: 80,  wood: 0   },
+  supply_truck: { food: 0,   metals: 0,   wood: 0   },
+};
 
 export interface FootprintHit {
   ok: boolean;
@@ -447,6 +467,28 @@ export interface Building {
    * spawn; wraps via modulo against the pad area.
    */
   spawnSlot: number;
+  /**
+   * Stockpile of harvested resources waiting for a truck to collect them.
+   * Meaningful for storage buildings. Workers deposit here instead of directly
+   * into the global resource pool; supply trucks then carry it to HQ.
+   */
+  stockpile: { metals: number; wood: number };
+  /**
+   * True when a supply truck is already on its way to this building (either
+   * to pick up from a storage, or to deliver to a production building).
+   * Prevents double-dispatching.
+   */
+  supplyInbound: boolean;
+  /**
+   * Set true when a supply truck delivers materials to a production building.
+   * Cleared immediately after the building consumes it to spawn a unit.
+   */
+  supplyDelivered: boolean;
+  /**
+   * HQ-only: number of supply trucks currently dispatched (en route or
+   * returning). Capped at `spec.maxTrucks`.
+   */
+  activeTrucks: number;
 }
 
 /**
@@ -2154,6 +2196,10 @@ export class BuildingManager {
       rallyPoint: null,
       rallyStance: 'aggressive',
       spawnSlot: 0,
+      stockpile: { metals: 0, wood: 0 },
+      supplyInbound: false,
+      supplyDelivered: false,
+      activeTrucks: 0,
     };
     this.buildings.push(b);
     return b;
@@ -2252,6 +2298,10 @@ export class BuildingManager {
 
   tick(dt: number, world: VoxelWorld, units: UnitManager): void {
     this.buildAAAssignments(units);
+    // Supply trucks only gate production when a live HQ is present. Without
+    // one the logistics system is offline and buildings produce freely, so the
+    // base doesn't freeze if the HQ is destroyed or missing in tests.
+    const hasLiveHQ = this.buildings.some(b => !b.destroyed && b.spec.kind === 'hq');
     for (const b of this.buildings) {
       if (b.destroyed) continue;
 
@@ -2287,7 +2337,14 @@ export class BuildingManager {
       }
       b.productionTimer -= dt;
       if (b.productionTimer > 0) continue;
+
+      // Timer has fired. When an HQ is present, wait for a supply truck
+      // delivery before spawning. Without an HQ the logistics system is offline
+      // and production runs free.
+      if (hasLiveHQ && !b.supplyDelivered) continue;
+
       b.productionTimer += b.spec.productionInterval;
+      if (hasLiveHQ) b.supplyDelivered = false;
 
       // Liveness check: structures whose perimeter has been chewed below 25%
       // count as destroyed and stop ticking.
@@ -2732,6 +2789,20 @@ export class BuildingManager {
   }
 
   /** Lookup the nearest live storage building (in XZ). Returns null if there are none. */
+  nearestHQ(x: number, z: number): Building | null {
+    let best: Building | null = null;
+    let bestD2 = Infinity;
+    for (const b of this.buildings) {
+      if (b.destroyed) continue;
+      if (b.spec.kind !== 'hq') continue;
+      const dpos = doorWorldPos(b);
+      const dx = dpos.x - x, dz = dpos.z - z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < bestD2) { bestD2 = d2; best = b; }
+    }
+    return best;
+  }
+
   nearestStorage(x: number, z: number): Building | null {
     let best: Building | null = null;
     let bestD2 = Infinity;
