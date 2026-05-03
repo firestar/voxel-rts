@@ -474,6 +474,12 @@ export interface Building {
    */
   stockpile: { metals: number; wood: number };
   /**
+   * Minimum total stockpile (metals + wood) that must accumulate before this
+   * storage building requests a pickup truck. Configurable per-building via the
+   * selection panel slider. Default 50.
+   */
+  truckCallThreshold: number;
+  /**
    * True when a supply truck is already on its way to this building (either
    * to pick up from a storage, or to deliver to a production building).
    * Prevents double-dispatching.
@@ -2197,6 +2203,7 @@ export class BuildingManager {
       rallyStance: 'aggressive',
       spawnSlot: 0,
       stockpile: { metals: 0, wood: 0 },
+      truckCallThreshold: 50,
       supplyInbound: false,
       supplyDelivered: false,
       activeTrucks: 0,

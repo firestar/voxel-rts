@@ -110,9 +110,11 @@ function dispatchStorageTrucks(deps: SupplyTruckDeps): void {
       if (b.spec.kind !== 'storage') continue;
       if (b.supplyInbound) continue;
       const amount = b.stockpile.metals + b.stockpile.wood;
+      // Only dispatch when the storage has accumulated enough material.
+      if (amount < b.truckCallThreshold) continue;
       if (amount > bestAmount) { bestAmount = amount; bestStorage = b; }
     }
-    if (!bestStorage || bestAmount === 0) continue;
+    if (!bestStorage) continue;
 
     bestStorage.supplyInbound = true;
     hq.activeTrucks++;

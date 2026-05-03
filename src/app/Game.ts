@@ -2513,6 +2513,22 @@ export class Game {
     const selUnits = this.units.units.filter(u => u.selected);
 
     if (selBuilding) {
+      if (selBuilding.spec.kind === 'storage') {
+        // Storage gets a custom panel: live stockpile readout + threshold slider.
+        const key = `b:${selBuilding.id}:storage`;
+        if (key !== this.actionsRenderedKey) {
+          this.buildStorageDom(selBuilding);
+          this.actionsRenderedKey = key;
+        }
+        // Update live stockpile numbers every frame.
+        const sp = selBuilding.stockpile;
+        const total = sp.metals + sp.wood;
+        const stockEl = this.actionsEl.querySelector('.storage-stockpile');
+        if (stockEl) stockEl.textContent = `Metals: ${sp.metals} · Wood: ${sp.wood} · Total: ${total}`;
+        this.actionsEl.style.display = 'block';
+        return;
+      }
+
       const acts = buildingActionsFor(selBuilding);
       const key = `b:${selBuilding.id}:${selBuilding.spec.kind}:${acts.map(a => a.id).join(',')}`;
       if (key !== this.actionsRenderedKey) {
@@ -2626,6 +2642,60 @@ export class Game {
       row.addEventListener('click', () => r.run());
       this.actionsEl.appendChild(row);
     }
+  }
+
+  /** Build the custom DOM panel for a selected storage building. */
+  private buildStorageDom(b: Building): void {
+    if (!this.actionsEl) return;
+    this.actionsEl.innerHTML = '';
+
+    const title = document.createElement('div');
+    title.className = 'actions-title';
+    title.textContent = `Storage (#${b.id})`;
+    this.actionsEl.appendChild(title);
+
+    const stockEl = document.createElement('div');
+    stockEl.className = 'actions-sub storage-stockpile';
+    const sp = b.stockpile;
+    stockEl.textContent = `Metals: ${sp.metals} · Wood: ${sp.wood} · Total: ${sp.metals + sp.wood}`;
+    this.actionsEl.appendChild(stockEl);
+
+    // Threshold slider row
+    const row = document.createElement('div');
+    row.className = 'action-row storage-threshold-row';
+    row.style.cssText = 'flex-direction:column;align-items:flex-start;gap:4px;padding:6px 8px;';
+
+    const lbl = document.createElement('div');
+    lbl.className = 'action-label';
+    lbl.style.marginBottom = '2px';
+    lbl.textContent = 'Call truck when ≥';
+    row.appendChild(lbl);
+
+    const sliderWrap = document.createElement('div');
+    sliderWrap.style.cssText = 'display:flex;align-items:center;gap:8px;width:100%;';
+
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = '200';
+    slider.step = '5';
+    slider.value = String(b.truckCallThreshold);
+    slider.style.cssText = 'flex:1;cursor:pointer;';
+
+    const valEl = document.createElement('span');
+    valEl.className = 'action-label';
+    valEl.style.cssText = 'min-width:32px;text-align:right;font-weight:bold;';
+    valEl.textContent = String(b.truckCallThreshold);
+
+    slider.addEventListener('input', () => {
+      b.truckCallThreshold = Number(slider.value);
+      valEl.textContent = slider.value;
+    });
+
+    sliderWrap.appendChild(slider);
+    sliderWrap.appendChild(valEl);
+    row.appendChild(sliderWrap);
+    this.actionsEl.appendChild(row);
   }
 
   /**
