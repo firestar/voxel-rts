@@ -1108,6 +1108,19 @@ export class UnitManager {
     const dy = tgt.y - u.y;
     const dz = tgt.z - u.z;
     const d = Math.hypot(dx, dy, dz);
+    // Same first-waypoint guard as tickSurface — drop a waypoint we're
+    // effectively at already so the next one (or empty path → idle) takes
+    // over next tick. Triggers when XZ distance is under 5 cm; we keep the
+    // 3-D gate generous (1 m on Y) because subsurface units commonly have
+    // their first waypoint at the surface cell centre well above their
+    // own y, and we want THAT skipped too — otherwise the truck wedges
+    // trying to climb to a vertically distant point that 2-D distance
+    // says we already reached.
+    if (Math.hypot(dx, dz) < 0.05 && Math.abs(dy) < 1.0) {
+      u.path.shift();
+      applyPathOrientation(u, dx, dy, dz, dt);
+      return;
+    }
 
     const cell = worldToVolumeCell(tgt.x, tgt.y, tgt.z);
     const ci = vnavIndex(cell.cx, cell.cy, cell.cz);
