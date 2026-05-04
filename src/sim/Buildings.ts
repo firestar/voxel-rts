@@ -3034,10 +3034,11 @@ export class BuildingManager {
     // Already ripe — wait for a harvester. collectFarm resets state.
     if (b.cropReady) return;
 
-    // Detect a worker physically present in the farm box. We accept any
-    // worker (regardless of focus / task), so a passing harvester also
-    // unlocks milestones. The farmer-id channel is preserved for the
-    // renderer / UI so a "dedicated farmer" still feels like one.
+    // Detect a FARM-FOCUSED worker physically present in the farm box.
+    // Miners / choppers / auto workers walking through don't count — only a
+    // worker dedicated to farming advances the milestone. The farmer-id
+    // channel is preserved for the renderer / UI so the visiting farmer
+    // shows as the farm's tender.
     const wxStart = b.ox * NAV_CELL_VOXELS * VOXEL_SIZE;
     const wzStart = b.oz * NAV_CELL_VOXELS * VOXEL_SIZE;
     const wxEnd = wxStart + b.spec.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE;
@@ -3046,10 +3047,10 @@ export class BuildingManager {
     for (const u of units.units) {
       if (u.hp <= 0) continue;
       if (u.kind !== 'worker') continue;
+      if (u.workerFocus !== 'farm') continue;
       if (u.x < wxStart || u.x >= wxEnd) continue;
       if (u.z < wzStart || u.z >= wzEnd) continue;
       farmerOnFarm = true;
-      // Track the most recent visitor as the farm's farmer for renderer/UI.
       b.farmerId = u.id;
       break;
     }

@@ -66,14 +66,21 @@ describe('Farm building', () => {
     expect(farm.cropProgress).toBeLessThan(0.4);
     expect(farm.cropReady).toBe(false);
 
-    // Drop a worker on the farm — milestone advances on next tick.
+    // Drop a non-farmer worker (auto focus) on the field — should NOT
+    // advance the milestone, since only farm-focused workers tend.
     const cxw = (farm.ox + farm.spec.cellsW * 0.5) * 8 * 0.125;
     const czw = (farm.oz + farm.spec.cellsD * 0.5) * 8 * 0.125;
-    um.spawn('worker', cxw, (fp.floorY + 1) * 0.125, czw);
+    const drifter = um.spawn('worker', cxw, (fp.floorY + 1) * 0.125, czw);
+    drifter.workerFocus = 'auto';
+    mgr.tick(0.05, world, um);
+    expect(farm.harvestMilestone).toBe(0);
+
+    // Now switch the worker to farm focus — milestone advances on next tick.
+    drifter.workerFocus = 'farm';
     mgr.tick(0.05, world, um);
     expect(farm.harvestMilestone).toBe(1);
 
-    // Remove the worker; growth resumes through to the next milestone (0.4)
+    // Remove the farmer; growth resumes through to the next milestone (0.4)
     // and pauses again.
     um.units.length = 0;
     for (let i = 0; i < 5; i++) mgr.tick(FARM.productionInterval, world, um);
@@ -93,11 +100,13 @@ describe('Farm building', () => {
     mgr.foodSink = (amount): void => { foodAdded += amount; };
     const farm = mgr.place(world, FARM, fp.ox, fp.oz, fp.floorY);
 
-    // Worker stays on the field — clears every milestone as growth advances.
+    // Farm-focused worker stays on the field — clears every milestone as
+    // growth advances.
     const um = new UnitManager();
     const cxw = (farm.ox + farm.spec.cellsW * 0.5) * 8 * 0.125;
     const czw = (farm.oz + farm.spec.cellsD * 0.5) * 8 * 0.125;
-    um.spawn('worker', cxw, (fp.floorY + 1) * 0.125, czw);
+    const farmer = um.spawn('worker', cxw, (fp.floorY + 1) * 0.125, czw);
+    farmer.workerFocus = 'farm';
     // Tick long enough to walk past all 4 milestones + finish to 1.0.
     for (let i = 0; i < 30; i++) mgr.tick(FARM.productionInterval, world, um);
     expect(farm.harvestMilestone).toBe(4);
