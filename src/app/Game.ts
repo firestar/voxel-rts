@@ -190,12 +190,14 @@ export class Game {
    * opacity so the player can see underground tunnels through it. Raycasts —
    * including the LMB target picker — also ignore voxels above the cutoff,
    * so a click pierces the see-through overlay and lands on whatever is
-   * actually visible underneath. `Infinity` disables the cutoff entirely.
+   * actually visible underneath.
    *
-   * Hotkeys: `[` lower the cutoff one meter, `]` raise it, `\` reset it
-   * (back to disabled, i.e. show everything).
+   * Defaults to the world's top in metres so `[` immediately steps a metre
+   * below the highest possible voxel — the player sees the full map until
+   * they start trimming. `]` raises the cutoff back toward the world top
+   * (clamped); `\` resets it to the world top (= effectively no cut).
    */
-  private hideAboveY = Infinity;
+  private hideAboveY = WORLD_Y * VOXEL_SIZE;
   private readonly explosionRadiusBigMeters = 3.0;
   private readonly explosionPeak = 90;
 
@@ -810,9 +812,7 @@ export class Game {
           : this.mode === 'terrain'
             ? `MODE: TERRAIN EDIT — ${TERRAIN_PALETTE[this.terrainPaletteIdx]!.label} r=${this.terrainBrushRadius} (LMB paint, shift+LMB carve, 1-${TERRAIN_PALETTE.length} material, ,/. brush, G/Esc exit)`
             : 'MODE: PLAY';
-      const cutDesc = isFinite(this.hideAboveY)
-        ? ` | Y-cutoff: ${this.hideAboveY.toFixed(1)} m ([/] adjust, \\ reset)`
-        : '';
+      const cutDesc = ` | Y-cutoff: ${this.hideAboveY.toFixed(1)} m ([/] adjust, \\ reset)`;
       this.modeEl.textContent = `${buildDesc} | selected: ${selDesc}${weaponDesc}${cutDesc}`;
     }
     this.renderActionPanel();
@@ -3116,27 +3116,26 @@ export class Game {
   }
 
   /**
-   * Hotkey handler for the Y-cutoff overlay. `[` and `]` step the cutoff up /
-   * down; `\` disables it. Holding shift quadruples the step. The cutoff is
-   * clamped against the world's vertical extent (in meters) so the player
-   * can't push it negative or past the sky.
+   * Hotkey handler for the Y-cutoff overlay. `[` lowers the cutoff (more
+   * terrain hidden above it), `]` raises it (more terrain visible), `\`
+   * snaps it back to the world top. Holding shift quadruples the step. The
+   * cutoff is clamped between 0.5 m and the world top so the player can't
+   * push it negative or beyond the sky.
    */
   private adjustHideAboveY(): void {
     const shift = this.input.keys.has('ShiftLeft') || this.input.keys.has('ShiftRight');
     const step = shift ? 4 : 1;
     const minY = 0.5;
-    // Default seed when the cutoff is currently disabled but the user wants
-    // to start cutting in: drop to roughly the ground we're focused on.
-    let v = isFinite(this.hideAboveY) ? this.hideAboveY : 24;
+    const maxY = WORLD_Y * VOXEL_SIZE;
+    let v = this.hideAboveY;
     if (this.input.pressed.has('Backslash')) {
-      this.hideAboveY = Infinity;
+      v = maxY;
     } else if (this.input.pressed.has('BracketLeft')) {
       v = Math.max(minY, v - step);
-      this.hideAboveY = v;
     } else if (this.input.pressed.has('BracketRight')) {
-      v = v + step;
-      this.hideAboveY = v;
+      v = Math.min(maxY, v + step);
     }
+    this.hideAboveY = v;
     this.meshes.setHideAboveY(this.hideAboveY);
   }
 
