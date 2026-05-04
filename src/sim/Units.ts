@@ -1280,8 +1280,9 @@ export class UnitManager {
       if (other === u || other.hp <= 0) continue;
       if (other.path.length === 0) continue; // only moving peers
       if (Math.abs(other.y - u.y) > 2.0) continue;
-      // Supply trucks pass through same-team movers without deflection.
-      if (u.kind === 'supply_truck' && other.team === u.team) continue;
+      // Supply trucks deflect against moving peers (so two opposing trucks
+      // steer past each other) but still clip-through stationary same-team
+      // units — that's handled in findCollisionBlocker, not here.
       const r2 = unitCollisionRadius(other);
       const minDist = r1 + r2;
       const sdx = other.x - ax;
