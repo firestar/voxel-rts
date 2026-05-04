@@ -3008,11 +3008,13 @@ export class BuildingManager {
   }
 
   /**
-   * Per-frame farm tick. Crops grow on a 0..1 progress meter; ambient growth
-   * is slow (so you see something happen even without a farmer), and an
-   * assigned farmer who is actually standing in the field accelerates it ~4x.
-   * On reaching 1, `cropReady` flips and growth pauses until a harvester
-   * collects (which clears it back to 0).
+   * Per-frame farm tick. Crops grow on a 0..1 progress meter that PAUSES at
+   * every 20 % barrier (0.2, 0.4, 0.6, 0.8) until a farmer steps onto the
+   * field. Each farmer visit advances `harvestMilestone` by one and growth
+   * resumes toward the next barrier. After the fourth advance (milestone == 4)
+   * growth runs to 1.0 unimpeded; at 100 % `cropReady` flips and the crop
+   * waits for a harvester. The farmer's role is "milestone unlock", not
+   * yield boost — there's no tend-acceleration any more.
    *
    * Liveness check is folded into this tick on a coarse interval so a farm
    * whose fence has been levelled goes inert.
@@ -3029,39 +3031,58 @@ export class BuildingManager {
         return;
       }
     }
-    // Growth is paused at each 20% milestone until a farmer collects the batch.
+    // Already ripe — wait for a harvester. collectFarm resets state.
     if (b.cropReady) return;
-    // Validate the assigned farmer still exists, is alive, and is at the farm
-    // with the farm task. If any of those fails, drop the assignment so a new
-    // worker can be tasked without a stale slot.
-    let farmerActive = false;
-    if (b.farmerId !== null) {
-      const farmer = lookupUnit(units, b.farmerId);
-      if (!farmer || farmer.hp <= 0) {
-        b.farmerId = null;
-      } else if (farmer.task.kind === 'farm' && farmer.task.buildingId === b.id) {
-        // Farmer must be standing in the farm rectangle to count as tending.
-        const wxStart = b.ox * NAV_CELL_VOXELS * VOXEL_SIZE;
-        const wzStart = b.oz * NAV_CELL_VOXELS * VOXEL_SIZE;
-        const wxEnd = wxStart + b.spec.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE;
-        const wzEnd = wzStart + b.spec.cellsD * NAV_CELL_VOXELS * VOXEL_SIZE;
-        if (farmer.x >= wxStart && farmer.x < wxEnd && farmer.z >= wzStart && farmer.z < wzEnd) {
-          farmerActive = true;
-        }
-      } else {
-        // Worker quit the task (player overrode with a move/chop command).
-        b.farmerId = null;
-      }
+
+    // Detect a worker physically present in the farm box. We accept any
+    // worker (regardless of focus / task), so a passing harvester also
+    // unlocks milestones. The farmer-id channel is preserved for the
+    // renderer / UI so a "dedicated farmer" still feels like one.
+    const wxStart = b.ox * NAV_CELL_VOXELS * VOXEL_SIZE;
+    const wzStart = b.oz * NAV_CELL_VOXELS * VOXEL_SIZE;
+    const wxEnd = wxStart + b.spec.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE;
+    const wzEnd = wzStart + b.spec.cellsD * NAV_CELL_VOXELS * VOXEL_SIZE;
+    let farmerOnFarm = false;
+    for (const u of units.units) {
+      if (u.hp <= 0) continue;
+      if (u.kind !== 'worker') continue;
+      if (u.x < wxStart || u.x >= wxEnd) continue;
+      if (u.z < wzStart || u.z >= wzEnd) continue;
+      farmerOnFarm = true;
+      // Track the most recent visitor as the farm's farmer for renderer/UI.
+      b.farmerId = u.id;
+      break;
     }
-    // Growth: slow ambient rate without a farmer, ×4 with a tending farmer.
-    const ambientRatePerSec = 0.25 / b.spec.productionInterval;
-    const tendedRatePerSec = 1.0 / b.spec.productionInterval;
-    const rate = farmerActive ? tendedRatePerSec : ambientRatePerSec;
-    b.cropProgress = Math.min(1, b.cropProgress + rate * dt);
-    // Crop only becomes harvestable at full ripeness (100%); growth then
-    // pauses until a harvester visits. The renderer's stalk height + colour
-    // tracks cropProgress continuously so the field still visibly grows.
-    if (b.cropProgress >= 1) {
+    if (!farmerOnFarm && b.farmerId !== null) {
+      // Stale farmer reference: clear so the UI doesn't show a phantom owner.
+      const farmer = lookupUnit(units, b.farmerId);
+      if (!farmer || farmer.hp <= 0) b.farmerId = null;
+    }
+
+    // Up to 4 milestones (one per 20 %); after the 4th, growth runs to 1.0.
+    const maxMilestones = 4;
+    const nextMilestone = (b.harvestMilestone + 1) * 0.2;
+    const atMilestone = b.harvestMilestone < maxMilestones && b.cropProgress >= nextMilestone;
+
+    if (atMilestone) {
+      // Paused — only advance when a farmer's actually on the plot.
+      if (farmerOnFarm) {
+        b.harvestMilestone++;
+      }
+      return;
+    }
+
+    // Between milestones (or past the last one) — grow at ambient rate. Clamp
+    // the per-tick advance to the upcoming milestone so a large dt doesn't
+    // skip over the pause band; the tick after this one will see
+    // cropProgress == nextMilestone, flag atMilestone, and stall until a
+    // farmer arrives.
+    const ratePerSec = 1.0 / b.spec.productionInterval;
+    const cap = b.harvestMilestone < maxMilestones ? nextMilestone : 1.0;
+    let next = b.cropProgress + ratePerSec * dt;
+    if (next > cap) next = cap;
+    b.cropProgress = Math.min(1, next);
+    if (b.cropProgress >= 1 && b.harvestMilestone >= maxMilestones) {
       b.cropReady = true;
     }
   }

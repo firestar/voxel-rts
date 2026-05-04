@@ -44,7 +44,7 @@ describe('Farm building', () => {
     expect(v[worldIndex(fenceX, fp.floorY + 1, fenceZ)]).toBe(M_DIRT_ROAD);
   });
 
-  it('crops only become harvestable at 100%; one collection per cycle drops 25 food', () => {
+  it('growth pauses at every 20% milestone until a farmer visits', () => {
     const world = buildGrassPlane();
     const nav = allocateNav(false);
     buildSurfaceNav(world.buffers.voxels, nav);
@@ -55,53 +55,63 @@ describe('Farm building', () => {
     const farm = mgr.place(world, FARM, fp.ox, fp.oz, fp.floorY);
     expect(farm.cropProgress).toBe(0);
     expect(farm.cropReady).toBe(false);
+    expect(farm.harvestMilestone).toBe(0);
 
-    // Ambient growth: 1 productionInterval tick advances ~25%, NOT enough
-    // to ripen — cropReady stays false because harvest only fires at 100%.
+    // Step well past 20 % growth without any farmer present. Growth pauses
+    // at the 0.2 barrier — cropProgress holds, harvestMilestone stays 0.
     const um = new UnitManager();
-    mgr.tick(FARM.productionInterval + 0.01, world, um);
-    expect(farm.cropReady).toBe(false);
-    expect(foodAdded).toBe(0);
-
-    // Pre-100% collection is rejected.
-    expect(mgr.collectFarm(farm, 999).foodGained).toBe(0);
-    expect(foodAdded).toBe(0);
-
-    // Tick enough intervals to ripen fully (ambient rate = 0.25/interval/sec,
-    // so 4 intervals * productionInterval seconds ~ 100%).
     for (let i = 0; i < 5; i++) mgr.tick(FARM.productionInterval, world, um);
-    expect(farm.cropReady).toBe(true);
-    expect(farm.cropProgress).toBe(1);
-
-    // One harvest at 100% drops the full bundle and resets the cycle.
-    const res = mgr.collectFarm(farm, 999);
-    expect(res.foodGained).toBe(25);
-    expect(foodAdded).toBe(25);
+    expect(farm.harvestMilestone).toBe(0);
+    expect(farm.cropProgress).toBeGreaterThanOrEqual(0.2);
+    expect(farm.cropProgress).toBeLessThan(0.4);
     expect(farm.cropReady).toBe(false);
-    expect(farm.cropProgress).toBe(0);
+
+    // Drop a worker on the farm — milestone advances on next tick.
+    const cxw = (farm.ox + farm.spec.cellsW * 0.5) * 8 * 0.125;
+    const czw = (farm.oz + farm.spec.cellsD * 0.5) * 8 * 0.125;
+    um.spawn('worker', cxw, (fp.floorY + 1) * 0.125, czw);
+    mgr.tick(0.05, world, um);
+    expect(farm.harvestMilestone).toBe(1);
+
+    // Remove the worker; growth resumes through to the next milestone (0.4)
+    // and pauses again.
+    um.units.length = 0;
+    for (let i = 0; i < 5; i++) mgr.tick(FARM.productionInterval, world, um);
+    expect(farm.harvestMilestone).toBe(1);
+    expect(farm.cropProgress).toBeGreaterThanOrEqual(0.4);
+    expect(farm.cropProgress).toBeLessThan(0.6);
+    expect(farm.cropReady).toBe(false);
   });
 
-  it('a tending farmer accelerates growth (~4×) vs ambient', () => {
+  it('once 100% is reached, a single harvest drops 25 food and resets', () => {
     const world = buildGrassPlane();
     const nav = allocateNav(false);
     buildSurfaceNav(world.buffers.voxels, nav);
     const fp = checkFootprint(world.buffers.voxels, nav, FARM, 70, 70);
     const mgr = new BuildingManager();
+    let foodAdded = 0;
+    mgr.foodSink = (amount): void => { foodAdded += amount; };
     const farm = mgr.place(world, FARM, fp.ox, fp.oz, fp.floorY);
 
-    // Spawn a worker at the farm centre and assign them as the farmer.
+    // Worker stays on the field — clears every milestone as growth advances.
     const um = new UnitManager();
-    const cxw = (farm.ox + farm.spec.cellsW * 0.5) * 8 * 0.125; // NAV_CELL_VOXELS=8, VOXEL_SIZE=0.125
+    const cxw = (farm.ox + farm.spec.cellsW * 0.5) * 8 * 0.125;
     const czw = (farm.oz + farm.spec.cellsD * 0.5) * 8 * 0.125;
-    const worker = um.spawn('worker', cxw, (fp.floorY + 1) * 0.125, czw);
-    worker.task = { kind: 'farm', buildingId: farm.id };
-    farm.farmerId = worker.id;
+    um.spawn('worker', cxw, (fp.floorY + 1) * 0.125, czw);
+    // Tick long enough to walk past all 4 milestones + finish to 1.0.
+    for (let i = 0; i < 30; i++) mgr.tick(FARM.productionInterval, world, um);
+    expect(farm.harvestMilestone).toBe(4);
+    expect(farm.cropProgress).toBe(1);
+    expect(farm.cropReady).toBe(true);
 
-    // 1.0 × productionInterval at the tended rate (1/interval per second)
-    // should bring cropProgress to ~1.0. Ambient alone (rate 0.25/interval
-    // per second) would only reach ~0.25 in the same window.
-    mgr.tick(FARM.productionInterval, world, um);
-    expect(farm.cropProgress).toBeGreaterThan(0.9);
+    // Pre-100% collect was rejected on previous milestones — verify only the
+    // final 100% harvest pays out.
+    const res = mgr.collectFarm(farm, 999);
+    expect(res.foodGained).toBe(25);
+    expect(foodAdded).toBe(25);
+    expect(farm.cropReady).toBe(false);
+    expect(farm.cropProgress).toBe(0);
+    expect(farm.harvestMilestone).toBe(0);
   });
 });
 

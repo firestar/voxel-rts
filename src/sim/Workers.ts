@@ -450,12 +450,13 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
 }
 
 function isHarvesterOrderForFocus(o: WorkOrder, focus: WorkerFocus): boolean {
-  // Only dedicated farm workers pick up farm orders. The farm task handles
-  // harvest collection at every 20% milestone, so harvestFarm orders are no
-  // longer separately consumed by auto/mine/chop workers.
-  if (focus === 'farm') return o.kind === 'farmTend';
+  // Farm workers handle every farm-related job: tend (unlock the 20 %
+  // milestones by walking the field) and harvest (collect at 100 %).
+  if (focus === 'farm') return o.kind === 'farmTend' || o.kind === 'harvestFarm';
   if (focus === 'mine' || focus === 'chop') return false;
-  return o.kind === 'plant'; // 'auto' workers only plant
+  // Auto-focus workers fall back to whatever's pending — plant orders, plus
+  // farm work when no dedicated farmer is around to grab it.
+  return o.kind === 'plant' || o.kind === 'farmTend' || o.kind === 'harvestFarm';
 }
 
 function applyOrderToHarvester(u: Unit, order: WorkOrder, deps: WorkerDeps): void {
