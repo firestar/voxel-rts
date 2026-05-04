@@ -906,7 +906,14 @@ export class Game {
     const cell = this.surfaceCellAt(wx, wz);
     const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
     const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
-    const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings);
+    // Underground placement: when the picker landed on a voxel below the
+    // local surface (player has the Y-cutoff active and is looking into the
+    // ground), validate at the picked voxel y instead of the surface topY.
+    const surfaceTop = cell.ok ? this.surfaceNav!.topY[cell.cz * NAV_W + cell.cx]! : -1;
+    const underground = surfaceTop > 0 && hit.y < surfaceTop;
+    const fp = underground
+      ? checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings, hit.y)
+      : checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings);
     this.ghost.place(ox, oz, fp.floorY >= 0 ? fp.floorY : hit.y, fp.ok);
   }
 
@@ -1367,7 +1374,7 @@ export class Game {
     }
   }
 
-  private tryPlaceBuilding(hit: { x: number; z: number }): void {
+  private tryPlaceBuilding(hit: { x: number; y: number; z: number }): void {
     if (!this.pathfinder) return;
     const spec = this.activeBuildSpec();
     if (!spec) return;
@@ -1376,7 +1383,14 @@ export class Game {
     const cell = this.surfaceCellAt(wx, wz);
     const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
     const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
-    const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings);
+    // Underground placement when the picker pierced the cutoff and landed
+    // below the local surface — use the hit voxel y as the floor instead
+    // of the surface topY.
+    const surfaceTop = cell.ok ? this.surfaceNav!.topY[cell.cz * NAV_W + cell.cx]! : -1;
+    const underground = surfaceTop > 0 && hit.y < surfaceTop;
+    const fp = underground
+      ? checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings, hit.y)
+      : checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings);
     if (!fp.ok) return;
 
     // Enforce HQ build range: proposed center must be within range of a live HQ.

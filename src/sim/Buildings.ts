@@ -1,7 +1,7 @@
 import { VoxelWorld } from '../voxel/VoxelWorld';
 import { worldIndex } from '../voxel/VoxelWorld';
 import { WORLD_X, WORLD_Y, WORLD_Z, AIR, MaterialId, VOXEL_SIZE } from '../voxel/types';
-import { M_WOOD, M_FARM, M_STONE, M_PATH, M_DIRT_ROAD, M_METAL, M_FED_RED, M_FED_WHITE, M_FED_BLUE } from '../voxel/Materials';
+import { M_WOOD, M_FARM, M_STONE, M_PATH, M_DIRT_ROAD, M_METAL, M_FED_RED, M_FED_WHITE, M_FED_BLUE, M_BEDROCK } from '../voxel/Materials';
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_VOXELS, FLAT_TOLERANCE_VOXELS } from '../path/SurfaceNav';
 import { UnitManager, UnitKind, Unit } from './Units';
 import { WeaponKind, WEAPONS } from './Weapons';
@@ -543,18 +543,25 @@ export function checkFootprint(
    * existing tests that don't construct a manager keep working.
    */
   existing?: readonly Building[],
+  /**
+   * Voxel-y override for underground placement. When provided, the surface
+   * nav is bypassed and the function validates the footprint at this y
+   * level: every cell's column must have a solid floor at exactly this y,
+   * and `headroomVoxels` of carve-able material (anything that isn't
+   * bedrock) above. Returned `floorY` is this override.
+   *
+   * Surface placement (the default) still uses nav.topY for each cell and
+   * the original flatness / headroom-against-air checks.
+   */
+  floorOverride?: number,
 ): FootprintHit {
   const totalW = spec.cellsW + spec.spawnPadCells;
   if (ox < 0 || oz < 0 || ox + totalW > NAV_W || oz + spec.cellsD > NAV_H) {
     return { ok: false, reason: 'out of bounds', floorY: -1, ox, oz };
   }
-  const i0 = navIndex(ox, oz);
-  if (nav.blocked[i0]) return { ok: false, reason: 'no surface', floorY: -1, ox, oz };
-  const baseY = nav.topY[i0]!;
 
   // Reject if any live building's footprint overlaps the proposed footprint
-  // or spawn-pad columns. Roof-top placement was previously possible because
-  // a building's stone roof reads as walkable terrain in the surface nav.
+  // or spawn-pad columns.
   if (existing && existing.length > 0) {
     const ox1 = ox + totalW;
     const oz1 = oz + spec.cellsD;
@@ -564,14 +571,50 @@ export function checkFootprint(
       const bz0 = b.oz;
       const bx1 = b.ox + b.spec.cellsW + b.spec.spawnPadCells;
       const bz1 = b.oz + b.spec.cellsD;
-      // AABB overlap on the cell grid.
       if (ox < bx1 && ox1 > bx0 && oz < bz1 && oz1 > bz0) {
-        return { ok: false, reason: 'overlaps existing building', floorY: baseY, ox, oz };
+        return { ok: false, reason: 'overlaps existing building', floorY: -1, ox, oz };
       }
     }
   }
 
-  // Validate building footprint + pad cells together for floor evenness.
+  // Underground placement: the player picked a voxel y under the Y-cutoff
+  // and wants a building stamped at that level. Validate that every cell's
+  // column has a solid (non-air, non-bedrock) voxel at the override y to
+  // serve as the floor, and headroom voxels of carveable material above
+  // (the building stamp will overwrite those with walls / interior / roof).
+  if (floorOverride !== undefined) {
+    const baseY = floorOverride;
+    for (let dz = 0; dz < spec.cellsD; dz++) {
+      for (let dx = 0; dx < totalW; dx++) {
+        const wxMid = (ox + dx) * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+        const wzMid = (oz + dz) * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
+        if (baseY < 0 || baseY >= WORLD_Y - 1) {
+          return { ok: false, reason: 'out of bounds (y)', floorY: baseY, ox, oz };
+        }
+        const floorMat = voxels[worldIndex(wxMid, baseY, wzMid)]!;
+        if (floorMat === AIR) {
+          return { ok: false, reason: 'no floor at y', floorY: baseY, ox, oz };
+        }
+        for (let h = 1; h <= spec.headroomVoxels; h++) {
+          const yy = baseY + h;
+          if (yy >= WORLD_Y) break;
+          const m = voxels[worldIndex(wxMid, yy, wzMid)]!;
+          // Bedrock is the only material the stamp can't overwrite cleanly.
+          // Stone / dirt / grass / etc. all get carved out by the stamp.
+          if (m === M_BEDROCK) {
+            return { ok: false, reason: 'bedrock above', floorY: baseY, ox, oz };
+          }
+        }
+      }
+    }
+    return { ok: true, floorY: baseY, ox, oz };
+  }
+
+  // Surface placement: standard nav-driven flatness + headroom check.
+  const i0 = navIndex(ox, oz);
+  if (nav.blocked[i0]) return { ok: false, reason: 'no surface', floorY: -1, ox, oz };
+  const baseY = nav.topY[i0]!;
+
   for (let dz = 0; dz < spec.cellsD; dz++) {
     for (let dx = 0; dx < totalW; dx++) {
       const i = navIndex(ox + dx, oz + dz);
@@ -583,7 +626,6 @@ export function checkFootprint(
     }
   }
 
-  // Headroom: check above both building and pad cells (units need to walk out).
   const headroom = spec.headroomVoxels;
   for (let dz = 0; dz < spec.cellsD; dz++) {
     for (let dx = 0; dx < totalW; dx++) {
