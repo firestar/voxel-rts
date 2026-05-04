@@ -124,8 +124,8 @@ export function buildWheatStalkGeometry(): THREE.BufferGeometry {
   return buildVoxelModel(blocks);
 }
 
-export const FARM_CORN_PER_FARM = 8;
-export const FARM_WHEAT_PER_FARM = 8;
+export const FARM_CORN_PER_FARM = 18;
+export const FARM_WHEAT_PER_FARM = 18;
 
 // ---------- Turret — rotating cannon head ------------------------------------
 // Detailed cannon with blast shield, mantlet armor, and recoil slide.

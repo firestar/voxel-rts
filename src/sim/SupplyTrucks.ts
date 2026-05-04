@@ -4,7 +4,11 @@ import { BuildingManager, Building, doorWorldPos, buildingApproachCandidates, bu
 
 export const TRUCK_CAPACITY = 100; // max materials per truck
 
-const INTERACT_REACH_M = 4.0;
+// How close the truck must be to a building's expanded approach box (4-voxel
+// halo) for delivery to trigger. With a 3-cell-wide chassis, the truck's
+// path stops ~1 m beyond the halo (footprint constraint), so 1.5 m gives a
+// small margin for path/render lag without letting trucks deliver from afar.
+const INTERACT_REACH_M = 1.5;
 
 // Only attempt dispatch at most this often (seconds) to avoid hammering every frame.
 const DISPATCH_INTERVAL = 2.0;

@@ -409,12 +409,11 @@ export interface Building {
    * draws ripe (slightly amber) stalks until a harvester collects.
    */
   cropProgress: number;
-  /** Farm-only: which 20% harvest milestone (0–4) was last collected. Growth
-   *  pauses at each milestone until a farmer visits. Resets to 0 after the
-   *  5th milestone (100% = full cycle complete). */
+  /** Farm-only: kept on the building for backwards compatibility but unused
+   *  under the single-cycle harvest scheme. Always 0. */
   harvestMilestone: number;
-  /** Farm-only: true when cropProgress has crossed the next 20% milestone
-   *  and a farmer is needed to collect the batch before growth resumes. */
+  /** Farm-only: true once cropProgress hits 1.0; cleared by collectFarm,
+   *  which also resets cropProgress to 0 to start a new cycle. */
   cropReady: boolean;
   /**
    * Farm-only: id of the worker currently dedicated as farmer here, or null
@@ -1158,12 +1157,14 @@ export function stampStorage(
  * destruction with the same threshold logic barracks uses.
  */
 /**
- * Farm — open furrowed field with a low wood-rail fence and a scarecrow at
- * the centre. The interior alternates strips of M_FARM (planted rows) and
- * M_DIRT_ROAD (tilled paths) along Z, so from above the field reads as a
- * striped agricultural plot rather than a flat green square. The scarecrow
- * sits one voxel above the field; the renderer's corn/wheat stalks fill the
- * planted strips.
+ * Farm — open cropland that units can walk on. Every interior voxel is
+ * planted M_FARM so the renderer's corn + wheat stalks cover the whole
+ * square; the fence is a single-voxel-tall wood rail on the perimeter
+ * (low enough to step over). A scarecrow at the centre adds a recognisable
+ * silhouette from the RTS camera.
+ *
+ * Farms aren't masked as buildings (Game.applyBuildingFootprintMask skips
+ * them), so workers and trucks can cross the field freely.
  */
 export function stampFarm(
   world: VoxelWorld,
@@ -1181,47 +1182,38 @@ export function stampFarm(
 
   let count = 0;
 
-  // Field with alternating planted / tilled strips along Z. 2-voxel-wide rows
-  // line up with the renderer's corn + wheat scatter.
+  // Whole interior is cropland; perimeter is a packed-dirt bund (M_DIRT_ROAD)
+  // with a single-voxel wood top rail acting as the fence. Stalks render on
+  // top of every M_FARM voxel so the field reads as fully planted.
   for (let z = wzStart; z < wzEnd; z++) {
     for (let x = wxStart; x < wxEnd; x++) {
       if (x >= WORLD_X || z >= WORLD_Z) continue;
       const onPerim = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
       if (onPerim) {
-        // Bottom rail (1 voxel of dirt road = packed earth bund).
         world.set(x, yField, z, M_DIRT_ROAD); count++;
-        // Top rail (1 voxel of wood at +1 height) gives the fence a 2-voxel
-        // visual that reads from above without blocking sightlines.
         if (yField + 1 < WORLD_Y) {
-          // Skip every 3rd voxel on long sides so the fence has visible posts + rails.
+          // Posts + rails pattern for the fence — skip every other voxel.
           const skip = (((x - wxStart) + (z - wzStart)) & 1) === 1;
           if (!skip) { world.set(x, yField + 1, z, spec.wall); count++; }
         }
       } else {
-        // Interior: 2-row planted, 1-row tilled pattern. Phase chosen so the
-        // farm centre lands on a planted row (M_FARM), which existing tests
-        // sample to confirm cropland was stamped.
-        const stripeZ = (z - wzStart - 1);
-        const tilled = stripeZ % 3 === 0;
-        world.set(x, yField, z, tilled ? M_DIRT_ROAD : M_FARM);
+        world.set(x, yField, z, M_FARM);
       }
     }
   }
 
-  // Scarecrow at field centre. Wood pole, cross-arm, and a single M_FARM head
-  // so it reads as a small figure when viewed from above.
+  // Scarecrow at field centre — wood pole + cross-arm + M_FARM straw head.
   if (yField + 4 < WORLD_Y) {
     world.set(cxv, yField + 1, czv, M_WOOD); count++;
     world.set(cxv, yField + 2, czv, M_WOOD); count++;
     world.set(cxv, yField + 3, czv, M_WOOD); count++;
-    // Cross-arm on one side at shoulder height.
     world.set(cxv - 1, yField + 3, czv, M_WOOD); count++;
     world.set(cxv + 1, yField + 3, czv, M_WOOD); count++;
-    // Straw head.
     world.set(cxv, yField + 4, czv, M_FARM);
   }
 
-  // Gate gap on +X face: clear two voxels of the fence so trucks can drive in.
+  // Gate gap on +X face: clear two voxels of the fence so units can enter
+  // the field. (The fence top rail is the only thing in their way.)
   const gateZ = czv;
   if (yField + 1 < WORLD_Y) {
     world.set(wxEnd - 1, yField + 1, gateZ, AIR);
@@ -2289,7 +2281,12 @@ export function doorWorldPos(b: Building, fromX?: number, fromZ?: number): DoorW
   const wxMid   = (wxStart + wxEnd) * 0.5;
   const wzMid   = (wzStart + wzEnd) * 0.5;
   const y       = (b.floorY + 1) * VOXEL_SIZE;
-  const gap     = 2 * NAV_CELL_VOXELS;  // 2 cells on every face — clears wall + footprint margin
+  // Tight approach gap: 4 voxels = 0.5 m outside the wall on every face.
+  // The path planner pulls the goal to the closest passable cell, and the
+  // truck stops at its footprint-imposed minimum (one nav cell out for a
+  // 3-cell-wide truck). Tightening the gap brings trucks visibly closer to
+  // the building face for delivery.
+  const gap     = 4;
 
   // For storage (4-sided doors), pick the nearest face when caller pos is given.
   if (b.spec.kind === 'storage' && fromX !== undefined && fromZ !== undefined) {
@@ -2330,7 +2327,7 @@ export function doorWorldPos(b: Building, fromX?: number, fromZ?: number): DoorW
  * triggers a delivery.
  */
 export function buildingNearestApproach(b: Building, fromX: number, fromZ: number): DoorWorldPos {
-  const gap = 2 * NAV_CELL_VOXELS;
+  const gap = 4; // 4 voxels = 0.5 m approach margin around the wall
   const x0 = (b.ox * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
   const x1 = ((b.ox + b.spec.cellsW) * NAV_CELL_VOXELS + gap) * VOXEL_SIZE;
   const z0 = (b.oz * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
@@ -2374,7 +2371,7 @@ export function buildingApproachCandidates(
   fromX: number,
   fromZ: number,
 ): DoorWorldPos[] {
-  const gap = 2 * NAV_CELL_VOXELS;
+  const gap = 4; // 4 voxels = 0.5 m approach margin around the wall
   const x0 = (b.ox * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
   const x1 = ((b.ox + b.spec.cellsW) * NAV_CELL_VOXELS + gap) * VOXEL_SIZE;
   const z0 = (b.oz * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
@@ -2408,7 +2405,7 @@ export function buildingApproachCandidates(
  * Returns 0 when the unit is on or inside the perimeter.
  */
 export function buildingBoxDistM(ux: number, uz: number, b: Building): number {
-  const gap = 2 * NAV_CELL_VOXELS;
+  const gap = 4; // 4 voxels = 0.5 m approach margin around the wall
   const x0 = (b.ox * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
   const x1 = ((b.ox + b.spec.cellsW) * NAV_CELL_VOXELS + gap) * VOXEL_SIZE;
   const z0 = (b.oz * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
@@ -3061,30 +3058,27 @@ export class BuildingManager {
     const tendedRatePerSec = 1.0 / b.spec.productionInterval;
     const rate = farmerActive ? tendedRatePerSec : ambientRatePerSec;
     b.cropProgress = Math.min(1, b.cropProgress + rate * dt);
-    // Trigger cropReady at every 20% milestone (0.2, 0.4, 0.6, 0.8, 1.0).
-    // Growth pauses until a farmer visits and collects the batch.
-    const nextMilestone = (b.harvestMilestone + 1) * 0.2;
-    if (b.cropProgress >= nextMilestone) {
+    // Crop only becomes harvestable at full ripeness (100%); growth then
+    // pauses until a harvester visits. The renderer's stalk height + colour
+    // tracks cropProgress continuously so the field still visibly grows.
+    if (b.cropProgress >= 1) {
       b.cropReady = true;
     }
   }
 
   /**
    * Called by tickWorkers when a harvester reaches a ripe farm. Drops the
-   * crop into the player's food counter, resets the farm, and clears the
-   * claim so the same field can ripen again.
+   * crop into the player's food counter, resets the farm to 0% so a fresh
+   * growth cycle starts, and clears the claim so the same field can ripen
+   * again.
    */
   collectFarm(b: Building, harvesterId: number): { foodGained: number } {
     if (!b.cropReady) return { foodGained: 0 };
     if (b.harvesterClaimId !== null && b.harvesterClaimId !== harvesterId) return { foodGained: 0 };
-    const food = 5;
+    const food = 25;
     b.cropReady = false;
-    b.harvestMilestone++;
-    if (b.harvestMilestone >= 5) {
-      // Full cycle complete — reset for the next growth cycle.
-      b.cropProgress = 0;
-      b.harvestMilestone = 0;
-    }
+    b.cropProgress = 0;
+    b.harvestMilestone = 0;
     b.harvesterClaimId = null;
     if (this.foodSink) this.foodSink(food, b);
     return { foodGained: food };

@@ -439,11 +439,15 @@ export class Game {
    * bits set, every nav column inside the footprint is treated as off-limits
    * by ground units' grid construction (no walking on roofs or through
    * interiors). With bits cleared (on destruction) the rubble becomes
-   * traversable again. Triggers an incremental nav rebuild so the
-   * per-unit-kind grids re-evaluate the affected cells immediately.
+   * traversable again.
+   *
+   * Farms are EXCLUDED — they're an open field with a low rail, not a sealed
+   * building. Units (workers especially) need to walk across the planted
+   * rows, so the footprint stays passable.
    */
   private applyBuildingFootprintMask(b: import('../sim/Buildings').Building, blocked: boolean): void {
     if (!this.pathfinder) return;
+    if (b.spec.kind === 'farm') return;
     const bm = this.pathfinder.volume.buildingMask;
     const cx0 = b.ox;
     const cz0 = b.oz;

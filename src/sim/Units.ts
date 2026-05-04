@@ -855,6 +855,12 @@ export class UnitManager {
     this.lastVoxels = voxels;
     for (const u of this.units) {
       const underground = isUnderground(u, nav);
+      // Tree shove — if a (non-digger) unit's centre lands inside a
+      // treeBlocked nav cell (canopy/trunk), push it horizontally toward the
+      // nearest passable neighbour each tick until it's clear and request a
+      // fresh path. Without this, soldiers spawned under or jostled into a
+      // tree wedge against the trunk forever.
+      if (!u.canDig && !underground) this.pushOutOfTree(u, nav, dt);
       if (u.path.length === 0) {
         u.stuckTimer = 0;
         // Idle: surface-follow only when actually on the surface; underground tunnelers
@@ -1356,6 +1362,51 @@ export class UnitManager {
    * own way out). After the teleport the unit requests a fresh route from the new
    * position.
    */
+  /**
+   * Push a unit out of a tree-occupied nav cell. Trees are stamped as
+   * standalone columns of M_WOOD / M_LEAF — when a unit's centre overlaps
+   * one (spawn + jostle, terrain regen) the surface tick wedges them
+   * against the trunk because every direction back into the cell is also
+   * "in the tree". This loop:
+   *   1. checks whether the unit's current nav cell has treeBlocked = 1;
+   *   2. if so, walks to the nearest non-treeBlocked neighbour and pushes
+   *      the unit's (x, z) toward that neighbour at ~3 m/s;
+   *   3. flags needsRepath so the harness routes a fresh path now that the
+   *      unit's start cell is no longer tree-locked.
+   * No-op when the unit is already out of trees.
+   */
+  private pushOutOfTree(u: Unit, nav: SurfaceNavBuffers, dt: number): void {
+    const cx = Math.floor(u.x / NAV_CELL_METERS);
+    const cz = Math.floor(u.z / NAV_CELL_METERS);
+    if (cx < 0 || cz < 0 || cx >= NAV_W || cz >= NAV_H) return;
+    if (nav.treeBlocked[navIndex(cx, cz)] !== 1) return;
+    // Find the nearest non-treeBlocked neighbour cell (BFS up to 4 cells).
+    let bestDx = 0, bestDz = 0, bestD2 = Infinity;
+    for (let radius = 1; radius <= 4 && bestD2 === Infinity; radius++) {
+      for (let dz = -radius; dz <= radius; dz++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+          if (Math.abs(dx) !== radius && Math.abs(dz) !== radius) continue;
+          const nx = cx + dx, nz = cz + dz;
+          if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) continue;
+          const i = navIndex(nx, nz);
+          if (nav.treeBlocked[i] !== 0) continue;
+          if (nav.blocked[i] !== 0) continue;
+          const d2 = dx * dx + dz * dz;
+          if (d2 < bestD2) { bestD2 = d2; bestDx = dx; bestDz = dz; }
+        }
+      }
+    }
+    if (bestD2 === Infinity) return; // surrounded — nothing we can do
+    // Direction from cell centre toward the nearest free cell.
+    const dirX = bestDx === 0 ? 0 : Math.sign(bestDx);
+    const dirZ = bestDz === 0 ? 0 : Math.sign(bestDz);
+    const len = Math.hypot(dirX, dirZ) || 1;
+    const speed = 3.0; // m/s — fast enough to escape in <1 s
+    u.x += (dirX / len) * speed * dt;
+    u.z += (dirZ / len) * speed * dt;
+    u.needsRepath = true;
+  }
+
   private tryUnstuck(u: Unit, nav: SurfaceNavBuffers): void {
     if (u.canDig) return;
     const r = Math.max(unitCollisionRadius(u) * 2.5, 1.2);

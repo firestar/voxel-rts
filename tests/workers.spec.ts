@@ -152,11 +152,11 @@ describe('worker — delivers carried resources to storage', () => {
     w.task = { kind: 'deliver' };
 
     // Teleport the worker to the storage door so the in-range branch fires
-    // immediately rather than depending on path follow.
+    // immediately rather than depending on path follow. Door rendezvous is
+    // 4 voxels (0.5 m) past the wall.
     const wxEnd = (storage.ox + storage.spec.cellsW) * 8; // NAV_CELL_VOXELS=8
     const wzMid = (storage.oz + storage.spec.cellsD * 0.5) * 8;
-    const NAV_CELL_VOXELS = 8;
-    w.x = (wxEnd + 2 * NAV_CELL_VOXELS) * VOXEL_SIZE; // matches doorWorldPos gap
+    w.x = (wxEnd + 4) * VOXEL_SIZE; // matches doorWorldPos gap (4 voxels)
     w.y = (storage.floorY + 1) * VOXEL_SIZE;
     w.z = wzMid * VOXEL_SIZE;
 

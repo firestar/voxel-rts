@@ -342,22 +342,21 @@ export class BuildingRenderer {
   ): void {
     // Per-farm stable phase so different farms sway out of sync.
     const phase = b.id * 0.713;
-    // Interior rectangle (skip the perimeter fence cells). Farm is 3x3 nav
-    // cells; interior is the inner 1x1, ~1m square. We pack stalks in a 4x4
-    // grid biased toward the centre to keep them inside the fence.
-    const interiorHalfMeters = (b.spec.cellsW - 2) * NAV_CELL_VOXELS * VOXEL_SIZE * 0.5;
+    // Stalks blanket the FULL farm footprint (perimeter cells included), so
+    // the field reads as fully planted from the RTS camera. We leave a tiny
+    // fence-clearance margin on each side so stalks don't poke through the
+    // top-rail.
+    const fullHalfMeters = b.spec.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE * 0.5;
     const stalkProg = Math.max(0.05, b.cropProgress);
     const baseScaleY = b.cropReady ? 1.05 : stalkProg;
     const totalCorn = FARM_CORN_PER_FARM;
     const totalWheat = FARM_WHEAT_PER_FARM;
-    // Lay stalks on a roughly-square grid covering totalCorn + totalWheat
-    // slots. We index across the grid sequentially, alternating corn and
-    // wheat so a field reads as a mixed crop.
     const total = totalCorn + totalWheat;
     const cols = Math.ceil(Math.sqrt(total));
     const rows = Math.ceil(total / cols);
-    const spacingX = (interiorHalfMeters * 1.6) / cols;
-    const spacingZ = (interiorHalfMeters * 1.6) / rows;
+    const spanMeters = (fullHalfMeters - 0.18) * 2; // 18 cm margin from the fence
+    const spacingX = spanMeters / cols;
+    const spacingZ = spanMeters / rows;
     const x0 = cx - spacingX * (cols - 1) * 0.5;
     const z0 = cz - spacingZ * (rows - 1) * 0.5;
 
