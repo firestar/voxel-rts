@@ -1269,13 +1269,40 @@ export class UnitManager {
   /**
    * When two moving units are about to overlap, deflect u's proposed step
    * laterally so both units steer around each other rather than phasing
-   * through or stopping. The deflection is perpendicular to the separation
-   * vector, capped to avoid visible jitter. Each unit applies this when its
-   * own tick runs, so the net result is that they diverge to opposite sides.
+   * through or stopping.
+   *
+   * Deflection direction is GLOBAL (the unit's own travel right-perpendicular),
+   * not relative to the peer. Each unit always pushes toward its own right —
+   * the analogue of "drive on the right" — so two opposing movers
+   * deterministically diverge to opposite world-space sides instead of
+   * orbiting each other when their relative angle wobbles. Two perpendicular
+   * crossing paths still de-conflict because each unit's right is in a
+   * different world-space direction.
+   *
+   * The deflection is capped to a small per-frame nudge so the unit stays
+   * roughly on its planned line.
    */
   private applyMovingPeerLateralOffset(u: Unit, nx: number, nz: number): { x: number; z: number } {
     const r1 = unitCollisionRadius(u);
     let ax = nx, az = nz;
+    // Travel direction = vector toward the unit's next path waypoint. Falls
+    // back to the unit's current heading if the path is empty (shouldn't
+    // happen given the call sites, but cheap to guard).
+    let tx = 0, tz = 0;
+    if (u.path.length > 0) {
+      const tgt = u.path[0]!;
+      tx = tgt.x - u.x; tz = tgt.z - u.z;
+    }
+    if (tx * tx + tz * tz < 1e-8) {
+      tx = -Math.sin(u.heading);
+      tz = -Math.cos(u.heading);
+    }
+    const tlen = Math.hypot(tx, tz) || 1;
+    const hx = tx / tlen, hz = tz / tlen;
+    // Right-perpendicular in the XZ plane: forward × up = (hz, -hx).
+    const rightX = hz;
+    const rightZ = -hx;
+
     for (const other of this.units) {
       if (other === u || other.hp <= 0) continue;
       if (other.path.length === 0) continue; // only moving peers
@@ -1291,22 +1318,15 @@ export class UnitManager {
       if (dist2 >= minDist * minDist) continue; // not overlapping at proposed position
 
       // Only push when this step makes us CLOSER than we are right now.
-      // If the step is already moving us apart, the avoidance has done its
-      // job — don't push again or we'll orbit each other.
       const curDx = other.x - u.x;
       const curDz = other.z - u.z;
       const curDist2 = curDx * curDx + curDz * curDz;
       if (dist2 >= curDist2) continue; // already separating — leave it alone
 
       const dist = Math.sqrt(dist2);
-      if (dist < 1e-6) { ax += r1 * 0.3; continue; }
-      // Perpendicular to the sep vector: (-sepZ, sepX).
-      // Both units independently use this rule so they diverge to opposite sides.
-      const sepX = sdx / dist;
-      const sepZ = sdz / dist;
       const pushAmt = Math.min(0.15, minDist - dist + 0.05);
-      ax += -sepZ * pushAmt;
-      az +=  sepX * pushAmt;
+      ax += rightX * pushAmt;
+      az += rightZ * pushAmt;
     }
     return { x: ax, z: az };
   }
