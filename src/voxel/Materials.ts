@@ -33,6 +33,15 @@ export const MATERIALS: Material[] = [
   // reads as cropland even at distance / before stalks are tall enough to
   // be visible.
   { id: 11, name: 'farm',     hp: 15,  r: 78,  g: 142, b: 56  },
+  // Federation team-colour accents — used by player-faction building stamps
+  // for flags, banners, roof trim and door frames so every Federation
+  // structure shows red/white/blue trim from the RTS camera. Same hp as
+  // wood (60) so they take roughly the same damage budget — they're trim,
+  // not load-bearing walls. Hidden from the dig-speed table (drillers won't
+  // typically encounter them).
+  { id: 12, name: 'fed_red',   hp: 60,  r: 200, g: 32,  b: 38  },
+  { id: 13, name: 'fed_white', hp: 60,  r: 235, g: 235, b: 240 },
+  { id: 14, name: 'fed_blue',  hp: 60,  r: 28,  g: 64,  b: 150 },
 ];
 
 export const M_AIR = 0;
@@ -47,6 +56,9 @@ export const M_MUD = 8;
 export const M_DIRT_ROAD = 9;
 export const M_METAL = 10;
 export const M_FARM = 11;
+export const M_FED_RED = 12;
+export const M_FED_WHITE = 13;
+export const M_FED_BLUE = 14;
 
 // Flat RGBA palette (length = MATERIALS.length * 4) for fast worker lookup.
 export function materialColors(): Uint8Array {

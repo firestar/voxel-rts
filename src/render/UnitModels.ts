@@ -37,22 +37,24 @@ export function buildVoxelModel(blocks: VoxelBlock[]): THREE.BufferGeometry {
 }
 
 // ---------- Soldier ----------------------------------------------------------
-// Faces -Z. Origin = feet, centered in XZ.
+// Faces -Z. Origin = feet, centered in XZ. Federation infantry: navy fatigues,
+// dark navy helmet, red chest plate, white shoulder mark.
 
-const SOLDIER_FATIGUES = { r: 0.40, g: 0.45, b: 0.27 };
-const SOLDIER_BOOT = { r: 0.18, g: 0.14, b: 0.10 };
+const SOLDIER_FATIGUES = { r: 0.14, g: 0.22, b: 0.46 };  // Federation navy
+const SOLDIER_BOOT = { r: 0.10, g: 0.10, b: 0.14 };
 
 /** Body, head, helmet, arms, rifle — everything above the hips. */
 export function buildSoldierBodyGeometry(): THREE.BufferGeometry {
   const skin = { r: 0.85, g: 0.70, b: 0.55 };
-  const helmet = { r: 0.27, g: 0.32, b: 0.20 };
-  const helmetStrap = { r: 0.18, g: 0.20, b: 0.14 };
+  const helmet = { r: 0.10, g: 0.16, b: 0.36 };           // dark Federation navy helmet
+  const helmetStrap = { r: 0.06, g: 0.10, b: 0.20 };
   const rifleBody = { r: 0.18, g: 0.18, b: 0.20 };
   const rifleStock = { r: 0.30, g: 0.18, b: 0.10 };
   const rifleMag = { r: 0.16, g: 0.16, b: 0.18 };
-  const vest = { r: 0.22, g: 0.25, b: 0.18 };
-  const pouch = { r: 0.30, g: 0.34, b: 0.22 };
-  const ruck = { r: 0.20, g: 0.22, b: 0.16 };
+  const vest = { r: 0.72, g: 0.14, b: 0.16 };             // red chest plate
+  const pouch = { r: 0.85, g: 0.85, b: 0.88 };            // white mag pouches
+  const ruck = { r: 0.10, g: 0.18, b: 0.40 };             // navy ruck
+  const star = { r: 0.92, g: 0.92, b: 0.95 };             // white shoulder mark
 
   const blocks: VoxelBlock[] = [
     // Torso.
@@ -75,6 +77,8 @@ export function buildSoldierBodyGeometry(): THREE.BufferGeometry {
     { x: 0.00, y: 1.30, z: 0.00, sx: 0.42, sy: 0.04, sz: 0.42, ...helmetStrap },
     // Helmet brim (visible from above).
     { x: 0.00, y: 1.36, z: -0.18, sx: 0.36, sy: 0.06, sz: 0.06, ...helmetStrap },
+    // White Federation star on the front of the helmet — visible from the front.
+    { x: 0.00, y: 1.42, z: -0.20, sx: 0.10, sy: 0.10, sz: 0.02, ...star },
     // Arms — right held forward to grip rifle, left at side.
     { x: -0.30, y: 0.78, z: 0.00, sx: 0.14, sy: 0.46, sz: 0.18, ...SOLDIER_FATIGUES },
     { x:  0.30, y: 0.85, z: -0.08, sx: 0.14, sy: 0.18, sz: 0.30, ...SOLDIER_FATIGUES },
@@ -194,8 +198,8 @@ export function buildSniperLegGeometry(): THREE.BufferGeometry {
 // high on the back. The widened LEG_X / pauldrons make the silhouette read
 // as twice the soldier's width from the RTS camera.
 
-const GUNNER_GEAR = { r: 0.22, g: 0.24, b: 0.20 };   // dark grey-green
-const GUNNER_BOOT = { r: 0.14, g: 0.11, b: 0.09 };
+const GUNNER_GEAR = { r: 0.10, g: 0.16, b: 0.36 };   // Federation deep navy
+const GUNNER_BOOT = { r: 0.08, g: 0.08, b: 0.12 };
 
 /** Wider stance than the soldier so the gunner is unmistakable from above. */
 export const GUNNER_HIP_Y = 0.55;
@@ -203,13 +207,14 @@ export const GUNNER_LEG_X = 0.18;
 
 export function buildGunnerBodyGeometry(): THREE.BufferGeometry {
   const skin    = { r: 0.85, g: 0.70, b: 0.55 };
-  const helmet  = { r: 0.16, g: 0.18, b: 0.14 };
-  const vest    = { r: 0.18, g: 0.20, b: 0.16 };
+  const helmet  = { r: 0.08, g: 0.12, b: 0.28 };          // Federation navy helmet
+  const vest    = { r: 0.72, g: 0.14, b: 0.16 };          // red armour plate
+  const pauldron= { r: 0.85, g: 0.85, b: 0.88 };          // white shoulder armour
   const visor   = { r: 0.05, g: 0.10, b: 0.18 };
   const gunMetal= { r: 0.15, g: 0.15, b: 0.17 };
   const gunStock= { r: 0.22, g: 0.14, b: 0.08 };
   const belt    = { r: 0.55, g: 0.48, b: 0.28 };
-  const ammoCan = { r: 0.20, g: 0.30, b: 0.20 };  // olive ammo can on back
+  const ammoCan = { r: 0.10, g: 0.16, b: 0.36 };          // navy ammo can
 
   const blocks: VoxelBlock[] = [
     // Torso — much wider silhouette than the soldier.
@@ -217,9 +222,10 @@ export function buildGunnerBodyGeometry(): THREE.BufferGeometry {
     // Heavy armour plates front + back.
     { x: 0.00, y: 0.80, z: -0.18, sx: 0.56, sy: 0.50, sz: 0.06, ...vest },
     { x: 0.00, y: 0.80, z:  0.18, sx: 0.56, sy: 0.50, sz: 0.06, ...vest },
-    // Wide pauldrons so shoulders dominate the top-down silhouette.
-    { x: -0.36, y: 1.00, z: 0.00, sx: 0.18, sy: 0.16, sz: 0.30, ...vest },
-    { x:  0.36, y: 1.00, z: 0.00, sx: 0.18, sy: 0.16, sz: 0.30, ...vest },
+    // Wide pauldrons so shoulders dominate the top-down silhouette — white
+    // so they read as Federation team colours from above.
+    { x: -0.36, y: 1.00, z: 0.00, sx: 0.18, sy: 0.16, sz: 0.30, ...pauldron },
+    { x:  0.36, y: 1.00, z: 0.00, sx: 0.18, sy: 0.16, sz: 0.30, ...pauldron },
     // Ammo belt looped from the can on the back over the right shoulder to the gun.
     { x: -0.18, y: 0.90, z: -0.10, sx: 0.10, sy: 0.34, sz: 0.06, ...belt },
     { x: -0.10, y: 1.10, z:  0.10, sx: 0.16, sy: 0.04, sz: 0.16, ...belt },
@@ -403,8 +409,8 @@ export const WORKER_LEG_X = 0.10;
 // Rough dimensions: 3.2 m long, 2.4 m wide (incl. treads), 2.0 m tall to top of antenna.
 
 export function buildTankHullGeometry(): THREE.BufferGeometry {
-  const hull = { r: 0.30, g: 0.45, b: 0.35 };
-  const hullDark = { r: 0.20, g: 0.30, b: 0.24 };
+  const hull = { r: 0.14, g: 0.22, b: 0.46 };       // Federation navy
+  const hullDark = { r: 0.08, g: 0.14, b: 0.32 };
   const tread = { r: 0.08, g: 0.08, b: 0.10 };
   const treadHi = { r: 0.20, g: 0.22, b: 0.24 };
   const wheelHub = { r: 0.45, g: 0.45, b: 0.45 };
@@ -444,13 +450,15 @@ export function buildTankHullGeometry(): THREE.BufferGeometry {
  * other) so the turret yaw is legible even from straight overhead.
  */
 export function buildTankTurretGeometry(): THREE.BufferGeometry {
-  const turret = { r: 0.34, g: 0.50, b: 0.40 };
-  const turretDark = { r: 0.24, g: 0.36, b: 0.28 };
+  const turret = { r: 0.16, g: 0.24, b: 0.50 };       // Federation navy turret
+  const turretDark = { r: 0.10, g: 0.16, b: 0.36 };
   const cannon = { r: 0.16, g: 0.16, b: 0.18 };
   const cannonHi = { r: 0.30, g: 0.30, b: 0.34 };
-  const hatch = { r: 0.18, g: 0.20, b: 0.16 };
+  const hatch = { r: 0.10, g: 0.14, b: 0.30 };
   const dshk = { r: 0.12, g: 0.12, b: 0.14 };
   const stowage = { r: 0.30, g: 0.26, b: 0.16 };
+  const star = { r: 0.92, g: 0.92, b: 0.95 };
+  const accent = { r: 0.72, g: 0.14, b: 0.16 };       // red accent stripe
 
   const blocks: VoxelBlock[] = [
     // Turret base (around pivot).
@@ -458,10 +466,15 @@ export function buildTankTurretGeometry(): THREE.BufferGeometry {
     // Sloped cheek plates that flare out toward the sides.
     { x: -0.74, y: 0.10, z: -0.20, sx: 0.18, sy: 0.30, sz: 0.80, ...turretDark },
     { x:  0.74, y: 0.10, z: -0.20, sx: 0.18, sy: 0.30, sz: 0.80, ...turretDark },
+    // Red accent stripe along the cheek.
+    { x: -0.74, y: 0.04, z: -0.20, sx: 0.20, sy: 0.05, sz: 0.80, ...accent },
+    { x:  0.74, y: 0.04, z: -0.20, sx: 0.20, sy: 0.05, sz: 0.80, ...accent },
     // Mantlet (front step) wraps around the trunnion of the gun.
     { x: 0.00, y: 0.18, z: -0.55, sx: 1.00, sy: 0.46, sz: 0.50, ...turretDark },
     // Roof.
     { x: 0.00, y: 0.36, z: 0.00, sx: 1.20, sy: 0.10, sz: 1.20, ...turret },
+    // Big white Federation star painted on the turret roof — visible from above.
+    { x: 0.00, y: 0.42, z: -0.05, sx: 0.40, sy: 0.02, sz: 0.40, ...star },
     // Commander cupola + hatch (right side).
     { x:  0.30, y: 0.42, z: 0.18, sx: 0.40, sy: 0.10, sz: 0.40, ...turretDark },
     { x:  0.30, y: 0.50, z: 0.18, sx: 0.32, sy: 0.06, sz: 0.32, ...hatch },
@@ -791,9 +804,9 @@ export const DOZER_BLADE_PIVOT_Z = -1.80;
 // pivots around the centre of the deck so the renderer can rotate it freely
 // on (turretYaw - heading) regardless of the hull's orientation.
 
-const ROCKET_HULL = { r: 0.35, g: 0.45, b: 0.30 };       // olive drab
-const ROCKET_HULL_DARK = { r: 0.22, g: 0.28, b: 0.18 };
-const ROCKET_HULL_HI = { r: 0.55, g: 0.62, b: 0.42 };
+const ROCKET_HULL = { r: 0.14, g: 0.22, b: 0.46 };       // Federation navy
+const ROCKET_HULL_DARK = { r: 0.08, g: 0.14, b: 0.32 };
+const ROCKET_HULL_HI = { r: 0.85, g: 0.85, b: 0.88 };    // white deck stripe
 const ROCKET_TIRE = { r: 0.08, g: 0.08, b: 0.10 };
 const ROCKET_HUB = { r: 0.45, g: 0.45, b: 0.45 };
 const ROCKET_GLASS = { r: 0.20, g: 0.45, b: 0.55 };
@@ -892,9 +905,9 @@ export const ROCKET_TRUCK_POD_PIVOT_Z = 0.55;
 // Unarmed logistics flatbed. Hull is built at 0.5× the original design scale.
 // Crates are a separate geometry so the renderer can show 0–5 levels of cargo.
 
-const SUPPLY_HULL      = { r: 0.55, g: 0.50, b: 0.30 }; // tan/sand camouflage
-const SUPPLY_HULL_DARK = { r: 0.38, g: 0.34, b: 0.20 };
-const SUPPLY_HULL_HI   = { r: 0.72, g: 0.66, b: 0.42 };
+const SUPPLY_HULL      = { r: 0.85, g: 0.85, b: 0.88 }; // Federation white
+const SUPPLY_HULL_DARK = { r: 0.10, g: 0.16, b: 0.36 }; // navy chassis
+const SUPPLY_HULL_HI   = { r: 0.72, g: 0.14, b: 0.16 }; // red flatbed accent
 const SUPPLY_TIRE      = { r: 0.08, g: 0.08, b: 0.10 };
 const SUPPLY_HUB       = { r: 0.50, g: 0.50, b: 0.50 };
 const SUPPLY_GLASS     = { r: 0.20, g: 0.45, b: 0.55 };

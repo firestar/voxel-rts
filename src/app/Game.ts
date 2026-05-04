@@ -362,7 +362,7 @@ export class Game {
     for (const [dx, dz] of offsets) {
       const ox = Math.max(0, Math.min(NAV_W - STORAGE.cellsW, startCx + dx - (STORAGE.cellsW >> 1)));
       const oz = Math.max(0, Math.min(NAV_H - STORAGE.cellsD, startCz + dz - (STORAGE.cellsD >> 1)));
-      const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, STORAGE, ox, oz);
+      const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, STORAGE, ox, oz, this.buildings.buildings);
       if (fp.ok) {
         this.buildings.place(this.world, STORAGE, ox, oz, fp.floorY);
         const pad = NAV_CELL_METERS;
@@ -381,7 +381,7 @@ export class Game {
     for (const [dx, dz] of hqOffsets) {
       const ox = Math.max(0, Math.min(NAV_W - HQ.cellsW, startCx + dx - (HQ.cellsW >> 1)));
       const oz = Math.max(0, Math.min(NAV_H - HQ.cellsD, startCz + dz - (HQ.cellsD >> 1)));
-      const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, HQ, ox, oz);
+      const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, HQ, ox, oz, this.buildings.buildings);
       if (fp.ok) {
         this.buildings.place(this.world, HQ, ox, oz, fp.floorY);
         const pad = NAV_CELL_METERS;
@@ -899,7 +899,7 @@ export class Game {
     const cell = this.surfaceCellAt(wx, wz);
     const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
     const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
-    const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz);
+    const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings);
     this.ghost.place(ox, oz, fp.floorY >= 0 ? fp.floorY : hit.y, fp.ok);
   }
 
@@ -1369,7 +1369,7 @@ export class Game {
     const cell = this.surfaceCellAt(wx, wz);
     const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
     const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
-    const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz);
+    const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings);
     if (!fp.ok) return;
 
     // Enforce HQ build range: proposed center must be within range of a live HQ.
@@ -1393,7 +1393,14 @@ export class Game {
     const by0 = fp.floorY * VOXEL_SIZE;
     const by1 = (fp.floorY + spec.headroomVoxels + 4) * VOXEL_SIZE;
     this.requestNavRebuildAround(bx0 - pad, by0 - pad, bz0 - pad, bx1 + pad, by1 + pad, bz1 + pad, true);
-    // Recompute power-line routes so new buildings that are energy sources or HQs appear.
+    // Synchronously refresh the main-thread Pathfinder's per-unit grids over
+    // the affected cells so `recomputePowerLinePaths` (which calls
+    // pathfinder.findPath synchronously) sees the new building blocking the
+    // soldier grid. Without this the worker rebuild is queued behind the
+    // current frame and the line routes through the new building.
+    this.pathfinder?.applyDamage(bx0 - pad, by0 - pad, bz0 - pad, bx1 + pad, by1 + pad, bz1 + pad);
+    // Recompute power-line routes so new buildings that are energy sources
+    // or HQs appear, and existing routes deflect around the new building.
     this.recomputePowerLinePaths();
   }
 

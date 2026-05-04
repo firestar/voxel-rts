@@ -1,7 +1,7 @@
 import { VoxelWorld } from '../voxel/VoxelWorld';
 import { worldIndex } from '../voxel/VoxelWorld';
 import { WORLD_X, WORLD_Y, WORLD_Z, AIR, MaterialId, VOXEL_SIZE } from '../voxel/types';
-import { M_WOOD, M_FARM, M_STONE, M_PATH, M_DIRT_ROAD, M_METAL } from '../voxel/Materials';
+import { M_WOOD, M_FARM, M_STONE, M_PATH, M_DIRT_ROAD, M_METAL, M_FED_RED, M_FED_WHITE, M_FED_BLUE } from '../voxel/Materials';
 import { SurfaceNavBuffers, navIndex, NAV_W, NAV_H, NAV_CELL_VOXELS, FLAT_TOLERANCE_VOXELS } from '../path/SurfaceNav';
 import { UnitManager, UnitKind, Unit } from './Units';
 import { WeaponKind, WEAPONS } from './Weapons';
@@ -523,6 +523,13 @@ export function checkFootprint(
   nav: SurfaceNavBuffers,
   spec: BuildingSpec,
   ox: number, oz: number,
+  /**
+   * Existing buildings to test against. When provided, the proposed footprint
+   * (and its spawn pad) is rejected if it overlaps any live building's
+   * footprint. Caller passes `this.buildings.buildings`. Optional so the
+   * existing tests that don't construct a manager keep working.
+   */
+  existing?: readonly Building[],
 ): FootprintHit {
   const totalW = spec.cellsW + spec.spawnPadCells;
   if (ox < 0 || oz < 0 || ox + totalW > NAV_W || oz + spec.cellsD > NAV_H) {
@@ -531,6 +538,25 @@ export function checkFootprint(
   const i0 = navIndex(ox, oz);
   if (nav.blocked[i0]) return { ok: false, reason: 'no surface', floorY: -1, ox, oz };
   const baseY = nav.topY[i0]!;
+
+  // Reject if any live building's footprint overlaps the proposed footprint
+  // or spawn-pad columns. Roof-top placement was previously possible because
+  // a building's stone roof reads as walkable terrain in the surface nav.
+  if (existing && existing.length > 0) {
+    const ox1 = ox + totalW;
+    const oz1 = oz + spec.cellsD;
+    for (const b of existing) {
+      if (b.destroyed) continue;
+      const bx0 = b.ox;
+      const bz0 = b.oz;
+      const bx1 = b.ox + b.spec.cellsW + b.spec.spawnPadCells;
+      const bz1 = b.oz + b.spec.cellsD;
+      // AABB overlap on the cell grid.
+      if (ox < bx1 && ox1 > bx0 && oz < bz1 && oz1 > bz0) {
+        return { ok: false, reason: 'overlaps existing building', floorY: baseY, ox, oz };
+      }
+    }
+  }
 
   // Validate building footprint + pad cells together for floor evenness.
   for (let dz = 0; dz < spec.cellsD; dz++) {
@@ -771,21 +797,24 @@ export function stampBarracks(
     }
   }
 
-  // 7. Tall flag pole at the front-right corner with a metal banner draped
-  // toward +X. Pole is 16 voxels above the eaves so the flag tops the roof.
+  // 7. Tall flag pole at the front-right corner with a Federation banner —
+  // five horizontal stripes of red/white/blue/white/red draped toward +X.
+  // Pole is 16 voxels above the eaves so the flag tops the roof.
   const poleX = wxEnd - 2;
   const poleZ = wzStart + 2;
   for (let dy = 1; dy <= 16; dy++) {
     const py = yEaves + dy; if (py >= WORLD_Y) break;
     world.set(poleX, py, poleZ, M_WOOD); count++;
   }
-  // Banner — 5 wide × 5 tall metal rectangle attached to the pole.
+  // Banner — 5 wide × 5 tall, top-down stripe pattern in team colours.
+  const bannerStripes = [M_FED_RED, M_FED_WHITE, M_FED_BLUE, M_FED_WHITE, M_FED_RED];
   for (let by = 0; by < 5; by++) {
+    const stripe = bannerStripes[by]!;
     for (let bx = 1; bx <= 5; bx++) {
       const px = poleX + bx;
-      const py = yEaves + 10 + by;
+      const py = yEaves + 14 - by;
       if (px >= WORLD_X || py >= WORLD_Y) continue;
-      world.set(px, py, poleZ, M_METAL); count++;
+      world.set(px, py, poleZ, stripe); count++;
     }
   }
 
@@ -1100,7 +1129,13 @@ export function stampStorage(
       if (px >= WORLD_X) break;
       for (let pz = doorZc0 - 1; pz <= doorZc1 + 1; pz++) {
         if (pz < 0 || pz >= WORLD_Z) continue;
-        world.set(px, canopyY, pz, M_WOOD); count++;
+        // Federation-striped canopy: red on outer Z, white middle, blue inner.
+        const stripe = (pz === doorZc0 - 1 || pz === doorZc1 + 1)
+          ? M_FED_RED
+          : (pz === doorZc0 || pz === doorZc1)
+          ? M_FED_WHITE
+          : M_FED_BLUE;
+        world.set(px, canopyY, pz, stripe); count++;
       }
     }
     for (const pz of [doorZc0 - 1, doorZc1 + 1]) {
@@ -1316,7 +1351,8 @@ export function stampPowerPlant(
         if (dy % 4 === 0 || inner) { world.set(tx, py, tz, M_WOOD); count++; }
       }
     }
-    // Metal crossbar at the top — a + shape extending one voxel each way.
+    // Federation blue crossbar at the top — a + shape extending one voxel
+    // each way so the pylon's silhouette pops with team colour.
     const topY = yFloor + pylonH;
     if (topY < WORLD_Y) {
       for (const [xo, zo] of [
@@ -1325,7 +1361,7 @@ export function stampPowerPlant(
       ] as [number, number][]) {
         const tx = px + xo, tz = pz + zo;
         if (tx < 0 || tx >= WORLD_X || tz < 0 || tz >= WORLD_Z) continue;
-        world.set(tx, topY, tz, M_METAL); count++;
+        world.set(tx, topY, tz, M_FED_BLUE); count++;
       }
     }
   }
@@ -1420,17 +1456,22 @@ export function stampRefinery(
     for (let xo = 0; xo < 2; xo++) for (let zo = 0; zo < 2; zo++) {
       const tx = mainChimX + xo, tz = mainChimZ + zo;
       if (tx >= WORLD_X || tz >= WORLD_Z) continue;
-      // Soot-darkened cap on the top 3 voxels.
-      world.set(tx, py, tz, dy >= mainChimH - 2 ? M_METAL : M_STONE); count++;
+      // Federation red/white cap stripes on the top 4 voxels of the stack.
+      let mat: number;
+      if (dy >= mainChimH - 1)      mat = M_FED_RED;
+      else if (dy >= mainChimH - 2) mat = M_FED_WHITE;
+      else if (dy >= mainChimH - 3) mat = M_FED_RED;
+      else                          mat = M_STONE;
+      world.set(tx, py, tz, mat); count++;
     }
   }
-  // Reinforcing stone band at half height.
+  // Reinforcing band at half height — painted Federation blue.
   const bandY = yRoof + Math.floor(mainChimH / 2);
   if (bandY < WORLD_Y) {
     for (let xo = -1; xo < 3; xo++) for (let zo = -1; zo < 3; zo++) {
       const tx = mainChimX + xo, tz = mainChimZ + zo;
       if (tx < wxStart || tx >= wxEnd || tz < wzStart || tz >= wzEnd) continue;
-      world.set(tx, bandY, tz, M_STONE); count++;
+      world.set(tx, bandY, tz, M_FED_BLUE); count++;
     }
   }
 
@@ -1751,7 +1792,9 @@ export function stampTurret(
     }
   }
 
-  // 5. Crenellated parapet on the outer ring (every 2 voxels).
+  // 5. Crenellated parapet on the outer ring (every 2 voxels) — alternating
+  // Federation blue and white merlons so the turret reads as friendly from
+  // the RTS camera.
   const parapetY = yRoof + 1;
   if (parapetY < WORLD_Y) {
     for (let x = wxStart; x < wxEnd; x++) {
@@ -1762,7 +1805,10 @@ export function stampTurret(
         const onOuterRing = dx === 0 || dz === 0;
         if (!onOuterRing) continue;
         const pos = (x - wxStart) + (z - wzStart);
-        if (pos % 2 === 0) { world.set(x, parapetY, z, M_STONE); count++; }
+        if (pos % 2 === 0) {
+          const stripe = ((pos >> 1) & 1) === 0 ? M_FED_BLUE : M_FED_WHITE;
+          world.set(x, parapetY, z, stripe); count++;
+        }
       }
     }
   }
@@ -1948,17 +1994,17 @@ export function stampSilo(
       world.set(tx, noseY3, tz, M_METAL);
       wallCount++;
     }
-    // Reinforcing bands — quarter and three-quarter height.
+    // Reinforcing bands — quarter and three-quarter height. Painted in
+    // Federation red so the cluster reads as friendly ICBMs from above.
     for (const frac of [0.25, 0.75]) {
       const bandY = tubeBaseY + Math.floor(thisTubeH * frac);
       if (bandY >= WORLD_Y) continue;
       for (let xo = -2; xo <= 2; xo++) {
         for (let zo = -2; zo <= 2; zo++) {
           const px = tx + xo; const pz = tz + zo;
-          // Outer ring only.
           if (Math.max(Math.abs(xo), Math.abs(zo)) !== 2) continue;
           if (px < 0 || px >= WORLD_X || pz < 0 || pz >= WORLD_Z) continue;
-          world.set(px, bandY, pz, M_STONE); wallCount++;
+          world.set(px, bandY, pz, M_FED_RED); wallCount++;
         }
       }
     }
@@ -2175,6 +2221,22 @@ export function stampHQ(
     // Guard booth roof.
     for (let xo = 0; xo < 4; xo++)
       for (let zo = 0; zo < 4; zo++) set(wxEnd + xo, yFloor + 8, gz + zo, M_STONE);
+  }
+
+  // ---- Federation flag pole on the central roof, banner draped toward +X ----
+  const flagX = cxv;
+  const flagZ = czv;
+  for (let dy = 1; dy <= 18; dy++) {
+    const py = yRoof + dy; if (py >= WORLD_Y) break;
+    set(flagX, py, flagZ, M_WOOD);
+  }
+  // 6 wide × 6 tall banner — top to bottom: red/white/blue/blue/white/red.
+  const hqStripes = [M_FED_RED, M_FED_WHITE, M_FED_BLUE, M_FED_BLUE, M_FED_WHITE, M_FED_RED];
+  for (let by = 0; by < 6; by++) {
+    const stripe = hqStripes[by]!;
+    for (let bx = 1; bx <= 6; bx++) {
+      set(flagX + bx, yRoof + 16 - by, flagZ, stripe);
+    }
   }
 
   return wallCount;
