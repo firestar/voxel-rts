@@ -121,7 +121,7 @@ export const BARRACKS: BuildingSpec = {
   label: 'Barracks',
   cellsW: 4,
   cellsD: 4,
-  headroomVoxels: 24, // 3 m at 0.125 m voxels
+  headroomVoxels: 6, // 0.75 m — flat low-profile bunker silhouette
   wall: M_WOOD,
   maxHp: 600,
   productionInterval: 6.0,
@@ -144,7 +144,7 @@ export const VEHICLE_DEPOT: BuildingSpec = {
   label: 'Vehicle Depot',
   cellsW: 5,
   cellsD: 4,
-  headroomVoxels: 28, // 3.5 m clearance for tank turret
+  headroomVoxels: 6, // 0.75 m — low-profile depot silhouette
   wall: M_METAL,
   maxHp: 900,
   productionInterval: 9.0,
@@ -578,31 +578,27 @@ export function checkFootprint(
   }
 
   // Underground placement: the player picked a voxel y under the Y-cutoff
-  // and wants a building stamped at that level. Validate that every cell's
-  // column has a solid (non-air, non-bedrock) voxel at the override y to
-  // serve as the floor, and headroom voxels of carveable material above
-  // (the building stamp will overwrite those with walls / interior / roof).
+  // and wants a building stamped at that level. The stamp itself writes the
+  // floor / walls / roof voxels regardless of what's there, so we only need
+  // to gate on (a) the y is in world bounds and (b) the building's roof
+  // wouldn't clip a bedrock layer (the indestructible layer at y=0..1).
   if (floorOverride !== undefined) {
     const baseY = floorOverride;
+    if (baseY < 0 || baseY + spec.headroomVoxels >= WORLD_Y) {
+      return { ok: false, reason: 'out of world y bounds', floorY: baseY, ox, oz };
+    }
+    // Look across the building's columns: if ANY cell has bedrock anywhere
+    // in [baseY+1, baseY+headroom] (the volume the stamp will carve) reject;
+    // bedrock can't be replaced by stamp materials.
     for (let dz = 0; dz < spec.cellsD; dz++) {
       for (let dx = 0; dx < totalW; dx++) {
         const wxMid = (ox + dx) * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
         const wzMid = (oz + dz) * NAV_CELL_VOXELS + (NAV_CELL_VOXELS >> 1);
-        if (baseY < 0 || baseY >= WORLD_Y - 1) {
-          return { ok: false, reason: 'out of bounds (y)', floorY: baseY, ox, oz };
-        }
-        const floorMat = voxels[worldIndex(wxMid, baseY, wzMid)]!;
-        if (floorMat === AIR) {
-          return { ok: false, reason: 'no floor at y', floorY: baseY, ox, oz };
-        }
         for (let h = 1; h <= spec.headroomVoxels; h++) {
           const yy = baseY + h;
           if (yy >= WORLD_Y) break;
-          const m = voxels[worldIndex(wxMid, yy, wzMid)]!;
-          // Bedrock is the only material the stamp can't overwrite cleanly.
-          // Stone / dirt / grass / etc. all get carved out by the stamp.
-          if (m === M_BEDROCK) {
-            return { ok: false, reason: 'bedrock above', floorY: baseY, ox, oz };
+          if (voxels[worldIndex(wxMid, yy, wzMid)] === M_BEDROCK) {
+            return { ok: false, reason: 'bedrock in carve zone', floorY: baseY, ox, oz };
           }
         }
       }
@@ -721,15 +717,12 @@ export function stampBarracks(
   const wxEnd   = wxStart + spec.cellsW * NAV_CELL_VOXELS; // +32
   const wzEnd   = wzStart + spec.cellsD * NAV_CELL_VOXELS; // +32
   const yFloor  = floorY + 1;
-  const yEaves  = floorY + spec.headroomVoxels;        // top of vertical wall
-  const ridgeH  = 6;                                    // pitched roof rises 6 voxels above eaves
-  const cxv     = (wxStart + wxEnd) >> 1;
-  const cwHalfX = (wxEnd - wxStart) >> 1;
+  const yRoof   = floorY + spec.headroomVoxels;        // top of building (= floor + 6)
 
-  // Door on +X face — 4 wide, 10 tall.
+  // Door on +X face — 4 wide; only as tall as the building (5 voxels of wall +
+  // 1 voxel cap means the doorway pierces the entire vertical extent).
   const doorWz0 = ((wzStart + wzEnd) >> 1) - 2;
   const doorWz1 = doorWz0 + 3;
-  const doorYTop = yFloor + 10;
 
   let count = 0;
 
@@ -742,138 +735,49 @@ export function stampBarracks(
   }
 
   // 2. Perimeter walls — stone base 3v, wood above. Pierce the door slot.
-  for (let y = yFloor + 1; y <= yEaves; y++) {
+  for (let y = yFloor + 1; y < yRoof; y++) {
     if (y >= WORLD_Y) break;
     for (let z = wzStart; z < wzEnd; z++) {
       for (let x = wxStart; x < wxEnd; x++) {
         if (x >= WORLD_X || z >= WORLD_Z) continue;
         const onPerim = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
         if (!onPerim) continue;
-        const isDoor = x === wxEnd - 1 && z >= doorWz0 && z <= doorWz1 && y < doorYTop;
+        const isDoor = x === wxEnd - 1 && z >= doorWz0 && z <= doorWz1;
         if (isDoor) { world.set(x, y, z, AIR); continue; }
-        world.set(x, y, z, (y - yFloor) <= 3 ? M_STONE : M_WOOD); count++;
+        world.set(x, y, z, (y - yFloor) <= 2 ? M_STONE : M_WOOD); count++;
       }
     }
   }
 
-  // 3. Pitched roof — gable runs along Z with the ridge along X-centre.
-  // For each (x), fill a horizontal slab spanning the full Z range at a height
-  // that depends on |x - centre|, so the roof rises in steps from the eaves
-  // up to the ridge in the middle.
-  for (let x = wxStart; x < wxEnd; x++) {
-    if (x >= WORLD_X) continue;
-    const dxFromCenter = Math.abs(x - cxv);
-    // 0 at the ridge, ridgeH at the eaves.
-    const rise = Math.max(0, ridgeH - Math.floor((dxFromCenter / cwHalfX) * ridgeH));
-    const ry = yEaves + rise;
-    if (ry >= WORLD_Y) continue;
-    for (let z = wzStart; z < wzEnd; z++) {
-      if (z >= WORLD_Z) continue;
-      world.set(x, ry, z, M_WOOD); count++;
+  // 3. Flat wood roof at yRoof (the cap). With headroom=6 the entire silhouette
+  // is 6 voxels tall, so no chimneys / pitched roof / flag pole / battle towers
+  // — just a low wood-clad bunker.
+  for (let z = wzStart; z < wzEnd; z++) {
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      world.set(x, yRoof, z, M_WOOD); count++;
     }
-    // Fill the volume below the slope down to the eaves so the roof is solid
-    // (no gap a unit could see the sky through).
-    for (let dy = 1; dy <= rise; dy++) {
-      const py = yEaves + dy; if (py >= WORLD_Y) break;
-      const onPerim = x === wxStart || x === wxEnd - 1;
-      // Roof end-walls (gable triangles on -X / +X) are wood.
-      if (onPerim) {
-        for (let z = wzStart; z < wzEnd; z++) {
-          if (z >= WORLD_Z) continue;
-          world.set(x, py, z, M_WOOD); count++;
-        }
-      } else {
-        // Z-end gable lines — only along z = wzStart and wzEnd-1 to seal the ridge.
-        world.set(x, py, wzStart, M_WOOD); count++;
-        if (wzEnd - 1 < WORLD_Z) { world.set(x, py, wzEnd - 1, M_WOOD); count++; }
+  }
+
+  // 4. Federation banner on the +X face — a 4-wide × 3-tall stripe band built
+  // INTO the wall just left of the door. Within the 6-voxel building height
+  // budget so the silhouette stays flat.
+  if (yFloor + 3 < yRoof) {
+    const bannerStripes = [M_FED_RED, M_FED_WHITE, M_FED_BLUE];
+    for (let by = 0; by < 3; by++) {
+      const stripe = bannerStripes[by]!;
+      const py = yFloor + 1 + by;
+      for (let zo = 0; zo < 4; zo++) {
+        const pz = doorWz0 - 5 + zo;
+        if (pz < wzStart + 1 || pz >= doorWz0) continue;
+        const px = wxEnd - 1;
+        if (px >= WORLD_X) continue;
+        world.set(px, py, pz, stripe); count++;
       }
     }
   }
 
-  // 4. Two ventilation chimneys on the roof — 2×2 stone columns.
-  const chimneys: [number, number][] = [
-    [cxv - 1, wzStart + 6],
-    [cxv - 1, wzEnd   - 8],
-  ];
-  for (const [cx, cz] of chimneys) {
-    for (let dy = 1; dy <= 5; dy++) {
-      const py = yEaves + ridgeH + dy; if (py >= WORLD_Y) break;
-      for (let xo = 0; xo < 2; xo++) {
-        for (let zo = 0; zo < 2; zo++) {
-          const tx = cx + xo, tz = cz + zo;
-          if (tx >= WORLD_X || tz >= WORLD_Z) continue;
-          world.set(tx, py, tz, M_STONE); count++;
-        }
-      }
-    }
-    // Metal cap.
-    const capY = yEaves + ridgeH + 6;
-    if (capY < WORLD_Y) {
-      for (let xo = 0; xo < 2; xo++) {
-        for (let zo = 0; zo < 2; zo++) {
-          const tx = cx + xo, tz = cz + zo;
-          if (tx >= WORLD_X || tz >= WORLD_Z) continue;
-          world.set(tx, capY, tz, M_METAL); count++;
-        }
-      }
-    }
-  }
-
-  // 5. Slot windows on -X (rear) face — 2 wide × 4 tall, three of them.
-  for (let wz = wzStart + 6; wz < wzEnd - 5; wz += 10) {
-    for (let dy = 0; dy < 4; dy++) {
-      const py = yFloor + 8 + dy;
-      if (py >= yEaves) break;
-      world.set(wxStart, py, wz, AIR);     count--;
-      world.set(wxStart, py, wz + 1, AIR); count--;
-    }
-  }
-
-  // 6. Entrance porch — wood canopy above the door on +X face.
-  const porchZ0 = doorWz0 - 1, porchZ1 = doorWz1 + 1;
-  const porchTopY = yFloor + 11;
-  if (porchTopY < WORLD_Y) {
-    for (let pz = porchZ0; pz <= porchZ1; pz++) {
-      if (pz < 0 || pz >= WORLD_Z) continue;
-      for (let dx = 0; dx < 4; dx++) {
-        const px = wxEnd + dx;
-        if (px >= WORLD_X) break;
-        world.set(px, porchTopY, pz, M_WOOD); count++;
-      }
-    }
-    for (const pz of [porchZ0, porchZ1]) {
-      if (pz < 0 || pz >= WORLD_Z) continue;
-      const px = wxEnd + 3;
-      if (px >= WORLD_X) continue;
-      for (let y = yFloor + 1; y <= porchTopY; y++) {
-        if (y >= WORLD_Y) break;
-        world.set(px, y, pz, M_WOOD); count++;
-      }
-    }
-  }
-
-  // 7. Tall flag pole at the front-right corner with a Federation banner —
-  // five horizontal stripes of red/white/blue/white/red draped toward +X.
-  // Pole is 16 voxels above the eaves so the flag tops the roof.
-  const poleX = wxEnd - 2;
-  const poleZ = wzStart + 2;
-  for (let dy = 1; dy <= 16; dy++) {
-    const py = yEaves + dy; if (py >= WORLD_Y) break;
-    world.set(poleX, py, poleZ, M_WOOD); count++;
-  }
-  // Banner — 5 wide × 5 tall, top-down stripe pattern in team colours.
-  const bannerStripes = [M_FED_RED, M_FED_WHITE, M_FED_BLUE, M_FED_WHITE, M_FED_RED];
-  for (let by = 0; by < 5; by++) {
-    const stripe = bannerStripes[by]!;
-    for (let bx = 1; bx <= 5; bx++) {
-      const px = poleX + bx;
-      const py = yEaves + 14 - by;
-      if (px >= WORLD_X || py >= WORLD_Y) continue;
-      world.set(px, py, poleZ, stripe); count++;
-    }
-  }
-
-  // 8. Drill yard outside +X face — paved with M_PATH, with M_DIRT_ROAD lane
+  // 5. Drill yard outside +X face — paved with M_PATH, with M_DIRT_ROAD lane
   // stripes every 4 voxels along Z. Spans the whole spawn-pad area.
   const padX0 = wxEnd;
   const padX1 = padX0 + spec.spawnPadCells * NAV_CELL_VOXELS;
@@ -890,12 +794,10 @@ export function stampBarracks(
 }
 
 /**
- * Vehicle depot — wide industrial hangar with a curved (stepped) arched roof
- * spanning along Z, an oversized rolling door on the +X face, painted vehicle
- * bays on the floor inside, and a fuel pump tower outside near the door. The
- * arched roof profile is the building's defining silhouette — no other
- * structure has a curved roof. The renderer overlays a gantry crane near the
- * top of the interior void.
+ * Vehicle depot — low-profile metal hangar with a flat roof, painted parking
+ * bays on the floor inside, and a fuel pump (well below the building's roof
+ * height) just outside the door. With headroom = 6 voxels the entire depot
+ * silhouette fits in 6 voxels of vertical extent.
  */
 export function stampVehicleDepot(
   world: VoxelWorld,
@@ -908,15 +810,12 @@ export function stampVehicleDepot(
   const wxEnd   = wxStart + spec.cellsW * NAV_CELL_VOXELS; // +40
   const wzEnd   = wzStart + spec.cellsD * NAV_CELL_VOXELS; // +32
   const yFloor  = floorY + 1;
-  const yEaves  = floorY + spec.headroomVoxels;
-  const cxv     = (wxStart + wxEnd) >> 1;
+  const yRoof   = floorY + spec.headroomVoxels;
   const czv     = (wzStart + wzEnd) >> 1;
-  const halfDz  = (wzEnd - wzStart) >> 1;
 
-  // Big rolling door — 10 wide × 16 tall, centred on +X.
+  // Rolling door — full wall height (5 voxels tall), 10 wide on +X face.
   const doorWz0 = ((wzStart + wzEnd) >> 1) - 5;
   const doorWz1 = doorWz0 + 9;
-  const doorYTop = yFloor + 16;
 
   let count = 0;
 
@@ -928,15 +827,15 @@ export function stampVehicleDepot(
     }
   }
 
-  // 2. Perimeter walls — metal sheet with stone corner anchors. Pierce the door.
-  for (let y = yFloor + 1; y <= yEaves; y++) {
+  // 2. Perimeter walls — metal with stone corner anchors. Pierce the door.
+  for (let y = yFloor + 1; y < yRoof; y++) {
     if (y >= WORLD_Y) break;
     for (let z = wzStart; z < wzEnd; z++) {
       for (let x = wxStart; x < wxEnd; x++) {
         if (x >= WORLD_X || z >= WORLD_Z) continue;
         const onPerim = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
         if (!onPerim) continue;
-        const isDoor = x === wxEnd - 1 && z >= doorWz0 && z <= doorWz1 && y < doorYTop;
+        const isDoor = x === wxEnd - 1 && z >= doorWz0 && z <= doorWz1;
         if (isDoor) { world.set(x, y, z, AIR); continue; }
         const isCorner = (x <= wxStart + 1 || x >= wxEnd - 2) && (z <= wzStart + 1 || z >= wzEnd - 2);
         world.set(x, y, z, isCorner ? M_STONE : spec.wall); count++;
@@ -944,95 +843,37 @@ export function stampVehicleDepot(
     }
   }
 
-  // 3. Curved arched roof — for each Z column, the roof rises higher toward
-  // the centre, falling off in steps toward the eaves. Profile: half-circle
-  // approximated by a 5-step ladder using sqrt-ish curve.
-  const archRise = 6;
+  // 3. Flat metal roof at yRoof. No arch, no skylight, no exhaust stacks —
+  // the 6-voxel silhouette budget rules them out.
   for (let z = wzStart; z < wzEnd; z++) {
-    if (z >= WORLD_Z) continue;
-    const dz = Math.abs(z - czv);
-    // Smooth curve: (1 - (dz/halfDz)^2) * archRise rounded.
-    const t = dz / halfDz;
-    const rise = Math.max(0, Math.round((1 - t * t) * archRise));
-    const ry = yEaves + rise;
-    if (ry >= WORLD_Y) continue;
     for (let x = wxStart; x < wxEnd; x++) {
-      if (x >= WORLD_X) continue;
-      world.set(x, ry, z, M_METAL); count++;
-    }
-    // Fill side gables on -X / +X to seal the roof curvature.
-    for (let dy = 1; dy <= rise; dy++) {
-      const py = yEaves + dy; if (py >= WORLD_Y) break;
-      world.set(wxStart, py, z, M_METAL); count++;
-      world.set(wxEnd - 1, py, z, M_METAL); count++;
+      if (x >= WORLD_X || z >= WORLD_Z) continue;
+      world.set(x, yRoof, z, M_METAL); count++;
     }
   }
 
-  // 4. Ridge skylight — a narrow strip of M_METAL "glass" running along the
-  // ridge at the top of the arch (visually a slightly different colour run
-  // because the surrounding roof is also metal — the grouping reads as a
-  // band). Placed exactly at z = czv ± 1.
-  const ridgeY = yEaves + archRise + 1;
-  if (ridgeY < WORLD_Y) {
-    for (let x = wxStart + 4; x < wxEnd - 4; x++) {
-      if (x >= WORLD_X) continue;
-      for (const dz of [-1, 0, 1]) {
-        const pz = czv + dz; if (pz < 0 || pz >= WORLD_Z) continue;
-        world.set(x, ridgeY, pz, M_METAL); count++;
+  // 4. Federation stripe band painted across the +X wall, beside the door.
+  if (yFloor + 3 < yRoof) {
+    const bannerStripes = [M_FED_RED, M_FED_WHITE, M_FED_BLUE];
+    for (let by = 0; by < 3; by++) {
+      const stripe = bannerStripes[by]!;
+      const py = yFloor + 1 + by;
+      const px = wxEnd - 1;
+      if (px >= WORLD_X) continue;
+      for (let zo = 0; zo < 4; zo++) {
+        const pz = doorWz0 - 5 + zo;
+        if (pz < wzStart + 1 || pz >= doorWz0) continue;
+        world.set(px, py, pz, stripe); count++;
       }
     }
   }
 
-  // 5. Lateral buttress ribs every 8 voxels on long faces — 1 voxel proud of the wall.
-  for (let rx = wxStart + 8; rx < wxEnd - 1; rx += 8) {
-    for (let y = yFloor + 1; y <= yEaves; y++) {
-      if (y >= WORLD_Y) break;
-      if (wzStart - 1 >= 0) { world.set(rx, y, wzStart - 1, M_STONE); count++; }
-      if (wzEnd     < WORLD_Z) { world.set(rx, y, wzEnd,     M_STONE); count++; }
-    }
-  }
-
-  // 6. Exhaust vent stacks on the rear (-X) side.
-  for (const vz of [wzStart + 6, wzEnd - 8]) {
-    for (let dy = 1; dy <= 8; dy++) {
-      const py = yEaves + dy; if (py >= WORLD_Y) break;
-      for (let xo = 0; xo < 2; xo++) {
-        const px = wxStart + 1 + xo;
-        if (px >= WORLD_X) continue;
-        world.set(px, py, vz, M_METAL); count++;
-      }
-    }
-  }
-
-  // 7. Vehicle bay markings on the floor — three M_DIRT_ROAD strips running
+  // 5. Vehicle bay markings on the floor — three M_DIRT_ROAD strips running
   // -X/+X across the building so each parking lane reads from above.
   for (const bayZ of [wzStart + 6, czv, wzEnd - 7]) {
     for (let x = wxStart + 4; x < wxEnd - 4; x++) {
       if (x >= WORLD_X || bayZ >= WORLD_Z) continue;
       world.set(x, yFloor, bayZ, M_DIRT_ROAD);
-    }
-  }
-
-  // 8. Fuel pump tower outside the +X face beside the door — 2×2 metal
-  // column 5 voxels tall with a stone base, planted on the apron.
-  const pumpX = wxEnd + 1;
-  const pumpZ = doorWz1 + 3;
-  if (pumpX + 1 < WORLD_X && pumpZ + 1 < WORLD_Z) {
-    // Stone base.
-    for (let xo = 0; xo < 2; xo++) for (let zo = 0; zo < 2; zo++) {
-      world.set(pumpX + xo, yFloor + 1, pumpZ + zo, M_STONE); count++;
-    }
-    // Metal pump body.
-    for (let dy = 2; dy <= 5; dy++) {
-      for (let xo = 0; xo < 2; xo++) for (let zo = 0; zo < 2; zo++) {
-        const py = yFloor + dy; if (py >= WORLD_Y) break;
-        world.set(pumpX + xo, py, pumpZ + zo, M_METAL); count++;
-      }
-    }
-    // Hose arm (single voxel sticking toward the door).
-    const armY = yFloor + 4;
-    if (armY < WORLD_Y) {
-      world.set(pumpX, armY, pumpZ - 1, M_WOOD); count++;
     }
   }
 

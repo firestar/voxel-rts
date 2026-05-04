@@ -903,14 +903,14 @@ export class Game {
     if (!hit) { this.ghost.hide(); return; }
     const wx = hit.x * VOXEL_SIZE;
     const wz = hit.z * VOXEL_SIZE;
-    const cell = this.surfaceCellAt(wx, wz);
-    const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
-    const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
-    // Underground placement: when the picker landed on a voxel below the
-    // local surface (player has the Y-cutoff active and is looking into the
-    // ground), validate at the picked voxel y instead of the surface topY.
-    const surfaceTop = cell.ok ? this.surfaceNav!.topY[cell.cz * NAV_W + cell.cx]! : -1;
-    const underground = surfaceTop > 0 && hit.y < surfaceTop;
+    const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(wx / NAV_CELL_METERS)));
+    const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(wz / NAV_CELL_METERS)));
+    const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cx - (spec.cellsW >> 1)));
+    const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cz - (spec.cellsD >> 1)));
+    // Underground placement when the picker pierced the cutoff and landed
+    // below the local surface — use the hit voxel y as the floor.
+    const surfaceTop = this.surfaceNav!.topY[navIndex(cx, cz)]!;
+    const underground = surfaceTop > 0 && hit.y < surfaceTop - 1;
     const fp = underground
       ? checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings, hit.y)
       : checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings);
@@ -1380,14 +1380,14 @@ export class Game {
     if (!spec) return;
     const wx = hit.x * VOXEL_SIZE;
     const wz = hit.z * VOXEL_SIZE;
-    const cell = this.surfaceCellAt(wx, wz);
-    const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cell.cx - (spec.cellsW >> 1)));
-    const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cell.cz - (spec.cellsD >> 1)));
+    const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(wx / NAV_CELL_METERS)));
+    const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(wz / NAV_CELL_METERS)));
+    const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, cx - (spec.cellsW >> 1)));
+    const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, cz - (spec.cellsD >> 1)));
     // Underground placement when the picker pierced the cutoff and landed
-    // below the local surface — use the hit voxel y as the floor instead
-    // of the surface topY.
-    const surfaceTop = cell.ok ? this.surfaceNav!.topY[cell.cz * NAV_W + cell.cx]! : -1;
-    const underground = surfaceTop > 0 && hit.y < surfaceTop;
+    // well below the local surface — use the hit voxel y as the floor.
+    const surfaceTop = this.surfaceNav!.topY[navIndex(cx, cz)]!;
+    const underground = surfaceTop > 0 && hit.y < surfaceTop - 1;
     const fp = underground
       ? checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings, hit.y)
       : checkFootprint(this.world.buffers.voxels, this.surfaceNav!, spec, ox, oz, this.buildings.buildings);
