@@ -963,7 +963,16 @@ export class UnitManager {
     const dx = tgt.x - u.x;
     const dz = tgt.z - u.z;
     const d = Math.hypot(dx, dz);
-    if (d < 1e-4) { sampleSurfaceFollow(u, nav, this.lastVoxels, dt); return; }
+    if (d < 1e-4) {
+      // Already at this waypoint — shift it off so the next one (if any)
+      // gets picked up next tick. Without this, a truck whose path goal
+      // coincides with its current position freezes here forever; the
+      // outer tick reads `u.path.length > 0` and re-enters tickSurface,
+      // which keeps falling into this branch.
+      u.path.shift();
+      sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
+      return;
+    }
 
     // Slew the heading toward the path direction at the unit's turn rate. Until the unit
     // is roughly facing forward, forward speed is reduced (cosine of misalignment), so a
