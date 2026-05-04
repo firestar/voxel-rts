@@ -242,8 +242,16 @@ export function findPath(
       if (enforceStep && cy !== 0 && ny !== 0 && aFloorY !== 255) {
         const bFloorY = topYArr![ni - Y_STRIDE]!;
         if (bFloorY !== 255) {
-          const dY = aFloorY < bFloorY ? bFloorY - aFloorY : aFloorY - bFloorY;
-          if (dY > maxStep) continue;
+          // Asymmetric step-climb: climbs are still hard-gated by the unit's
+          // maxStepVoxels (no scaling cliffs), but descents are allowed up
+          // to FALL_LIMIT voxels (4 m) since gravity handles the actual
+          // drop in tickVolume. Without this, surface units couldn't path
+          // into a tunnel mouth whose floor sat more than maxStep voxels
+          // below the surface — they'd walk past the entry forever.
+          const climbing = aFloorY < bFloorY;
+          const dY = climbing ? bFloorY - aFloorY : aFloorY - bFloorY;
+          const cap = climbing ? maxStep : 32;
+          if (dY > cap) continue;
         }
       }
 
@@ -375,8 +383,16 @@ export function findPathThetaStar(
       if (enforceStep && cy !== 0 && ny !== 0 && aFloorY !== 255) {
         const bFloorY = topYArr![ni - Y_STRIDE]!;
         if (bFloorY !== 255) {
-          const dY = aFloorY < bFloorY ? bFloorY - aFloorY : aFloorY - bFloorY;
-          if (dY > maxStep) continue;
+          // Asymmetric step-climb: climbs are still hard-gated by the unit's
+          // maxStepVoxels (no scaling cliffs), but descents are allowed up
+          // to FALL_LIMIT voxels (4 m) since gravity handles the actual
+          // drop in tickVolume. Without this, surface units couldn't path
+          // into a tunnel mouth whose floor sat more than maxStep voxels
+          // below the surface — they'd walk past the entry forever.
+          const climbing = aFloorY < bFloorY;
+          const dY = climbing ? bFloorY - aFloorY : aFloorY - bFloorY;
+          const cap = climbing ? maxStep : 32;
+          if (dY > cap) continue;
         }
       }
 
