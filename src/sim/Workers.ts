@@ -212,6 +212,14 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
         u.task = { kind: 'idle' };
         return false;
       }
+      // Choppers must not fell building walls. If a building has been placed
+      // on top of an existing tree task (or the target was somehow assigned
+      // inside a footprint), abandon the task back to idle so the next scan
+      // picks an off-building tree instead.
+      if (u.task.kind === 'chop' && voxelInsideAnyBuilding(deps.buildings, vx, vz)) {
+        u.task = { kind: 'idle' };
+        return false;
+      }
 
       if (u.task.kind === 'mine' && deps.findMetalCluster) {
         const cluster = deps.findMetalCluster(vx, vy, vz);
@@ -442,7 +450,8 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
   }
 
   if (focus !== 'mine') {
-    const wood = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_WOOD);
+    const wood = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_WOOD,
+      (vx, _vy, vz) => !voxelInsideAnyBuilding(deps.buildings, vx, vz));
     if (wood) {
       u.task = { kind: 'chop', wx: (wood.vx + 0.5) * VOXEL_SIZE, wy: (wood.vy + 0.5) * VOXEL_SIZE, wz: (wood.vz + 0.5) * VOXEL_SIZE };
       // Approach offset = 10 voxels (1.25 m) so the goal lands in a nav cell
@@ -530,6 +539,9 @@ function findNearestExposed(
   voxels: Uint8Array,
   wx: number, wy: number, wz: number,
   targetMat: number,
+  /** Optional caller filter — return false to skip a candidate voxel
+   *  (e.g. wood inside a building footprint). */
+  accept?: (vx: number, vy: number, vz: number) => boolean,
 ): VoxelHit | null {
   const radiusVoxels = Math.ceil(SCAN_RADIUS_M / VOXEL_SIZE);
   const cx = Math.floor(wx / VOXEL_SIZE);
@@ -559,6 +571,7 @@ function findNearestExposed(
         if (d2 > reachM2) continue;
         if (voxels[worldIndex(x, y, z)] !== targetMat) continue;
         if (!isExposed(voxels, x, y, z)) continue;
+        if (accept && !accept(x, y, z)) continue;
         bestD2 = d2;
         best = { vx: x, vy: y, vz: z };
       }
@@ -580,6 +593,29 @@ function isExposed(voxels: Uint8Array, vx: number, vy: number, vz: number): bool
 function readVoxel(voxels: Uint8Array, vx: number, vy: number, vz: number): number {
   if (vx < 0 || vy < 0 || vz < 0 || vx >= WORLD_X || vy >= WORLD_Y || vz >= WORLD_Z) return AIR;
   return voxels[worldIndex(vx, vy, vz)]!;
+}
+
+/**
+ * True if the voxel at (vx, vz) sits in any LIVE building's footprint (the
+ * nav-cell rectangle that the building stamp wrote into). Choppers use this
+ * to skip M_WOOD voxels that belong to building walls / roofs / fences —
+ * trees only spawn outside building footprints, so any wood inside one is
+ * by definition a building part and shouldn't be felled by a worker.
+ *
+ * Cheap O(buildings) check; the building list is small. Y is ignored on
+ * purpose so a worker can't even cut a wooden roof voxel that hangs above
+ * the floor inside the footprint.
+ */
+function voxelInsideAnyBuilding(buildings: BuildingManager, vx: number, vz: number): boolean {
+  for (const b of buildings.buildings) {
+    if (b.destroyed) continue;
+    const x0 = b.ox * NAV_CELL_VOXELS;
+    const x1 = (b.ox + b.spec.cellsW) * NAV_CELL_VOXELS;
+    const z0 = b.oz * NAV_CELL_VOXELS;
+    const z1 = (b.oz + b.spec.cellsD) * NAV_CELL_VOXELS;
+    if (vx >= x0 && vx < x1 && vz >= z0 && vz < z1) return true;
+  }
+  return false;
 }
 
 export { findNearestExposed };
