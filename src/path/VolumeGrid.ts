@@ -30,6 +30,15 @@ export interface VolumeGrid {
    * (= 0..191), so a Uint8Array fits with 255 as the "all-air" sentinel.
    */
   topY: Uint8Array;
+  /**
+   * 1 byte per (cx, cz) nav column — set when a building's footprint occupies
+   * this column. Marked off-limits to ground units regardless of the volume
+   * grid's solid/bedrock bits, so units never path on top of building roofs
+   * or through their interior. Maintained by BuildingManager (place sets
+   * bits, destroy clears them); shared via SAB so the path worker and main
+   * thread see the same mask.
+   */
+  buildingMask: Uint8Array;
 }
 
 export function allocateVolumeGrid(useShared: boolean): VolumeGrid {
@@ -39,6 +48,8 @@ export function allocateVolumeGrid(useShared: boolean): VolumeGrid {
     bedrock: allocateBitmap(useShared, GRID_COUNT),
     digCost: new Uint8Array(new Buf(GRID_COUNT)),
     topY: new Uint8Array(new Buf(GRID_COUNT)),
+    // GRID_X * GRID_Z = NAV_W * NAV_H — one byte per ground column.
+    buildingMask: new Uint8Array(new Buf(GRID_X * GRID_Z)),
   };
 }
 

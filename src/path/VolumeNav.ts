@@ -72,6 +72,11 @@ export function buildVolumeNav(voxels: Uint8Array, vnav: VolumeNavBuffers): void
     bedrock: vnav.bedrock,
     digCost: vnav.digCost,
     topY: vnav.topY,
+    // VolumeNav doesn't own a building footprint mask — the legacy callers
+    // (Units.tickVolume, sealed-cave checks) only consult solid/bedrock.
+    // Pass a zero-length view so the type-check is satisfied without
+    // allocating; rebuildCell never reads this field.
+    buildingMask: new Uint8Array(0),
   };
   buildVolumeGrid(voxels, vg);
 }
@@ -82,6 +87,7 @@ export function rebuildVolumeCell(voxels: Uint8Array, vnav: VolumeNavBuffers, cx
     bedrock: vnav.bedrock,
     digCost: vnav.digCost,
     topY: vnav.topY,
+    buildingMask: new Uint8Array(0),
   };
   rebuildCell(voxels, vg, cx, cy, cz);
 }

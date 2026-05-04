@@ -93,6 +93,18 @@ export function isUnitCellPassable(vg: VolumeGrid, p: UnitProfile, cx: number, c
   const x1 = cx + r;
   const z0 = cz - r;
   const z1 = cz + r;
+
+  // Building footprint mask — any cell of the unit's footprint inside a
+  // building is unpassable regardless of the volume grid (so units don't
+  // path across rooftops or through interiors).
+  const bm = vg.buildingMask;
+  for (let z = z0; z <= z1; z++) {
+    const zOff = z * GRID_X;
+    for (let x = x0; x <= x1; x++) {
+      if (bm[zOff + x] !== 0) return false;
+    }
+  }
+
   for (let dy = 0; dy < h; dy++) {
     const y = cy + dy;
     const yOff = y * Y_STRIDE;

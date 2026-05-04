@@ -2417,6 +2417,15 @@ export class BuildingManager {
         color: { r: number; g: number; b: number }) => void)
     | null = null;
   /**
+   * Lifecycle hooks. `onBuildingPlaced` fires synchronously inside `place()`
+   * after the building is in the array; `onBuildingDestroyed` fires when HP
+   * hits zero or the wall-liveness check trips. Game wires these to update
+   * the path system's building footprint mask so units never path on top of
+   * a live building's roof (and the rubble becomes traversable on destroy).
+   */
+  onBuildingPlaced: ((b: Building) => void) | null = null;
+  onBuildingDestroyed: ((b: Building) => void) | null = null;
+  /**
    * Per-tick AA network assignment: maps projectile.id → the building.id of
    * the nearest live AA turret in range. Populated by `buildAAAssignments`
    * at the start of each tick before the per-building loop runs. Each AA
@@ -2424,6 +2433,18 @@ export class BuildingManager {
    * incoming round is engaged by exactly one turret — the closest one.
    */
   private readonly aaAssignments = new Map<number, number>();
+
+  /**
+   * Centralised destruction so the lifecycle hook fires exactly once per
+   * building and any future cleanup (mask clearing, rubble effects) has a
+   * single path. Idempotent — calling it again on an already-destroyed
+   * building is a no-op.
+   */
+  private markDestroyed(b: Building): void {
+    if (b.destroyed) return;
+    b.destroyed = true;
+    this.onBuildingDestroyed?.(b);
+  }
 
   place(
     world: VoxelWorld,
@@ -2465,6 +2486,7 @@ export class BuildingManager {
       activeTrucks: 0,
     };
     this.buildings.push(b);
+    this.onBuildingPlaced?.(b);
     return b;
   }
 
@@ -2500,7 +2522,7 @@ export class BuildingManager {
       b.hp -= damage;
       if (b.hp <= 0) {
         b.hp = 0;
-        b.destroyed = true;
+        this.markDestroyed(b);
       }
     }
   }
@@ -2613,7 +2635,7 @@ export class BuildingManager {
       // count as destroyed and stop ticking.
       const alive = countLivingWalls(world, b);
       if (alive < b.wallVoxelsAtBuild * 0.25) {
-        b.destroyed = true;
+        this.markDestroyed(b);
         continue;
       }
 
@@ -2944,7 +2966,7 @@ export class BuildingManager {
       b.productionTimer += b.spec.productionInterval;
       const alive = countLivingWalls(world, b);
       if (alive < b.wallVoxelsAtBuild * 0.25) {
-        b.destroyed = true;
+        this.markDestroyed(b);
         return;
       }
     }

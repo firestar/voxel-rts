@@ -262,6 +262,12 @@ export class Game {
     this.buildings.onBuildingMuzzleFlash = (x, y, z, radius, life, color): void => {
       this.muzzleFlashes.spawn(x, y, z, radius, life, color.r, color.g, color.b);
     };
+    // Mark each building's footprint as off-limits in the path system so units
+    // never path on top of a roof or through the interior; clear the mask on
+    // destruction so rubble becomes traversable again. The mask lives on the
+    // shared VolumeGrid (SAB) so the path worker sees the same bits.
+    this.buildings.onBuildingPlaced = (b): void => this.applyBuildingFootprintMask(b, true);
+    this.buildings.onBuildingDestroyed = (b): void => this.applyBuildingFootprintMask(b, false);
 
     this.fpsEl = statsEl;
     this.modeEl = document.getElementById('mode');
@@ -426,6 +432,29 @@ export class Game {
       return { x, z: wz1 + margin };
     }
     return { x, z };
+  }
+
+  /**
+   * Set or clear the path system's building-footprint mask for `b`. With the
+   * bits set, every nav column inside the footprint is treated as off-limits
+   * by ground units' grid construction (no walking on roofs or through
+   * interiors). With bits cleared (on destruction) the rubble becomes
+   * traversable again. Triggers an incremental nav rebuild so the
+   * per-unit-kind grids re-evaluate the affected cells immediately.
+   */
+  private applyBuildingFootprintMask(b: import('../sim/Buildings').Building, blocked: boolean): void {
+    if (!this.pathfinder) return;
+    const bm = this.pathfinder.volume.buildingMask;
+    const cx0 = b.ox;
+    const cz0 = b.oz;
+    const cx1 = b.ox + b.spec.cellsW;
+    const cz1 = b.oz + b.spec.cellsD;
+    for (let cz = cz0; cz < cz1; cz++) {
+      const zOff = cz * NAV_W;
+      for (let cx = cx0; cx < cx1; cx++) {
+        bm[zOff + cx] = blocked ? 1 : 0;
+      }
+    }
   }
 
   private spawnUnit(kind: UnitKind, x: number, y: number, z: number): Unit | null {
@@ -676,12 +705,20 @@ export class Game {
           if (!nav) return true;
           const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(x / NAV_CELL_METERS)));
           const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(z / NAV_CELL_METERS)));
-          const r = 2; // supply_truck footprintRadius
+          // Truck footprintRadius=2 → halfFootprint=1, so the truck centred at
+          // (cx, cz) only occupies the 3×3 box. Checking r=1 matches the
+          // pathfinder's own passability geometry; r=2 was pessimistic and made
+          // every approach point near a building wall fail this gate.
+          const r = 1;
+          // Building mask blocks any cell touching a live building's footprint.
+          const bm = this.pathfinder?.volume.buildingMask;
           for (let dz = -r; dz <= r; dz++) {
             for (let dx = -r; dx <= r; dx++) {
               const nx = cx + dx; const nz = cz + dz;
               if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) return false;
-              if (nav.blocked[navIndex(nx, nz)]) return false;
+              const i = navIndex(nx, nz);
+              if (nav.blocked[i]) return false;
+              if (bm && bm[i]) return false;
             }
           }
           return true;
