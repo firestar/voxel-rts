@@ -46,30 +46,49 @@ const SOLDIER_BOOT = { r: 0.18, g: 0.14, b: 0.10 };
 export function buildSoldierBodyGeometry(): THREE.BufferGeometry {
   const skin = { r: 0.85, g: 0.70, b: 0.55 };
   const helmet = { r: 0.27, g: 0.32, b: 0.20 };
+  const helmetStrap = { r: 0.18, g: 0.20, b: 0.14 };
   const rifleBody = { r: 0.18, g: 0.18, b: 0.20 };
   const rifleStock = { r: 0.30, g: 0.18, b: 0.10 };
+  const rifleMag = { r: 0.16, g: 0.16, b: 0.18 };
   const vest = { r: 0.22, g: 0.25, b: 0.18 };
+  const pouch = { r: 0.30, g: 0.34, b: 0.22 };
+  const ruck = { r: 0.20, g: 0.22, b: 0.16 };
 
   const blocks: VoxelBlock[] = [
-    // Torso
+    // Torso.
     { x: 0.00, y: 0.78, z: 0.00, sx: 0.46, sy: 0.50, sz: 0.28, ...SOLDIER_FATIGUES },
-    // Vest plate
-    { x: 0.00, y: 0.78, z: -0.13, sx: 0.40, sy: 0.42, sz: 0.05, ...vest },
-    // Neck + head
+    // Vest plate front + back so torso reads as armoured.
+    { x: 0.00, y: 0.78, z: -0.14, sx: 0.40, sy: 0.42, sz: 0.05, ...vest },
+    { x: 0.00, y: 0.78, z:  0.14, sx: 0.40, sy: 0.42, sz: 0.05, ...vest },
+    // Mag pouches across the lower chest.
+    { x: -0.14, y: 0.66, z: -0.16, sx: 0.12, sy: 0.16, sz: 0.04, ...pouch },
+    { x:  0.00, y: 0.66, z: -0.16, sx: 0.12, sy: 0.16, sz: 0.04, ...pouch },
+    { x:  0.14, y: 0.66, z: -0.16, sx: 0.12, sy: 0.16, sz: 0.04, ...pouch },
+    // Small rucksack on back so silhouette isn't flat from the rear.
+    { x: 0.00, y: 0.84, z: 0.22, sx: 0.36, sy: 0.36, sz: 0.16, ...ruck },
+    { x: 0.00, y: 1.02, z: 0.24, sx: 0.30, sy: 0.04, sz: 0.14, ...helmetStrap },
+    // Neck + head.
     { x: 0.00, y: 1.07, z: 0.00, sx: 0.16, sy: 0.10, sz: 0.16, ...skin },
     { x: 0.00, y: 1.22, z: 0.00, sx: 0.32, sy: 0.30, sz: 0.32, ...skin },
-    // Helmet
-    { x: 0.00, y: 1.40, z: 0.00, sx: 0.40, sy: 0.16, sz: 0.40, ...helmet },
-    { x: 0.00, y: 1.32, z: 0.00, sx: 0.40, sy: 0.04, sz: 0.40, r: 0.18, g: 0.20, b: 0.14 },
-    // Arms — right held forward to grip rifle, left at side
+    // Helmet — slightly taller dome with chinstrap.
+    { x: 0.00, y: 1.40, z: 0.00, sx: 0.40, sy: 0.18, sz: 0.40, ...helmet },
+    { x: 0.00, y: 1.30, z: 0.00, sx: 0.42, sy: 0.04, sz: 0.42, ...helmetStrap },
+    // Helmet brim (visible from above).
+    { x: 0.00, y: 1.36, z: -0.18, sx: 0.36, sy: 0.06, sz: 0.06, ...helmetStrap },
+    // Arms — right held forward to grip rifle, left at side.
     { x: -0.30, y: 0.78, z: 0.00, sx: 0.14, sy: 0.46, sz: 0.18, ...SOLDIER_FATIGUES },
     { x:  0.30, y: 0.85, z: -0.08, sx: 0.14, sy: 0.18, sz: 0.30, ...SOLDIER_FATIGUES },
     { x:  0.30, y: 0.66, z: -0.18, sx: 0.14, sy: 0.18, sz: 0.18, ...SOLDIER_FATIGUES },
-    // Rifle
-    { x:  0.30, y: 0.84, z: -0.36, sx: 0.06, sy: 0.06, sz: 0.42, ...rifleBody },
-    { x:  0.30, y: 0.84, z: -0.04, sx: 0.06, sy: 0.10, sz: 0.16, ...rifleStock },
-    { x:  0.30, y: 0.74, z: -0.24, sx: 0.06, sy: 0.10, sz: 0.06, r: 0.10, g: 0.10, b: 0.12 },
-    { x:  0.30, y: 0.92, z: -0.30, sx: 0.04, sy: 0.04, sz: 0.10, r: 0.10, g: 0.10, b: 0.12 },
+    // Rifle barrel + stock + magazine + iron sights.
+    { x:  0.30, y: 0.84, z: -0.40, sx: 0.07, sy: 0.07, sz: 0.50, ...rifleBody },
+    { x:  0.30, y: 0.84, z:  0.02, sx: 0.07, sy: 0.10, sz: 0.20, ...rifleStock },
+    // Curved magazine hanging below the receiver.
+    { x:  0.30, y: 0.72, z: -0.20, sx: 0.06, sy: 0.16, sz: 0.10, ...rifleMag },
+    // Front + rear iron sights.
+    { x:  0.30, y: 0.92, z: -0.34, sx: 0.04, sy: 0.06, sz: 0.05, r: 0.08, g: 0.08, b: 0.10 },
+    { x:  0.30, y: 0.92, z: -0.16, sx: 0.04, sy: 0.06, sz: 0.05, r: 0.08, g: 0.08, b: 0.10 },
+    // Muzzle flash hider.
+    { x:  0.30, y: 0.84, z: -0.66, sx: 0.06, sy: 0.06, sz: 0.06, r: 0.10, g: 0.10, b: 0.12 },
   ];
   return buildVoxelModel(blocks);
 }
@@ -94,114 +113,165 @@ export const SOLDIER_HIP_Y = 0.55;
 export const SOLDIER_LEG_X = 0.10;
 
 // ---------- Sniper -----------------------------------------------------------
-// Ghillie/overwatch role. Earth-tone camo, long-barrelled sniper rifle held
-// across the chest. Same hip pivot as the soldier so leg geometry is shared.
+// Crouched / kneeling overwatch silhouette. Head sits at ~1.05 m vs the
+// soldier's ~1.55 m so the unit reads as low-profile from the RTS camera. The
+// rifle barrel extends well past the body so the elongated front-back shape
+// dominates the silhouette.
 
 const SNIPER_GHILLIE = { r: 0.32, g: 0.26, b: 0.16 };   // dark earthy brown
 const SNIPER_BOOT    = { r: 0.15, g: 0.12, b: 0.08 };
 
-/** Body, head, balaclava, arms, sniper rifle — everything above the hips. */
+/** Sniper hip is lower than the soldier's so the unit reads as crouched. */
+export const SNIPER_HIP_Y = 0.32;
+export const SNIPER_LEG_X = 0.10;
+
 export function buildSniperBodyGeometry(): THREE.BufferGeometry {
-  const skin      = { r: 0.85, g: 0.70, b: 0.55 };
-  const balaclava = { r: 0.20, g: 0.17, b: 0.12 };      // dark balaclava
-  const rifleBody = { r: 0.14, g: 0.14, b: 0.16 };
-  const rifleStock= { r: 0.28, g: 0.18, b: 0.10 };
-  const scope     = { r: 0.08, g: 0.08, b: 0.10 };
-  const suppressor= { r: 0.12, g: 0.12, b: 0.14 };
+  const skin       = { r: 0.85, g: 0.70, b: 0.55 };
+  const balaclava  = { r: 0.20, g: 0.17, b: 0.12 };
+  const rifleBody  = { r: 0.14, g: 0.14, b: 0.16 };
+  const rifleStock = { r: 0.28, g: 0.18, b: 0.10 };
+  const scope      = { r: 0.08, g: 0.08, b: 0.10 };
+  const suppressor = { r: 0.12, g: 0.12, b: 0.14 };
+  const lensGlint  = { r: 0.55, g: 0.85, b: 0.95 };
+  const fringe     = { r: 0.22, g: 0.18, b: 0.10 };
 
   const blocks: VoxelBlock[] = [
-    // Torso — ghillie strips over fatigues, slightly wider
-    { x: 0.00, y: 0.78, z: 0.00, sx: 0.48, sy: 0.50, sz: 0.28, ...SNIPER_GHILLIE },
-    // Ghillie fringe overlay (darker strips across chest and shoulders)
-    { x: 0.00, y: 0.94, z: -0.12, sx: 0.42, sy: 0.18, sz: 0.06, r: 0.22, g: 0.18, b: 0.10 },
-    { x: 0.00, y: 0.72, z: -0.12, sx: 0.42, sy: 0.14, sz: 0.06, r: 0.22, g: 0.18, b: 0.10 },
-    // Neck
-    { x: 0.00, y: 1.07, z: 0.00, sx: 0.16, sy: 0.10, sz: 0.16, ...skin },
-    // Head + balaclava (no helmet — only eyes exposed)
-    { x: 0.00, y: 1.22, z: 0.00, sx: 0.32, sy: 0.30, sz: 0.32, ...balaclava },
-    { x: 0.00, y: 1.24, z: -0.14, sx: 0.16, sy: 0.12, sz: 0.05, ...skin },  // eye slit
-    // Low-profile cap/hood
-    { x: 0.00, y: 1.40, z: 0.00, sx: 0.36, sy: 0.10, sz: 0.36, r: 0.24, g: 0.20, b: 0.14 },
-    // Arms — both forward, cradling long rifle
-    { x: -0.30, y: 0.80, z: -0.10, sx: 0.14, sy: 0.40, sz: 0.22, ...SNIPER_GHILLIE },
-    { x:  0.30, y: 0.80, z: -0.10, sx: 0.14, sy: 0.40, sz: 0.22, ...SNIPER_GHILLIE },
-    // Sniper rifle — long barrel extending well forward
-    { x:  0.00, y: 0.80, z: -0.55, sx: 0.06, sy: 0.06, sz: 0.72, ...rifleBody },  // barrel
-    { x:  0.00, y: 0.80, z: -0.04, sx: 0.06, sy: 0.12, sz: 0.22, ...rifleStock }, // stock
-    // Scope (mounted on top)
-    { x:  0.00, y: 0.88, z: -0.38, sx: 0.05, sy: 0.05, sz: 0.28, ...scope },
-    // Suppressor at muzzle
-    { x:  0.00, y: 0.80, z: -0.84, sx: 0.08, sy: 0.08, sz: 0.14, ...suppressor },
-    // Bipod legs folded under barrel
-    { x: -0.08, y: 0.74, z: -0.64, sx: 0.04, sy: 0.08, sz: 0.04, r: 0.10, g: 0.10, b: 0.12 },
-    { x:  0.08, y: 0.74, z: -0.64, sx: 0.04, sy: 0.08, sz: 0.04, r: 0.10, g: 0.10, b: 0.12 },
+    // Torso leans forward over the rifle.
+    { x: 0.00, y: 0.55, z: 0.04, sx: 0.50, sy: 0.40, sz: 0.32, ...SNIPER_GHILLIE },
+    // Ghillie strips draped over back/shoulders.
+    { x: 0.00, y: 0.74, z: 0.18, sx: 0.46, sy: 0.10, sz: 0.10, ...fringe },
+    { x: 0.00, y: 0.62, z: 0.21, sx: 0.40, sy: 0.18, sz: 0.04, ...fringe },
+    { x: -0.20, y: 0.50, z: 0.21, sx: 0.10, sy: 0.30, sz: 0.04, ...fringe },
+    { x:  0.20, y: 0.50, z: 0.21, sx: 0.10, sy: 0.30, sz: 0.04, ...fringe },
+    // Neck (tilted slightly forward).
+    { x: 0.00, y: 0.78, z: -0.04, sx: 0.16, sy: 0.10, sz: 0.16, ...skin },
+    // Head — balaclava with only eyes exposed.
+    { x: 0.00, y: 0.92, z: -0.04, sx: 0.32, sy: 0.30, sz: 0.32, ...balaclava },
+    { x: 0.00, y: 0.94, z: -0.20, sx: 0.16, sy: 0.10, sz: 0.04, ...skin },
+    // Low-profile cap/hood — shorter than soldier's helmet so the silhouette is squatter.
+    { x: 0.00, y: 1.05, z: -0.04, sx: 0.36, sy: 0.08, sz: 0.36, r: 0.24, g: 0.20, b: 0.14 },
+    // Arms extended forward cradling the rifle.
+    { x: -0.22, y: 0.62, z: -0.20, sx: 0.14, sy: 0.16, sz: 0.34, ...SNIPER_GHILLIE },
+    { x:  0.22, y: 0.62, z: -0.20, sx: 0.14, sy: 0.16, sz: 0.34, ...SNIPER_GHILLIE },
+    // Rifle stock pulled into shoulder, very long barrel out the front.
+    { x:  0.00, y: 0.62, z:  0.02, sx: 0.06, sy: 0.10, sz: 0.18, ...rifleStock },
+    { x:  0.00, y: 0.62, z: -0.55, sx: 0.06, sy: 0.06, sz: 0.92, ...rifleBody },
+    // Long scope on top of the receiver — visible eyepiece + bell objective.
+    { x:  0.00, y: 0.72, z: -0.30, sx: 0.05, sy: 0.06, sz: 0.40, ...scope },
+    { x:  0.00, y: 0.72, z: -0.10, sx: 0.07, sy: 0.07, sz: 0.05, ...lensGlint },
+    { x:  0.00, y: 0.72, z: -0.51, sx: 0.10, sy: 0.10, sz: 0.06, ...lensGlint },
+    // Suppressor at the muzzle (front-most point of the silhouette).
+    { x:  0.00, y: 0.62, z: -1.06, sx: 0.10, sy: 0.10, sz: 0.16, ...suppressor },
+    // Deployed bipod splayed under barrel.
+    { x: -0.10, y: 0.50, z: -0.86, sx: 0.04, sy: 0.20, sz: 0.04, r: 0.10, g: 0.10, b: 0.12 },
+    { x:  0.10, y: 0.50, z: -0.86, sx: 0.04, sy: 0.20, sz: 0.04, r: 0.10, g: 0.10, b: 0.12 },
+    { x: -0.10, y: 0.40, z: -0.86, sx: 0.10, sy: 0.04, sz: 0.10, r: 0.10, g: 0.10, b: 0.12 },
+    { x:  0.10, y: 0.40, z: -0.86, sx: 0.10, sy: 0.04, sz: 0.10, r: 0.10, g: 0.10, b: 0.12 },
   ];
   return buildVoxelModel(blocks);
 }
 
-/** Sniper leg — same pivot/dimensions as soldier leg but in ghillie colours. */
+/**
+ * Short crouched leg — pivot at SNIPER_HIP_Y. Boot lands at body origin (= u.y)
+ * when un-rotated. Tucked-in shape so leg-swing animation reads as a small
+ * shuffle rather than a stride.
+ */
 export function buildSniperLegGeometry(): THREE.BufferGeometry {
   const blocks: VoxelBlock[] = [
-    { x: 0.0, y: -0.25, z: 0.0, sx: 0.18, sy: 0.50, sz: 0.20, ...SNIPER_GHILLIE },
-    { x: 0.0, y: -0.55, z: 0.04, sx: 0.20, sy: 0.10, sz: 0.26, ...SNIPER_BOOT },
+    // Thigh — angled forward (knee in front of hip).
+    { x: 0.0, y: -0.10, z: 0.04, sx: 0.18, sy: 0.18, sz: 0.22, ...SNIPER_GHILLIE },
+    // Shin tucked back under thigh.
+    { x: 0.0, y: -0.22, z: -0.02, sx: 0.16, sy: 0.16, sz: 0.20, ...SNIPER_GHILLIE },
+    // Boot.
+    { x: 0.0, y: -0.32, z: 0.04, sx: 0.20, sy: 0.06, sz: 0.26, ...SNIPER_BOOT },
   ];
   return buildVoxelModel(blocks);
 }
 
 // ---------- Gunner -----------------------------------------------------------
-// Heavy-weapons infantry. Dark tactical gear, wide armoured vest, belt-fed
-// machine gun held at waist height. Same hip pivot as soldier.
+// Heavy-weapons infantry. Wide planted stance, bulky shoulder armour, belt-fed
+// machine gun with prominent forward bipod, and a square ammo pack riding
+// high on the back. The widened LEG_X / pauldrons make the silhouette read
+// as twice the soldier's width from the RTS camera.
 
 const GUNNER_GEAR = { r: 0.22, g: 0.24, b: 0.20 };   // dark grey-green
 const GUNNER_BOOT = { r: 0.14, g: 0.11, b: 0.09 };
 
-/** Body, head, helmet, arms, machine gun — everything above the hips. */
+/** Wider stance than the soldier so the gunner is unmistakable from above. */
+export const GUNNER_HIP_Y = 0.55;
+export const GUNNER_LEG_X = 0.18;
+
 export function buildGunnerBodyGeometry(): THREE.BufferGeometry {
   const skin    = { r: 0.85, g: 0.70, b: 0.55 };
-  const helmet  = { r: 0.16, g: 0.18, b: 0.14 };   // matte dark helmet
-  const vest    = { r: 0.18, g: 0.20, b: 0.16 };   // heavy armour vest
+  const helmet  = { r: 0.16, g: 0.18, b: 0.14 };
+  const vest    = { r: 0.18, g: 0.20, b: 0.16 };
+  const visor   = { r: 0.05, g: 0.10, b: 0.18 };
   const gunMetal= { r: 0.15, g: 0.15, b: 0.17 };
   const gunStock= { r: 0.22, g: 0.14, b: 0.08 };
-  const belt    = { r: 0.55, g: 0.48, b: 0.28 };   // ammo belt (brass colour)
+  const belt    = { r: 0.55, g: 0.48, b: 0.28 };
+  const ammoCan = { r: 0.20, g: 0.30, b: 0.20 };  // olive ammo can on back
 
   const blocks: VoxelBlock[] = [
-    // Torso — wider/heavier silhouette
-    { x: 0.00, y: 0.80, z: 0.00, sx: 0.52, sy: 0.52, sz: 0.30, ...GUNNER_GEAR },
-    // Heavy armoured vest (full coverage)
-    { x: 0.00, y: 0.80, z: -0.14, sx: 0.46, sy: 0.48, sz: 0.06, ...vest },
-    { x: 0.00, y: 0.80, z:  0.14, sx: 0.46, sy: 0.48, sz: 0.06, ...vest },
-    // Ammo belt looped across chest
-    { x: -0.14, y: 0.78, z: -0.12, sx: 0.10, sy: 0.36, sz: 0.06, ...belt },
-    // Neck + head
-    { x: 0.00, y: 1.09, z: 0.00, sx: 0.18, sy: 0.10, sz: 0.18, ...skin },
+    // Torso — much wider silhouette than the soldier.
+    { x: 0.00, y: 0.80, z: 0.00, sx: 0.62, sy: 0.55, sz: 0.36, ...GUNNER_GEAR },
+    // Heavy armour plates front + back.
+    { x: 0.00, y: 0.80, z: -0.18, sx: 0.56, sy: 0.50, sz: 0.06, ...vest },
+    { x: 0.00, y: 0.80, z:  0.18, sx: 0.56, sy: 0.50, sz: 0.06, ...vest },
+    // Wide pauldrons so shoulders dominate the top-down silhouette.
+    { x: -0.36, y: 1.00, z: 0.00, sx: 0.18, sy: 0.16, sz: 0.30, ...vest },
+    { x:  0.36, y: 1.00, z: 0.00, sx: 0.18, sy: 0.16, sz: 0.30, ...vest },
+    // Ammo belt looped from the can on the back over the right shoulder to the gun.
+    { x: -0.18, y: 0.90, z: -0.10, sx: 0.10, sy: 0.34, sz: 0.06, ...belt },
+    { x: -0.10, y: 1.10, z:  0.10, sx: 0.16, sy: 0.04, sz: 0.16, ...belt },
+    // Square ammo can riding high on the back.
+    { x: 0.00, y: 0.92, z: 0.34, sx: 0.42, sy: 0.36, sz: 0.18, ...ammoCan },
+    { x: 0.00, y: 1.12, z: 0.34, sx: 0.46, sy: 0.04, sz: 0.20, r: 0.10, g: 0.18, b: 0.12 },
+    // Neck + head.
+    { x: 0.00, y: 1.10, z: 0.00, sx: 0.18, sy: 0.10, sz: 0.18, ...skin },
     { x: 0.00, y: 1.24, z: 0.00, sx: 0.34, sy: 0.30, sz: 0.34, ...skin },
-    // Helmet — large ballistic dome
-    { x: 0.00, y: 1.42, z: 0.00, sx: 0.44, sy: 0.20, sz: 0.44, ...helmet },
-    { x: 0.00, y: 1.33, z: 0.00, sx: 0.44, sy: 0.06, sz: 0.44, r: 0.12, g: 0.13, b: 0.11 },
-    // Ear/cheek guards
-    { x: -0.22, y: 1.28, z: 0.00, sx: 0.05, sy: 0.18, sz: 0.32, ...helmet },
-    { x:  0.22, y: 1.28, z: 0.00, sx: 0.05, sy: 0.18, sz: 0.32, ...helmet },
-    // Arms — both out to the sides carrying the heavy gun
-    { x: -0.34, y: 0.80, z: -0.04, sx: 0.14, sy: 0.46, sz: 0.22, ...GUNNER_GEAR },
-    { x:  0.34, y: 0.80, z: -0.04, sx: 0.14, sy: 0.46, sz: 0.22, ...GUNNER_GEAR },
-    // Machine gun body — chunky receiver carried at waist
-    { x:  0.00, y: 0.72, z: -0.30, sx: 0.12, sy: 0.14, sz: 0.44, ...gunMetal },
-    { x:  0.00, y: 0.72, z:  0.06, sx: 0.10, sy: 0.12, sz: 0.18, ...gunStock },  // butt
-    // Barrel — longer than rifle, protruding forward
-    { x:  0.00, y: 0.74, z: -0.62, sx: 0.06, sy: 0.06, sz: 0.32, ...gunMetal },
-    // Top-mounted carry handle / iron sights
-    { x:  0.00, y: 0.82, z: -0.24, sx: 0.05, sy: 0.08, sz: 0.20, ...gunMetal },
-    // Box magazine on left side
-    { x:  0.10, y: 0.66, z: -0.30, sx: 0.06, sy: 0.12, sz: 0.16, r: 0.22, g: 0.22, b: 0.24 },
+    // Helmet — large ballistic dome.
+    { x: 0.00, y: 1.44, z: 0.00, sx: 0.46, sy: 0.22, sz: 0.46, ...helmet },
+    { x: 0.00, y: 1.34, z: 0.00, sx: 0.46, sy: 0.06, sz: 0.46, r: 0.12, g: 0.13, b: 0.11 },
+    // Tactical visor strip across the eyes.
+    { x: 0.00, y: 1.26, z: -0.18, sx: 0.30, sy: 0.06, sz: 0.04, ...visor },
+    // Ear/cheek guards.
+    { x: -0.24, y: 1.30, z: 0.00, sx: 0.05, sy: 0.20, sz: 0.34, ...helmet },
+    { x:  0.24, y: 1.30, z: 0.00, sx: 0.05, sy: 0.20, sz: 0.34, ...helmet },
+    // Arms — wider apart, extended forward holding the receiver.
+    { x: -0.40, y: 0.82, z: -0.06, sx: 0.16, sy: 0.50, sz: 0.26, ...GUNNER_GEAR },
+    { x:  0.40, y: 0.82, z: -0.06, sx: 0.16, sy: 0.50, sz: 0.26, ...GUNNER_GEAR },
+    // Machine-gun receiver — chunky and centred at waist.
+    { x:  0.00, y: 0.72, z: -0.36, sx: 0.18, sy: 0.18, sz: 0.56, ...gunMetal },
+    { x:  0.00, y: 0.72, z:  0.06, sx: 0.12, sy: 0.14, sz: 0.20, ...gunStock },
+    // Barrel + cooling shroud — longer than soldier rifle.
+    { x:  0.00, y: 0.72, z: -0.78, sx: 0.10, sy: 0.10, sz: 0.46, ...gunMetal },
+    { x:  0.00, y: 0.80, z: -0.65, sx: 0.20, sy: 0.04, sz: 0.40, ...gunMetal },
+    { x:  0.00, y: 0.64, z: -0.65, sx: 0.20, sy: 0.04, sz: 0.40, ...gunMetal },
+    // Big bipod, splayed wide, planted in front.
+    { x: -0.16, y: 0.58, z: -1.02, sx: 0.04, sy: 0.22, sz: 0.04, r: 0.10, g: 0.10, b: 0.12 },
+    { x:  0.16, y: 0.58, z: -1.02, sx: 0.04, sy: 0.22, sz: 0.04, r: 0.10, g: 0.10, b: 0.12 },
+    { x: -0.16, y: 0.46, z: -1.02, sx: 0.10, sy: 0.04, sz: 0.10, r: 0.10, g: 0.10, b: 0.12 },
+    { x:  0.16, y: 0.46, z: -1.02, sx: 0.10, sy: 0.04, sz: 0.10, r: 0.10, g: 0.10, b: 0.12 },
+    // Top-mounted carry handle / iron sights.
+    { x:  0.00, y: 0.86, z: -0.34, sx: 0.06, sy: 0.10, sz: 0.26, ...gunMetal },
+    // Belt-feed box on right side of the receiver.
+    { x:  0.16, y: 0.66, z: -0.34, sx: 0.10, sy: 0.20, sz: 0.24, r: 0.22, g: 0.22, b: 0.24 },
   ];
   return buildVoxelModel(blocks);
 }
 
-/** Gunner leg — same pivot/dimensions as soldier leg but in darker gear. */
+/** Gunner leg — thicker than the soldier's, pads at the knee. */
 export function buildGunnerLegGeometry(): THREE.BufferGeometry {
+  const padded = { r: 0.18, g: 0.20, b: 0.16 };
   const blocks: VoxelBlock[] = [
-    { x: 0.0, y: -0.25, z: 0.0, sx: 0.20, sy: 0.50, sz: 0.22, ...GUNNER_GEAR },
-    { x: 0.0, y: -0.55, z: 0.04, sx: 0.22, sy: 0.10, sz: 0.28, ...GUNNER_BOOT },
+    // Thigh.
+    { x: 0.0, y: -0.16, z: 0.0, sx: 0.22, sy: 0.32, sz: 0.24, ...GUNNER_GEAR },
+    // Knee pad — visible armoured cap so it reads as heavy from above.
+    { x: 0.0, y: -0.32, z: 0.06, sx: 0.24, sy: 0.06, sz: 0.18, ...padded },
+    // Shin.
+    { x: 0.0, y: -0.43, z: 0.0, sx: 0.20, sy: 0.20, sz: 0.22, ...GUNNER_GEAR },
+    // Boot.
+    { x: 0.0, y: -0.55, z: 0.04, sx: 0.24, sy: 0.10, sz: 0.30, ...GUNNER_BOOT },
   ];
   return buildVoxelModel(blocks);
 }
@@ -367,33 +437,59 @@ export function buildTankHullGeometry(): THREE.BufferGeometry {
   return buildVoxelModel(blocks);
 }
 
-/** Turret + cannon. Turret pivot at TANK_TURRET_PIVOT_Y / _Z relative to hull origin. */
+/**
+ * Turret + long cannon + commander DShK + bustle rack. Pivot at
+ * TANK_TURRET_PIVOT_Y / _Z relative to hull origin. Roof detail is asymmetric
+ * (commander hatch + DShK on one side, loader hatch + smoke launchers on the
+ * other) so the turret yaw is legible even from straight overhead.
+ */
 export function buildTankTurretGeometry(): THREE.BufferGeometry {
   const turret = { r: 0.34, g: 0.50, b: 0.40 };
   const turretDark = { r: 0.24, g: 0.36, b: 0.28 };
   const cannon = { r: 0.16, g: 0.16, b: 0.18 };
   const cannonHi = { r: 0.30, g: 0.30, b: 0.34 };
   const hatch = { r: 0.18, g: 0.20, b: 0.16 };
+  const dshk = { r: 0.12, g: 0.12, b: 0.14 };
+  const stowage = { r: 0.30, g: 0.26, b: 0.16 };
 
   const blocks: VoxelBlock[] = [
-    // Turret base (around pivot)
+    // Turret base (around pivot).
     { x: 0.00, y: 0.00, z: 0.00, sx: 1.30, sy: 0.36, sz: 1.30, ...turret },
-    // Mantlet (front step)
-    { x: 0.00, y: 0.18, z: -0.55, sx: 1.00, sy: 0.40, sz: 0.50, ...turretDark },
-    // Roof
+    // Sloped cheek plates that flare out toward the sides.
+    { x: -0.74, y: 0.10, z: -0.20, sx: 0.18, sy: 0.30, sz: 0.80, ...turretDark },
+    { x:  0.74, y: 0.10, z: -0.20, sx: 0.18, sy: 0.30, sz: 0.80, ...turretDark },
+    // Mantlet (front step) wraps around the trunnion of the gun.
+    { x: 0.00, y: 0.18, z: -0.55, sx: 1.00, sy: 0.46, sz: 0.50, ...turretDark },
+    // Roof.
     { x: 0.00, y: 0.36, z: 0.00, sx: 1.20, sy: 0.10, sz: 1.20, ...turret },
-    // Commander hatch
-    { x: 0.20, y: 0.40, z: 0.30, sx: 0.34, sy: 0.06, sz: 0.34, ...hatch },
-    // Periscope
-    { x: 0.20, y: 0.46, z: 0.30, sx: 0.10, sy: 0.10, sz: 0.10, r: 0.05, g: 0.05, b: 0.08 },
-    // Antenna whip
-    { x: -0.36, y: 0.62, z: 0.36, sx: 0.04, sy: 0.50, sz: 0.04, r: 0.05, g: 0.05, b: 0.05 },
-    // Cannon barrel
-    { x: 0.0, y: 0.22, z: -1.10, sx: 0.26, sy: 0.26, sz: 1.00, ...cannon },
-    // Muzzle brake
-    { x: 0.0, y: 0.22, z: -1.66, sx: 0.34, sy: 0.34, sz: 0.16, ...cannonHi },
-    // Bore evacuator (a slight bulge on the barrel)
-    { x: 0.0, y: 0.22, z: -1.40, sx: 0.32, sy: 0.32, sz: 0.18, ...cannonHi },
+    // Commander cupola + hatch (right side).
+    { x:  0.30, y: 0.42, z: 0.18, sx: 0.40, sy: 0.10, sz: 0.40, ...turretDark },
+    { x:  0.30, y: 0.50, z: 0.18, sx: 0.32, sy: 0.06, sz: 0.32, ...hatch },
+    // DShK heavy machine gun pintled on the cupola.
+    { x:  0.30, y: 0.60, z:  0.04, sx: 0.06, sy: 0.06, sz: 0.40, ...dshk },
+    { x:  0.30, y: 0.66, z: -0.04, sx: 0.04, sy: 0.04, sz: 0.30, ...dshk },
+    { x:  0.30, y: 0.62, z:  0.18, sx: 0.20, sy: 0.10, sz: 0.10, ...dshk },
+    // Loader hatch (left side).
+    { x: -0.28, y: 0.42, z: 0.20, sx: 0.34, sy: 0.06, sz: 0.34, ...hatch },
+    // Smoke launchers (cluster on left turret cheek).
+    { x: -0.50, y: 0.40, z: -0.46, sx: 0.10, sy: 0.10, sz: 0.18, ...dshk },
+    { x: -0.36, y: 0.40, z: -0.46, sx: 0.10, sy: 0.10, sz: 0.18, ...dshk },
+    { x: -0.50, y: 0.50, z: -0.46, sx: 0.10, sy: 0.10, sz: 0.18, ...dshk },
+    { x: -0.36, y: 0.50, z: -0.46, sx: 0.10, sy: 0.10, sz: 0.18, ...dshk },
+    // Stowage bustle on the rear of the turret (tarp + boxes).
+    { x: 0.00, y: 0.30, z: 0.62, sx: 1.10, sy: 0.30, sz: 0.18, ...stowage },
+    { x: -0.30, y: 0.46, z: 0.62, sx: 0.30, sy: 0.10, sz: 0.18, ...stowage },
+    // Antenna whips (two — one taller).
+    { x: -0.50, y: 0.62, z: 0.42, sx: 0.04, sy: 0.60, sz: 0.04, r: 0.05, g: 0.05, b: 0.05 },
+    { x:  0.52, y: 0.62, z: 0.42, sx: 0.04, sy: 0.40, sz: 0.04, r: 0.05, g: 0.05, b: 0.05 },
+    // Long main cannon — thicker and longer than before.
+    { x: 0.0, y: 0.22, z: -1.20, sx: 0.30, sy: 0.30, sz: 1.20, ...cannon },
+    // Bore evacuator bulge along the barrel.
+    { x: 0.0, y: 0.22, z: -1.55, sx: 0.38, sy: 0.38, sz: 0.22, ...cannonHi },
+    // Front-most muzzle brake — distinct silhouette tip.
+    { x: 0.0, y: 0.22, z: -1.92, sx: 0.42, sy: 0.20, sz: 0.18, ...cannonHi },
+    { x: 0.0, y: 0.22, z: -1.92, sx: 0.20, sy: 0.42, sz: 0.18, ...cannonHi },
+    { x: 0.0, y: 0.22, z: -2.04, sx: 0.30, sy: 0.30, sz: 0.08, ...cannonHi },
   ];
   return buildVoxelModel(blocks);
 }
@@ -461,7 +557,8 @@ export function buildTunnelerHullGeometry(): THREE.BufferGeometry {
 
 /**
  * The cutter head — stepped rings and many teeth around the perimeter. Pivot at the collar;
- * spins about its forward axis (the unit's local Z).
+ * spins about its forward axis (the unit's local Z). The outer disc is widened so it
+ * over-fills the chassis width and reads as the dominant element of the silhouette.
  */
 export function buildTunnelerDrillGeometry(): THREE.BufferGeometry {
   const headOuter = { r: 0.40, g: 0.40, b: 0.45 };
@@ -469,28 +566,31 @@ export function buildTunnelerDrillGeometry(): THREE.BufferGeometry {
   const headCenter = { r: 0.70, g: 0.70, b: 0.75 };
   const tooth = { r: 0.85, g: 0.85, b: 0.90 };
   const teethTip = { r: 0.95, g: 0.95, b: 1.00 };
+  const rim = { r: 0.32, g: 0.32, b: 0.36 };
 
   const blocks: VoxelBlock[] = [];
-  // Stepped rings of decreasing radius, advancing forward (-Z) so the head looks dome-like.
-  // Outer disc — 1.8 m diameter
-  blocks.push({ x: 0.0, y: 0.0, z: -0.10, sx: 3.20, sy: 3.20, sz: 0.20, ...headOuter });
-  // Mid disc
-  blocks.push({ x: 0.0, y: 0.0, z: -0.28, sx: 2.60, sy: 2.60, sz: 0.20, ...headInner });
-  // Inner disc
-  blocks.push({ x: 0.0, y: 0.0, z: -0.43, sx: 1.80, sy: 1.80, sz: 0.16, ...headInner });
-  // Hub
+  // Outer rim — slightly wider than the chassis so it dominates the head-on silhouette.
+  blocks.push({ x: 0.0, y: 0.0, z: 0.04, sx: 3.60, sy: 3.60, sz: 0.14, ...rim });
+  // Outer disc — main face plate.
+  blocks.push({ x: 0.0, y: 0.0, z: -0.10, sx: 3.40, sy: 3.40, sz: 0.20, ...headOuter });
+  // Mid disc.
+  blocks.push({ x: 0.0, y: 0.0, z: -0.28, sx: 2.70, sy: 2.70, sz: 0.20, ...headInner });
+  // Inner disc.
+  blocks.push({ x: 0.0, y: 0.0, z: -0.43, sx: 1.90, sy: 1.90, sz: 0.16, ...headInner });
+  // Hub.
   blocks.push({ x: 0.0, y: 0.0, z: -0.53, sx: 0.90, sy: 0.90, sz: 0.16, ...headCenter });
-  // Center tip
-  blocks.push({ x: 0.0, y: 0.0, z: -0.62, sx: 0.40, sy: 0.40, sz: 0.10, ...teethTip });
+  // Center pilot tip — protrudes ahead of the rest of the head.
+  blocks.push({ x: 0.0, y: 0.0, z: -0.66, sx: 0.50, sy: 0.50, sz: 0.14, ...headCenter });
+  blocks.push({ x: 0.0, y: 0.0, z: -0.78, sx: 0.20, sy: 0.20, sz: 0.16, ...teethTip });
 
-  // Outer ring of cutter teeth.
-  const teethCount = 14;
+  // Outer ring of cutter teeth — bigger and more numerous so the perimeter reads as serrated.
+  const teethCount = 18;
   for (let i = 0; i < teethCount; i++) {
     const a = (i / teethCount) * Math.PI * 2;
-    const r = 1.50;
+    const r = 1.62;
     blocks.push({
-      x: Math.cos(a) * r, y: Math.sin(a) * r, z: -0.10,
-      sx: 0.22, sy: 0.22, sz: 0.28, ...tooth,
+      x: Math.cos(a) * r, y: Math.sin(a) * r, z: -0.04,
+      sx: 0.26, sy: 0.26, sz: 0.36, ...tooth,
     });
   }
   // Inner ring of teeth.
@@ -737,39 +837,50 @@ export function buildRocketTruckHullGeometry(): THREE.BufferGeometry {
  */
 export function buildRocketTruckPodGeometry(): THREE.BufferGeometry {
   const blocks: VoxelBlock[] = [];
-  // Pod base (the frame that holds the tubes).
-  blocks.push({ x: 0, y: 0.10, z: 0.0, sx: 1.20, sy: 0.20, sz: 1.30, ...ROCKET_POD_BODY });
-  // Tube grid: 4 across, 2 stacked. Each tube is a long cylinder approximated
-  // as a stack of two boxes (body + dark inner liner) pointing -Z.
-  const tubeLen = 1.50;
-  const tubeR = 0.12;
-  const tubeGapX = 0.32;
-  const tubeRowY = [0.30, 0.58];
+  // Pod base (the frame that holds the tubes) + traverse pivot disc.
+  blocks.push({ x: 0, y: 0.06, z: 0.0, sx: 1.40, sy: 0.12, sz: 1.40, ...ROCKET_POD_RIM });
+  blocks.push({ x: 0, y: 0.16, z: 0.0, sx: 1.30, sy: 0.20, sz: 1.40, ...ROCKET_POD_BODY });
+  // Tube grid: 4 across, 2 stacked, fatter tubes than before so the pod
+  // reads as a missile cluster rather than a rifle rack.
+  const tubeLen = 1.70;
+  const tubeR = 0.16;
+  const tubeGapX = 0.36;
+  const tubeRowY = [0.36, 0.72];
   for (const ty of tubeRowY) {
     for (let i = -1.5; i <= 1.5; i += 1) {
       blocks.push({
-        x: i * tubeGapX, y: ty, z: -0.05,
+        x: i * tubeGapX, y: ty, z: -0.10,
         sx: tubeR * 2, sy: tubeR * 2, sz: tubeLen,
         ...ROCKET_POD_TUBE,
       });
-      // Tip showing the rocket nose.
+      // Visible rocket nose protruding from the front of each tube.
       blocks.push({
-        x: i * tubeGapX, y: ty, z: -0.05 - tubeLen * 0.5 + 0.03,
-        sx: tubeR * 1.4, sy: tubeR * 1.4, sz: 0.06,
+        x: i * tubeGapX, y: ty, z: -0.10 - tubeLen * 0.5 + 0.02,
+        sx: tubeR * 1.6, sy: tubeR * 1.6, sz: 0.10,
         ...ROCKET_TIP,
       });
-      // Rear cap (where exhaust would come out).
+      // Rear blast cap.
       blocks.push({
-        x: i * tubeGapX, y: ty, z: -0.05 + tubeLen * 0.5 - 0.03,
-        sx: tubeR * 2.2, sy: tubeR * 2.2, sz: 0.06,
+        x: i * tubeGapX, y: ty, z: -0.10 + tubeLen * 0.5 - 0.02,
+        sx: tubeR * 2.3, sy: tubeR * 2.3, sz: 0.06,
         ...ROCKET_POD_RIM,
       });
     }
   }
-  // Side reinforcements.
-  for (const sx of [-0.66, 0.66]) {
-    blocks.push({ x: sx, y: 0.45, z: 0.0, sx: 0.06, sy: 0.55, sz: 1.30, ...ROCKET_POD_RIM });
+  // Cross-bracing rings along the tube cluster — read as a real frame.
+  for (const sz of [-0.55, -0.10, 0.40]) {
+    blocks.push({ x: 0, y: 0.36, z: sz, sx: 1.30, sy: 0.04, sz: 0.06, ...ROCKET_POD_RIM });
+    blocks.push({ x: 0, y: 0.72, z: sz, sx: 1.30, sy: 0.04, sz: 0.06, ...ROCKET_POD_RIM });
   }
+  // Side reinforcement plates with cutouts.
+  for (const sx of [-0.74, 0.74]) {
+    blocks.push({ x: sx, y: 0.54, z: 0.0, sx: 0.08, sy: 0.65, sz: 1.30, ...ROCKET_POD_RIM });
+    blocks.push({ x: sx, y: 0.36, z: -0.30, sx: 0.10, sy: 0.10, sz: 0.30, ...ROCKET_POD_BODY });
+    blocks.push({ x: sx, y: 0.72, z: -0.30, sx: 0.10, sy: 0.10, sz: 0.30, ...ROCKET_POD_BODY });
+  }
+  // Rear-pointing aiming hydraulic — visible wedge that lifts the pod up.
+  blocks.push({ x: 0, y: 0.30, z: 0.55, sx: 0.18, sy: 0.18, sz: 0.40, ...ROCKET_POD_RIM });
+  blocks.push({ x: 0, y: 0.16, z: 0.55, sx: 0.30, sy: 0.10, sz: 0.20, ...ROCKET_POD_BODY });
   return buildVoxelModel(blocks);
 }
 

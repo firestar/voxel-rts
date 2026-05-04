@@ -1860,35 +1860,81 @@ export function stampSilo(
     }
   }
 
-  // Missile tubes — 5 in an X pattern on the roof (4 corners + centre).
-  // Each tube is a 2×2 metal column, 10 voxels tall with a metal nosecone cap.
-  const tubeBaseY = yRoof + 4;
-  const tubeH = 10;
+  // Missile tubes — 5 in an X pattern on the roof (4 corners + centre). Each
+  // tube is a 3×3 metal column 26 voxels tall (~3.25 m) with a stepped
+  // nosecone, two reinforcing bands, and exhaust grating at the base. Tall
+  // enough that the silo is the most vertical building on the map.
+  const tubeBaseY = yRoof + 2;
+  const tubeH = 26;
   const tubePositions: [number, number][] = [
-    [cxv - 1, czv - 1],       // centre
-    [cxv - 6, czv - 6],       // NW quad
-    [cxv + 4, czv - 6],       // NE quad
-    [cxv - 6, czv + 4],       // SW quad
-    [cxv + 4, czv + 4],       // SE quad
+    [cxv - 1, czv - 1],        // centre — slightly taller
+    [cxv - 7, czv - 7],        // NW quad
+    [cxv + 4, czv - 7],        // NE quad
+    [cxv - 7, czv + 4],        // SW quad
+    [cxv + 4, czv + 4],        // SE quad
   ];
-  for (const [tx, tz] of tubePositions) {
-    for (let dy = 0; dy < tubeH; dy++) {
+  for (let i = 0; i < tubePositions.length; i++) {
+    const [tx, tz] = tubePositions[i]!;
+    const isCenter = i === 0;
+    const thisTubeH = isCenter ? tubeH + 6 : tubeH;
+    // Body — 3×3 metal column.
+    for (let dy = 0; dy < thisTubeH; dy++) {
       const py = tubeBaseY + dy; if (py >= WORLD_Y) break;
-      for (let xo = 0; xo < 2; xo++) {
-        for (let zo = 0; zo < 2; zo++) {
-          const px = tx + xo; const pz = tz + zo;
+      for (let xo = 0; xo < 3; xo++) {
+        for (let zo = 0; zo < 3; zo++) {
+          const px = tx + xo - 1; const pz = tz + zo - 1;
           if (px < 0 || px >= WORLD_X || pz < 0 || pz >= WORLD_Z) continue;
           world.set(px, py, pz, M_METAL); wallCount++;
         }
       }
     }
-    // Reinforcing collar band at mid-height.
-    const bandY = tubeBaseY + (tubeH >> 1); if (bandY < WORLD_Y) {
-      world.set(tx - 1, bandY, tz, M_STONE);
-      world.set(tx + 2, bandY, tz, M_STONE);
-      world.set(tx, bandY, tz - 1, M_STONE);
-      world.set(tx, bandY, tz + 2, M_STONE);
+    // Tapered nosecone — two stepped layers above the tube body.
+    const noseY1 = tubeBaseY + thisTubeH;
+    const noseY2 = noseY1 + 1;
+    const noseY3 = noseY1 + 2;
+    if (noseY1 < WORLD_Y) {
+      for (let xo = 0; xo < 3; xo++) for (let zo = 0; zo < 3; zo++) {
+        const px = tx + xo - 1; const pz = tz + zo - 1;
+        if (px < 0 || px >= WORLD_X || pz < 0 || pz >= WORLD_Z) continue;
+        world.set(px, noseY1, pz, M_METAL); wallCount++;
+      }
+    }
+    if (noseY2 < WORLD_Y) {
+      world.set(tx - 0, noseY2, tz - 0, M_METAL);
+      world.set(tx - 0, noseY2, tz + 1, M_METAL);
+      world.set(tx + 1, noseY2, tz - 0, M_METAL);
+      world.set(tx + 1, noseY2, tz + 1, M_METAL);
       wallCount += 4;
+    }
+    if (noseY3 < WORLD_Y) {
+      world.set(tx, noseY3, tz, M_METAL);
+      wallCount++;
+    }
+    // Reinforcing bands — quarter and three-quarter height.
+    for (const frac of [0.25, 0.75]) {
+      const bandY = tubeBaseY + Math.floor(thisTubeH * frac);
+      if (bandY >= WORLD_Y) continue;
+      for (let xo = -2; xo <= 2; xo++) {
+        for (let zo = -2; zo <= 2; zo++) {
+          const px = tx + xo; const pz = tz + zo;
+          // Outer ring only.
+          if (Math.max(Math.abs(xo), Math.abs(zo)) !== 2) continue;
+          if (px < 0 || px >= WORLD_X || pz < 0 || pz >= WORLD_Z) continue;
+          world.set(px, bandY, pz, M_STONE); wallCount++;
+        }
+      }
+    }
+    // Exhaust grating at the base — a 5×5 stone collar around the tube's foot.
+    const baseY = tubeBaseY - 1;
+    if (baseY >= 0 && baseY < WORLD_Y) {
+      for (let xo = -2; xo <= 2; xo++) {
+        for (let zo = -2; zo <= 2; zo++) {
+          const px = tx + xo; const pz = tz + zo;
+          if (Math.max(Math.abs(xo), Math.abs(zo)) < 2) continue;
+          if (px < 0 || px >= WORLD_X || pz < 0 || pz >= WORLD_Z) continue;
+          world.set(px, baseY, pz, M_STONE); wallCount++;
+        }
+      }
     }
   }
 

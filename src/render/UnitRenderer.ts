@@ -2,8 +2,8 @@ import * as THREE from 'three';
 import { Unit, UnitManager } from '../sim/Units';
 import {
   buildSoldierBodyGeometry, buildSoldierLegGeometry, SOLDIER_HIP_Y, SOLDIER_LEG_X,
-  buildSniperBodyGeometry, buildSniperLegGeometry,
-  buildGunnerBodyGeometry, buildGunnerLegGeometry,
+  buildSniperBodyGeometry, buildSniperLegGeometry, SNIPER_HIP_Y, SNIPER_LEG_X,
+  buildGunnerBodyGeometry, buildGunnerLegGeometry, GUNNER_HIP_Y, GUNNER_LEG_X,
   buildTankHullGeometry, buildTankTurretGeometry, TANK_TURRET_PIVOT_Y, TANK_TURRET_PIVOT_Z,
   buildTunnelerHullGeometry, buildTunnelerDrillGeometry,
   TUNNELER_DRILL_PIVOT_Y, TUNNELER_DRILL_PIVOT_Z,
@@ -256,9 +256,10 @@ export class UnitRenderer {
         this.sniperBody.setColorAt(nSnip, tint);
         this.sniperLegL.setColorAt(nSnip, tint);
         this.sniperLegR.setColorAt(nSnip, tint);
-        const swing = isMoving ? Math.sin(u.distanceWalked * 4.0 + u.id) * 0.55 : 0;
-        this.applyLegMatrix(nSnip, this.sniperLegL, swing,  +SOLDIER_LEG_X);
-        this.applyLegMatrix(nSnip, this.sniperLegR, -swing, -SOLDIER_LEG_X);
+        // Crouched pose: small shuffle, not a stride.
+        const swing = isMoving ? Math.sin(u.distanceWalked * 4.0 + u.id) * 0.30 : 0;
+        this.applyLegMatrix(nSnip, this.sniperLegL, swing,  +SNIPER_LEG_X, SNIPER_HIP_Y);
+        this.applyLegMatrix(nSnip, this.sniperLegR, -swing, -SNIPER_LEG_X, SNIPER_HIP_Y);
         nSnip++;
       } else if (u.kind === 'gunner') {
         if (nGun >= this.capacity) continue;
@@ -266,9 +267,10 @@ export class UnitRenderer {
         this.gunnerBody.setColorAt(nGun, tint);
         this.gunnerLegL.setColorAt(nGun, tint);
         this.gunnerLegR.setColorAt(nGun, tint);
-        const swing = isMoving ? Math.sin(u.distanceWalked * 3.5 + u.id) * 0.50 : 0;
-        this.applyLegMatrix(nGun, this.gunnerLegL, swing,  +SOLDIER_LEG_X);
-        this.applyLegMatrix(nGun, this.gunnerLegR, -swing, -SOLDIER_LEG_X);
+        // Plodding heavy gait, wider stance.
+        const swing = isMoving ? Math.sin(u.distanceWalked * 3.5 + u.id) * 0.45 : 0;
+        this.applyLegMatrix(nGun, this.gunnerLegL, swing,  +GUNNER_LEG_X, GUNNER_HIP_Y);
+        this.applyLegMatrix(nGun, this.gunnerLegR, -swing, -GUNNER_LEG_X, GUNNER_HIP_Y);
         nGun++;
       } else if (u.kind === 'worker') {
         const vi = WORKER_VARIANT_IDX[u.workerFocus] ?? 0;
@@ -510,8 +512,8 @@ export class UnitRenderer {
     }
   }
 
-  private applyLegMatrix(slot: number, mesh: THREE.InstancedMesh, swing: number, hipX: number): void {
-    this.hipOffset.makeTranslation(hipX, SOLDIER_HIP_Y, 0);
+  private applyLegMatrix(slot: number, mesh: THREE.InstancedMesh, swing: number, hipX: number, hipY = SOLDIER_HIP_Y): void {
+    this.hipOffset.makeTranslation(hipX, hipY, 0);
     this.legRot.makeRotationX(swing);
     this.legPivot.multiplyMatrices(this.hipOffset, this.legRot);
     this.partM.multiplyMatrices(this.bodyM, this.legPivot);
