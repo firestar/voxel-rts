@@ -16,7 +16,12 @@ import { WorkerTaskBoard, WorkOrder } from './WorkerTasks';
  */
 export const WORKER_CARRY_CAP = 20;
 
-const WORK_REACH_M    = VOXEL_SIZE * 3;   // chop reach: 3 voxels
+// Chop reach: 12 voxels = 1.5 m. The worker has to stand in a non-tree-blocked
+// nav cell, so they're typically a full nav cell (1 m centre-to-centre) away
+// from the trunk voxel. The previous 3-voxel (0.375 m) reach put the chop
+// trigger band INSIDE the tree's own cell — which the pathfinder won't route
+// the worker into — so trees were "found" but never chopped.
+const WORK_REACH_M    = VOXEL_SIZE * 12;
 const MINE_REACH_M    = VOXEL_SIZE * 10;  // mine reach: swing from perimeter
 const INTERACT_REACH_M = 1.6;             // storage drop-off / farm enter
 
@@ -271,7 +276,7 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
             // keeping the worker within MINE_REACH_M.
             routeIfDue(u, deps, tx, ty, tz);
           } else {
-            const ap = approachPos(u.x, u.z, tx, tz, 3);
+            const ap = approachPos(u.x, u.z, tx, tz, 10);
             routeIfDue(u, deps, ap.x, ty, ap.z);
           }
         }
@@ -440,7 +445,9 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
     const wood = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_WOOD);
     if (wood) {
       u.task = { kind: 'chop', wx: (wood.vx + 0.5) * VOXEL_SIZE, wy: (wood.vy + 0.5) * VOXEL_SIZE, wz: (wood.vz + 0.5) * VOXEL_SIZE };
-      const ap = approachPos(u.x, u.z, u.task.wx, u.task.wz, 3);
+      // Approach offset = 10 voxels (1.25 m) so the goal lands in a nav cell
+      // adjacent to the trunk, not inside the tree's own (blocked) cell.
+      const ap = approachPos(u.x, u.z, u.task.wx, u.task.wz, 10);
       u.workerRouteCooldown = 0;
       deps.routeWorker(u, ap.x, u.task.wy, ap.z);
       return true;

@@ -492,16 +492,30 @@ export interface Building {
    */
   truckCallThreshold: number;
   /**
-   * True when a supply truck is already on its way to this building (either
-   * to pick up from a storage, or to deliver to a production building).
-   * Prevents double-dispatching.
+   * Storage-only: true when a pickup truck is already on its way to fetch
+   * from this building. Prevents double-dispatching.
    */
   supplyInbound: boolean;
   /**
-   * Set true when a supply truck delivers materials to a production building.
-   * Cleared immediately after the building consumes it to spawn a unit.
+   * Storage-only legacy flag kept for compat; production buildings now use
+   * `suppliedUnits` / `inboundResupplyTrucks` instead.
    */
   supplyDelivered: boolean;
+  /**
+   * Production-only: number of queued units whose resources HAVE arrived and
+   * are sitting in the building, waiting for the production timer to expire.
+   * Each successful spawn decrements this. The production tick refuses to
+   * count down `productionTimer` while this is 0 — units never start
+   * building without resources on hand.
+   */
+  suppliedUnits: number;
+  /**
+   * Production-only: number of resupply trucks currently en route to this
+   * building. Combined with `suppliedUnits` and `trainQueue.length` to
+   * decide how many MORE trucks the dispatcher should send. Decremented on
+   * delivery (success → suppliedUnits++) or combat-kill (resources refunded).
+   */
+  inboundResupplyTrucks: number;
   /**
    * HQ-only: number of supply trucks currently dispatched (en route or
    * returning). Capped at `spec.maxTrucks`.
@@ -2542,6 +2556,8 @@ export class BuildingManager {
       truckCallThreshold: 50,
       supplyInbound: false,
       supplyDelivered: false,
+      suppliedUnits: 0,
+      inboundResupplyTrucks: 0,
       activeTrucks: 0,
     };
     this.buildings.push(b);
@@ -2679,16 +2695,20 @@ export class BuildingManager {
         b.productionTimer = b.spec.productionInterval;
         continue;
       }
+      // With an HQ alive, building of a unit only starts after the resources
+      // for that unit have arrived (suppliedUnits > 0). Until then, the
+      // timer is held at full interval — production literally hasn't begun.
+      // Without an HQ the logistics system is offline so production runs
+      // free as before.
+      if (hasLiveHQ && b.suppliedUnits <= 0) {
+        b.productionTimer = b.spec.productionInterval;
+        continue;
+      }
       b.productionTimer -= dt;
       if (b.productionTimer > 0) continue;
 
-      // Timer has fired. When an HQ is present, wait for a supply truck
-      // delivery before spawning. Without an HQ the logistics system is offline
-      // and production runs free.
-      if (hasLiveHQ && !b.supplyDelivered) continue;
-
       b.productionTimer += b.spec.productionInterval;
-      if (hasLiveHQ) b.supplyDelivered = false;
+      if (hasLiveHQ) b.suppliedUnits = Math.max(0, b.suppliedUnits - 1);
 
       // Liveness check: structures whose perimeter has been chewed below 25%
       // count as destroyed and stop ticking.

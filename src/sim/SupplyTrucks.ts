@@ -25,6 +25,15 @@ let logTimer = 0;
 // going through the normal completion / despawn path).
 const activeTruckToHQ = new Map<number, number>();
 
+/** In-flight resupply trucks: payload + target building so a combat kill
+ *  can refund the reserved resources and decrement target.inboundResupplyTrucks
+ *  rather than locking up the queue with phantom in-flight supplies. */
+const activeResupply = new Map<number, { targetId: number; payload: { food: number; metals: number; wood: number } }>();
+
+/** In-flight fetch trucks: storage id so a combat kill can clear the
+ *  storage's `supplyInbound` flag and let the dispatcher try again. */
+const activeFetch = new Map<number, number>();
+
 // Per-HQ rebuild countdowns (seconds remaining). When one reaches 0
 // the slot is freed so the dispatch system can send a replacement.
 const truckRebuildQueues = new Map<number, number[]>();
@@ -81,6 +90,30 @@ function reconcileCombatKills(deps: SupplyTruckDeps): void {
     // Truck is gone from the array but wasn't despawned via normal path.
     activeTruckToHQ.delete(truckId);
     truckRepathTimer.delete(truckId);
+
+    // If the truck was carrying a unit-resupply payload, refund the reserved
+    // resources to the HQ and unwind the target building's pending count so
+    // the dispatcher will send a replacement.
+    const resupply = activeResupply.get(truckId);
+    if (resupply) {
+      activeResupply.delete(truckId);
+      const target = deps.buildings.buildings.find(b => b.id === resupply.targetId);
+      if (target && !target.destroyed) {
+        target.inboundResupplyTrucks = Math.max(0, target.inboundResupplyTrucks - 1);
+      }
+      deps.resources.food += resupply.payload.food;
+      deps.resources.metals += resupply.payload.metals;
+      deps.resources.wood += resupply.payload.wood;
+    }
+    // If the truck was on a storage fetch, clear the storage's inbound flag
+    // so the dispatcher will retry.
+    const fetchStorage = activeFetch.get(truckId);
+    if (fetchStorage !== undefined) {
+      activeFetch.delete(truckId);
+      const storage = deps.buildings.buildings.find(b => b.id === fetchStorage);
+      if (storage) storage.supplyInbound = false;
+    }
+
     const hq = deps.buildings.buildings.find(b => b.id === hqId);
     if (!hq || hq.destroyed) continue;
     hq.activeTrucks = Math.max(0, hq.activeTrucks - 1);
@@ -151,6 +184,7 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         storage.stockpile.wood   -= payload.wood;
         console.log(`[TRUCK #${u.id}] PICKUP from storage#${storage.id}: metals=${payload.metals} wood=${payload.wood}`);
         storage.supplyInbound = false;
+        activeFetch.delete(u.id);
         const hq = deps.buildings.nearestHQ(u.x, u.z);
         if (!hq) { despawn(u, deps); continue; }
         u.task = { kind: 'truck_deliver_hq', payload };
@@ -200,8 +234,9 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
       }
       if (buildingBoxDistM(u.x, u.z, target) <= INTERACT_REACH_M) {
         console.log(`[TRUCK #${u.id}] RESUPPLY delivered to ${target.spec.kind}#${target.id}`);
-        target.supplyInbound = false;
-        target.supplyDelivered = true;
+        target.inboundResupplyTrucks = Math.max(0, target.inboundResupplyTrucks - 1);
+        target.suppliedUnits++;
+        activeResupply.delete(u.id);
         const hq = deps.buildings.nearestHQ(u.x, u.z);
         if (!hq) { despawn(u, deps); continue; }
         u.task = { kind: 'truck_return' };
@@ -290,6 +325,7 @@ function dispatchStorageTrucks(deps: SupplyTruckDeps): void {
           payload: { metals: cargoMetals, wood: cargoWood },
         };
         activeTruckToHQ.set(truck.id, hq.id);
+        activeFetch.set(truck.id, b.id);
         const sPos = pickApproach(b, hqPos.x, hqPos.z, deps);
         console.log(`[DISPATCH] STORAGE truck #${truck.id} → storage#${b.id} cargo=(m=${cargoMetals} w=${cargoWood})`);
         deps.routeTruck(truck, sPos.x, sPos.y, sPos.z);
@@ -307,7 +343,13 @@ function dispatchStorageTrucks(deps: SupplyTruckDeps): void {
   }
 }
 
-/** Dispatch trucks from HQ to production buildings that need materials. */
+/**
+ * Dispatch resupply trucks for ALL queued units that don't yet have resources
+ * delivered or in-flight. Each truck carries one unit's worth of materials,
+ * so a player who queued 5 soldiers gets up to 5 trucks dispatched (limited
+ * by the HQ's `maxTrucks` cap and current `activeTrucks`). Production
+ * literally won't begin on a unit until its truck has arrived.
+ */
 function dispatchResupplyTrucks(deps: SupplyTruckDeps): void {
   const hqs = deps.buildings.buildings.filter(b => !b.destroyed && b.spec.kind === 'hq');
 
@@ -319,46 +361,59 @@ function dispatchResupplyTrucks(deps: SupplyTruckDeps): void {
       if (b.destroyed) continue;
       if (b.spec.produces.length === 0) continue;
       if (b.trainQueue.length === 0) continue;
-      if (b.productionTimer > 0) continue;
-      if (b.supplyInbound || b.supplyDelivered) continue;
-      if (hq.activeTrucks >= maxTrucks) break;
 
-      const kind = b.trainQueue[0]!;
-      const cost = UNIT_TRAIN_COST[kind];
+      // How many queued units have neither delivered supplies nor a truck
+      // already in flight? That's how many trucks we still need to send.
+      let needed = b.trainQueue.length - b.suppliedUnits - b.inboundResupplyTrucks;
+      if (needed <= 0) continue;
 
-      // Check if HQ has enough resources
-      if (deps.resources.food < cost.food) continue;
-      if (deps.resources.metals < cost.metals) continue;
-      if (deps.resources.wood < cost.wood) continue;
+      // Walk the queue from the first un-supplied unit forward and dispatch
+      // a truck per unit until we hit the maxTrucks cap, an out-of-resources
+      // condition, or the queue end.
+      const startIdx = b.suppliedUnits + b.inboundResupplyTrucks;
+      for (let i = 0; i < needed; i++) {
+        if (hq.activeTrucks >= maxTrucks) break;
+        const queueIdx = startIdx + i;
+        if (queueIdx >= b.trainQueue.length) break;
+        const kind = b.trainQueue[queueIdx]!;
+        const cost = UNIT_TRAIN_COST[kind];
 
-      // Deduct resources immediately (reserved by this truck)
-      deps.resources.food -= cost.food;
-      deps.resources.metals -= cost.metals;
-      deps.resources.wood -= cost.wood;
+        // Reserve resources at the HQ (deducted now; refunded if truck dies).
+        if (deps.resources.food < cost.food) break;
+        if (deps.resources.metals < cost.metals) break;
+        if (deps.resources.wood < cost.wood) break;
+        deps.resources.food -= cost.food;
+        deps.resources.metals -= cost.metals;
+        deps.resources.wood -= cost.wood;
 
-      b.supplyInbound = true;
-      hq.activeTrucks++;
+        b.inboundResupplyTrucks++;
+        hq.activeTrucks++;
 
-      console.log(`[DISPATCH] RESUPPLY truck: HQ#${hq.id} → ${b.spec.kind}#${b.id} for ${kind} (food=${cost.food} metals=${cost.metals} wood=${cost.wood})`);
-      const truck = deps.spawnTruck(hqPos.x, hqPos.y, hqPos.z);
-      if (!truck) {
-        // Refund and reset
-        deps.resources.food += cost.food;
-        deps.resources.metals += cost.metals;
-        deps.resources.wood += cost.wood;
-        b.supplyInbound = false;
-        hq.activeTrucks--;
-        continue;
+        console.log(`[DISPATCH] RESUPPLY truck: HQ#${hq.id} → ${b.spec.kind}#${b.id} for ${kind} (queued #${queueIdx + 1}/${b.trainQueue.length}; food=${cost.food} metals=${cost.metals} wood=${cost.wood})`);
+        const truck = deps.spawnTruck(hqPos.x, hqPos.y, hqPos.z);
+        if (!truck) {
+          // Refund + reset: spawn pad blocked.
+          deps.resources.food += cost.food;
+          deps.resources.metals += cost.metals;
+          deps.resources.wood += cost.wood;
+          b.inboundResupplyTrucks--;
+          hq.activeTrucks--;
+          break;
+        }
+
+        truck.task = {
+          kind: 'truck_resupply',
+          buildingId: b.id,
+          payload: { food: cost.food, metals: cost.metals, wood: cost.wood },
+        };
+        activeTruckToHQ.set(truck.id, hq.id);
+        activeResupply.set(truck.id, {
+          targetId: b.id,
+          payload: { food: cost.food, metals: cost.metals, wood: cost.wood },
+        });
+        const bPos = pickApproach(b, hqPos.x, hqPos.z, deps);
+        deps.routeTruck(truck, bPos.x, bPos.y, bPos.z);
       }
-
-      truck.task = {
-        kind: 'truck_resupply',
-        buildingId: b.id,
-        payload: { food: cost.food, metals: cost.metals, wood: cost.wood },
-      };
-      activeTruckToHQ.set(truck.id, hq.id);
-      const bPos = pickApproach(b, hqPos.x, hqPos.z, deps);
-      deps.routeTruck(truck, bPos.x, bPos.y, bPos.z);
     }
   }
 }
@@ -366,6 +421,25 @@ function dispatchResupplyTrucks(deps: SupplyTruckDeps): void {
 function despawn(u: Unit, deps: SupplyTruckDeps): void {
   const hq = deps.buildings.nearestHQ(u.x, u.z);
   if (hq) hq.activeTrucks = Math.max(0, hq.activeTrucks - 1);
+  // Refund any payload still attached to the truck — its target won't get
+  // its delivery.
+  const resupply = activeResupply.get(u.id);
+  if (resupply) {
+    activeResupply.delete(u.id);
+    const target = deps.buildings.buildings.find(b => b.id === resupply.targetId);
+    if (target && !target.destroyed) {
+      target.inboundResupplyTrucks = Math.max(0, target.inboundResupplyTrucks - 1);
+    }
+    deps.resources.food += resupply.payload.food;
+    deps.resources.metals += resupply.payload.metals;
+    deps.resources.wood += resupply.payload.wood;
+  }
+  const fetchStorage = activeFetch.get(u.id);
+  if (fetchStorage !== undefined) {
+    activeFetch.delete(u.id);
+    const storage = deps.buildings.buildings.find(b => b.id === fetchStorage);
+    if (storage) storage.supplyInbound = false;
+  }
   activeTruckToHQ.delete(u.id); // normal despawn — no rebuild
   truckRepathTimer.delete(u.id);
   u.hp = 0;
