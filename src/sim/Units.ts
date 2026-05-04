@@ -926,6 +926,15 @@ export class UnitManager {
         if (u.stuckTimer >= STUCK_TELEPORT_SECS) {
           if (u.kind === 'worker') {
             this.tryUnstuck(u, nav);
+          } else if (u.kind === 'supply_truck') {
+            // Trucks can't safely teleport (in flight on roads, carrying
+            // payload). Clear the stale path entirely so the truck task
+            // state machine in SupplyTrucks can re-dispatch with full task
+            // context (not just the existing goal hack used for combat
+            // units' needsRepath). The next tick's retry timer fires a
+            // fresh routeTruck within REPATH_RETRY_SECS.
+            u.path = [];
+            u.blockedFrames = 0;
           } else {
             // Non-worker units don't teleport — just request a reroute so the
             // harness can find a path around whatever is blocking them.
@@ -963,12 +972,13 @@ export class UnitManager {
     const dx = tgt.x - u.x;
     const dz = tgt.z - u.z;
     const d = Math.hypot(dx, dz);
-    if (d < 1e-4) {
-      // Already at this waypoint — shift it off so the next one (if any)
-      // gets picked up next tick. Without this, a truck whose path goal
-      // coincides with its current position freezes here forever; the
-      // outer tick reads `u.path.length > 0` and re-enters tickSurface,
-      // which keeps falling into this branch.
+    // Drop a waypoint that we're effectively at already. Threshold is 5 cm so
+    // we eat the start-cell waypoint (path planner returns waypoints at cell
+    // centres; a unit spawned mid-cell is typically within a few cm of the
+    // first waypoint in pathToWaypoints output). Without this the truck
+    // re-enters tickSurface forever and the outer tick reports "path>0,
+    // distance unchanged" → STUCK TRUCK error.
+    if (d < 0.05) {
       u.path.shift();
       sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
       return;
