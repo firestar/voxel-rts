@@ -927,12 +927,21 @@ export class UnitManager {
           if (u.kind === 'worker') {
             this.tryUnstuck(u, nav);
           } else if (u.kind === 'supply_truck') {
-            // Trucks can't safely teleport (in flight on roads, carrying
-            // payload). Clear the stale path entirely so the truck task
-            // state machine in SupplyTrucks can re-dispatch with full task
-            // context (not just the existing goal hack used for combat
-            // units' needsRepath). The next tick's retry timer fires a
-            // fresh routeTruck within REPATH_RETRY_SECS.
+            // First, check whether the truck is stranded below the surface
+            // (e.g. fell into a chamber or got pushed into a dug-out cell)
+            // and the surface-follow's per-tick search range can't reach
+            // the surface above. Lift it to the surface and clear the
+            // path so the supply task state machine re-dispatches with
+            // current geometry. Without this the truck sits at its sub-
+            // surface y forever — every path the planner returns has
+            // waypoints at the surface cy, so 2-D distance to path[0]
+            // is zero and tickVolume's 3-D step is rejected by the
+            // floor-snap right after.
+            const surfY = surfaceWorldY(nav, u.x, u.z);
+            if (u.y < surfY - 1.0) {
+              u.y = surfY;
+              u.vy = 0;
+            }
             u.path = [];
             u.blockedFrames = 0;
           } else {
