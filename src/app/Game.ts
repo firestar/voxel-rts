@@ -1789,13 +1789,17 @@ export class Game {
     const grid = this.pathfinder.getGrid(unit.kind);
     if (!grid) return;
     // Snap start to nearest passable cell — the spawn y may not align exactly
-    // with the unit-kind grid, causing A* to fail from a blocked start.
+    // with the unit-kind grid, causing A* to fail from a blocked start. The
+    // search ring is widened for wide-footprint units (trucks, vehicles) so a
+    // spawn next to a thick wall / building cluster can still find a clear
+    // standing cell within reach.
+    const passableRing = unit.footprintRadius >= 2 ? 10 : 5;
     let start = this.pathfinder.cellAt(unit.x, unit.y, unit.z);
     const startGround = this.pathfinder.groundCellAt(unit.kind, unit.x, unit.z);
     if (startGround && !this.isUnitCellPassable(unit.kind, start)) {
       start = startGround;
     }
-    start = this.pathfinder.nearestPassable(unit.kind, start, 5);
+    start = this.pathfinder.nearestPassable(unit.kind, start, passableRing);
     let goal = this.pathfinder.cellAt(wx, wy, wz);
     // If the click landed on a non-passable cell (carved-out column, building
     // edge, ceiling), pull the goal toward the nearest cell where the unit's
@@ -1805,7 +1809,7 @@ export class Game {
     if (groundCell && !this.isUnitCellPassable(unit.kind, goal)) {
       goal = groundCell;
     }
-    goal = this.pathfinder.nearestPassable(unit.kind, goal, 5);
+    goal = this.pathfinder.nearestPassable(unit.kind, goal, passableRing);
 
     // Tag this request so a stale reply (older order superseded by a newer
     // one for the same unit) can't clobber the fresh path on arrival.
@@ -1841,7 +1845,15 @@ export class Game {
 
     if (res.waypoints.length === 0 || !res.reached) {
       if (unit.kind === 'supply_truck' || unit.kind === 'worker') {
-        console.warn(`[PATH FAIL] ${unit.kind}#${unit.id} start=(${start.cx},${start.cy},${start.cz}) goal=(${goal.cx},${goal.cy},${goal.cz}) reached=${res.reached} expanded=${res.expanded}`);
+        const startOk = this.isUnitCellPassable(unit.kind, start);
+        const goalOk  = this.isUnitCellPassable(unit.kind, goal);
+        console.warn(
+          `[PATH FAIL] ${unit.kind}#${unit.id} ` +
+          `pos=(${unit.x.toFixed(1)},${unit.y.toFixed(1)},${unit.z.toFixed(1)}) ` +
+          `start=(${start.cx},${start.cy},${start.cz}){pass=${startOk}} ` +
+          `goal=(${goal.cx},${goal.cy},${goal.cz}){pass=${goalOk}} ` +
+          `reached=${res.reached} expanded=${res.expanded}`,
+        );
       }
       return;
     }
