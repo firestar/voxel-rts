@@ -167,14 +167,16 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
     } else if (task.kind === 'truck_deliver_hq') {
       const hq = deps.buildings.nearestHQ(u.x, u.z);
       if (!hq || hq.destroyed) { despawn(u, deps); continue; }
-      // Delivery uses the building-box distance (4-voxel halo around the
-      // building) so the truck offloads the moment it reaches the closest
-      // legal stopping point — the truck's footprint constrains it to ~1 m
-      // off the wall, which is just outside the halo, and INTERACT_REACH_M
-      // bridges the rest. Using point-distance from doorWorldPos was too
-      // tight after the gap shrunk to 4 voxels — trucks parked next to HQ
-      // never triggered.
-      if (buildingBoxDistM(u.x, u.z, hq) <= INTERACT_REACH_M) {
+      const hqDist = buildingBoxDistM(u.x, u.z, hq);
+      if (doLog) {
+        // Diagnostic: print the geometry whenever a deliver-HQ truck is hovering
+        // outside the trigger band. Helps spot a too-narrow INTERACT_REACH_M or
+        // a doorWorldPos vs nearestHQ mismatch (multi-HQ build).
+        if (hqDist > INTERACT_REACH_M) {
+          console.log(`[TRUCK #${u.id}] HQ#${hq.id} box-dist=${hqDist.toFixed(2)}m INTERACT=${INTERACT_REACH_M}m hq.ox=${hq.ox} hq.oz=${hq.oz} cellsW=${hq.spec.cellsW} cellsD=${hq.spec.cellsD}`);
+        }
+      }
+      if (hqDist <= INTERACT_REACH_M) {
         console.log(`[TRUCK #${u.id}] DELIVER to HQ: metals=${task.payload.metals} wood=${task.payload.wood}`);
         deps.resources.metals += task.payload.metals;
         deps.resources.wood += task.payload.wood;
