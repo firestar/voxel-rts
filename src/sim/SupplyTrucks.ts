@@ -167,9 +167,14 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
     } else if (task.kind === 'truck_deliver_hq') {
       const hq = deps.buildings.nearestHQ(u.x, u.z);
       if (!hq || hq.destroyed) { despawn(u, deps); continue; }
-      const hqPos = doorWorldPos(hq);
-      const dxHq = u.x - hqPos.x, dzHq = u.z - hqPos.z;
-      if (dxHq * dxHq + dzHq * dzHq <= INTERACT_REACH_M * INTERACT_REACH_M) {
+      // Delivery uses the building-box distance (4-voxel halo around the
+      // building) so the truck offloads the moment it reaches the closest
+      // legal stopping point — the truck's footprint constrains it to ~1 m
+      // off the wall, which is just outside the halo, and INTERACT_REACH_M
+      // bridges the rest. Using point-distance from doorWorldPos was too
+      // tight after the gap shrunk to 4 voxels — trucks parked next to HQ
+      // never triggered.
+      if (buildingBoxDistM(u.x, u.z, hq) <= INTERACT_REACH_M) {
         console.log(`[TRUCK #${u.id}] DELIVER to HQ: metals=${task.payload.metals} wood=${task.payload.wood}`);
         deps.resources.metals += task.payload.metals;
         deps.resources.wood += task.payload.wood;
@@ -178,6 +183,7 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         u.hp = 0;
       } else if (u.path.length === 0) {
         retryRoute(u, deps, dt, () => {
+          const hqPos = doorWorldPos(hq);
           deps.routeTruck(u, hqPos.x, hqPos.y, hqPos.z);
         });
       }
@@ -210,15 +216,16 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
     } else if (task.kind === 'truck_return') {
       const hq = deps.buildings.nearestHQ(u.x, u.z);
       if (!hq || hq.destroyed) { despawn(u, deps); continue; }
-      const hqPos = doorWorldPos(hq);
-      const dxHq = u.x - hqPos.x, dzHq = u.z - hqPos.z;
-      if (dxHq * dxHq + dzHq * dzHq <= INTERACT_REACH_M * INTERACT_REACH_M) {
+      // Same fix as truck_deliver_hq: use the box-distance check so the
+      // truck despawns when it reaches HQ instead of point-precision.
+      if (buildingBoxDistM(u.x, u.z, hq) <= INTERACT_REACH_M) {
         console.log(`[TRUCK #${u.id}] RETURNED to HQ, despawning`);
         hq.activeTrucks = Math.max(0, hq.activeTrucks - 1);
         activeTruckToHQ.delete(u.id);
         u.hp = 0;
       } else if (u.path.length === 0) {
         retryRoute(u, deps, dt, () => {
+          const hqPos = doorWorldPos(hq);
           deps.routeTruck(u, hqPos.x, hqPos.y, hqPos.z);
         });
       }
