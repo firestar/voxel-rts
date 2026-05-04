@@ -200,15 +200,18 @@ export class Game {
   private readonly explosionPeak = 90;
 
   constructor(canvas: HTMLCanvasElement, statsEl: HTMLElement | null) {
-    // Relay console.log / console.warn to the local log server so terminal monitoring works.
+    // Relay console.log / console.warn / console.error to the local log
+    // server so terminal monitoring works.
     const relay = (prefix: string, args: unknown[]): void => {
       const line = prefix + args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') + '\n';
       navigator.sendBeacon('http://localhost:4444/log', line);
     };
     const _log = console.log.bind(console);
     const _warn = console.warn.bind(console);
+    const _err = console.error.bind(console);
     console.log = (...args) => { _log(...args); relay('', args); };
     console.warn = (...args) => { _warn(...args); relay('WARN ', args); };
+    console.error = (...args) => { _err(...args); relay('ERROR ', args); };
 
     this.renderer = new Renderer(canvas);
     this.camera = new RTSCamera();

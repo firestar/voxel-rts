@@ -487,6 +487,14 @@ export interface Unit {
   /** Seconds the unit has had an active path but made no measurable forward progress.
    *  When it crosses STUCK_TELEPORT_SECS the unit is nudged to a random clear nearby cell. */
   stuckTimer: number;
+  /** Sliding window of recent (x, z) positions sampled once per tick. Used by the
+   *  stuck-truck diagnostic dump so we can see the path the unit took just before
+   *  it ground to a halt. Capped at ~60 entries (~1 s at 60 Hz). */
+  trail: { x: number; z: number }[];
+  /** Last time (sim seconds) we already emitted a stuck-error console dump for
+   *  this unit. Used to throttle the spam — we re-emit at most every 4 s while
+   *  the unit is still stuck. */
+  stuckErrorAt: number;
   /** Remaining cooldown before the next expensive voxel scan (findNearestExposed).
    *  Counts down only while the worker is idle; reset to SCAN_COOLDOWN_SECS after each scan. */
   workerScanCooldown: number;
@@ -704,6 +712,10 @@ export type WorldEditRequest = CarveRequest | LevelRequest | TrampleRequest;
 export class UnitManager {
   units: Unit[] = [];
   private nextId = 1;
+  /** Cumulative sim seconds — used to timestamp the stuck-truck error dump
+   *  so we can see when a peer was sampled relative to the moment the truck
+   *  detected it had stopped. */
+  private simTime = 0;
 
   spawn(
     kind: UnitKind,
@@ -775,6 +787,8 @@ export class UnitManager {
       taskProgressKey: 0,
       miningTicks: 0,
       stuckTimer: 0,
+      trail: [],
+      stuckErrorAt: -Infinity,
       workerScanCooldown: Math.random() * 0.5,
       workerRouteCooldown: 0,
       mineSwingTimer: 0,
@@ -853,6 +867,7 @@ export class UnitManager {
   ): void {
     this.lastSurfaceNav = nav;
     this.lastVoxels = voxels;
+    this.simTime += dt;
     for (const u of this.units) {
       const underground = isUnderground(u, nav);
       // Tree shove — if a (non-digger) unit's centre lands inside a
@@ -893,8 +908,21 @@ export class UnitManager {
       if (using3D) this.tickVolume(u, dt, nav, vnav, worldEdit);
       else this.tickSurface(u, dt, nav, worldEdit);
 
+      // Trail sample for diagnostics — keep ~3 s at 60 Hz (180 entries) so the
+      // dump shows the path the unit took through the stuck region.
+      this.recordTrail(u);
+
       if (u.distanceWalked - prevDist < 0.001) {
         u.stuckTimer += dt;
+        // Diagnostic: when a truck (or other automated unit) stops moving
+        // while its path is non-empty, dump the trail + every nearby peer's
+        // trail so we can replay why it wedged. Throttled to once every 4 s.
+        if (u.kind === 'supply_truck' && u.stuckTimer > 2.0) {
+          if (this.simTime - u.stuckErrorAt > 4.0) {
+            this.emitStuckTruckError(u);
+            u.stuckErrorAt = this.simTime;
+          }
+        }
         if (u.stuckTimer >= STUCK_TELEPORT_SECS) {
           if (u.kind === 'worker') {
             this.tryUnstuck(u, nav);
@@ -1426,6 +1454,60 @@ export class UnitManager {
     u.x += (dirX / len) * speed * dt;
     u.z += (dirZ / len) * speed * dt;
     u.needsRepath = true;
+  }
+
+  /**
+   * Append the unit's current (x, z) to its rolling trail buffer. The buffer
+   * is bounded so memory stays flat even for units that live for hours; only
+   * the most recent ~3 s of motion is kept. We sample for every unit so the
+   * stuck-truck dump can include trails from any peer the truck encountered,
+   * not just same-kind ones.
+   */
+  private recordTrail(u: Unit): void {
+    u.trail.push({ x: u.x, z: u.z });
+    if (u.trail.length > 180) u.trail.shift();
+  }
+
+  /**
+   * Emit a console.error dump describing why a supply truck has stopped
+   * making progress. Includes the truck's current task / position / path /
+   * recent trail, and the same trail for every peer unit currently within
+   * 12 m of the truck (likely to have been the obstacle that caused the
+   * wedge). Picked up by the log relay (Game.ts beacons console output to
+   * localhost:4444) so we can pore over it in /tmp/voxel-game-logs.txt.
+   */
+  private emitStuckTruckError(u: Unit): void {
+    const fmtTrail = (t: { x: number; z: number }[]): string => {
+      if (t.length === 0) return '[]';
+      // Sample every 6th entry so a 180-frame trail fits a single log line.
+      const step = Math.max(1, Math.floor(t.length / 30));
+      const pts: string[] = [];
+      for (let i = 0; i < t.length; i += step) {
+        const p = t[i]!;
+        pts.push(`(${p.x.toFixed(2)},${p.z.toFixed(2)})`);
+      }
+      return pts.join(' ');
+    };
+    const taskKind = u.task.kind;
+    const pathHead = u.path[0];
+    const pathTxt = pathHead
+      ? `[${u.path.length} wp, next=(${pathHead.x.toFixed(2)},${pathHead.z.toFixed(2)})]`
+      : '[no path]';
+    const lines: string[] = [];
+    lines.push(
+      `[STUCK TRUCK] #${u.id} task=${taskKind} pos=(${u.x.toFixed(2)},${u.z.toFixed(2)}) heading=${u.heading.toFixed(2)} path=${pathTxt} stuck=${u.stuckTimer.toFixed(2)}s simT=${this.simTime.toFixed(2)}s`,
+    );
+    lines.push(`  trail: ${fmtTrail(u.trail)}`);
+    for (const other of this.units) {
+      if (other === u || other.hp <= 0) continue;
+      const dx = other.x - u.x, dz = other.z - u.z;
+      if (dx * dx + dz * dz > 12 * 12) continue;
+      lines.push(
+        `  peer #${other.id} kind=${other.kind} team=${other.team} pos=(${other.x.toFixed(2)},${other.z.toFixed(2)}) path=${other.path.length} task=${other.task.kind}`,
+      );
+      lines.push(`    trail: ${fmtTrail(other.trail)}`);
+    }
+    console.error(lines.join('\n'));
   }
 
   private tryUnstuck(u: Unit, nav: SurfaceNavBuffers): void {
