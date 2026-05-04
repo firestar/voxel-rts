@@ -78,8 +78,33 @@ export interface WorkerDeps {
   findBestMineTarget?: (fromX: number, fromZ: number) => { wx: number; wy: number; wz: number } | null;
 }
 
+let workerLogTimer = 0;
+const WORKER_LOG_INTERVAL = 3.0;
+
 export function tickWorkers(dt: number, deps: WorkerDeps): void {
   deps.taskBoard.syncAutoOrders(deps.buildings);
+
+  workerLogTimer -= dt;
+  if (workerLogTimer <= 0) {
+    workerLogTimer = WORKER_LOG_INTERVAL;
+    const workers = deps.units.units.filter(u => u.kind === 'worker' && u.hp > 0);
+    if (workers.length > 0) {
+      console.log('[WORKERS]', workers.map(w => {
+        const carry = `W=${w.carrying.wood} M=${w.carrying.metals}`;
+        const task = w.task.kind;
+        const pos = `(${w.x.toFixed(1)},${w.z.toFixed(1)})`;
+        const path = w.path.length > 0 ? ` path=${w.path.length}` : '';
+        return `#${w.id}[${task} ${carry} @${pos}${path}]`;
+      }).join('  '));
+    }
+    // Also log storage stockpiles
+    const storages = deps.buildings.buildings.filter(b => b.spec.kind === 'storage' && !b.destroyed);
+    if (storages.length > 0) {
+      console.log('[STORAGE]', storages.map(s =>
+        `#${s.id}[metals=${s.stockpile.metals} wood=${s.stockpile.wood} inbound=${s.supplyInbound} threshold=${s.truckCallThreshold}]`
+      ).join('  '));
+    }
+  }
 
   // Allow at most one expensive voxel scan (findNearestExposed) per tickWorkers
   // call. Without this limit, every idle worker fires its scan in the same JS
@@ -128,7 +153,7 @@ export function tickWorkers(dt: number, deps: WorkerDeps): void {
 }
 
 function workerProgressKey(u: Unit): number {
-  const carry = u.carrying.wood * 31 + u.carrying.metals;
+  const carry = u.carrying.wood * 31 + u.carrying.metals + u.carrying.food * 7;
   const path = u.path.length;
   return ((carry & 0xffff) << 16) ^ (path & 0xff) ^ ((u.miningTicks & 0xff) << 8);
 }
@@ -155,7 +180,7 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
   if (u.task.kind === 'idle' && u.claimedOrderId !== 0) releaseClaimedOrder(u, deps);
   if (u.task.kind !== 'mine') releaseClusterSlotIfHeld(u, deps);
 
-  const total = u.carrying.wood + u.carrying.metals;
+  const total = u.carrying.wood + u.carrying.metals + u.carrying.food;
   // Cap reached → switch to delivery so the worker walks the load to storage
   // before resuming. Done in any non-deliver state so a fresh chop/mine that
   // pushes the carry over the cap immediately swaps over to delivery.
@@ -191,7 +216,7 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
             const approachR = (cluster.rxz + 8) * VOXEL_SIZE;
             if (cdx * cdx + cdz * cdz > approachR * approachR) {
               if (u.path.length === 0)
-                routeIfDue(u, deps, cluster.worldX, (cluster.surfaceTop + 1) * VOXEL_SIZE, cluster.worldZ);
+                routeIfDue(u, deps, cluster.worldX, u.y, cluster.worldZ);
               return false;
             }
             const slot = deps.tryClaimClusterSlot?.(cluster, u.id) ?? null;
@@ -304,7 +329,14 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
         return false;
       }
       if (inside && farm.cropReady && (farm.harvesterClaimId === null || farm.harvesterClaimId === u.id)) {
-        deps.buildings.collectFarm(farm, u.id);
+        const { foodGained } = deps.buildings.collectFarm(farm, u.id);
+        if (foodGained > 0) {
+          u.carrying.food += foodGained;
+          // Leave the farm to deliver; farmTend order remains on the board so
+          // the farmer will reclaim it after returning from the storage run.
+          u.task = { kind: 'deliver' };
+          u.path = [];
+        }
       }
       return false;
     }
@@ -337,13 +369,17 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
       }
       const storage = deps.buildings.nearestStorage(u.x, u.z);
       if (!storage) return false;
-      const dpos = doorWorldPos(storage);
+      const dpos = doorWorldPos(storage, u.x, u.z);
       const dx = dpos.x - u.x, dz = dpos.z - u.z;
       if (dx * dx + dz * dz <= INTERACT_REACH_M * INTERACT_REACH_M) {
         storage.stockpile.wood += u.carrying.wood;
         storage.stockpile.metals += u.carrying.metals;
+        // Food goes directly to the global resource pool — it's perishable and
+        // doesn't wait for a truck run.
+        deps.resources.food += u.carrying.food;
         u.carrying.wood = 0;
         u.carrying.metals = 0;
+        u.carrying.food = 0;
         u.task = { kind: 'idle' };
         return false;
       }
@@ -414,9 +450,12 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
 }
 
 function isHarvesterOrderForFocus(o: WorkOrder, focus: WorkerFocus): boolean {
-  if (focus === 'farm') return o.kind === 'farmTend' || o.kind === 'harvestFarm';
+  // Only dedicated farm workers pick up farm orders. The farm task handles
+  // harvest collection at every 20% milestone, so harvestFarm orders are no
+  // longer separately consumed by auto/mine/chop workers.
+  if (focus === 'farm') return o.kind === 'farmTend';
   if (focus === 'mine' || focus === 'chop') return false;
-  return o.kind === 'plant' || o.kind === 'farmTend' || o.kind === 'harvestFarm';
+  return o.kind === 'plant'; // 'auto' workers only plant
 }
 
 function applyOrderToHarvester(u: Unit, order: WorkOrder, deps: WorkerDeps): void {

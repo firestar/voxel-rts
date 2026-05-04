@@ -59,6 +59,13 @@ export interface BuildingSpec {
    */
   spawnPadCells: number;
   /**
+   * How many pad cells to skip before placing the first spawn slot. Wide
+   * vehicle chassis have a `widthMeters/2` scan radius in `sampleSurfaceFollow`
+   * that can reach into the building wall and snap the unit to the roof.
+   * Setting this to 2 keeps even the widest units (tunneler 3.6 m) clear.
+   */
+  spawnPadSafeStart?: number;
+  /**
    * Optional weapon mounted on this building. Buildings with a weapon
    * auto-target the nearest enemy unit within the weapon's `rangeMeters` and
    * fire on its cooldown. Aim mount is always treated as 'turret' regardless
@@ -123,6 +130,7 @@ export const BARRACKS: BuildingSpec = {
   produces: ['soldier', 'sniper', 'gunner', 'worker'],
   stamp: stampBarracks,
   spawnPadCells: 2,
+  spawnPadSafeStart: 1, // skip cell 0 (overlaps barracks porch canopy)
 };
 
 /**
@@ -143,6 +151,7 @@ export const VEHICLE_DEPOT: BuildingSpec = {
   produces: ['tank', 'dozer', 'tunneler', 'worm', 'rocket_truck'],
   stamp: stampVehicleDepot,
   spawnPadCells: 3,
+  spawnPadSafeStart: 2, // skip cells 0-1 so wide chassis (tunneler 3.6 m) clear the east wall
 };
 
 /**
@@ -400,7 +409,12 @@ export interface Building {
    * draws ripe (slightly amber) stalks until a harvester collects.
    */
   cropProgress: number;
-  /** Farm-only: true once `cropProgress` hit 1; reset by harvester collection. */
+  /** Farm-only: which 20% harvest milestone (0–4) was last collected. Growth
+   *  pauses at each milestone until a farmer visits. Resets to 0 after the
+   *  5th milestone (100% = full cycle complete). */
+  harvestMilestone: number;
+  /** Farm-only: true when cropProgress has crossed the next 20% milestone
+   *  and a farmer is needed to collect the batch before growth resumes. */
   cropReady: boolean;
   /**
    * Farm-only: id of the worker currently dedicated as farmer here, or null
@@ -472,11 +486,10 @@ export interface Building {
    * Meaningful for storage buildings. Workers deposit here instead of directly
    * into the global resource pool; supply trucks then carry it to HQ.
    */
-  stockpile: { metals: number; wood: number };
+  stockpile: { metals: number; wood: number; food: number };
   /**
-   * Minimum total stockpile (metals + wood) that must accumulate before this
-   * storage building requests a pickup truck. Configurable per-building via the
-   * selection panel slider. Default 50.
+   * Minimum total stockpile (metals + wood + food) that must accumulate before
+   * this storage building requests a pickup truck. Default 50.
    */
   truckCallThreshold: number;
   /**
@@ -971,10 +984,24 @@ export function stampStorage(
   const yFloor = floorY + 1;
   const yRoof  = floorY + spec.headroomVoxels;
 
-  // Entry door on +X face — 2 wide, 6 tall, centered.
-  const doorWz0 = ((wzStart + wzEnd) >> 1) - 1;
-  const doorWz1 = doorWz0 + 1;
-  const doorYTop = yFloor + 6;
+  // Doors on all 4 faces — 2 wide, 6 tall, centered on each wall.
+  const doorHeight = 6;
+  const doorYTop   = yFloor + doorHeight;
+  // +X and -X doors: centered in Z
+  const doorZc0 = ((wzStart + wzEnd) >> 1) - 1;
+  const doorZc1 = doorZc0 + 1;
+  // +Z and -Z doors: centered in X
+  const doorXc0 = ((wxStart + wxEnd) >> 1) - 1;
+  const doorXc1 = doorXc0 + 1;
+
+  const isDoor = (x: number, z: number, y: number): boolean => {
+    if (y >= doorYTop) return false;
+    if (x === wxEnd - 1 && (z === doorZc0 || z === doorZc1)) return true; // +X face
+    if (x === wxStart   && (z === doorZc0 || z === doorZc1)) return true; // -X face
+    if (z === wzEnd - 1 && (x === doorXc0 || x === doorXc1)) return true; // +Z face
+    if (z === wzStart   && (x === doorXc0 || x === doorXc1)) return true; // -Z face
+    return false;
+  };
 
   let count = 0;
 
@@ -987,7 +1014,7 @@ export function stampStorage(
     }
   }
 
-  // 2. Perimeter walls (stone base 3 voxels, then wood).
+  // 2. Perimeter walls — openings for doors on all 4 faces.
   for (let y = yFloor + 1; y <= yRoof; y++) {
     if (y >= WORLD_Y) break;
     for (let z = wzStart; z < wzEnd; z++) {
@@ -995,8 +1022,7 @@ export function stampStorage(
         if (x >= WORLD_X || z >= WORLD_Z) continue;
         const onPerim = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
         if (!onPerim) continue;
-        const isDoor = x === wxEnd - 1 && (z === doorWz0 || z === doorWz1) && y < doorYTop;
-        if (isDoor) { world.set(x, y, z, AIR); continue; }
+        if (isDoor(x, z, y)) { world.set(x, y, z, AIR); continue; }
         world.set(x, y, z, M_WOOD);
         count++;
       }
@@ -1042,30 +1068,29 @@ export function stampStorage(
     }
   }
 
-  // 5. Covered loading platform in front of door.
-  const platY = yFloor;
+  // 5. Loading platform on the +X face (main truck access).
   for (let dx = 0; dx < 4; dx++) {
     const px = wxEnd + dx;
     if (px >= WORLD_X) break;
-    for (let pz = doorWz0 - 1; pz <= doorWz1 + 1; pz++) {
+    for (let pz = doorZc0 - 1; pz <= doorZc1 + 1; pz++) {
       if (pz < 0 || pz >= WORLD_Z) continue;
-      world.set(px, platY, pz, M_PATH);
+      world.set(px, yFloor, pz, M_PATH);
     }
   }
-  // Platform roof.
-  const platRoofY = yFloor + doorYTop;
+  // Platform canopy.
+  const platRoofY = doorYTop;
   if (platRoofY < WORLD_Y) {
     for (let dx = 0; dx < 5; dx++) {
       const px = wxEnd + dx;
       if (px >= WORLD_X) break;
-      for (let pz = doorWz0 - 1; pz <= doorWz1 + 1; pz++) {
+      for (let pz = doorZc0 - 1; pz <= doorZc1 + 1; pz++) {
         if (pz < 0 || pz >= WORLD_Z) continue;
         world.set(px, platRoofY, pz, M_WOOD);
         count++;
       }
     }
-    // Platform roof posts.
-    for (const pz of [doorWz0 - 1, doorWz1 + 1]) {
+    // Canopy posts.
+    for (const pz of [doorZc0 - 1, doorZc1 + 1]) {
       const px = wxEnd + 4;
       if (px >= WORLD_X || pz < 0 || pz >= WORLD_Z) continue;
       for (let y = yFloor + 1; y < platRoofY; y++) {
@@ -2098,14 +2123,153 @@ export function countLivingWalls(world: VoxelWorld, b: Building): number {
 
 export interface DoorWorldPos { x: number; y: number; z: number; }
 
-export function doorWorldPos(b: Building): DoorWorldPos {
-  const wxEnd = (b.ox + b.spec.cellsW) * NAV_CELL_VOXELS;
-  const wzMid = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS;
+/**
+ * Returns the world-space rendezvous point for building `b`. When `fromX` and
+ * `fromZ` are supplied (caller world-space position), storage buildings pick
+ * whichever of their 4 face doors is closest to the caller. All other buildings
+ * always use the +X face.
+ *
+ * Supply trucks have footprintRadius=2 (halfFootprint=1): their 3×3 cell box
+ * extends 1 cell into the building wall unless the rendezvous is pushed at least
+ * 2 nav cells outside. For -X/-Z faces the building's first cell is the wall, so
+ * 2 cells is required. We use 2*NAV_CELL_VOXELS uniformly on all four faces.
+ * HQ uses the same 2-cell gap for its guard booths.
+ */
+export function doorWorldPos(b: Building, fromX?: number, fromZ?: number): DoorWorldPos {
+  const wxStart = b.ox * NAV_CELL_VOXELS;
+  const wxEnd   = (b.ox + b.spec.cellsW) * NAV_CELL_VOXELS;
+  const wzStart = b.oz * NAV_CELL_VOXELS;
+  const wzEnd   = (b.oz + b.spec.cellsD) * NAV_CELL_VOXELS;
+  const wxMid   = (wxStart + wxEnd) * 0.5;
+  const wzMid   = (wzStart + wzEnd) * 0.5;
+  const y       = (b.floorY + 1) * VOXEL_SIZE;
+  const gap     = 2 * NAV_CELL_VOXELS;  // 2 cells on every face — clears wall + footprint margin
+
+  // For storage (4-sided doors), pick the nearest face when caller pos is given.
+  if (b.spec.kind === 'storage' && fromX !== undefined && fromZ !== undefined) {
+    const candidates: DoorWorldPos[] = [
+      { x: (wxEnd   + gap) * VOXEL_SIZE, y, z: wzMid  * VOXEL_SIZE },  // +X
+      { x: (wxStart - gap) * VOXEL_SIZE, y, z: wzMid  * VOXEL_SIZE },  // -X
+      { x: wxMid * VOXEL_SIZE, y, z: (wzEnd   + gap) * VOXEL_SIZE },   // +Z
+      { x: wxMid * VOXEL_SIZE, y, z: (wzStart - gap) * VOXEL_SIZE },   // -Z
+    ];
+    let best = candidates[0]!;
+    let bestD2 = Infinity;
+    for (const c of candidates) {
+      const dx = c.x - fromX, dz = c.z - fromZ;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < bestD2) { bestD2 = d2; best = c; }
+    }
+    return best;
+  }
+
   return {
-    x: (wxEnd + 1) * VOXEL_SIZE,
-    y: (b.floorY + 1) * VOXEL_SIZE,
-    z: (wzMid) * VOXEL_SIZE,
+    x: (wxEnd + gap) * VOXEL_SIZE,
+    y,
+    z: wzMid * VOXEL_SIZE,
   };
+}
+
+/**
+ * Nearest point on the building's approach perimeter (expanded by the minimum
+ * truck clearance of 2 nav cells on every side) to the query position.
+ *
+ * Unlike doorWorldPos which returns one of 4 fixed face-center points, this
+ * lets trucks approach from any angle — corners included — so pathfinding
+ * can pick the genuinely shortest route rather than always going to a
+ * perpendicular face.
+ *
+ * The interaction check in SupplyTrucks uses buildingBoxDistM() against the
+ * same expanded box so any position within INTERACT_REACH_M of the perimeter
+ * triggers a delivery.
+ */
+export function buildingNearestApproach(b: Building, fromX: number, fromZ: number): DoorWorldPos {
+  const gap = 2 * NAV_CELL_VOXELS;
+  const x0 = (b.ox * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
+  const x1 = ((b.ox + b.spec.cellsW) * NAV_CELL_VOXELS + gap) * VOXEL_SIZE;
+  const z0 = (b.oz * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
+  const z1 = ((b.oz + b.spec.cellsD) * NAV_CELL_VOXELS + gap) * VOXEL_SIZE;
+  const y  = (b.floorY + 1) * VOXEL_SIZE;
+
+  // Clamp query point to the expanded box.
+  const cx = Math.max(x0, Math.min(x1, fromX));
+  const cz = Math.max(z0, Math.min(z1, fromZ));
+
+  const onX = cx === x0 || cx === x1;
+  const onZ = cz === z0 || cz === z1;
+
+  if (onX || onZ) {
+    // Query is outside or on the boundary — clamped point is already on the perimeter.
+    return { x: cx, y, z: cz };
+  }
+
+  // Query is strictly inside the expanded box — project to nearest face.
+  const dLeft  = cx - x0;
+  const dRight = x1 - cx;
+  const dBack  = cz - z0;
+  const dFront = z1 - cz;
+  const minD   = Math.min(dLeft, dRight, dBack, dFront);
+  if (minD === dLeft)  return { x: x0, y, z: cz };
+  if (minD === dRight) return { x: x1, y, z: cz };
+  if (minD === dBack)  return { x: cx, y, z: z0 };
+  return { x: cx, y, z: z1 };
+}
+
+/**
+ * Returns up to 9 candidate approach points on the building's perimeter arc,
+ * sorted nearest-first relative to (fromX, fromZ). The caller should iterate
+ * them and pick the first one that is passable in the nav grid; the last entry
+ * is always the raw nearest-perimeter point as an unconditional fallback.
+ *
+ * Candidates: nearest perimeter point, 4 face centres, 4 corners (deduplicated).
+ */
+export function buildingApproachCandidates(
+  b: Building,
+  fromX: number,
+  fromZ: number,
+): DoorWorldPos[] {
+  const gap = 2 * NAV_CELL_VOXELS;
+  const x0 = (b.ox * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
+  const x1 = ((b.ox + b.spec.cellsW) * NAV_CELL_VOXELS + gap) * VOXEL_SIZE;
+  const z0 = (b.oz * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
+  const z1 = ((b.oz + b.spec.cellsD) * NAV_CELL_VOXELS + gap) * VOXEL_SIZE;
+  const xm = (x0 + x1) * 0.5;
+  const zm = (z0 + z1) * 0.5;
+  const y  = (b.floorY + 1) * VOXEL_SIZE;
+
+  const pts: DoorWorldPos[] = [
+    buildingNearestApproach(b, fromX, fromZ), // geometric nearest — always first before sort
+    { x: x1, y, z: zm }, { x: x0, y, z: zm }, // face centres ±X
+    { x: xm, y, z: z1 }, { x: xm, y, z: z0 }, // face centres ±Z
+    { x: x1, y, z: z1 }, { x: x1, y, z: z0 }, // +X corners
+    { x: x0, y, z: z1 }, { x: x0, y, z: z0 }, // -X corners
+  ];
+
+  // Sort by distance (nearest first).
+  pts.sort((a, c) => (a.x - fromX) ** 2 + (a.z - fromZ) ** 2 - ((c.x - fromX) ** 2 + (c.z - fromZ) ** 2));
+
+  // Deduplicate on (x, z) to within 0.05 m.
+  const out: DoorWorldPos[] = [];
+  for (const p of pts) {
+    if (!out.some(q => Math.abs(q.x - p.x) < 0.05 && Math.abs(q.z - p.z) < 0.05)) out.push(p);
+  }
+  return out;
+}
+
+/**
+ * Distance (metres) from world point (ux, uz) to the building's expanded
+ * approach box (same 2-nav-cell gap used by buildingNearestApproach).
+ * Returns 0 when the unit is on or inside the perimeter.
+ */
+export function buildingBoxDistM(ux: number, uz: number, b: Building): number {
+  const gap = 2 * NAV_CELL_VOXELS;
+  const x0 = (b.ox * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
+  const x1 = ((b.ox + b.spec.cellsW) * NAV_CELL_VOXELS + gap) * VOXEL_SIZE;
+  const z0 = (b.oz * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
+  const z1 = ((b.oz + b.spec.cellsD) * NAV_CELL_VOXELS + gap) * VOXEL_SIZE;
+  const dx = Math.max(0, x0 - ux, ux - x1);
+  const dz = Math.max(0, z0 - uz, uz - z1);
+  return Math.sqrt(dx * dx + dz * dz);
 }
 
 /**
@@ -2118,10 +2282,17 @@ export function padSpawnPos(b: Building): DoorWorldPos {
   const pad = b.spec.spawnPadCells;
   if (pad <= 0) return doorWorldPos(b);
 
-  const slots = pad * b.spec.cellsD;
+  // Skip the cells closest to the building wall. Wide vehicle chassis have a
+  // halfWidthM scan radius in sampleSurfaceFollow that extends into the
+  // building wall and snaps the unit to the building roof. Safe start defaults
+  // to 0 for infantry buildings; vehicle_depot uses 2 so tanks/tunnelers clear
+  // the east wall completely.
+  const safeStart = b.spec.spawnPadSafeStart ?? 0;
+  const usableCols = Math.max(1, pad - safeStart);
+  const slots = usableCols * b.spec.cellsD;
   const slot = b.spawnSlot % slots;
-  const dx = slot % pad;            // 0..pad-1
-  const dz = Math.floor(slot / pad); // 0..cellsD-1
+  const dx = (slot % usableCols) + safeStart;
+  const dz = Math.floor(slot / usableCols);
 
   // Place the unit at the centre of the chosen pad cell.
   const cellX = b.ox + b.spec.cellsW + dx;
@@ -2191,6 +2362,7 @@ export class BuildingManager {
       selected: false,
       trainQueue: [],
       cropProgress: 0,
+      harvestMilestone: 0,
       cropReady: false,
       farmerId: null,
       harvesterClaimId: null,
@@ -2202,7 +2374,7 @@ export class BuildingManager {
       rallyPoint: null,
       rallyStance: 'aggressive',
       spawnSlot: 0,
-      stockpile: { metals: 0, wood: 0 },
+      stockpile: { metals: 0, wood: 0, food: 0 },
       truckCallThreshold: 50,
       supplyInbound: false,
       supplyDelivered: false,
@@ -2692,6 +2864,7 @@ export class BuildingManager {
         return;
       }
     }
+    // Growth is paused at each 20% milestone until a farmer collects the batch.
     if (b.cropReady) return;
     // Validate the assigned farmer still exists, is alive, and is at the farm
     // with the farm task. If any of those fails, drop the assignment so a new
@@ -2715,22 +2888,15 @@ export class BuildingManager {
         b.farmerId = null;
       }
     }
-    // Validate harvester claim — clear it if the claimant is gone or no longer
-    // headed here, so a new harvester can pick up where they left off.
-    if (b.harvesterClaimId !== null) {
-      const h = lookupUnit(units, b.harvesterClaimId);
-      if (!h || h.hp <= 0 || (h.task.kind !== 'harvestFarm' || h.task.buildingId !== b.id)) {
-        b.harvesterClaimId = null;
-      }
-    }
-    // Growth: slow ambient rate without a farmer, ×4 with a tending farmer. The
-    // numbers are tuned so farmer-tended fields ripen in ~productionInterval
-    // seconds; ambient growth still gets there but takes 4× longer.
+    // Growth: slow ambient rate without a farmer, ×4 with a tending farmer.
     const ambientRatePerSec = 0.25 / b.spec.productionInterval;
     const tendedRatePerSec = 1.0 / b.spec.productionInterval;
     const rate = farmerActive ? tendedRatePerSec : ambientRatePerSec;
     b.cropProgress = Math.min(1, b.cropProgress + rate * dt);
-    if (b.cropProgress >= 1) {
+    // Trigger cropReady at every 20% milestone (0.2, 0.4, 0.6, 0.8, 1.0).
+    // Growth pauses until a farmer visits and collects the batch.
+    const nextMilestone = (b.harvestMilestone + 1) * 0.2;
+    if (b.cropProgress >= nextMilestone) {
       b.cropReady = true;
     }
   }
@@ -2745,7 +2911,12 @@ export class BuildingManager {
     if (b.harvesterClaimId !== null && b.harvesterClaimId !== harvesterId) return { foodGained: 0 };
     const food = 5;
     b.cropReady = false;
-    b.cropProgress = 0;
+    b.harvestMilestone++;
+    if (b.harvestMilestone >= 5) {
+      // Full cycle complete — reset for the next growth cycle.
+      b.cropProgress = 0;
+      b.harvestMilestone = 0;
+    }
     b.harvesterClaimId = null;
     if (this.foodSink) this.foodSink(food, b);
     return { foodGained: food };

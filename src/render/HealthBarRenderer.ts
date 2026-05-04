@@ -88,7 +88,7 @@ export class HealthBarRenderer {
         const cropPct = b.spec.kind === 'farm' ? Math.round(b.cropProgress * 100) : -1;
 
         const hasStatus = prodPct >= 0 || reloadPct >= 0 || cropPct >= 0;
-        const showBar = b.hp < b.maxHp || b.selected || hasStatus;
+        const showBar = b.hp < b.maxHp || b.selected || hasStatus || b.spec.kind === 'hq';
         if (!showBar) continue;
 
         seenB.add(b.id);
@@ -104,9 +104,11 @@ export class HealthBarRenderer {
         entry.sprite.position.set(cx, cy, cz);
 
         const hpInt = Math.max(0, Math.ceil(b.hp));
-        const statusKey = `${hpInt}:${prodPct}:${prodLabel}:${reloadPct}:${cropPct}`;
+        const truckLine = b.spec.kind === 'hq'
+          ? `${b.activeTrucks}/${b.spec.maxTrucks ?? 5} trucks` : '';
+        const statusKey = `${hpInt}:${prodPct}:${prodLabel}:${reloadPct}:${cropPct}:${truckLine}`;
         if (statusKey !== entry.lastStatusKey) {
-          drawBuildingBar(entry.canvas, hpInt, b.maxHp, prodPct, prodLabel, reloadPct, cropPct);
+          drawBuildingBar(entry.canvas, hpInt, b.maxHp, prodPct, prodLabel, reloadPct, cropPct, truckLine);
           entry.texture.needsUpdate = true;
           entry.lastHp = hpInt;
           entry.lastMax = b.maxHp;
@@ -270,6 +272,7 @@ function drawBuildingBar(
   prodPct: number, prodLabel: string,
   reloadPct: number,
   cropPct: number,
+  truckLine = '',
 ): void {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
@@ -277,16 +280,23 @@ function drawBuildingBar(
   ctx.clearRect(0, 0, W, canvas.height);
   const BX = 4, BW = W - 8;
 
-  // HP value text
+  // HP value text (left) + optional truck count (right)
   ctx.font = 'bold 13px ui-monospace, SFMono-Regular, Menlo, monospace';
-  ctx.textAlign = 'left';
   ctx.textBaseline = 'top';
-  const hpText = `${hp}`;
   ctx.lineWidth = 3;
   ctx.strokeStyle = 'rgba(0,0,0,0.85)';
-  ctx.strokeText(hpText, BX, 1);
   ctx.fillStyle = '#ffffff';
+  const hpText = `${hp}`;
+  ctx.textAlign = 'left';
+  ctx.strokeText(hpText, BX, 1);
   ctx.fillText(hpText, BX, 1);
+  if (truckLine) {
+    ctx.textAlign = 'right';
+    ctx.font = 'bold 11px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.strokeText(truckLine, W - BX, 1);
+    ctx.fillStyle = '#88ddff';
+    ctx.fillText(truckLine, W - BX, 1);
+  }
 
   // HP bar
   const hpFrac = maxHp > 0 ? Math.max(0, Math.min(1, hp / maxHp)) : 0;

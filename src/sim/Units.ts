@@ -63,8 +63,9 @@ export type WorkerTask =
   /** Worker is collecting a ripe crop from a specific farm — auto-picked
    *  in `assignNextHarvestTask` when a `cropReady` farm is in range. */
   | { kind: 'harvestFarm'; buildingId: number }
-  /** Supply truck en route to a storage building to pick up resources. */
-  | { kind: 'truck_fetch'; storageId: number }
+  /** Supply truck en route to a storage building to pick up resources.
+   *  payload: the portion of the stockpile this truck is reserved to carry. */
+  | { kind: 'truck_fetch'; storageId: number; payload: { metals: number; wood: number } }
   /** Supply truck returning to HQ carrying harvested resources. */
   | { kind: 'truck_deliver_hq'; payload: { metals: number; wood: number } }
   /** Supply truck en route to a production building carrying unit-build materials. */
@@ -397,7 +398,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
       // production buildings as fast as the road allows.
       return {
         footprintRadius: 2, widthMeters: 2.0,
-        maxStepVoxels: 3, slopePenalty: 0.35,
+        maxStepVoxels: 8, slopePenalty: 0.35,
         bodyHalfCells: 1, bodyRoughnessVoxels: 4,
         turnRateRadPerSec: 1.8,
         maxPitchRad: Math.PI / 6,
@@ -475,7 +476,7 @@ export interface Unit {
    * What the worker is currently carrying. Capacity is enforced by the
    * automation tick (CARRY_CAP). Non-workers leave this at zero.
    */
-  carrying: { wood: number; metals: number };
+  carrying: { wood: number; metals: number; food: number };
   /**
    * Seconds the worker has been on the current non-idle task without making
    * forward progress (no carry change, no path advance, no voxel chip).
@@ -769,7 +770,7 @@ export class UnitManager {
       cutterForward: cfg.cutterForward,
       cutterHeight: cfg.cutterHeight,
       task: { kind: 'idle' },
-      carrying: { wood: 0, metals: 0 },
+      carrying: { wood: 0, metals: 0, food: 0 },
       taskStallTimer: 0,
       taskProgressKey: 0,
       miningTicks: 0,
@@ -933,12 +934,15 @@ export class UnitManager {
     // Slew the heading toward the path direction at the unit's turn rate. Until the unit
     // is roughly facing forward, forward speed is reduced (cosine of misalignment), so a
     // tank pivots in place before driving and a soldier sweeps around briskly.
+    // Supply trucks and workers are non-combat wheeled/foot units that should never stop
+    // for a turn — they move at full speed while slewing their heading.
     const targetHeading = Math.atan2(-dx, -dz);
     const angDiff = wrapAngle(targetHeading - u.heading);
     const turnStep = u.turnRateRadPerSec * dt;
     u.heading += clamp(angDiff, -turnStep, turnStep);
 
-    const align = Math.max(0, Math.cos(Math.abs(angDiff)));
+    const noAlignPenalty = u.kind === 'supply_truck' || u.kind === 'worker';
+    const align = noAlignPenalty ? 1.0 : Math.max(0, Math.cos(Math.abs(angDiff)));
     // Surface material under the unit modulates speed — mud bogs vehicles down, paths
     // give a small bonus. Sample the cell-level top material; for soldiers this barely
     // matters but is consistent with the tank/tunneler.
@@ -958,7 +962,12 @@ export class UnitManager {
       nx = u.x + dx * inv * step;
       nz = u.z + dz * inv * step;
     }
-    // Unit-vs-unit collision: if the next foothold overlaps another unit,
+    // Moving-peer avoidance: laterally deflect both units when they are about
+    // to overlap, so moving pairs steer around each other instead of phasing
+    // through or stopping.
+    ({ x: nx, z: nz } = this.applyMovingPeerLateralOffset(u, nx, nz));
+
+    // Unit-vs-unit collision: if the next foothold overlaps a *stationary* unit,
     // hold position this frame. We first try to nudge the offending peer
     // perpendicular to our motion so it can shuffle off our line; the
     // existing repath / give-up timers stay as fallbacks if the sidestep
@@ -1089,6 +1098,7 @@ export class UnitManager {
       nextY = u.y + dy * inv * step;
       nextZ = u.z + dz * inv * step;
     }
+    ({ x: nextX, z: nextZ } = this.applyMovingPeerLateralOffset(u, nextX, nextZ));
     const volumeBlocker = this.findCollisionBlocker(u, nextX, nextZ);
     if (volumeBlocker !== null) {
       this.tryNudgeAside(volumeBlocker, u, nav);
@@ -1220,6 +1230,9 @@ export class UnitManager {
       if (other.hp <= 0) continue;
       if (other.path.length > 0) continue;
       if (Math.abs(other.y - u.y) > 2.0) continue;
+      // Supply trucks clip through same-team units — they're automated and must
+      // always make progress; friendly nudge-aside loops cause stuck routes.
+      if (u.kind === 'supply_truck' && other.team === u.team) continue;
       const r2 = unitCollisionRadius(other);
       const minDist2 = (r1 + r2) * (r1 + r2);
       const ndx = other.x - px;
@@ -1247,6 +1260,50 @@ export class UnitManager {
    * a digger (tunneler/worm). Skipped when neither perpendicular cell is a
    * valid foothold for the blocker's kind (cliff, low headroom, etc.).
    */
+  /**
+   * When two moving units are about to overlap, deflect u's proposed step
+   * laterally so both units steer around each other rather than phasing
+   * through or stopping. The deflection is perpendicular to the separation
+   * vector, capped to avoid visible jitter. Each unit applies this when its
+   * own tick runs, so the net result is that they diverge to opposite sides.
+   */
+  private applyMovingPeerLateralOffset(u: Unit, nx: number, nz: number): { x: number; z: number } {
+    const r1 = unitCollisionRadius(u);
+    let ax = nx, az = nz;
+    for (const other of this.units) {
+      if (other === u || other.hp <= 0) continue;
+      if (other.path.length === 0) continue; // only moving peers
+      if (Math.abs(other.y - u.y) > 2.0) continue;
+      // Supply trucks pass through same-team movers without deflection.
+      if (u.kind === 'supply_truck' && other.team === u.team) continue;
+      const r2 = unitCollisionRadius(other);
+      const minDist = r1 + r2;
+      const sdx = other.x - ax;
+      const sdz = other.z - az;
+      const dist2 = sdx * sdx + sdz * sdz;
+      if (dist2 >= minDist * minDist) continue; // not overlapping at proposed position
+
+      // Only push when this step makes us CLOSER than we are right now.
+      // If the step is already moving us apart, the avoidance has done its
+      // job — don't push again or we'll orbit each other.
+      const curDx = other.x - u.x;
+      const curDz = other.z - u.z;
+      const curDist2 = curDx * curDx + curDz * curDz;
+      if (dist2 >= curDist2) continue; // already separating — leave it alone
+
+      const dist = Math.sqrt(dist2);
+      if (dist < 1e-6) { ax += r1 * 0.3; continue; }
+      // Perpendicular to the sep vector: (-sepZ, sepX).
+      // Both units independently use this rule so they diverge to opposite sides.
+      const sepX = sdx / dist;
+      const sepZ = sdz / dist;
+      const pushAmt = Math.min(0.15, minDist - dist + 0.05);
+      ax += -sepZ * pushAmt;
+      az +=  sepX * pushAmt;
+    }
+    return { x: ax, z: az };
+  }
+
   private tryNudgeAside(blocker: Unit, mover: Unit, nav: SurfaceNavBuffers): boolean {
     if (blocker.path.length > 0) return false;
     if (blocker.firingTarget !== null) return false;

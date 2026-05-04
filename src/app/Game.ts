@@ -200,6 +200,16 @@ export class Game {
   private readonly explosionPeak = 90;
 
   constructor(canvas: HTMLCanvasElement, statsEl: HTMLElement | null) {
+    // Relay console.log / console.warn to the local log server so terminal monitoring works.
+    const relay = (prefix: string, args: unknown[]): void => {
+      const line = prefix + args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') + '\n';
+      navigator.sendBeacon('http://localhost:4444/log', line);
+    };
+    const _log = console.log.bind(console);
+    const _warn = console.warn.bind(console);
+    console.log = (...args) => { _log(...args); relay('', args); };
+    console.warn = (...args) => { _warn(...args); relay('WARN ', args); };
+
     this.renderer = new Renderer(canvas);
     this.camera = new RTSCamera();
     this.input = new Input();
@@ -328,28 +338,13 @@ export class Game {
       }
     }
     const c = navCenter(nav, found.cx, found.cz);
-    this.spawnUnit('soldier', c.x, c.y, c.z);
-    this.spawnUnit('tank', c.x + 3.0, c.y, c.z);
-    this.spawnUnit('tunneler', c.x - 2.0, c.y, c.z);
-    this.spawnUnit('worm', c.x + 0.5, c.y, c.z + 4.0);
-    this.spawnUnit('dozer', c.x + 5.0, c.y, c.z + 1.5);
-    // Vehicle rocket platforms — one cluster, one heavy. The cluster_pod is
-    // the rocket_truck default; the heavy platform spawns with the
-    // single-warhead rocket_pod weapon override.
-    this.spawnUnit('rocket_truck', c.x + 7.0, c.y, c.z + 2.0);
-    this.units.spawn('rocket_truck', c.x + 8.5, c.y, c.z + 2.0, { weapon: 'rocket_pod' });
-    // Soldier loadouts — one of each archetype so the player can RMB-fire
-    // any weapon without chasing the build menu first.
-    this.units.spawn('soldier', c.x + 1.5, c.y, c.z - 2.0, { weapon: 'sniper' });
-    this.units.spawn('soldier', c.x - 1.5, c.y, c.z - 2.0, { weapon: 'machine_gun' });
-    this.units.spawn('soldier', c.x + 0.0, c.y, c.z - 3.0, { weapon: 'rpg_launcher' });
-    this.units.spawn('soldier', c.x + 2.5, c.y, c.z - 3.0, { weapon: 'pistol' });
-    // Three workers so the player sees the economy loop running from the
-    // first frame. They auto-pick targets via tickWorkers — the player can
-    // still override with click commands.
-    this.spawnWorker(c.x - 4.0, c.y, c.z + 1.0);
-    this.spawnWorker(c.x - 4.5, c.y, c.z - 1.0);
-    this.spawnWorker(c.x - 3.0, c.y, c.z + 2.5);
+    // Six workers to seed the economy loop from the start.
+    this.spawnWorker(c.x - 2.0, c.y, c.z + 1.0);
+    this.spawnWorker(c.x - 2.5, c.y, c.z - 1.0);
+    this.spawnWorker(c.x - 1.5, c.y, c.z + 2.5);
+    this.spawnWorker(c.x + 2.0, c.y, c.z + 1.0);
+    this.spawnWorker(c.x + 2.5, c.y, c.z - 1.0);
+    this.spawnWorker(c.x + 1.5, c.y, c.z - 2.5);
 
     // Place a starter Storage depot near spawn so workers always have a
     // delivery target. We try a handful of candidate footprints around the
@@ -398,14 +393,60 @@ export class Game {
     this.camera.target.set(c.x, 0, c.z);
     // Compute power-line routes now that HQ is placed.
     this.recomputePowerLinePaths();
+
+    // Seed the economy so the player can queue units immediately.
+    this.resources.food    = 200;
+    this.resources.metals  = 100;
+    this.resources.wood    = 100;
+  }
+
+  /**
+   * Push (x, z) outside any live building's footprint. If the point is inside
+   * a building, it's ejected to the nearest face + one nav-cell margin so the
+   * unit spawns on clear ground rather than snapping to the building roof.
+   */
+  private safeSpawnXZ(x: number, z: number): { x: number; z: number } {
+    const margin = NAV_CELL_VOXELS * VOXEL_SIZE; // 1 nav cell = 1 m
+    for (const b of this.buildings.buildings) {
+      if (b.destroyed) continue;
+      const wx0 = b.ox * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const wx1 = (b.ox + b.spec.cellsW) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const wz0 = b.oz * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const wz1 = (b.oz + b.spec.cellsD) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      if (x < wx0 || x >= wx1 || z < wz0 || z >= wz1) continue;
+      // Inside this building's footprint — eject to nearest face.
+      const dLeft  = x - wx0;
+      const dRight = wx1 - x;
+      const dBack  = z - wz0;
+      const dFront = wz1 - z;
+      const minD   = Math.min(dLeft, dRight, dBack, dFront);
+      if (minD === dLeft)  return { x: wx0 - margin, z };
+      if (minD === dRight) return { x: wx1 + margin, z };
+      if (minD === dBack)  return { x, z: wz0 - margin };
+      return { x, z: wz1 + margin };
+    }
+    return { x, z };
   }
 
   private spawnUnit(kind: UnitKind, x: number, y: number, z: number): Unit | null {
+    ({ x, z } = this.safeSpawnXZ(x, z));
     return this.units.spawn(kind, x, y, z);
   }
 
   private spawnWorker(x: number, y: number, z: number): Unit | null {
+    ({ x, z } = this.safeSpawnXZ(x, z));
     return this.units.spawn('worker', x, y, z);
+  }
+
+  private debugLogTimer = 0;
+  private debugLogResources(dt: number): void {
+    this.debugLogTimer -= dt;
+    if (this.debugLogTimer > 0) return;
+    this.debugLogTimer = 5.0;
+    const r = this.resources;
+    const trucks = this.units.units.filter(u => u.kind === 'supply_truck' && u.hp > 0);
+    const hqs = this.buildings.buildings.filter(b => b.spec.kind === 'hq' && !b.destroyed);
+    console.log(`[RESOURCES] food=${r.food.toFixed(0)} metals=${r.metals.toFixed(0)} wood=${r.wood.toFixed(0)} | active_trucks=${trucks.length} | HQ activeTrucks=${hqs.map(h => `${h.activeTrucks}/${h.spec.maxTrucks ?? 5}`).join(',')}`);
   }
 
   start(): void {
@@ -628,9 +669,25 @@ export class Game {
         units: this.units,
         buildings: this.buildings,
         resources: this.resources,
-        spawnTruck: (x, y, z) => this.units.spawn('supply_truck', x, y, z),
+        spawnTruck: (x, y, z) => { ({ x, z } = this.safeSpawnXZ(x, z)); return this.units.spawn('supply_truck', x, y, z); },
         routeTruck: (u, wx, wy, wz) => { void this.routePath(u, wx, wy, wz); },
+        isPassable: (x, z) => {
+          const nav = this.surfaceNav;
+          if (!nav) return true;
+          const cx = Math.max(0, Math.min(NAV_W - 1, Math.floor(x / NAV_CELL_METERS)));
+          const cz = Math.max(0, Math.min(NAV_H - 1, Math.floor(z / NAV_CELL_METERS)));
+          const r = 2; // supply_truck footprintRadius
+          for (let dz = -r; dz <= r; dz++) {
+            for (let dx = -r; dx <= r; dx++) {
+              const nx = cx + dx; const nz = cz + dz;
+              if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) return false;
+              if (nav.blocked[navIndex(nx, nz)]) return false;
+            }
+          }
+          return true;
+        },
       });
+      this.debugLogResources(dt);
       const grow = this.saplings.tick(dt, this.world);
       if (grow.matured > 0) this.requestNavRebuild(false);
       // Drain the per-tick accumulated nav-rebuild AABB: one sync main-thread
@@ -733,21 +790,22 @@ export class Game {
     if (this.input.mouseX < 0) return;
     const r = this.resolveTarget(this.input.mouseX, this.input.mouseY, w, h, 0);
     if (!r) return;
+    const { x: sx, z: sz } = this.safeSpawnXZ(r.surface.x, r.surface.z);
     if (ctrl) {
-      this.units.spawn('soldier', r.surface.x, r.surface.y, r.surface.z, {
+      this.units.spawn('soldier', sx, r.surface.y, sz, {
         team: 'enemy', stance: 'aggressive', weapon: 'rpg_launcher',
       });
       return;
     }
     if (alt) {
       const weapon: WeaponKind = shift ? 'rocket_pod' : 'cluster_pod';
-      this.units.spawn('rocket_truck', r.surface.x, r.surface.y, r.surface.z, {
+      this.units.spawn('rocket_truck', sx, r.surface.y, sz, {
         team: 'enemy', stance: 'aggressive', weapon,
       });
       return;
     }
     const kind: UnitKind = shift ? 'tank' : 'soldier';
-    this.units.spawn(kind, r.surface.x, r.surface.y, r.surface.z, {
+    this.units.spawn(kind, sx, r.surface.y, sz, {
       team: 'enemy', stance: 'aggressive',
     });
   }
@@ -1679,7 +1737,14 @@ export class Game {
 
     const grid = this.pathfinder.getGrid(unit.kind);
     if (!grid) return;
-    const start = this.pathfinder.cellAt(unit.x, unit.y, unit.z);
+    // Snap start to nearest passable cell — the spawn y may not align exactly
+    // with the unit-kind grid, causing A* to fail from a blocked start.
+    let start = this.pathfinder.cellAt(unit.x, unit.y, unit.z);
+    const startGround = this.pathfinder.groundCellAt(unit.kind, unit.x, unit.z);
+    if (startGround && !this.isUnitCellPassable(unit.kind, start)) {
+      start = startGround;
+    }
+    start = this.pathfinder.nearestPassable(unit.kind, start, 5);
     let goal = this.pathfinder.cellAt(wx, wy, wz);
     // If the click landed on a non-passable cell (carved-out column, building
     // edge, ceiling), pull the goal toward the nearest cell where the unit's
@@ -1723,7 +1788,16 @@ export class Game {
       timestamp: Date.now(),
     });
 
-    if (res.waypoints.length === 0 || !res.reached) return;
+    if (res.waypoints.length === 0 || !res.reached) {
+      if (unit.kind === 'supply_truck' || unit.kind === 'worker') {
+        console.warn(`[PATH FAIL] ${unit.kind}#${unit.id} start=(${start.cx},${start.cy},${start.cz}) goal=(${goal.cx},${goal.cy},${goal.cz}) reached=${res.reached} expanded=${res.expanded}`);
+      }
+      return;
+    }
+    if (unit.kind === 'supply_truck') {
+      const last = res.waypoints[res.waypoints.length - 1]!;
+      console.log(`[PATH OK] truck#${unit.id} ${res.waypoints.length} waypoints, goal=(${last.x.toFixed(1)},${last.z.toFixed(1)}) expanded=${res.expanded}`);
+    }
     this.units.setPath(unit, res.waypoints);
   }
 

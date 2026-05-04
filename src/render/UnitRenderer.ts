@@ -16,7 +16,7 @@ import {
   DOZER_BLADE_PIVOT_Y, DOZER_BLADE_PIVOT_Z,
   buildRocketTruckHullGeometry, buildRocketTruckPodGeometry,
   ROCKET_TRUCK_POD_PIVOT_Y, ROCKET_TRUCK_POD_PIVOT_Z,
-  buildSupplyTruckGeometry,
+  buildSupplyTruckHullGeometry, buildSupplyTruckCratesGeometry,
 } from './UnitModels';
 
 const WORKER_VARIANTS: WorkerVariant[] = ['auto', 'mine', 'chop', 'farm'];
@@ -59,6 +59,8 @@ export class UnitRenderer {
   private rocketTruckHull: THREE.InstancedMesh;
   private rocketTruckPod: THREE.InstancedMesh;
   private supplyTruckHull: THREE.InstancedMesh;
+  // One crate mesh per cargo level (index 0 = level 1, index 4 = level 5).
+  private supplyTruckCrates: THREE.InstancedMesh[] = [];
 
   private capacity: number;
   private bodyM = new THREE.Matrix4();
@@ -123,7 +125,12 @@ export class UnitRenderer {
     this.dozerBlade = makeIM(buildDozerBladeGeometry(), mat, capacity);
     this.rocketTruckHull = makeIM(buildRocketTruckHullGeometry(), mat, capacity);
     this.rocketTruckPod = makeIM(buildRocketTruckPodGeometry(), mat, capacity);
-    this.supplyTruckHull = makeIM(buildSupplyTruckGeometry(), mat, capacity);
+    this.supplyTruckHull = makeIM(buildSupplyTruckHullGeometry(), mat, capacity);
+    for (let lv = 1; lv <= 5; lv++) {
+      this.supplyTruckCrates.push(
+        makeIM(buildSupplyTruckCratesGeometry(lv as 1|2|3|4|5), mat, capacity),
+      );
+    }
 
     this.group.add(
       this.soldierBody, this.soldierLegL, this.soldierLegR,
@@ -136,7 +143,7 @@ export class UnitRenderer {
       this.workerCrateWood, this.workerCrateMetal,
       this.dozerHull, this.dozerBlade,
       this.rocketTruckHull, this.rocketTruckPod,
-      this.supplyTruckHull,
+      this.supplyTruckHull, ...this.supplyTruckCrates,
     );
 
     this.ringTemplates.set('soldier',      { radius: 0.6,  color: 0x00ff88 });
@@ -170,6 +177,7 @@ export class UnitRenderer {
     const nWorkV = [0, 0, 0, 0];
     let nCrateW = 0, nCrateM = 0;
     let nDoz = 0, nRkt = 0, nSup = 0;
+    const nSupCrates = [0, 0, 0, 0, 0]; // per level 1-5
     const ringCounts = new Map<string, number>();
     const now = performance.now() / 1000;
 
@@ -417,6 +425,21 @@ export class UnitRenderer {
         if (nSup >= this.capacity) continue;
         this.supplyTruckHull.setMatrixAt(nSup, this.bodyM);
         this.supplyTruckHull.setColorAt(nSup, tint);
+        // Determine cargo amount for crate level.
+        let cargo = 0;
+        const t = u.task;
+        if (t.kind === 'truck_deliver_hq') cargo = t.payload.metals + t.payload.wood;
+        else if (t.kind === 'truck_resupply') cargo = t.payload.food + t.payload.metals + t.payload.wood;
+        if (cargo > 0) {
+          const lv = Math.min(5, Math.ceil(cargo / 20)) - 1; // index 0-4
+          const cm = this.supplyTruckCrates[lv]!;
+          const ci = nSupCrates[lv]!;
+          if (ci < this.capacity) {
+            cm.setMatrixAt(ci, this.bodyM);
+            cm.setColorAt(ci, tint);
+            nSupCrates[lv] = ci + 1;
+          }
+        }
         nSup++;
       }
 
@@ -458,6 +481,7 @@ export class UnitRenderer {
     this.rocketTruckHull.count = nRkt;
     this.rocketTruckPod.count = nRkt;
     this.supplyTruckHull.count = nSup;
+    for (let i = 0; i < 5; i++) this.supplyTruckCrates[i]!.count = nSupCrates[i]!;
     for (const m of [
       this.soldierBody, this.soldierLegL, this.soldierLegR,
       this.sniperBody, this.sniperLegL, this.sniperLegR,
@@ -469,7 +493,7 @@ export class UnitRenderer {
       this.workerCrateWood, this.workerCrateMetal,
       this.dozerHull, this.dozerBlade,
       this.rocketTruckHull, this.rocketTruckPod,
-      this.supplyTruckHull,
+      this.supplyTruckHull, ...this.supplyTruckCrates,
     ]) {
       m.instanceMatrix.needsUpdate = true;
       // instanceColor only exists once setColorAt has been called at least

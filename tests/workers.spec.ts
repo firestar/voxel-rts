@@ -155,7 +155,8 @@ describe('worker — delivers carried resources to storage', () => {
     // immediately rather than depending on path follow.
     const wxEnd = (storage.ox + storage.spec.cellsW) * 8; // NAV_CELL_VOXELS=8
     const wzMid = (storage.oz + storage.spec.cellsD * 0.5) * 8;
-    w.x = (wxEnd + 1) * VOXEL_SIZE;
+    const NAV_CELL_VOXELS = 8;
+    w.x = (wxEnd + 2 * NAV_CELL_VOXELS) * VOXEL_SIZE; // matches doorWorldPos gap
     w.y = (storage.floorY + 1) * VOXEL_SIZE;
     w.z = wzMid * VOXEL_SIZE;
 
