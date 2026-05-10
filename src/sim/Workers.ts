@@ -21,7 +21,11 @@ export const WORKER_CARRY_CAP = 20;
 // from the trunk voxel. The previous 3-voxel (0.375 m) reach put the chop
 // trigger band INSIDE the tree's own cell — which the pathfinder won't route
 // the worker into — so trees were "found" but never chopped.
-const WORK_REACH_M    = VOXEL_SIZE * 12;
+export const WORKER_CHOP_REACH_M = VOXEL_SIZE * 12;
+// Vertical chop reach: 200 voxels = 25 m straight up from the worker's feet.
+// Lets a chopper fell tall trees from the top down without needing to climb.
+const CHOP_REACH_UP_VOXELS = 200;
+const WORK_REACH_M    = WORKER_CHOP_REACH_M;
 const MINE_REACH_M    = VOXEL_SIZE * 10;  // mine reach: swing from perimeter
 const INTERACT_REACH_M = 1.6;             // storage drop-off / farm enter
 
@@ -35,21 +39,118 @@ const SCAN_RADIUS_M = 32;
 const SCAN_R2 = SCAN_RADIUS_M * SCAN_RADIUS_M;
 
 // Drop task after this many seconds with no measurable progress.
-const TASK_STALL_SECONDS = 8;
+const TASK_STALL_SECONDS = 1.00;
 // Minimum seconds between consecutive expensive voxel scans per idle worker.
-const SCAN_COOLDOWN_SECS = 0.5;
+const SCAN_COOLDOWN_SECS = 0.05;
 // Minimum seconds between repeated routeWorker calls while waiting for an async path.
 const ROUTE_COOLDOWN_SECS = 0.4;
+
+// --- Worker coordination ----------------------------------------------------
+//
+// Friendly workers share a global tree-reservation table so two workers never
+// race to the same trunk. Metal clusters already have per-slot reservation;
+// wood is per-voxel. Keys are voxel indexes; values are the worker unit id
+// holding the reservation. `unitWoodReservation` is the reverse map so we can
+// release in O(1) on task change / death.
+//
+// All friendly workers participate (the user's "40-voxel network" is a
+// stronger guarantee than necessary — globally-shared state is cheaper and
+// has the same effect since faraway workers never compete for the same tree
+// in practice). Hostile units never enter this table.
+const woodReservations = new Map<number, number>();
+const unitWoodReservation = new Map<number, number>();
+
+/** Per-worker temporary blacklist of metal clusters whose path attempts
+ *  have repeatedly failed. The next scan skips any cluster in the set;
+ *  the entry expires after CLUSTER_BLACKLIST_SECS so a previously-
+ *  unreachable cluster gets retried later (terrain may have changed). */
+const workerClusterBlacklist = new Map<number, Map<number, number>>();
+const CLUSTER_BLACKLIST_SECS = 60;
+function blacklistCluster(unitId: number, clusterId: number, now: number): void {
+  let m = workerClusterBlacklist.get(unitId);
+  if (!m) { m = new Map(); workerClusterBlacklist.set(unitId, m); }
+  m.set(clusterId, now + CLUSTER_BLACKLIST_SECS);
+}
+function getClusterBlacklist(unitId: number, now: number): Set<number> {
+  const m = workerClusterBlacklist.get(unitId);
+  const out = new Set<number>();
+  if (!m) return out;
+  for (const [cid, expiresAt] of m) {
+    if (expiresAt < now) m.delete(cid);
+    else out.add(cid);
+  }
+  return out;
+}
+
+function claimWood(unitId: number, voxelIdx: number): boolean {
+  const owner = woodReservations.get(voxelIdx);
+  if (owner !== undefined && owner !== unitId) return false;
+  releaseWood(unitId);
+  woodReservations.set(voxelIdx, unitId);
+  unitWoodReservation.set(unitId, voxelIdx);
+  return true;
+}
+
+function releaseWood(unitId: number): void {
+  const idx = unitWoodReservation.get(unitId);
+  if (idx === undefined) return;
+  unitWoodReservation.delete(unitId);
+  if (woodReservations.get(idx) === unitId) woodReservations.delete(idx);
+}
+
+function isWoodReservedByOther(unitId: number, voxelIdx: number): boolean {
+  const owner = woodReservations.get(voxelIdx);
+  return owner !== undefined && owner !== unitId;
+}
+
+/** Drop reservations belonging to dead workers and to workers whose current
+ *  task no longer references the reserved voxel. Cheap O(workers) sweep. */
+function reapWoodReservations(units: UnitManager): void {
+  if (unitWoodReservation.size === 0) return;
+  const alive = new Set<number>();
+  for (const u of units.units) {
+    if (u.kind !== 'worker' || u.hp <= 0) continue;
+    alive.add(u.id);
+    if (u.task.kind !== 'chop') {
+      releaseWood(u.id);
+      continue;
+    }
+    const reserved = unitWoodReservation.get(u.id);
+    if (reserved === undefined) continue;
+    const vx = Math.floor(u.task.wx / VOXEL_SIZE);
+    const vy = Math.floor(u.task.wy / VOXEL_SIZE);
+    const vz = Math.floor(u.task.wz / VOXEL_SIZE);
+    if (worldIndex(vx, vy, vz) !== reserved) releaseWood(u.id);
+  }
+  for (const id of unitWoodReservation.keys()) {
+    if (!alive.has(id)) releaseWood(id);
+  }
+}
 
 export interface WorkerDeps {
   units: UnitManager;
   world: VoxelWorld;
   buildings: BuildingManager;
   saplings: SaplingManager;
+  /** Player-team resources. Worker food deposits land here unless the
+   *  worker's team is `'enemy'` and `enemyResources` is provided. */
   resources: Resources;
+  /** Optional enemy-team resources. Set in production; left undefined
+   *  in tests that don't exercise the enemy economy. */
+  enemyResources?: Resources;
   taskBoard: WorkerTaskBoard;
   routeWorker: (u: Unit, wx: number, wy: number, wz: number) => void;
   onVoxelEdit: (wx: number, wy: number, wz: number) => void;
+  /**
+   * World-space Y of the ground at (wx, wz), with tree wood/leaf voxels
+   * skipped — i.e. the surface a unit would walk on. Used by the chop
+   * routing so the goal lands at the actual ground level next to a trunk
+   * rather than on top of the tree (path planner's `nearestPassable`
+   * otherwise finds the airy cell directly above the trunk top, since wood
+   * counts as a passable floor below it). Optional in tests that don't
+   * need real path follow.
+   */
+  surfaceY?: (wx: number, wz: number) => number;
   /**
    * Look up the MetalCluster that owns the voxel at (vx, vy, vz), or null
    * if no living cluster covers that position.
@@ -80,7 +181,20 @@ export interface WorkerDeps {
    * the nearest one. Returns a voxel target in the best cluster, or null when no
    * cluster has a free slot.
    */
-  findBestMineTarget?: (fromX: number, fromZ: number) => { wx: number; wy: number; wz: number } | null;
+  findBestMineTarget?: (fromX: number, fromZ: number, excludeClusterIds?: ReadonlySet<number>) => { wx: number; wy: number; wz: number; clusterId: number } | null;
+  /**
+   * Pick a passable nav cell adjacent to the trunk that the worker can stand
+   * in to chop. Returns the cell-center world position and ground Y, or null
+   * when every neighbour of the trunk's nav cell is blocked (canopy, terrain,
+   * or building) and the tree should be skipped. The implementation queries
+   * the worker's UnitGrid directly, which is the only authority on whether a
+   * cell is actually reachable — `approachPos` alone can land in a cell whose
+   * column has no walkable cy near the surface (dense canopies block every cy
+   * inside the body-height span, leaving only above-canopy air cells that A*
+   * cannot reach from the ground).
+   */
+  findChopApproach?: (workerX: number, workerZ: number, trunkX: number, trunkZ: number) =>
+    { x: number; y: number; z: number } | null;
 }
 
 let workerLogTimer = 0;
@@ -88,6 +202,7 @@ const WORKER_LOG_INTERVAL = 3.0;
 
 export function tickWorkers(dt: number, deps: WorkerDeps): void {
   deps.taskBoard.syncAutoOrders(deps.buildings);
+  reapWoodReservations(deps.units);
 
   workerLogTimer -= dt;
   if (workerLogTimer <= 0) {
@@ -131,9 +246,15 @@ export function tickWorkers(dt: number, deps: WorkerDeps): void {
       if (key !== u.taskProgressKey) {
         u.taskProgressKey = key;
         u.taskStallTimer = 0;
+        u.repathFailures = 0;
       } else {
         u.taskStallTimer += dt;
         if (u.taskStallTimer >= TASK_STALL_SECONDS) {
+          // Blacklist the current cluster for this worker so the next
+          // auto-task scan picks a different one.
+          if (u.task.kind === 'mine' && u.claimedClusterId >= 0) {
+            blacklistCluster(u.id, u.claimedClusterId, performance.now() / 1000);
+          }
           if (u.claimedOrderId !== 0) {
             const o = deps.taskBoard.byId(u.claimedOrderId);
             if (o && o.claimedBy === u.id) o.claimedBy = 0;
@@ -147,7 +268,11 @@ export function tickWorkers(dt: number, deps: WorkerDeps): void {
           u.task = { kind: 'idle' };
           u.path = [];
           u.taskStallTimer = 0;
-          u.taskProgressKey = 0;
+          // Keep `taskProgressKey` at its current value so the next
+          // tick's "did progress happen?" check stays accurate. If
+          // we reset to 0 the worker's carry-based key always looks
+          // like a fresh transition, masking repeat stalls.
+          u.taskProgressKey = workerProgressKey(u);
           continue;
         }
       }
@@ -158,9 +283,14 @@ export function tickWorkers(dt: number, deps: WorkerDeps): void {
 }
 
 function workerProgressKey(u: Unit): number {
+  // Path length is intentionally excluded: a worker that's
+  // re-routing every 0.4 s on a failing partial path looks like
+  // it's making progress (path: 0 → N → walked → 0 → repeat) when
+  // it's actually trapped. Real progress = carry change or a chip
+  // landed. Position deltas would also work but are noisy under
+  // collision-resolved peers; carry+chips is the cleanest signal.
   const carry = u.carrying.wood * 31 + u.carrying.metals + u.carrying.food * 7;
-  const path = u.path.length;
-  return ((carry & 0xffff) << 16) ^ (path & 0xff) ^ ((u.miningTicks & 0xff) << 8);
+  return ((carry & 0xffff) << 16) ^ ((u.miningTicks & 0xffff));
 }
 
 // ----------------------------- Harvester -------------------------------------
@@ -201,7 +331,27 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
     case 'chop':
     case 'mine': {
       const targetMat = u.task.kind === 'chop' ? M_WOOD : M_METAL;
-      const tx = u.task.wx, ty = u.task.wy, tz = u.task.wz;
+      let tx = u.task.wx, ty = u.task.wy, tz = u.task.wz;
+      // Re-target each tick when chopping: prefer the topmost wood voxel
+      // within reach (horizontal ≤ WORK_REACH_M, vertical up to
+      // CHOP_REACH_UP_VOXELS above the worker's feet) so a tall tree falls
+      // top-down. Search radius narrows once the worker is within reach so
+      // we don't switch trees mid-chop just because another trunk is
+      // marginally taller; while still walking in (out of horiz reach) we
+      // keep targeting the originally-assigned voxel and let the routing
+      // catch us up.
+      if (u.task.kind === 'chop') {
+        const homeVx = Math.floor(tx / VOXEL_SIZE);
+        const homeVz = Math.floor(tz / VOXEL_SIZE);
+        const top = findTopmostWoodInReach(
+          deps.world.buffers.voxels, u, homeVx, homeVz,
+        );
+        if (top) {
+          tx = (top.vx + 0.5) * VOXEL_SIZE;
+          ty = (top.vy + 0.5) * VOXEL_SIZE;
+          tz = (top.vz + 0.5) * VOXEL_SIZE;
+        }
+      }
       const dx = tx - u.x, dz = tz - u.z;
       const horiz2 = dx * dx + dz * dz;
       const vx = Math.floor(tx / VOXEL_SIZE);
@@ -227,7 +377,22 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
           if (u.claimedClusterId !== cluster.id) {
             const cdx = cluster.worldX - u.x, cdz = cluster.worldZ - u.z;
             const approachR = (cluster.rxz + 8) * VOXEL_SIZE;
-            if (cdx * cdx + cdz * cdz > approachR * approachR) {
+            const outsideApproach = cdx * cdx + cdz * cdz > approachR * approachR;
+            // While still walking toward the cluster, bail to a different one
+            // if every slot is already taken — no point arriving just to bounce
+            // off a full mine. The slot count is a simple Array.some so this is
+            // cheap to re-check each tick.
+            if (outsideApproach && !cluster.workerSlots.some(s => s === 0 || s === u.id)) {
+              const alt = deps.findAlternateClusterTarget?.(cluster.id, u.x, u.z) ?? null;
+              if (alt) {
+                u.task = { kind: 'mine', wx: alt.wx, wy: alt.wy, wz: alt.wz };
+                u.path = [];
+              } else {
+                u.task = { kind: 'idle' };
+              }
+              return false;
+            }
+            if (outsideApproach) {
               if (u.path.length === 0)
                 routeIfDue(u, deps, cluster.worldX, u.y, cluster.worldZ);
               return false;
@@ -241,24 +406,19 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
             }
             u.claimedClusterId = cluster.id;
             u.claimedSlotIndex = slot;
-            u.path = [];
-            // Snap to the slot immediately — worker is already inside the approach
-            // radius so the teleport is at most a few voxels.
+            // Route to the slot position via the path planner so the
+            // worker walks there smoothly. Previous code snapped XZ
+            // directly which counts as a teleport in the harness.
             if (deps.clusterSlotPos) {
               const sp = deps.clusterSlotPos(cluster, slot);
-              u.x = sp.x; u.y = sp.y; u.z = sp.z;
+              u.workerRouteCooldown = 0;
+              deps.routeWorker(u, sp.x, sp.y, sp.z);
               u.blockedFrames = 0;
             }
           }
-          // Re-snap if the separation pass or physics nudged the worker off their spot.
-          if (deps.clusterSlotPos) {
-            const sp = deps.clusterSlotPos(cluster, u.claimedSlotIndex);
-            const sdx = sp.x - u.x, sdz = sp.z - u.z;
-            if (sdx * sdx + sdz * sdz > WORK_REACH_M * WORK_REACH_M) {
-              u.x = sp.x; u.y = sp.y; u.z = sp.z;
-              u.path = []; u.blockedFrames = 0;
-            }
-          }
+          // No re-snap: if separation drifts the worker off the slot,
+          // the next routeIfDue call below pushes a fresh path so it
+          // walks back. Teleports are forbidden.
           if (u.path.length > 0) u.path = [];
           u.mineSwingTimer += dt;
           u.miningTicks++;
@@ -279,13 +439,31 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
       if (horiz2 > reachM * reachM) {
         if (u.path.length === 0) {
           if (u.task.kind === 'mine') {
-            // Route directly to the ore voxel; the pathfinder's nearestPassable
-            // snaps the goal to the nearest walkable cell adjacent to the ore pile,
-            // keeping the worker within MINE_REACH_M.
+            // Route directly to the ore voxel — `nearestPassable` snaps to
+            // the walkable cell adjacent to the surface-exposed ore.
             routeIfDue(u, deps, tx, ty, tz);
           } else {
-            const ap = approachPos(u.x, u.z, tx, tz, 10);
-            routeIfDue(u, deps, ap.x, ty, ap.z);
+            // For chop, ask the host for a passable nav cell adjacent to the
+            // trunk's cell. With overlapping canopies the trunk's cell *and*
+            // some of its neighbours can be tree-blocked at every cy inside
+            // the body-height span, so a naive 1.25 m offset can land in a
+            // cell A* cannot reach from the ground. The host implementation
+            // walks the trunk's neighbours, picks the closest passable one to
+            // the worker, and returns its centre — guaranteed reachable. If
+            // every neighbour is blocked the tree itself is unreachable; drop
+            // the task so the next scan finds a different one.
+            const cap = deps.findChopApproach?.(u.x, u.z, tx, tz);
+            if (cap) {
+              routeIfDue(u, deps, cap.x, cap.y, cap.z);
+            } else if (deps.findChopApproach) {
+              releaseWood(u.id);
+              u.task = { kind: 'idle' };
+              return false;
+            } else {
+              const ap = approachPos(u.x, u.z, tx, tz, 10);
+              const apY = deps.surfaceY ? deps.surfaceY(ap.x, ap.z) : u.y;
+              routeIfDue(u, deps, ap.x, apY, ap.z);
+            }
           }
         }
         return false;
@@ -380,16 +558,22 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
         u.task = { kind: 'idle' };
         return false;
       }
-      const storage = deps.buildings.nearestStorage(u.x, u.z);
+      const storage = deps.buildings.nearestStorage(u.x, u.z, u.team);
       if (!storage) return false;
       const dpos = doorWorldPos(storage, u.x, u.z);
       const dx = dpos.x - u.x, dz = dpos.z - u.z;
       if (dx * dx + dz * dz <= INTERACT_REACH_M * INTERACT_REACH_M) {
         storage.stockpile.wood += u.carrying.wood;
         storage.stockpile.metals += u.carrying.metals;
-        // Food goes directly to the global resource pool — it's perishable and
-        // doesn't wait for a truck run.
-        deps.resources.food += u.carrying.food;
+        // Food is perishable: skip the truck run and credit the
+        // worker's team resource pool directly. All non-player
+        // teams (enemy + enemy2 + …) share the enemyResources pool;
+        // omitting the enemy2 case used to route enemy2 food into
+        // the player team's bank, starving the second AI's economy.
+        const teamRes = u.team !== 'player' && deps.enemyResources
+          ? deps.enemyResources
+          : deps.resources;
+        teamRes.food += u.carrying.food;
         u.carrying.wood = 0;
         u.carrying.metals = 0;
         u.carrying.food = 0;
@@ -408,7 +592,16 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
   const focus = u.workerFocus;
 
   // Board claims are cheap — always check for fresh orders every tick.
-  const order = deps.taskBoard.claim(u.id, (o) => isHarvesterOrderForFocus(o, focus));
+  // Cross-team farms / saplings are skipped: an enemy farm-focused
+  // worker shouldn't trudge into the player's base to tend their crops.
+  const order = deps.taskBoard.claim(u.id, (o) => {
+    if (!isHarvesterOrderForFocus(o, focus)) return false;
+    if (o.buildingId !== undefined) {
+      const b = deps.buildings.byId(o.buildingId);
+      if (b && b.team !== u.team) return false;
+    }
+    return true;
+  });
   if (order) {
     u.claimedOrderId = order.id;
     u.workerScanCooldown = 0;
@@ -428,11 +621,28 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
 
   if (focus !== 'chop') {
     if (deps.findBestMineTarget) {
-      // Cluster-aware load-balanced assignment: cheap, so multiple workers can
-      // be assigned in the same tick without triggering scanFiredThisTick.
-      const target = deps.findBestMineTarget(u.x, u.z);
+      const blacklist = getClusterBlacklist(u.id, performance.now() / 1000);
+      const target = deps.findBestMineTarget(u.x, u.z, blacklist);
       if (target) {
+        // Reserve a slot on the cluster up-front so the
+        // per-cluster max enforcement is honored from the moment
+        // of assignment, not just when the worker arrives. We
+        // look up the cluster via findMetalCluster on the picked
+        // voxel and call tryClaimClusterSlot. If reservation
+        // fails, the cluster is genuinely full — pick another.
+        const tvx = Math.floor(target.wx / VOXEL_SIZE);
+        const tvy = Math.floor(target.wy / VOXEL_SIZE);
+        const tvz = Math.floor(target.wz / VOXEL_SIZE);
+        const cluster = deps.findMetalCluster?.(tvx, tvy, tvz) ?? null;
+        const slot = cluster ? (deps.tryClaimClusterSlot?.(cluster, u.id) ?? null) : null;
+        if (cluster && slot === null) {
+          // Slot race-lost. Skip this assignment; the worker
+          // re-scans next tick and picks a different cluster.
+          return false;
+        }
         u.task = { kind: 'mine', wx: target.wx, wy: target.wy, wz: target.wz };
+        u.claimedClusterId = target.clusterId;
+        if (slot !== null) u.claimedSlotIndex = slot;
         u.workerRouteCooldown = 0;
         deps.routeWorker(u, target.wx, target.wy, target.wz);
         return false; // cheap — don't block other workers from assigning this tick
@@ -451,14 +661,45 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
 
   if (focus !== 'mine') {
     const wood = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_WOOD,
-      (vx, _vy, vz) => !voxelInsideAnyBuilding(deps.buildings, vx, vz));
+      (vx, vy, vz) => {
+        if (voxelInsideAnyBuilding(deps.buildings, vx, vz)) return false;
+        // Skip trunks already reserved by a different friendly worker so each
+        // worker walks to its own tree instead of all converging on the
+        // nearest one.
+        if (isWoodReservedByOther(u.id, worldIndex(vx, vy, vz))) return false;
+        // Skip trees that already have a friendly worker actively chopping
+        // them. Without this filter two harvesters would race for the same
+        // trunk: the second one would jostle into the first's hit-box,
+        // forcing the active chopper to abandon its swing and re-route.
+        if (anotherWorkerChoppingNear(deps.units, u.id, vx, vz)) return false;
+        // Skip trees whose every nav-cell neighbour is blocked. With dense
+        // canopy these trees are physically out of reach, and assigning them
+        // just stalls the worker until the task-stall timer fires.
+        if (deps.findChopApproach) {
+          const tx = (vx + 0.5) * VOXEL_SIZE;
+          const tz = (vz + 0.5) * VOXEL_SIZE;
+          if (deps.findChopApproach(u.x, u.z, tx, tz) === null) return false;
+        }
+        return true;
+      });
     if (wood) {
+      claimWood(u.id, worldIndex(wood.vx, wood.vy, wood.vz));
       u.task = { kind: 'chop', wx: (wood.vx + 0.5) * VOXEL_SIZE, wy: (wood.vy + 0.5) * VOXEL_SIZE, wz: (wood.vz + 0.5) * VOXEL_SIZE };
-      // Approach offset = 10 voxels (1.25 m) so the goal lands in a nav cell
-      // adjacent to the trunk, not inside the tree's own (blocked) cell.
-      const ap = approachPos(u.x, u.z, u.task.wx, u.task.wz, 10);
+      // Route to a passable nav cell adjacent to the trunk. The host's
+      // `findChopApproach` walks the 8 neighbour cells of the trunk's nav
+      // cell, picks the closest passable one to the worker, and returns its
+      // centre at ground Y. When the host doesn't supply that callback (e.g.
+      // tests with a minimal harness) we fall back to the older 1.25 m
+      // approach offset.
+      const cap = deps.findChopApproach?.(u.x, u.z, u.task.wx, u.task.wz) ?? null;
       u.workerRouteCooldown = 0;
-      deps.routeWorker(u, ap.x, u.task.wy, ap.z);
+      if (cap) {
+        deps.routeWorker(u, cap.x, cap.y, cap.z);
+      } else {
+        const ap = approachPos(u.x, u.z, u.task.wx, u.task.wz, 10);
+        const apY = deps.surfaceY ? deps.surfaceY(ap.x, ap.z) : u.y;
+        deps.routeWorker(u, ap.x, apY, ap.z);
+      }
       return true;
     }
   }
@@ -466,13 +707,15 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
 }
 
 function isHarvesterOrderForFocus(o: WorkOrder, focus: WorkerFocus): boolean {
-  // Farm-focused workers are the only ones that touch farms. Miners /
-  // choppers / auto-focus workers ignore farmTend and harvestFarm — the
-  // player has to dedicate a worker to "farm" focus before any tending
-  // happens. Auto workers still pick up plant orders.
+  // Farm-focused workers handle every farm order. Auto-focus workers
+  // ALSO handle every farm order so the AI's food economy doesn't
+  // starve when nobody is explicitly set to "farm" — without this,
+  // the AI's farms never get tended past their first milestone, so
+  // crops never ripen, and unit production starves once the seeded
+  // food is spent. Mining / chopping workers stay specialized.
   if (focus === 'farm') return o.kind === 'farmTend' || o.kind === 'harvestFarm';
   if (focus === 'mine' || focus === 'chop') return false;
-  return o.kind === 'plant';
+  return o.kind === 'plant' || o.kind === 'farmTend' || o.kind === 'harvestFarm';
 }
 
 function applyOrderToHarvester(u: Unit, order: WorkOrder, deps: WorkerDeps): void {
@@ -593,6 +836,96 @@ function isExposed(voxels: Uint8Array, vx: number, vy: number, vz: number): bool
 function readVoxel(voxels: Uint8Array, vx: number, vy: number, vz: number): number {
   if (vx < 0 || vy < 0 || vz < 0 || vx >= WORLD_X || vy >= WORLD_Y || vz >= WORLD_Z) return AIR;
   return voxels[worldIndex(vx, vy, vz)]!;
+}
+
+/**
+ * Find the highest M_WOOD voxel within the worker's chop reach: horizontal
+ * distance ≤ WORK_REACH_M from the worker, AND vertical distance ≤
+ * CHOP_REACH_UP_VOXELS above the worker's feet. Search columns within the
+ * horizontal reach radius, anchored on the originally-assigned trunk
+ * column. Returns the topmost voxel found, or null when the tree is gone.
+ *
+ * Anchoring on `homeVx`/`homeVz` keeps the chopper committed to the assigned
+ * tree even if a neighbouring tree's canopy briefly enters reach — without
+ * the anchor a chopper would dance between trunks as foliage shuffles around.
+ */
+function findTopmostWoodInReach(
+  voxels: Uint8Array,
+  u: Unit,
+  homeVx: number, homeVz: number,
+): { vx: number; vy: number; vz: number } | null {
+  const reachVoxels = Math.ceil(WORK_REACH_M / VOXEL_SIZE);
+  const feetVy = Math.floor(u.y / VOXEL_SIZE);
+  const yMax = Math.min(WORLD_Y - 1, feetVy + CHOP_REACH_UP_VOXELS);
+  const yMin = Math.max(0, feetVy);
+  // Workers chop the assigned tree's column (and any wood directly above it
+  // in that column). Looking only at the trunk's column avoids accidentally
+  // chopping a different tree whose canopy briefly drifted into reach. Other
+  // wood within the worker's horizontal range belongs to a different tree
+  // that another scan iteration will pick up.
+  const ux = u.x, uz = u.z;
+  const reachM2 = WORK_REACH_M * WORK_REACH_M;
+  // First try the home column straight up (the typical fast path).
+  let best: { vx: number; vy: number; vz: number } | null = null;
+  const homeWx = (homeVx + 0.5) * VOXEL_SIZE;
+  const homeWz = (homeVz + 0.5) * VOXEL_SIZE;
+  if ((homeWx - ux) ** 2 + (homeWz - uz) ** 2 <= reachM2) {
+    for (let vy = yMax; vy >= yMin; vy--) {
+      if (voxels[worldIndex(homeVx, vy, homeVz)] === M_WOOD) {
+        return { vx: homeVx, vy, vz: homeVz };
+      }
+    }
+  }
+  // Home column is empty (whole trunk felled or worker drifted) — fan out a
+  // small ring to find any remaining wood from the same tree. Cap the scan
+  // tight so we don't rake distant forests every chop tick.
+  const homeCx = Math.floor(homeVx);
+  const homeCz = Math.floor(homeVz);
+  let bestVy = -1;
+  for (let dz = -reachVoxels; dz <= reachVoxels; dz++) {
+    for (let dx = -reachVoxels; dx <= reachVoxels; dx++) {
+      const vx = homeCx + dx, vz = homeCz + dz;
+      if (vx < 0 || vz < 0 || vx >= WORLD_X || vz >= WORLD_Z) continue;
+      const wx = (vx + 0.5) * VOXEL_SIZE, wz = (vz + 0.5) * VOXEL_SIZE;
+      const ddx = wx - ux, ddz = wz - uz;
+      if (ddx * ddx + ddz * ddz > reachM2) continue;
+      // Walk the column top-down to find the highest wood voxel.
+      for (let vy = yMax; vy >= yMin; vy--) {
+        if (voxels[worldIndex(vx, vy, vz)] === M_WOOD) {
+          if (vy > bestVy) { bestVy = vy; best = { vx, vy, vz }; }
+          break;
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * True when another friendly worker has already locked onto this trunk and
+ * is in chop range (task = chop, path empty, body within chop reach of the
+ * trunk voxel). The scan filter uses this to steer newly-idle workers away
+ * from trees that are already being felled, so the active chopper keeps
+ * swinging instead of being shoved off the cell by a peer.
+ *
+ * Cheap O(workers) — the worker count is always small.
+ */
+function anotherWorkerChoppingNear(units: UnitManager, selfId: number, vx: number, vz: number): boolean {
+  const tx = (vx + 0.5) * VOXEL_SIZE;
+  const tz = (vz + 0.5) * VOXEL_SIZE;
+  // Slack = chop reach + one nav cell; covers any worker who has stopped to
+  // swing at this tree's voxel column.
+  const reach = WORK_REACH_M + NAV_CELL_VOXELS * VOXEL_SIZE;
+  const reach2 = reach * reach;
+  for (const o of units.units) {
+    if (o.kind !== 'worker' || o.hp <= 0) continue;
+    if (o.id === selfId) continue;
+    if (o.task.kind !== 'chop') continue;
+    if (o.path.length > 0) continue;
+    const dx = tx - o.x, dz = tz - o.z;
+    if (dx * dx + dz * dz <= reach2) return true;
+  }
+  return false;
 }
 
 /**

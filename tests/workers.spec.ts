@@ -72,6 +72,7 @@ describe('worker — chop tree', () => {
       deps.world.set(baseX, SURFACE_Y + dy, baseZ, M_WOOD);
     }
     const targetY = SURFACE_Y + 1;
+    const topY = SURFACE_Y + 4;
     const w = deps.units.spawn(
       'worker',
       (baseX + 0.5) * VOXEL_SIZE,
@@ -79,8 +80,8 @@ describe('worker — chop tree', () => {
       (baseZ + 0.5) * VOXEL_SIZE,
     );
     // Pre-set the chop task pointed at the lowest wood voxel so the auto-
-    // scanner doesn't pick something far away (testing the action, not the
-    // search). The voxel is 1 voxel above the worker's feet.
+    // scanner doesn't pick something far away. Per-tick retargeting will
+    // walk up the trunk to chop top-down within reach.
     w.task = {
       kind: 'chop',
       wx: (baseX + 0.5) * VOXEL_SIZE,
@@ -88,13 +89,13 @@ describe('worker — chop tree', () => {
       wz: (baseZ + 0.5) * VOXEL_SIZE,
     };
 
-    // Tick a couple of seconds in 100 ms steps. With WORK_DPS=60, hp 60 wood
-    // breaks in ~1 s, so 2 s is plenty for at least one voxel.
-    for (let i = 0; i < 25; i++) tick(deps, 0.1);
+    // Tick 2 s in 100 ms steps. With WORK_DPS=60 and hp 60 per wood voxel,
+    // that's enough to fell at least the topmost voxel.
+    for (let i = 0; i < 20; i++) tick(deps, 0.1);
 
     expect(w.carrying.wood).toBeGreaterThan(0);
-    // Lowest wood voxel should be air now.
-    expect(deps.world.get(baseX, targetY, baseZ)).toBe(AIR);
+    // Choppers fell trees top-down, so the topmost voxel should be air first.
+    expect(deps.world.get(baseX, topY, baseZ)).toBe(AIR);
   });
 });
 

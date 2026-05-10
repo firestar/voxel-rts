@@ -35,12 +35,50 @@ export class ChunkMeshRegistry {
    */
   readonly hideAboveYUniform = { value: 1e9 };
 
+  /** Maximum number of vision sources (units + buildings) packed
+   *  into the FoW uniform per frame. Sized to fit comfortably
+   *  inside the WebGL minimum guaranteed vec4 uniform budget for
+   *  fragment shaders (224 fragment-uniform vectors on the floor)
+   *  while leaving headroom for Three.js's own MeshLambert
+   *  uniforms. The fragment shader loop is bounded at compile
+   *  time at this value with a runtime `break` once the active
+   *  count is reached. */
+  static readonly MAX_FOW_SOURCES = 64;
+
+  /**
+   * Fog-of-war uniforms shared with the chunk material's
+   * onBeforeCompile patch. Game updates them every render frame with
+   * the player's live vision-source positions; fragments outside
+   * every sphere are discarded so terrain only shows where the
+   * player has eyes. Each source is a vec4 with .xyz = world-metre
+   * position and .w = radius² (so the fragment shader avoids a
+   * per-pixel sqrt). Buildings get a wider radius than units.
+   */
+  readonly fowUniforms = {
+    uFowEnabled: { value: 0 },
+    uFowSourceCountM: { value: 0 },
+    uFowSourcesM: {
+      value: Array.from(
+        { length: ChunkMeshRegistry.MAX_FOW_SOURCES },
+        () => new THREE.Vector4(),
+      ) as THREE.Vector4[],
+    },
+    // Tri-state FoW: an XZ bitmap of explored cells (sticky once
+    // visited). Inside a current vision sphere → full colour;
+    // explored-but-out-of-current-vision → desaturated grey;
+    // unexplored → discarded. The texture is single-channel R8 of
+    // size NAV_W × NAV_H; sampling uses world XZ / world-extent.
+    uExploredMap: { value: null as THREE.Texture | null },
+    uExploredEnabled: { value: 0 },
+    uWorldExtentXZ: { value: new THREE.Vector2(1, 1) },
+  };
+
   constructor(
     public readonly scene: THREE.Scene,
     public readonly world: VoxelWorld,
   ) {
     this.worldVersion = world.buffers.version;
-    this.material = makeChunkMaterial(this.hideAboveYUniform);
+    this.material = makeChunkMaterial(this.hideAboveYUniform, this.fowUniforms);
     const cores = Math.max(2, Math.min((navigator.hardwareConcurrency ?? 4) - 1, 8));
     for (let i = 0; i < cores; i++) {
       const w = new MesherWorker();
@@ -157,16 +195,80 @@ export class ChunkMeshRegistry {
       m.needsUpdate = true;
     }
   }
+
+  /**
+   * Configure the chunk-FoW shader. `flatXyzR` is a Float32Array of
+   * length ≥ 4*count packed as (x, y, z, radius) per source — both
+   * units and buildings. Each source's radius is independent, so a
+   * 22 m HQ vision disc and a 6 m soldier disc share the same
+   * uniform. Anything outside every sphere is discarded by the
+   * fragment shader. Pass `enabled=false` to restore full terrain.
+   */
+  setFow(
+    enabled: boolean,
+    flatXyzR: Float32Array,
+    count: number,
+  ): void {
+    const max = ChunkMeshRegistry.MAX_FOW_SOURCES;
+    const n = Math.min(count | 0, max);
+    this.fowUniforms.uFowEnabled.value = enabled ? 1 : 0;
+    this.fowUniforms.uFowSourceCountM.value = n;
+    const arr = this.fowUniforms.uFowSourcesM.value;
+    for (let i = 0; i < n; i++) {
+      const r = flatXyzR[i * 4 + 3]!;
+      arr[i]!.set(
+        flatXyzR[i * 4]!,
+        flatXyzR[i * 4 + 1]!,
+        flatXyzR[i * 4 + 2]!,
+        r * r,
+      );
+    }
+  }
+
+  /**
+   * Wire an explored-cells texture into the chunk material. The
+   * texture is single-channel R8 of size NAV_W × NAV_H; the shader
+   * samples it by (worldX, worldZ) / worldExtent to decide whether a
+   * fragment outside the live FoW spheres should render as
+   * desaturated grey (was-seen) or be discarded (never-seen).
+   */
+  setExplored(
+    enabled: boolean,
+    tex: THREE.Texture,
+    worldExtentX: number,
+    worldExtentZ: number,
+  ): void {
+    this.fowUniforms.uExploredEnabled.value = enabled ? 1 : 0;
+    this.fowUniforms.uExploredMap.value = tex;
+    this.fowUniforms.uWorldExtentXZ.value.set(worldExtentX, worldExtentZ);
+  }
 }
 
-function makeChunkMaterial(hideUniform: { value: number }): THREE.Material {
+function makeChunkMaterial(
+  hideUniform: { value: number },
+  fowUniforms: {
+    uFowEnabled: { value: number };
+    uFowSourceCountM: { value: number };
+    uFowSourcesM: { value: THREE.Vector4[] };
+    uExploredMap: { value: THREE.Texture | null };
+    uExploredEnabled: { value: number };
+    uWorldExtentXZ: { value: THREE.Vector2 };
+  },
+): THREE.Material {
   // Per-vertex color carries (r,g,b, ao). We pipe AO through a tiny onBeforeCompile patch
   // so it multiplies the diffuse term, giving cheap baked AO without a custom ShaderMaterial.
-  // The same patch wires `uHideAboveY` so the Y-axis cutoff overlay can render any fragment
-  // above the cutoff at 5% opacity (so the player can see underground tunnels through it).
+  // The same patch wires `uHideAboveY` (Y-axis cutoff at 5% opacity for underground viewing)
+  // and a fog-of-war discard around the player's units, so terrain only renders where the
+  // player has eyes on the ground.
   const m = new THREE.MeshLambertMaterial({ vertexColors: true });
   m.onBeforeCompile = (shader) => {
     shader.uniforms.uHideAboveY = hideUniform;
+    shader.uniforms.uFowEnabled = fowUniforms.uFowEnabled;
+    shader.uniforms.uFowSourceCountM = fowUniforms.uFowSourceCountM;
+    shader.uniforms.uFowSourcesM = fowUniforms.uFowSourcesM;
+    shader.uniforms.uExploredMap = fowUniforms.uExploredMap;
+    shader.uniforms.uExploredEnabled = fowUniforms.uExploredEnabled;
+    shader.uniforms.uWorldExtentXZ = fowUniforms.uWorldExtentXZ;
     shader.vertexShader = shader.vertexShader
       .replace(
         '#include <common>',
@@ -188,6 +290,12 @@ function makeChunkMaterial(hideUniform: { value: number }): THREE.Material {
         `
         #include <common>
         uniform float uHideAboveY;
+        uniform int uFowEnabled;
+        uniform int uFowSourceCountM;
+        uniform vec4 uFowSourcesM[${ChunkMeshRegistry.MAX_FOW_SOURCES}];
+        uniform sampler2D uExploredMap;
+        uniform int uExploredEnabled;
+        uniform vec2 uWorldExtentXZ;
         varying vec3 vWorldPosForCutoff;
         `,
       )
@@ -198,6 +306,26 @@ function makeChunkMaterial(hideUniform: { value: number }): THREE.Material {
         diffuseColor.rgb *= vColor.a;
         if (vWorldPosForCutoff.y >= uHideAboveY) {
           diffuseColor.a *= 0.05;
+        }
+        if (uFowEnabled == 1) {
+          bool inside = false;
+          for (int i = 0; i < ${ChunkMeshRegistry.MAX_FOW_SOURCES}; i++) {
+            if (i >= uFowSourceCountM) break;
+            vec4 src = uFowSourcesM[i];
+            vec3 d = vWorldPosForCutoff - src.xyz;
+            if (dot(d, d) <= src.w) { inside = true; break; }
+          }
+          if (!inside) {
+            if (uExploredEnabled == 1) {
+              vec2 uvE = vWorldPosForCutoff.xz / uWorldExtentXZ;
+              float ex = texture2D(uExploredMap, uvE).r;
+              if (ex < 0.5) discard;
+              float g = dot(diffuseColor.rgb, vec3(0.299, 0.587, 0.114));
+              diffuseColor.rgb = vec3(g) * 0.55;
+            } else {
+              discard;
+            }
+          }
         }
         `,
       );

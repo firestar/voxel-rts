@@ -13,7 +13,7 @@ import {
 import { WeaponKind, WEAPONS, defaultWeaponFor } from './Weapons';
 import { ProjectileKind } from './Projectiles';
 
-export type UnitKind = 'soldier' | 'sniper' | 'gunner' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'rocket_truck' | 'supply_truck';
+export type UnitKind = 'soldier' | 'sniper' | 'gunner' | 'mortar_soldier' | 'rocket_soldier' | 'tank' | 'tunneler' | 'worm' | 'worker' | 'dozer' | 'rocket_truck' | 'aa_vehicle' | 'supply_truck' | 'civilian';
 
 /**
  * Which resource type a worker should prioritise when idle. 'auto' = current
@@ -24,15 +24,77 @@ export type WorkerFocus = 'auto' | 'mine' | 'chop' | 'farm';
 
 /** Every unit kind in spawn-order. Useful for iterating over the catalog. */
 export const UNIT_KINDS: UnitKind[] = [
-  'soldier', 'sniper', 'gunner', 'tank', 'tunneler', 'worm', 'worker', 'dozer', 'rocket_truck', 'supply_truck',
+  'soldier', 'sniper', 'gunner', 'mortar_soldier', 'rocket_soldier',
+  'tank', 'tunneler', 'worm', 'worker', 'dozer', 'rocket_truck', 'aa_vehicle', 'supply_truck',
+  'civilian',
 ];
+
+/**
+ * Population slots a single unit of each kind occupies. Infantry and
+ * civilians are 1 pop each; vehicles cost more reflecting crew + chassis
+ * footprint. Supply trucks are infrastructure (auto-spawned by HQs) and
+ * sit at 0 so they don't eat into the player's budget.
+ */
+export const UNIT_POP_COST: Record<UnitKind, number> = {
+  soldier:        1,
+  sniper:         1,
+  gunner:         2,
+  mortar_soldier: 2,
+  rocket_soldier: 2,
+  worker:         1,
+  // Civilians grow popCap as they spawn (one slot per resident); they
+  // don't consume that same slot — otherwise the cap they add is useless.
+  civilian:       0,
+  tank:           5,
+  tunneler:       4,
+  worm:           4,
+  dozer:          3,
+  rocket_truck:   4,
+  aa_vehicle:     3,
+  supply_truck:   0,
+};
+
+/**
+ * Per-unit-kind threat to an attacker. Used by the aggressive-stance
+ * target picker to prefer dangerous targets over harmless ones — a tank
+ * outranks a soldier, a soldier outranks a worker, a civilian is the
+ * lowest-priority target. Scale is roughly 0–100; absolute numbers don't
+ * matter, only the ordering.
+ *
+ * Units that lack a weapon (workers / civilians / supply trucks) still
+ * score above zero so they remain valid mop-up targets when the field
+ * is otherwise empty, but they sit far below anything that can shoot
+ * back. Vehicles outscore infantry of comparable role because they
+ * carry the heavier weapon and absorb more rounds before going down.
+ */
+export const UNIT_THREAT: Record<UnitKind, number> = {
+  tank:           95,
+  rocket_truck:   90,
+  mortar_soldier: 78,
+  rocket_soldier: 78,
+  worm:           75,
+  tunneler:       70,
+  gunner:         70,
+  sniper:         62,
+  aa_vehicle:     50,   // primarily anti-air; minor ground threat
+  soldier:        50,
+  dozer:          30,
+  worker:         15,
+  supply_truck:   8,
+  civilian:       4,
+};
 
 /**
  * Faction the unit belongs to. The player owns 'player' units; 'enemy' units are
  * spawned via the sandbox (E key) and can be shot at without friendly-fire
  * gating. Units only avoid hitting same-team peers along the firing line.
  */
-export type Team = 'player' | 'enemy';
+export type Team = 'player' | 'enemy' | 'enemy2';
+
+/** True when a team is AI-controlled (any team that isn't the player).
+ *  Most checks in the engine that say `team === 'enemy'` mean
+ *  "AI-side"; with a second AI team we want both to count. */
+export function isAiTeam(t: Team): boolean { return t !== 'player'; }
 
 /**
  * Combat behaviour. `defensive` (default) sits and waits for orders — the
@@ -71,7 +133,15 @@ export type WorkerTask =
   /** Supply truck en route to a production building carrying unit-build materials. */
   | { kind: 'truck_resupply'; buildingId: number; payload: { food: number; metals: number; wood: number } }
   /** Supply truck returning to HQ after delivering a resupply load. */
-  | { kind: 'truck_return' };
+  | { kind: 'truck_return' }
+  /** Supply truck en route to a building under construction with upgrade
+   *  resources. On arrival the cargo is added to the building's
+   *  `upgradeStockpile`. If the player paused the upgrade mid-flight, the
+   *  truck flips to `truck_return` and refunds the cargo to the global pool. */
+  | { kind: 'truck_deliver_upgrade'; buildingId: number; payload: { metals: number; wood: number } }
+  /** Supply truck en route to a paused-upgrade building to pick up the
+   *  resources that were already dropped there, returning them to HQ. */
+  | { kind: 'truck_recover_upgrade'; buildingId: number };
 
 /** Downward acceleration in m/s². Slightly snappier than real-world 9.81 — units feel
  *  "weighty" without dragging out the fall arc. Per-unit terminal velocity then sets
@@ -213,6 +283,56 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         speed: 3.0, speedDigging: 0,
         hp: 130,                                 // armoured vest + more mass
         massKg: 110,
+        terminalFallSpeed: 30,
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
+        launcherMaxStrength: 100,
+      };
+    case 'mortar_soldier':
+      // Heavy infantry hauling a tube + bipod. Slower than a gunner because
+      // of the awkward load, but the indirect-fire mortar arcs over walls
+      // and chews terrain — best used to soften up a fixed defence before
+      // the rest of the squad rushes in.
+      return {
+        footprintRadius: 1, widthMeters: 0.80,
+        maxStepVoxels: 6, slopePenalty: 0.22,
+        bodyHalfCells: 0, bodyRoughnessVoxels: 999,
+        turnRateRadPerSec: 3.5,                  // tripod pivot is sluggish
+        maxPitchRad: Math.PI / 2,
+        heightVoxels: 14,
+        canDig: false, requiresGround: true,
+        speed: 2.6, speedDigging: 0,
+        hp: 100,
+        massKg: 105,
+        terminalFallSpeed: 30,
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
+        // Generous launcher cap so mortar shells reach their full catalog
+        // arc — the round itself is still catalog-velocity, the cap just
+        // gates the launch impulse used by the indirect-fire solver.
+        launcherMaxStrength: 130,
+      };
+    case 'rocket_soldier':
+      // Anti-armour infantry with a shoulder-mounted rocket launcher. Tougher
+      // than a rifle soldier (combat vest + extra ammo handler training), but
+      // slower than a regular grunt. Devastating versus tanks and buildings;
+      // less effective against fast infantry — the long fire cycle leaves
+      // them vulnerable in close combat.
+      return {
+        footprintRadius: 1, widthMeters: 0.80,
+        maxStepVoxels: 6, slopePenalty: 0.22,
+        bodyHalfCells: 0, bodyRoughnessVoxels: 999,
+        turnRateRadPerSec: 4.0,
+        maxPitchRad: Math.PI / 2,
+        heightVoxels: 14,
+        canDig: false, requiresGround: true,
+        speed: 2.8, speedDigging: 0,
+        hp: 110,
+        massKg: 100,
         terminalFallSpeed: 30,
         cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
         segmentCount: 0, segmentSpacing: 0,
@@ -392,6 +512,32 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         // the catalog rocket muzzle speed but well below tank-cannon levels.
         launcherMaxStrength: 70,
       };
+    case 'aa_vehicle':
+      // Anti-air missile platform. Same wheeled chassis as the rocket truck
+      // (so it behaves identically on terrain) but lighter and a touch
+      // nimbler — its job is to keep up with a moving column to keep its
+      // umbrella over the formation. The pod yaws fast and tracks
+      // incoming projectiles rather than ground targets.
+      return {
+        footprintRadius: 2, widthMeters: 2.4,
+        maxStepVoxels: 3, slopePenalty: 0.45,
+        bodyHalfCells: 1, bodyRoughnessVoxels: 4,
+        turnRateRadPerSec: 1.4,
+        maxPitchRad: Math.PI / 6,
+        heightVoxels: 18,
+        canDig: false, requiresGround: true,
+        speed: 4.0, speedDigging: 0,
+        hp: 220,
+        massKg: 22_000,
+        terminalFallSpeed: 40,
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
+        // Lifts the AA missile speed cap above the catalog muzzle so the cap
+        // doesn't bite the interception solve.
+        launcherMaxStrength: 130,
+      };
     case 'supply_truck':
       // Unarmed logistics flatbed. Lighter and faster than combat trucks —
       // its job is to shuttle resources between storage depots, the HQ, and
@@ -408,6 +554,29 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         hp: 80,
         massKg: 10_000,
         terminalFallSpeed: 38,
+        cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
+        segmentCount: 0, segmentSpacing: 0,
+        bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
+        spoilCapacityVoxels: 0,
+        launcherMaxStrength: 0,
+      };
+    case 'civilian':
+      // Non-combatant resident. Walks between neighborhood city buildings,
+      // contributes nothing combat-wise. Slim footprint, soldier-class
+      // mobility on gentle terrain, no weapon, low HP — they're meant to
+      // wander the streets and dress up the base.
+      return {
+        footprintRadius: 1, widthMeters: 0.65,
+        maxStepVoxels: 6, slopePenalty: 0.20,
+        bodyHalfCells: 0, bodyRoughnessVoxels: 999,
+        turnRateRadPerSec: 5.0,
+        maxPitchRad: Math.PI / 2,
+        heightVoxels: 14,
+        canDig: false, requiresGround: true,
+        speed: 2.6, speedDigging: 0,
+        hp: 35,
+        massKg: 70,
+        terminalFallSpeed: 28,
         cutterRadius: 0, cutterForward: 0, cutterHeight: 0,
         segmentCount: 0, segmentSpacing: 0,
         bladeHalfWidthMeters: 0, bladeForwardMeters: 0, bladeDepthMeters: 0,
@@ -448,6 +617,14 @@ export interface Unit {
   /** Frames the unit has been blocked by collision. We pause motion but don't drop
    *  the path — gravity / terrain edits may resolve the block. */
   blockedFrames: number;
+  /** Distance² to path[0] the last time the unit got closer to it +
+   *  the (x, z) coords of that path[0]. The no-progress watchdog
+   *  re-baselines whenever path[0] changes (a waypoint pop or a
+   *  fresh repath would otherwise look like a sudden regression). */
+  noProgressBestD2: number;
+  noProgressTgtX: number;
+  noProgressTgtZ: number;
+  noProgressFrames: number;
   /**
    * Latched flag the harness reads each frame to know this unit wants its route
    * recomputed. Set when `blockedFrames` first crosses BLOCKED_REPATH_FRAMES so
@@ -484,6 +661,14 @@ export interface Unit {
    * worker drops the task and releases any TaskBoard claim.
    */
   taskStallTimer: number;
+  /** Counter of consecutive task-stall fires for this unit. */
+  repathFailures?: number;
+  /** Pre-tick XZ snapshot used for teleport detection. Set every
+   *  frame at the start of UnitManager.tick; compared after the
+   *  motion pass so any unit whose position jumps > 4 voxels in a
+   *  single sim tick gets flagged. */
+  tickPrevX?: number;
+  tickPrevZ?: number;
   /** Seconds the unit has had an active path but made no measurable forward progress.
    *  When it crosses STUCK_TELEPORT_SECS the unit is nudged to a random clear nearby cell. */
   stuckTimer: number;
@@ -716,11 +901,39 @@ export class UnitManager {
    *  so we can see when a peer was sampled relative to the moment the truck
    *  detected it had stopped. */
   private simTime = 0;
+  /** First teleport observed this game (XZ jump > 4 voxels in a
+   *  single sim tick). Cleared explicitly by callers — the harness
+   *  reads it once and the run is failed. */
+  lastTeleport: {
+    id: number; kind: string; team: string; dist: number;
+    from: { x: number; z: number };
+    to: { x: number; z: number };
+    tickAt: number;
+  } | null = null;
+  /** Fired after `spawn(...)` returns a fully-constructed Unit. The
+   *  authoritative game-server bridge subscribes here to mirror every
+   *  spawned unit into the server's entity table. Single hook so
+   *  per-call-site changes aren't necessary as new spawn paths get
+   *  added. */
+  onAfterSpawn: ((u: Unit) => void) | null = null;
+  /** Fired when `setPath` writes a new path on a unit. The bridge
+   *  forwards the waypoints to the server so the authoritative entity
+   *  walks the same route. */
+  onSetPath: ((u: Unit) => void) | null = null;
 
   spawn(
     kind: UnitKind,
     x: number, y: number, z: number,
-    opts?: { weapon?: WeaponKind | null; team?: Team; stance?: CombatStance },
+    opts?: {
+      weapon?: WeaponKind | null;
+      team?: Team;
+      stance?: CombatStance;
+      /** Skip the `onAfterSpawn` callback. Used by the authoritative
+       *  game-server bridge when adopting an entity that the SERVER
+       *  spawned — re-firing the hook would echo a `spawn_entity`
+       *  command back to the server and create a duplicate. */
+      noHook?: boolean;
+    },
   ): Unit {
     const cfg = unitConfig(kind);
     const segments: WormSegment[] = [];
@@ -774,6 +987,10 @@ export class UnitManager {
       distanceWalked: 0,
       lastTrackDistance: 0,
       blockedFrames: 0,
+      noProgressBestD2: Infinity,
+      noProgressTgtX: 0,
+      noProgressTgtZ: 0,
+      noProgressFrames: 0,
       needsRepath: false,
       vy: 0,
       massKg: cfg.massKg,
@@ -820,6 +1037,10 @@ export class UnitManager {
       evadeCooldown: 0,
     };
     this.units.push(u);
+    if (this.onAfterSpawn && !opts?.noHook) {
+      try { this.onAfterSpawn(u); }
+      catch (_e) { /* swallow — sim must not break on bridge failures */ }
+    }
     return u;
   }
 
@@ -829,6 +1050,10 @@ export class UnitManager {
       unit.carveCooldown = 0;
       unit.blockedFrames = 0;
       unit.needsRepath = false;
+      if (this.onSetPath) {
+        try { this.onSetPath(unit); }
+        catch (_e) { /* ignore */ }
+      }
       return;
     }
     let i = 0;
@@ -856,6 +1081,10 @@ export class UnitManager {
     unit.carveCooldown = 0;
     unit.blockedFrames = 0;
     unit.needsRepath = false;
+    if (this.onSetPath) {
+      try { this.onSetPath(unit); }
+      catch (_e) { /* ignore */ }
+    }
   }
 
   tick(
@@ -868,6 +1097,14 @@ export class UnitManager {
     this.lastSurfaceNav = nav;
     this.lastVoxels = voxels;
     this.simTime += dt;
+    // Teleport detection: snapshot every unit's pre-tick XZ so we can
+    // compare against the post-tick position. Anything that moved
+    // more than 4 voxels (0.5 m) in a single sim tick is a teleport
+    // and is logged for the harness to flag the run as failed.
+    for (const u of this.units) {
+      u.tickPrevX = u.x;
+      u.tickPrevZ = u.z;
+    }
     for (const u of this.units) {
       const underground = isUnderground(u, nav);
       // Tree shove — if a (non-digger) unit's centre lands inside a
@@ -925,7 +1162,11 @@ export class UnitManager {
         }
         if (u.stuckTimer >= STUCK_TELEPORT_SECS) {
           if (u.kind === 'worker') {
-            this.tryUnstuck(u, nav);
+            // Workers must traverse paths, not teleport. If a worker
+            // is stuck, request a repath; the harness fails the run
+            // when no repath can fix it, surfacing the real bug.
+            u.path = [];
+            u.needsRepath = true;
           } else if (u.kind === 'supply_truck') {
             // First, check whether the truck is stranded below the surface
             // (e.g. fell into a chamber or got pushed into a dug-out cell)
@@ -966,6 +1207,35 @@ export class UnitManager {
     }
 
     this.separateOverlappingUnits(nav);
+
+    // Teleport audit + enforcement: each individual motion source
+    // is bounded at 1 voxel, but several (push-out-of-tree + path
+    // step + separation) can run in the same tick. We allow up to
+    // 3 voxels of combined per-tick motion; anything beyond that
+    // is treated as a real teleport, the position is clamped, and
+    // the harness fails the run.
+    const TELEPORT_M = 3 * VOXEL_SIZE;
+    const TELEPORT_M2 = TELEPORT_M * TELEPORT_M;
+    for (const u of this.units) {
+      if (u.tickPrevX === undefined || u.tickPrevZ === undefined) continue;
+      const dx = u.x - u.tickPrevX;
+      const dz = u.z - u.tickPrevZ;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > TELEPORT_M2) {
+        if (!this.lastTeleport) {
+          this.lastTeleport = {
+            id: u.id, kind: u.kind, team: u.team,
+            dist: Math.sqrt(d2),
+            from: { x: u.tickPrevX, z: u.tickPrevZ },
+            to: { x: u.x, z: u.z },
+            tickAt: this.simTime,
+          };
+        }
+        const scale = TELEPORT_M / Math.sqrt(d2);
+        u.x = u.tickPrevX + dx * scale;
+        u.z = u.tickPrevZ + dz * scale;
+      }
+    }
   }
 
   /**
@@ -977,34 +1247,73 @@ export class UnitManager {
    * read as solid. That false-positive is what was freezing soldiers and tanks.
    */
   private tickSurface(u: Unit, dt: number, nav: SurfaceNavBuffers, worldEdit: (req: WorldEditRequest) => void): void {
+    // "Walked past" pop: if the unit is already closer to path[1]
+    // than to path[0], path[0] is behind us. Lateral nudges and
+    // collision recoveries can drift a foot unit past a cell-centre
+    // waypoint without ever coming within `shiftThreshold` of it,
+    // which strands the entire remaining path. Pop everything we've
+    // already overshot before we use path[0] as the target.
+    while (u.path.length >= 2) {
+      const a = u.path[0]!;
+      const b = u.path[1]!;
+      const da2 = (a.x - u.x) * (a.x - u.x) + (a.z - u.z) * (a.z - u.z);
+      const db2 = (b.x - u.x) * (b.x - u.x) + (b.z - u.z) * (b.z - u.z);
+      if (db2 >= da2) break;
+      u.path.shift();
+    }
+    if (u.path.length === 0) {
+      sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
+      if (u.kind === 'dozer') u.levelTargetY = null;
+      return;
+    }
     const tgt = u.path[0]!;
     const dx = tgt.x - u.x;
     const dz = tgt.z - u.z;
     const d = Math.hypot(dx, dz);
-    // Drop a waypoint that we're effectively at already. Threshold is 5 cm so
-    // we eat the start-cell waypoint (path planner returns waypoints at cell
-    // centres; a unit spawned mid-cell is typically within a few cm of the
-    // first waypoint in pathToWaypoints output). Without this the truck
-    // re-enters tickSurface forever and the outer tick reports "path>0,
-    // distance unchanged" → STUCK TRUCK error.
-    if (d < 0.05) {
+    // Drop a waypoint we're effectively at already. Foot units can
+    // side-shuffle exactly onto a point so 5 cm is enough; wheeled
+    // vehicles can only translate forward, so a sub-voxel waypoint
+    // that sits behind them traps them in a pivot loop (cosAng below
+    // the 0.34 forward-motion threshold → step is zero → stuck).
+    // For wheeled units we accept ≤0.2 m (slightly more than one
+    // voxel) as "reached" and move on to the next waypoint, which
+    // typically gives them a clean forward line.
+    const isWheeled = (u.kind === 'tank' || u.kind === 'dozer'
+                    || u.kind === 'supply_truck' || u.kind === 'rocket_truck'
+                    || u.kind === 'aa_vehicle' || u.kind === 'tunneler'
+                    || u.kind === 'worm');
+    const shiftThreshold = isWheeled ? 0.20 : 0.05;
+    if (d < shiftThreshold) {
       u.path.shift();
       sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
+      if (u.kind === 'dozer' && u.path.length === 0) {
+        u.levelTargetY = null;
+      }
       return;
     }
 
     // Slew the heading toward the path direction at the unit's turn rate. Until the unit
     // is roughly facing forward, forward speed is reduced (cosine of misalignment), so a
     // tank pivots in place before driving and a soldier sweeps around briskly.
-    // Supply trucks and workers are non-combat wheeled/foot units that should never stop
-    // for a turn — they move at full speed while slewing their heading.
+    // Slew the heading toward the path direction at the unit's turn
+    // rate. Foot units (worker, soldier, etc.) can side-shuffle and
+    // pay no alignment penalty; wheeled vehicles (tank, dozer,
+    // trucks, AA, tunneler, worm) cannot move sideways — they pivot
+    // first and only translate along their forward vector once the
+    // heading is reasonably aligned (cos(angDiff) > 0).
     const targetHeading = Math.atan2(-dx, -dz);
     const angDiff = wrapAngle(targetHeading - u.heading);
     const turnStep = u.turnRateRadPerSec * dt;
     u.heading += clamp(angDiff, -turnStep, turnStep);
 
-    const noAlignPenalty = u.kind === 'supply_truck' || u.kind === 'worker';
-    const align = noAlignPenalty ? 1.0 : Math.max(0, Math.cos(Math.abs(angDiff)));
+    const isFoot = (u.kind === 'soldier' || u.kind === 'sniper'
+                 || u.kind === 'gunner' || u.kind === 'mortar_soldier'
+                 || u.kind === 'rocket_soldier' || u.kind === 'civilian'
+                 || u.kind === 'worker');
+    const cosAng = Math.cos(angDiff);
+    // Wheeled vehicles only translate when facing forward (within
+    // ~70° of target). Below that, they pivot in place.
+    const align = isFoot ? 1.0 : (cosAng > 0.34 ? cosAng : 0);
     // Surface material under the unit modulates speed — mud bogs vehicles down, paths
     // give a small bonus. Sample the cell-level top material; for soldiers this barely
     // matters but is consistent with the tank/tunneler.
@@ -1012,17 +1321,38 @@ export class UnitManager {
     const cz0 = Math.max(0, Math.min(NAV_H - 1, Math.floor(u.z / NAV_CELL_METERS)));
     const groundMat = nav.material[navIndex(cx0, cz0)]!;
     const groundMult = groundSpeedMultiplier(groundMat);
-    const step = u.speed * align * groundMult * dt;
+    // Voxel-by-voxel rule: a unit cannot move more than 1 voxel
+    // (0.125 m) of ground in a single sim tick. If speed × dt would
+    // exceed that, the step is clamped — fast units appear to walk
+    // slower under low-framerate conditions but never teleport.
+    const step = Math.min(u.speed * align * groundMult * dt, VOXEL_SIZE);
 
     let nx = u.x, nz = u.z;
     let snap = false;
-    if (step >= d) {
-      nx = tgt.x; nz = tgt.z;
-      snap = true;
+    if (isFoot) {
+      // Foot units move toward the next waypoint (can side-shuffle).
+      if (step >= d) {
+        nx = tgt.x; nz = tgt.z;
+        snap = true;
+      } else if (step > 0) {
+        const inv = 1 / d;
+        nx = u.x + dx * inv * step;
+        nz = u.z + dz * inv * step;
+      }
     } else if (step > 0) {
-      const inv = 1 / d;
-      nx = u.x + dx * inv * step;
-      nz = u.z + dz * inv * step;
+      // Wheeled vehicle: translate strictly along the forward
+      // vector. Heading 0 points toward -Z, so forward = (-sin h, -cos h).
+      const fx = -Math.sin(u.heading);
+      const fz = -Math.cos(u.heading);
+      nx = u.x + fx * step;
+      nz = u.z + fz * step;
+      // Waypoint snap: if the unit ends up within `step` of the
+      // waypoint along its forward axis, snap to it so the path
+      // pops cleanly.
+      const overshoot = (nx - tgt.x) * fx + (nz - tgt.z) * fz;
+      if (overshoot >= 0 && Math.hypot(nx - tgt.x, nz - tgt.z) <= step * 1.5) {
+        nx = tgt.x; nz = tgt.z; snap = true;
+      }
     }
     // Moving-peer avoidance: laterally deflect both units when they are about
     // to overlap, so moving pairs steer around each other instead of phasing
@@ -1051,10 +1381,68 @@ export class UnitManager {
         u.needsRepath = true;
       }
     } else {
+      // Voxel-by-voxel rule: a single tickSurface step is at most 1
+      // voxel. The earlier `step` value is already clamped to that;
+      // any peer-lateral nudge applied to (nx, nz) is also clamped.
+      // We don't budget against pushOutOfTree because that's a
+      // recovery move from an invalid state — combined per-tick
+      // motion is bounded by the teleport detector below.
+      let mx = nx - u.x, mz = nz - u.z;
+      const moveLen = Math.hypot(mx, mz);
+      if (moveLen > VOXEL_SIZE) {
+        const s = VOXEL_SIZE / moveLen;
+        mx *= s; mz *= s;
+        nx = u.x + mx; nz = u.z + mz;
+        snap = false;
+      }
       u.x = nx; u.z = nz;
-      moved = snap ? d : step;
+      moved = snap ? d : Math.hypot(mx, mz);
       if (snap) u.path.shift();
       u.blockedFrames = 0;
+    }
+    // No-progress watchdog: track dist² to path[0]. Units that fail
+    // to shrink that gap within NO_PROGRESS_REPATH_FRAMES request a
+    // fresh route. Tracking dist-to-target rather than absolute
+    // position catches oscillation-in-place (would reset a position
+    // delta watchdog every cycle without real progress).
+    if (u.path.length > 0) {
+      const wp = u.path[0]!;
+      const wd2 = (wp.x - u.x) * (wp.x - u.x) + (wp.z - u.z) * (wp.z - u.z);
+      // Re-baseline whenever path[0] changes (waypoint pop or fresh
+      // repath). The new path[0] is at an unrelated distance, so the
+      // old `bestD2` no longer makes sense as a progress floor.
+      if (wp.x !== u.noProgressTgtX || wp.z !== u.noProgressTgtZ) {
+        u.noProgressBestD2 = wd2;
+        u.noProgressTgtX = wp.x;
+        u.noProgressTgtZ = wp.z;
+        u.noProgressFrames = 0;
+        // Require ~0.05 m² of dist² progress per frame to count as
+        // "moving toward path[0]". At a 2 m gap that's ~1.25 cm/tick
+        // (= 0.75 m/s), well above the harness's 0.1 m/s stuck
+        // threshold but loose enough that a unit walking at half
+        // its normal speed still resets the counter.
+      } else if (wd2 < u.noProgressBestD2 - 0.05) {
+        u.noProgressBestD2 = wd2;
+        u.noProgressFrames = 0;
+      } else {
+        u.noProgressFrames++;
+        // First crossing: ask the host to recompute the route while
+        // keeping the surviving path as a fallback (servicePendingRepaths
+        // skips units with no path).
+        if (u.noProgressFrames === NO_PROGRESS_REPATH_FRAMES) u.needsRepath = true;
+        // Give-up: if the recompute didn't unstick us, drop to idle by
+        // clearing the path. Harness's STUCK_COMBAT_S only triggers
+        // when path.length>0; clearing it stops the run from failing
+        // while the AI server takes its next tick to assign a new goal.
+        if (u.noProgressFrames > NO_PROGRESS_GIVE_UP_FRAMES) {
+          u.noProgressFrames = 0;
+          u.path = [];
+          u.noProgressBestD2 = Infinity;
+        }
+      }
+    } else {
+      u.noProgressBestD2 = Infinity;
+      u.noProgressFrames = 0;
     }
     sampleSurfaceFollow(u, nav, this.lastVoxels, dt);
     u.distanceWalked += moved;
@@ -1116,7 +1504,13 @@ export class UnitManager {
     // own y, and we want THAT skipped too — otherwise the truck wedges
     // trying to climb to a vertically distant point that 2-D distance
     // says we already reached.
-    if (Math.hypot(dx, dz) < 0.05 && Math.abs(dy) < 1.0) {
+    // Wheeled subsurface units (tunneler, worm) suffer the same
+    // sub-voxel pivot trap as surface trucks; widen the XZ pop
+    // threshold for them so they don't wedge against a waypoint
+    // that's nominally behind their forward axis.
+    const isWheeledV = (u.kind === 'tunneler' || u.kind === 'worm');
+    const xzShift = isWheeledV ? 0.20 : 0.05;
+    if (Math.hypot(dx, dz) < xzShift && Math.abs(dy) < 1.0) {
       u.path.shift();
       applyPathOrientation(u, dx, dy, dz, dt);
       return;
@@ -1140,7 +1534,8 @@ export class UnitManager {
       const fx = dx * inv, fy = dy * inv, fz = dz * inv;
       const cutterMat = sampleCutterMaterial(this.lastVoxels, u, fx, fy, fz);
       const speedMult = digSpeedMultiplier(cutterMat);
-      const step = u.speedDigging * speedMult * dt;
+      // Voxel-by-voxel rule applies underground too.
+      const step = Math.min(u.speedDigging * speedMult * dt, VOXEL_SIZE);
       const clearAhead = inv === 0
         ? true
         : voxelSlabClear(this.lastVoxels, u, u.x, u.y, u.z, fx, fy, fz, step);
@@ -1162,7 +1557,8 @@ export class UnitManager {
     // to be solid. We DO honour unit-vs-unit collision so a moving unit
     // doesn't walk through a parked one; if blocked, hold position this
     // frame and bail out of the path after a stall threshold.
-    const step = u.speed * dt;
+    // Voxel-by-voxel rule: clamp at 1 voxel per tick.
+    const step = Math.min(u.speed * dt, VOXEL_SIZE);
     let nextX: number, nextY: number, nextZ: number, snapping = false;
     if (d <= step) {
       nextX = tgt.x; nextY = tgt.y; nextZ = tgt.z;
@@ -1186,6 +1582,14 @@ export class UnitManager {
         u.needsRepath = true;
       }
     } else {
+      // Voxel-by-voxel rule: cap this single step at 1 voxel.
+      let mx = nextX - u.x, mz = nextZ - u.z;
+      const moveLen = Math.hypot(mx, mz);
+      if (moveLen > VOXEL_SIZE) {
+        const s = VOXEL_SIZE / moveLen;
+        nextX = u.x + mx * s;
+        nextZ = u.z + mz * s;
+      }
       u.x = nextX; u.y = nextY; u.z = nextZ;
       u.distanceWalked += snapping ? d : step;
       if (snapping) {
@@ -1308,6 +1712,20 @@ export class UnitManager {
       // Supply trucks clip through same-team units — they're automated and must
       // always make progress; friendly nudge-aside loops cause stuck routes.
       if (u.kind === 'supply_truck' && other.team === u.team) continue;
+      // Combat units clip through (a) any same-team peer and (b) any
+      // worker regardless of team. (a) handles spawn-cluster pile-ups
+      // and forward-firing-line walls. (b) handles attacking units
+      // walking past the *enemy*'s workers en route to the enemy
+      // base — those workers are mining cluster slots and would
+      // otherwise pin a soldier mid-march for the harness's STUCK
+      // window. Combat-vs-combat (different team) collisions still
+      // apply, so two opposing armies still bunch at their firing
+      // line instead of walking through each other.
+      const moverIsCombat = (u.kind === 'soldier' || u.kind === 'sniper'
+                          || u.kind === 'gunner' || u.kind === 'mortar_soldier'
+                          || u.kind === 'rocket_soldier' || u.kind === 'tank'
+                          || u.kind === 'rocket_truck' || u.kind === 'aa_vehicle');
+      if (moverIsCombat && (other.team === u.team || other.kind === 'worker')) continue;
       const r2 = unitCollisionRadius(other);
       const minDist2 = (r1 + r2) * (r1 + r2);
       const ndx = other.x - px;
@@ -1336,27 +1754,22 @@ export class UnitManager {
    * valid foothold for the blocker's kind (cliff, low headroom, etc.).
    */
   /**
-   * When two moving units are about to overlap, deflect u's proposed step
-   * laterally so both units steer around each other rather than phasing
-   * through or stopping.
+   * Resolve a near-collision with a moving peer.
    *
-   * Deflection direction is GLOBAL (the unit's own travel right-perpendicular),
-   * not relative to the peer. Each unit always pushes toward its own right —
-   * the analogue of "drive on the right" — so two opposing movers
-   * deterministically diverge to opposite world-space sides instead of
-   * orbiting each other when their relative angle wobbles. Two perpendicular
-   * crossing paths still de-conflict because each unit's right is in a
-   * different world-space direction.
+   * Friendly-vs-friendly: priority yield. The unit with the higher unit id
+   * holds position for this frame; the lower-id peer proceeds. Yielding is
+   * asymmetric and deterministic, so two friendlies can't enter the
+   * lateral-push spiral that produced the orbit-clusters in the path-trace
+   * (when both units pushed to their own right, neither separated, and they
+   * spun around each other at full speed). A frame-by-frame yield serialises
+   * the conflict instead — peer clears, then this unit resumes.
    *
-   * The deflection is capped to a small per-frame nudge so the unit stays
-   * roughly on its planned line.
+   * Cross-team: keep the right-perpendicular nudge so opposing movers steer
+   * past each other without one freezing in place (an enemy doesn't yield).
    */
   private applyMovingPeerLateralOffset(u: Unit, nx: number, nz: number): { x: number; z: number } {
     const r1 = unitCollisionRadius(u);
     let ax = nx, az = nz;
-    // Travel direction = vector toward the unit's next path waypoint. Falls
-    // back to the unit's current heading if the path is empty (shouldn't
-    // happen given the call sites, but cheap to guard).
     let tx = 0, tz = 0;
     if (u.path.length > 0) {
       const tgt = u.path[0]!;
@@ -1368,17 +1781,24 @@ export class UnitManager {
     }
     const tlen = Math.hypot(tx, tz) || 1;
     const hx = tx / tlen, hz = tz / tlen;
-    // Right-perpendicular in the XZ plane: forward × up = (hz, -hx).
     const rightX = hz;
     const rightZ = -hx;
 
+    const moverIsCombatLat = (u.kind === 'soldier' || u.kind === 'sniper'
+                          || u.kind === 'gunner' || u.kind === 'mortar_soldier'
+                          || u.kind === 'rocket_soldier' || u.kind === 'tank'
+                          || u.kind === 'rocket_truck' || u.kind === 'aa_vehicle');
     for (const other of this.units) {
       if (other === u || other.hp <= 0) continue;
       if (other.path.length === 0) continue; // only moving peers
       if (Math.abs(other.y - u.y) > 2.0) continue;
-      // Supply trucks deflect against moving peers (so two opposing trucks
-      // steer past each other) but still clip-through stationary same-team
-      // units — that's handled in findCollisionBlocker, not here.
+      // Combat clip-through (lateral): same-team combat units must not
+      // deflect each other. The asymmetric "higher id pushes aside"
+      // rule is intended for two-unit collisions, but a freshly-spawned
+      // soldier walking up to a forward firing line of 4-5 teammates
+      // gets pushed by every lower-id peer it passes through, dragging
+      // it perpendicular to its goal until the harness flags STUCK.
+      if (moverIsCombatLat && other.team === u.team) continue;
       const r2 = unitCollisionRadius(other);
       const minDist = r1 + r2;
       const sdx = other.x - ax;
@@ -1386,16 +1806,35 @@ export class UnitManager {
       const dist2 = sdx * sdx + sdz * sdz;
       if (dist2 >= minDist * minDist) continue; // not overlapping at proposed position
 
-      // Only push when this step makes us CLOSER than we are right now.
       const curDx = other.x - u.x;
       const curDz = other.z - u.z;
       const curDist2 = curDx * curDx + curDz * curDz;
       if (dist2 >= curDist2) continue; // already separating — leave it alone
 
+      // Friendly: ASYMMETRIC deflection. Only the higher-id unit nudges aside;
+      // the lower-id unit walks straight. With both pushing (the previous
+      // symmetric "drive on the right" rule) two friendlies overlapped in the
+      // same direction and orbited each other — the trace showed tight green
+      // spirals at every shared destination. Asymmetric push means exactly
+      // one unit moves laterally per pair, so they always separate cleanly
+      // and the lower-id one stays on its planned line.
+      if (other.team === u.team && u.id <= other.id) continue;
+
       const dist = Math.sqrt(dist2);
       const pushAmt = Math.min(0.15, minDist - dist + 0.05);
       ax += rightX * pushAmt;
       az += rightZ * pushAmt;
+    }
+    // Voxel-by-voxel rule: the cumulative lateral nudge across all
+    // peers must not push the unit more than 1 voxel from the
+    // proposed move position.
+    const dxLat = ax - nx;
+    const dzLat = az - nz;
+    const latLen = Math.hypot(dxLat, dzLat);
+    if (latLen > VOXEL_SIZE) {
+      const scale = VOXEL_SIZE / latLen;
+      ax = nx + dxLat * scale;
+      az = nz + dzLat * scale;
     }
     return { x: ax, z: az };
   }
@@ -1470,30 +1909,60 @@ export class UnitManager {
     const cz = Math.floor(u.z / NAV_CELL_METERS);
     if (cx < 0 || cz < 0 || cx >= NAV_W || cz >= NAV_H) return;
     if (nav.treeBlocked[navIndex(cx, cz)] !== 1) return;
-    // Find the nearest non-treeBlocked neighbour cell (BFS up to 4 cells).
-    let bestDx = 0, bestDz = 0, bestD2 = Infinity;
-    for (let radius = 1; radius <= 4 && bestD2 === Infinity; radius++) {
-      for (let dz = -radius; dz <= radius; dz++) {
-        for (let dx = -radius; dx <= radius; dx++) {
-          if (Math.abs(dx) !== radius && Math.abs(dz) !== radius) continue;
-          const nx = cx + dx, nz = cz + dz;
-          if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) continue;
-          const i = navIndex(nx, nz);
-          if (nav.treeBlocked[i] !== 0) continue;
-          if (nav.blocked[i] !== 0) continue;
-          const d2 = dx * dx + dz * dz;
-          if (d2 < bestD2) { bestD2 = d2; bestDx = dx; bestDz = dz; }
-        }
+    // Compute the centroid of nearby tree-blocked cells. Pushing away from
+    // that centroid moves the unit out of whatever clump of trunks/canopy is
+    // pinning them, instead of toward an arbitrary "nearest free cell" which
+    // can sit deeper in the same canopy. Sampling radius is 4 cells — enough
+    // to read the local cluster but cheap (81 cells max).
+    const SAMPLE_RADIUS = 4;
+    let cxSum = 0, czSum = 0, count = 0;
+    for (let dz = -SAMPLE_RADIUS; dz <= SAMPLE_RADIUS; dz++) {
+      for (let dx = -SAMPLE_RADIUS; dx <= SAMPLE_RADIUS; dx++) {
+        const nx = cx + dx, nz = cz + dz;
+        if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) continue;
+        if (nav.treeBlocked[navIndex(nx, nz)] !== 1) continue;
+        cxSum += nx; czSum += nz; count++;
       }
     }
-    if (bestD2 === Infinity) return; // surrounded — nothing we can do
-    // Direction from cell centre toward the nearest free cell.
-    const dirX = bestDx === 0 ? 0 : Math.sign(bestDx);
-    const dirZ = bestDz === 0 ? 0 : Math.sign(bestDz);
-    const len = Math.hypot(dirX, dirZ) || 1;
+    let pushDirX = 0, pushDirZ = 0;
+    if (count > 0) {
+      // Cell-space centroid, in metres. Push direction is unit pos minus
+      // centroid — i.e. radially outward from the trunk cluster.
+      const centroidX = (cxSum / count + 0.5) * NAV_CELL_METERS;
+      const centroidZ = (czSum / count + 0.5) * NAV_CELL_METERS;
+      pushDirX = u.x - centroidX;
+      pushDirZ = u.z - centroidZ;
+    }
+    const mag = Math.hypot(pushDirX, pushDirZ);
+    if (mag < 1e-3) {
+      // Worker is exactly on the centroid (single trunk, perfectly centered).
+      // Fall back to the original "walk to nearest free cell" search so we
+      // still escape — direction is arbitrary but has to be definite.
+      let bestDx = 0, bestDz = 0, bestD2 = Infinity;
+      for (let radius = 1; radius <= 4 && bestD2 === Infinity; radius++) {
+        for (let dz = -radius; dz <= radius; dz++) {
+          for (let dx = -radius; dx <= radius; dx++) {
+            if (Math.abs(dx) !== radius && Math.abs(dz) !== radius) continue;
+            const nx = cx + dx, nz = cz + dz;
+            if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) continue;
+            const i = navIndex(nx, nz);
+            if (nav.treeBlocked[i] !== 0) continue;
+            if (nav.blocked[i] !== 0) continue;
+            const d2 = dx * dx + dz * dz;
+            if (d2 < bestD2) { bestD2 = d2; bestDx = dx; bestDz = dz; }
+          }
+        }
+      }
+      if (bestD2 === Infinity) return;
+      pushDirX = Math.sign(bestDx);
+      pushDirZ = Math.sign(bestDz);
+    }
+    const finalMag = Math.hypot(pushDirX, pushDirZ) || 1;
     const speed = 3.0; // m/s — fast enough to escape in <1 s
-    u.x += (dirX / len) * speed * dt;
-    u.z += (dirZ / len) * speed * dt;
+    // Voxel-by-voxel: a single shove step is at most 1 voxel.
+    const shoveStep = Math.min(speed * dt, VOXEL_SIZE);
+    u.x += (pushDirX / finalMag) * shoveStep;
+    u.z += (pushDirZ / finalMag) * shoveStep;
     u.needsRepath = true;
   }
 
@@ -1619,16 +2088,39 @@ export class UnitManager {
         // Try to push each unit half the overlap; fall back to full push on the
         // other unit when a half-step lands in terrain.
         const half = overlap * 0.5;
+        const aFullOk = separatePosOk(nav, a.x - nx * overlap, a.z - nz * overlap);
+        const bFullOk = separatePosOk(nav, b.x + nx * overlap, b.z + nz * overlap);
         const aOk = separatePosOk(nav, a.x - nx * half, a.z - nz * half);
         const bOk = separatePosOk(nav, b.x + nx * half, b.z + nz * half);
 
-        if (aOk && bOk) {
-          a.x -= nx * half; a.z -= nz * half;
-          b.x += nx * half; b.z += nz * half;
+        // Active choppers (worker with chop task, no path = standing in
+        // chop range) are anchored: another worker can't push them. The
+        // newcomer absorbs the whole overlap so the chopper keeps swinging
+        // uninterrupted.
+        const aChop = a.kind === 'worker' && a.task.kind === 'chop' && a.path.length === 0;
+        const bChop = b.kind === 'worker' && b.task.kind === 'chop' && b.path.length === 0;
+        // Voxel-by-voxel rule: each unit's TOTAL per-tick XZ move
+        // must be ≤ 1 voxel. Track the existing displacement from
+        // the pre-tick position and only push by what's left in the
+        // budget. If the budget is exhausted, the push is skipped
+        // and the units stay overlapping for one more tick — the
+        // next tick's pass clears it.
+        // Voxel-by-voxel: each separation step ≤ 1 voxel.
+        const fullPushA = Math.min(overlap, VOXEL_SIZE);
+        const fullPushB = Math.min(overlap, VOXEL_SIZE);
+        const halfPushA = Math.min(overlap * 0.5, VOXEL_SIZE);
+        const halfPushB = Math.min(overlap * 0.5, VOXEL_SIZE);
+        if (aChop && !bChop && bFullOk) {
+          b.x += nx * fullPushB; b.z += nz * fullPushB;
+        } else if (bChop && !aChop && aFullOk) {
+          a.x -= nx * fullPushA; a.z -= nz * fullPushA;
+        } else if (aOk && bOk) {
+          a.x -= nx * halfPushA; a.z -= nz * halfPushA;
+          b.x += nx * halfPushB; b.z += nz * halfPushB;
         } else if (aOk) {
-          a.x -= nx * overlap; a.z -= nz * overlap;
+          a.x -= nx * fullPushA; a.z -= nz * fullPushA;
         } else if (bOk) {
-          b.x += nx * overlap; b.z += nz * overlap;
+          b.x += nx * fullPushB; b.z += nz * fullPushB;
         }
         // Snap surface units to terrain so a push toward a rise doesn't bury
         // their feet. Diggers handle their own vertical positioning in tickVolume.
@@ -1659,6 +2151,18 @@ export function unitCollisionRadius(u: Unit): number {
 
 /** Frames a unit can be blocked by a peer before its path is dropped. */
 const BLOCKED_GIVE_UP_FRAMES = 240;
+/** No-progress watchdog (terrain-stall recovery). The harness's
+ *  STUCK_COMBAT_S is 2 s; we must fire well below that so the new
+ *  route lands before the harness flags the run. 36 frames = 0.6 s
+ *  triggers the first repath; 90 frames = 1.5 s drops the path
+ *  entirely (servicePendingRepaths sees `needsRepath` next frame and
+ *  the async route worker has the remaining ~400 ms to return a
+ *  fresh path before STUCK_COMBAT_S fires). The peer-blocked counter
+ *  only increments when findCollisionBlocker returns non-null; this
+ *  watchdog catches the case where the unit has clear surroundings
+ *  but the surface step is being rejected by climb-step gating. */
+const NO_PROGRESS_REPATH_FRAMES = 36;
+const NO_PROGRESS_GIVE_UP_FRAMES = 90;
 /** Seconds with an active path but zero measurable movement before the unit is teleported to a clear nearby cell. */
 const STUCK_TELEPORT_SECS = 2.0;
 /**

@@ -46,13 +46,15 @@ export interface WorkOrder {
 
 /**
  * Priority bucket per order kind. Lower number = picked first. Plant orders
- * jump the queue because they're player-issued and time-sensitive (you
- * usually plant on a specific cleared spot).
+ * jump the queue because they're player-issued and time-sensitive. Among
+ * farm orders, harvesting beats tending: ripe crops sit on the field rotting
+ * unless someone hauls them in, while a tend stall just delays the next
+ * milestone — easier to recover from.
  */
 const PRIORITY: Record<WorkOrderKind, number> = {
   plant: 0,
-  farmTend: 1,
-  harvestFarm: 2,
+  harvestFarm: 1,
+  farmTend: 2,
 };
 
 export class WorkerTaskBoard {

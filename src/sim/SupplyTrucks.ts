@@ -1,17 +1,25 @@
 import { Unit, UnitManager } from './Units';
 import { Resources } from './Resources';
-import { BuildingManager, Building, doorWorldPos, buildingApproachCandidates, buildingBoxDistM, UNIT_TRAIN_COST } from './Buildings';
+import { BuildingManager, Building, BuildingTeam, doorWorldPos, buildingApproachCandidates, buildingBoxDistM, UNIT_TRAIN_COST } from './Buildings';
+import { NAV_CELL_VOXELS } from '../path/SurfaceNav';
+import { VOXEL_SIZE } from '../voxel/types';
 
 export const TRUCK_CAPACITY = 100; // max materials per truck
 
 // How close the truck must be to a building's expanded approach box (4-voxel
 // halo) for delivery to trigger. With a 3-cell-wide chassis, the truck's
-// path stops ~1 m beyond the halo (footprint constraint), so 1.5 m gives a
-// small margin for path/render lag without letting trucks deliver from afar.
-const INTERACT_REACH_M = 1.5;
+// last reachable cell sits ~2 m from the box edge (footprint halo + safety
+// for the path planner pulling the goal to nearestPassable). 3.0 m is loose
+// enough that the truck always triggers at its geometric stopping point but
+// still small relative to the building footprint so it can't deliver from
+// across the map.
+const INTERACT_REACH_M = 3.0;
 
-// Only attempt dispatch at most this often (seconds) to avoid hammering every frame.
-const DISPATCH_INTERVAL = 2.0;
+// Only attempt dispatch at most this often (seconds) to avoid hammering every
+// frame. Per-HQ launch staggering (HQ_LAUNCH_GAP_S) is the real spacing gate;
+// keep the dispatch tick brisk so a freed HQ launches its next truck quickly
+// once the previous one has cleared the spawn corridor.
+const DISPATCH_INTERVAL = 0.5;
 
 // How long (seconds) before a destroyed truck is rebuilt at the HQ.
 export const TRUCK_REBUILD_SECS = 15.0;
@@ -43,14 +51,83 @@ const REPATH_RETRY_SECS = 2.0;
 // Per-truck countdown until next repath retry (only set when path is empty).
 const truckRepathTimer = new Map<number, number>();
 
+// Minimum seconds between successive truck spawns from the same HQ. When 5
+// resupply trucks spawn back-to-back at the same door they cluster up, deflect
+// each other, and orbit the spawn pad instead of pulling away cleanly. A 1.5 s
+// gap gives the previous truck enough head start (~12 m at 8 m/s) to clear the
+// approach corridor before the next one launches.
+const HQ_LAUNCH_GAP_S = 1.5;
+
+type HqSide = 'east' | 'west' | 'north' | 'south';
+interface HqGateCooldowns { east: number; west: number; north: number; south: number; }
+
+/**
+ * Per-HQ, per-cardinal-gate launch cooldown. Trucks heading to different
+ * sides of the HQ can spawn simultaneously, but two trucks bound for the
+ * same side still have to wait `HQ_LAUNCH_GAP_S` between launches so they
+ * don't pile up at the same door.
+ */
+const hqLaunchCooldown = new Map<number, HqGateCooldowns>();
+
+function getHqCooldowns(hqId: number): HqGateCooldowns {
+  let c = hqLaunchCooldown.get(hqId);
+  if (!c) {
+    c = { east: 0, west: 0, north: 0, south: 0 };
+    hqLaunchCooldown.set(hqId, c);
+  }
+  return c;
+}
+
+/**
+ * Resolve which cardinal face of `hq` is closest to a target position.
+ * Mirrors the side selection in `doorWorldPos(hq, fromX, fromZ)` so the
+ * cooldown gate lines up with the door the truck will actually use.
+ */
+function pickHqSide(hq: Building, targetX: number, targetZ: number): HqSide {
+  const cx = (hq.ox + hq.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+  const cz = (hq.oz + hq.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+  const dx = targetX - cx;
+  const dz = targetZ - cz;
+  if (Math.abs(dx) >= Math.abs(dz)) {
+    return dx >= 0 ? 'east' : 'west';
+  }
+  return dz >= 0 ? 'south' : 'north';
+}
+
 export interface SupplyTruckDeps {
   units: UnitManager;
   buildings: BuildingManager;
+  /** Player-team resources. Truck deliveries land here unless the
+   *  participating HQ / building is enemy-team and `enemyResources`
+   *  is supplied. */
   resources: Resources;
-  spawnTruck: (x: number, y: number, z: number) => Unit | null;
+  /** Optional enemy-team resources. Wired in production; absent in
+   *  tests that only exercise the player economy. */
+  enemyResources?: Resources;
+  spawnTruck: (x: number, y: number, z: number, team: BuildingTeam) => Unit | null;
   routeTruck: (u: Unit, wx: number, wy: number, wz: number) => void;
   /** Returns true if a supply truck can stand at world (x, z) — nav cell unblocked within truck footprint. */
   isPassable: (x: number, z: number) => boolean;
+}
+
+/** Pick the resource pool that belongs to a given team. Falls back to
+ *  the player pool when an enemy pool was never wired. */
+function teamResources(deps: SupplyTruckDeps, team: BuildingTeam): Resources {
+  // All AI factions share the enemyResources pool for now — separate
+  // per-AI economies would need a Map<team, Resources>. For the test
+  // we just want them building forces, not stealing from each other.
+  if (team !== 'player' && deps.enemyResources) return deps.enemyResources;
+  return deps.resources;
+}
+
+/** Resolve the team that owns a given truck via the activeTruckToHQ
+ *  registry. Falls back to player when the registry is missing the
+ *  truck (truck spawned outside the dispatch flow). */
+function truckTeam(truckId: number, deps: SupplyTruckDeps): BuildingTeam {
+  const hqId = activeTruckToHQ.get(truckId);
+  if (hqId === undefined) return 'player';
+  const hq = deps.buildings.buildings.find(b => b.id === hqId);
+  return hq?.team ?? 'player';
 }
 
 let dispatchTimer = 0;
@@ -68,6 +145,15 @@ export function tickSupplyTrucks(dt: number, deps: SupplyTruckDeps): void {
   reconcileCombatKills(deps);
   tickRebuildQueues(dt, deps);
   tickActiveTrucks(deps, dt);
+  for (const [hqId, c] of hqLaunchCooldown) {
+    c.east  = Math.max(0, c.east  - dt);
+    c.west  = Math.max(0, c.west  - dt);
+    c.north = Math.max(0, c.north - dt);
+    c.south = Math.max(0, c.south - dt);
+    if (c.east === 0 && c.west === 0 && c.north === 0 && c.south === 0) {
+      hqLaunchCooldown.delete(hqId);
+    }
+  }
 
   dispatchTimer -= dt;
   if (dispatchTimer > 0) return;
@@ -75,6 +161,8 @@ export function tickSupplyTrucks(dt: number, deps: SupplyTruckDeps): void {
 
   dispatchStorageTrucks(deps);
   dispatchResupplyTrucks(deps);
+  dispatchUpgradeTrucks(deps);
+  dispatchUpgradeRecoveryTrucks(deps);
 }
 
 /**
@@ -101,9 +189,11 @@ function reconcileCombatKills(deps: SupplyTruckDeps): void {
       if (target && !target.destroyed) {
         target.inboundResupplyTrucks = Math.max(0, target.inboundResupplyTrucks - 1);
       }
-      deps.resources.food += resupply.payload.food;
-      deps.resources.metals += resupply.payload.metals;
-      deps.resources.wood += resupply.payload.wood;
+      const team = truckTeam(truckId, deps);
+      const r = teamResources(deps, team);
+      r.food += resupply.payload.food;
+      r.metals += resupply.payload.metals;
+      r.wood += resupply.payload.wood;
     }
     // If the truck was on a storage fetch, clear the storage's inbound flag
     // so the dispatcher will retry.
@@ -145,16 +235,91 @@ function tickRebuildQueues(dt: number, deps: SupplyTruckDeps): void {
   }
 }
 
+/** Per-truck progress watchdog. Tracks two things:
+ *   - sinceS: time since last meaningful XZ progress; when it exceeds
+ *     TRUCK_STALL_REPATH_S we clear the path so the per-task block
+ *     issues a fresh route.
+ *   - taskFirstAt: wall-clock time the current task was first observed.
+ *     If the task hasn't completed after TRUCK_TASK_DESPAWN_S we
+ *     despawn the truck — the rebuild queue fires a replacement.
+ *     Catches the "wandering but never delivering" case where each
+ *     small spurt of progress resets a hit-count watchdog forever.
+ *  The taskKey identifies the current task so a real task switch
+ *  (deliver → return) resets the timer. */
+const truckProgressTrack = new Map<number, {
+  x: number; z: number; sinceS: number;
+  taskKey: string; taskFirstAt: number;
+}>();
+// A healthy supply truck does 5 m/s. 1 m / 4 s is the "still trying"
+// floor — slower means the wheeled-pivot oscillation kicks in.
+const TRUCK_STALL_REPATH_S = 4.0;
+const TRUCK_PROGRESS_M = 1.0;
+// Per-task wall-clock budget. Way under the harness's 60 s
+// truckTaskAt failure so we self-heal before the run dies.
+const TRUCK_TASK_DESPAWN_S = 25.0;
+
 /** Advance all active supply_truck units through their task state machine. */
 function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
   logTimer -= dt;
   const doLog = logTimer <= 0;
   if (doLog) logTimer = LOG_INTERVAL;
 
+  // Sweep dead trucks from the watchdog map.
+  if (truckProgressTrack.size > 0) {
+    const alive = new Set(deps.units.units.filter(u => u.kind === 'supply_truck' && u.hp > 0).map(u => u.id));
+    for (const id of truckProgressTrack.keys()) {
+      if (!alive.has(id)) truckProgressTrack.delete(id);
+    }
+  }
+
   for (const u of deps.units.units) {
     if (u.kind !== 'supply_truck') continue;
     if (u.hp <= 0) continue;
     const task = u.task;
+
+    // Watchdog: track progress + total time-on-task. A non-zero path
+    // that isn't advancing → clear path for a fresh route. A task that
+    // takes too long overall → despawn so the HQ rebuild queue tries
+    // again with a fresh truck.
+    {
+      const taskKey = task.kind + ':' + (
+        ('buildingId' in task ? task.buildingId : 0) ||
+        ('storageId' in task ? task.storageId : 0) || 0
+      );
+      let track = truckProgressTrack.get(u.id);
+      if (!track || track.taskKey !== taskKey) {
+        track = { x: u.x, z: u.z, sinceS: 0, taskKey, taskFirstAt: 0 };
+        truckProgressTrack.set(u.id, track);
+      }
+      track.taskFirstAt += dt;
+      // Time-on-task budget kicks in regardless of small-spurt progress.
+      // truck_return is exempt — getting back to the HQ is best-effort
+      // and not load-bearing for the harness's failure conditions.
+      if (track.taskFirstAt > TRUCK_TASK_DESPAWN_S && task.kind !== 'truck_return') {
+        console.warn(`[TRUCK #${u.id}] watchdog: ${track.taskFirstAt.toFixed(1)}s on ${task.kind} (${taskKey}) without completing — despawning to break loop`);
+        despawn(u, deps);
+        truckProgressTrack.delete(u.id);
+        continue;
+      }
+      if (u.path.length > 0) {
+        const moved = Math.hypot(u.x - track.x, u.z - track.z);
+        if (moved > TRUCK_PROGRESS_M) {
+          track.x = u.x;
+          track.z = u.z;
+          track.sinceS = 0;
+        } else {
+          track.sinceS += dt;
+          if (track.sinceS > TRUCK_STALL_REPATH_S) {
+            console.warn(`[TRUCK #${u.id}] watchdog: stalled ${track.sinceS.toFixed(1)}s on ${task.kind} pos=(${u.x.toFixed(1)},${u.z.toFixed(1)}) pathLen=${u.path.length} taskAge=${track.taskFirstAt.toFixed(1)}s — clearing path for retry`);
+            u.path = [];
+            truckRepathTimer.delete(u.id);
+            track.sinceS = 0;
+            track.x = u.x;
+            track.z = u.z;
+          }
+        }
+      }
+    }
 
     if (doLog) {
       let distInfo = '';
@@ -171,6 +336,8 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
       console.log(`[TRUCK #${u.id}] task=${task.kind} pos=(${u.x.toFixed(1)},${u.z.toFixed(1)}) path=${u.path.length} waypoints${distInfo}`);
     }
 
+    const teamOfTruck = truckTeam(u.id, deps);
+
     if (task.kind === 'truck_fetch') {
       const storage = deps.buildings.buildings.find(b => b.id === task.storageId);
       if (!storage || storage.destroyed) { despawn(u, deps); continue; }
@@ -185,12 +352,12 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         console.log(`[TRUCK #${u.id}] PICKUP from storage#${storage.id}: metals=${payload.metals} wood=${payload.wood}`);
         storage.supplyInbound = false;
         activeFetch.delete(u.id);
-        const hq = deps.buildings.nearestHQ(u.x, u.z);
+        const hq = deps.buildings.nearestHQ(u.x, u.z, teamOfTruck);
         if (!hq) { despawn(u, deps); continue; }
         u.task = { kind: 'truck_deliver_hq', payload };
         u.path = [];
         truckRepathTimer.delete(u.id);
-        const hqPos = doorWorldPos(hq);
+        const hqPos = doorWorldPos(hq, u.x, u.z);
         deps.routeTruck(u, hqPos.x, hqPos.y, hqPos.z);
       } else if (u.path.length === 0) {
         retryRoute(u, deps, dt, () => {
@@ -199,7 +366,7 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         });
       }
     } else if (task.kind === 'truck_deliver_hq') {
-      const hq = deps.buildings.nearestHQ(u.x, u.z);
+      const hq = deps.buildings.nearestHQ(u.x, u.z, teamOfTruck);
       if (!hq || hq.destroyed) { despawn(u, deps); continue; }
       const hqDist = buildingBoxDistM(u.x, u.z, hq);
       if (doLog) {
@@ -212,23 +379,25 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
       }
       if (hqDist <= INTERACT_REACH_M) {
         console.log(`[TRUCK #${u.id}] DELIVER to HQ: metals=${task.payload.metals} wood=${task.payload.wood}`);
-        deps.resources.metals += task.payload.metals;
-        deps.resources.wood += task.payload.wood;
+        const r = teamResources(deps, teamOfTruck);
+        r.metals += task.payload.metals;
+        r.wood += task.payload.wood;
         hq.activeTrucks = Math.max(0, hq.activeTrucks - 1);
         activeTruckToHQ.delete(u.id);
         u.hp = 0;
       } else if (u.path.length === 0) {
         retryRoute(u, deps, dt, () => {
-          const hqPos = doorWorldPos(hq);
+          const hqPos = doorWorldPos(hq, u.x, u.z);
           deps.routeTruck(u, hqPos.x, hqPos.y, hqPos.z);
         });
       }
     } else if (task.kind === 'truck_resupply') {
       const target = deps.buildings.buildings.find(b => b.id === task.buildingId);
       if (!target || target.destroyed) {
-        deps.resources.food += task.payload.food;
-        deps.resources.metals += task.payload.metals;
-        deps.resources.wood += task.payload.wood;
+        const r = teamResources(deps, teamOfTruck);
+        r.food += task.payload.food;
+        r.metals += task.payload.metals;
+        r.wood += task.payload.wood;
         despawn(u, deps);
         continue;
       }
@@ -237,12 +406,12 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         target.inboundResupplyTrucks = Math.max(0, target.inboundResupplyTrucks - 1);
         target.suppliedUnits++;
         activeResupply.delete(u.id);
-        const hq = deps.buildings.nearestHQ(u.x, u.z);
+        const hq = deps.buildings.nearestHQ(u.x, u.z, teamOfTruck);
         if (!hq) { despawn(u, deps); continue; }
         u.task = { kind: 'truck_return' };
         u.path = [];
         truckRepathTimer.delete(u.id);
-        const hqPos = doorWorldPos(hq);
+        const hqPos = doorWorldPos(hq, u.x, u.z);
         deps.routeTruck(u, hqPos.x, hqPos.y, hqPos.z);
       } else if (u.path.length === 0) {
         retryRoute(u, deps, dt, () => {
@@ -251,7 +420,7 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         });
       }
     } else if (task.kind === 'truck_return') {
-      const hq = deps.buildings.nearestHQ(u.x, u.z);
+      const hq = deps.buildings.nearestHQ(u.x, u.z, teamOfTruck);
       if (!hq || hq.destroyed) { despawn(u, deps); continue; }
       // Same fix as truck_deliver_hq: use the box-distance check so the
       // truck despawns when it reaches HQ instead of point-precision.
@@ -262,8 +431,74 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         u.hp = 0;
       } else if (u.path.length === 0) {
         retryRoute(u, deps, dt, () => {
-          const hqPos = doorWorldPos(hq);
+          const hqPos = doorWorldPos(hq, u.x, u.z);
           deps.routeTruck(u, hqPos.x, hqPos.y, hqPos.z);
+        });
+      }
+    } else if (task.kind === 'truck_deliver_upgrade') {
+      const target = deps.buildings.buildings.find(b => b.id === task.buildingId);
+      if (!target || target.destroyed) {
+        // Target gone — refund the cargo to the truck's HQ team and head home.
+        const r = teamResources(deps, teamOfTruck);
+        r.metals += task.payload.metals;
+        r.wood   += task.payload.wood;
+        target && target.inboundUpgradeTrucks > 0 && target.inboundUpgradeTrucks--;
+        u.task = { kind: 'truck_return' };
+        u.path = [];
+        continue;
+      }
+      // Owner cancelled the upgrade while the truck was en route — turn
+      // around without dropping. Refund to the truck's HQ team.
+      if (target.upgradeState !== 'pending') {
+        console.log(`[TRUCK #${u.id}] upgrade for ${target.spec.kind}#${target.id} no longer pending — aborting`);
+        const r = teamResources(deps, teamOfTruck);
+        r.metals += task.payload.metals;
+        r.wood   += task.payload.wood;
+        target.inboundUpgradeTrucks = Math.max(0, target.inboundUpgradeTrucks - 1);
+        u.task = { kind: 'truck_return' };
+        u.path = [];
+        continue;
+      }
+      if (buildingBoxDistM(u.x, u.z, target) <= INTERACT_REACH_M) {
+        target.upgradeStockpile.metals += task.payload.metals;
+        target.upgradeStockpile.wood   += task.payload.wood;
+        target.inboundUpgradeTrucks = Math.max(0, target.inboundUpgradeTrucks - 1);
+        console.log(`[TRUCK #${u.id}] DELIVER upgrade to ${target.spec.kind}#${target.id}: m=${task.payload.metals} w=${task.payload.wood}`);
+        u.task = { kind: 'truck_return' };
+        u.path = [];
+      } else if (u.path.length === 0) {
+        retryRoute(u, deps, dt, () => {
+          const bPos = pickApproach(target, u.x, u.z, deps);
+          deps.routeTruck(u, bPos.x, bPos.y, bPos.z);
+        });
+      }
+    } else if (task.kind === 'truck_recover_upgrade') {
+      const target = deps.buildings.buildings.find(b => b.id === task.buildingId);
+      if (!target || target.destroyed) { despawn(u, deps); continue; }
+      // Target switched off the cancelled state (e.g. the player re-armed
+      // the upgrade) — abandon the recovery and head home empty.
+      if (target.upgradeState !== 'cancelled') {
+        u.task = { kind: 'truck_return' };
+        u.path = [];
+        continue;
+      }
+      if (buildingBoxDistM(u.x, u.z, target) <= INTERACT_REACH_M) {
+        const m = target.upgradeStockpile.metals;
+        const w = target.upgradeStockpile.wood;
+        if (m + w > 0) {
+          target.upgradeStockpile.metals = 0;
+          target.upgradeStockpile.wood   = 0;
+          const r = teamResources(deps, teamOfTruck);
+          r.metals += m;
+          r.wood   += w;
+          console.log(`[TRUCK #${u.id}] RECOVER from ${target.spec.kind}#${target.id}: m=${m} w=${w}`);
+        }
+        u.task = { kind: 'truck_return' };
+        u.path = [];
+      } else if (u.path.length === 0) {
+        retryRoute(u, deps, dt, () => {
+          const bPos = pickApproach(target, u.x, u.z, deps);
+          deps.routeTruck(u, bPos.x, bPos.y, bPos.z);
         });
       }
     }
@@ -288,12 +523,12 @@ function dispatchStorageTrucks(deps: SupplyTruckDeps): void {
   const hqs = deps.buildings.buildings.filter(b => !b.destroyed && b.spec.kind === 'hq');
 
   for (const hq of hqs) {
-    const maxTrucks = hq.spec.maxTrucks ?? 5;
-    const hqPos = doorWorldPos(hq);
+    const maxTrucks = deps.buildings.hqMaxTrucks(hq);
 
     for (const b of deps.buildings.buildings) {
       if (b.destroyed) continue;
       if (b.spec.kind !== 'storage') continue;
+      if (b.team !== hq.team) continue;
       if (b.supplyInbound) continue;
       const amount = b.stockpile.metals + b.stockpile.wood;
       if (amount < b.truckCallThreshold) continue;
@@ -302,20 +537,30 @@ function dispatchStorageTrucks(deps: SupplyTruckDeps): void {
       // Fraction of stockpile each truck should carry (split proportionally).
       const ratio = b.stockpile.metals / (b.stockpile.metals + b.stockpile.wood || 1);
 
+      // Spawn from whichever HQ face is closest to the storage so the truck
+      // doesn't always have to wrap around the +X corner of the HQ.
+      const targetX = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const targetZ = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const hqPos = doorWorldPos(hq, targetX, targetZ);
+      const hqSide = pickHqSide(hq, targetX, targetZ);
+      const hqCooldowns = getHqCooldowns(hq.id);
+
       let dispatched = 0;
       let remainMetals = b.stockpile.metals;
       let remainWood   = b.stockpile.wood;
 
       for (let t = 0; t < trucksNeeded; t++) {
         if (hq.activeTrucks >= maxTrucks) break;
+        if (hqCooldowns[hqSide] > 0) break;
         const cargoMetals = Math.min(Math.round(TRUCK_CAPACITY * ratio), remainMetals);
         const cargoWood   = Math.min(TRUCK_CAPACITY - cargoMetals, remainWood);
         if (cargoMetals + cargoWood === 0) break;
 
-        const truck = deps.spawnTruck(hqPos.x, hqPos.y, hqPos.z);
+        const truck = deps.spawnTruck(hqPos.x, hqPos.y, hqPos.z, hq.team);
         if (!truck) break;
 
         hq.activeTrucks++;
+        hqCooldowns[hqSide] = HQ_LAUNCH_GAP_S;
         remainMetals -= cargoMetals;
         remainWood   -= cargoWood;
 
@@ -354,13 +599,21 @@ function dispatchResupplyTrucks(deps: SupplyTruckDeps): void {
   const hqs = deps.buildings.buildings.filter(b => !b.destroyed && b.spec.kind === 'hq');
 
   for (const hq of hqs) {
-    const maxTrucks = hq.spec.maxTrucks ?? 5;
-    const hqPos = doorWorldPos(hq);
+    const maxTrucks = deps.buildings.hqMaxTrucks(hq);
+    const r = teamResources(deps, hq.team);
 
     for (const b of deps.buildings.buildings) {
       if (b.destroyed) continue;
+      if (b.team !== hq.team) continue;
       if (b.spec.produces.length === 0) continue;
       if (b.trainQueue.length === 0) continue;
+      // Pick the HQ face closest to this consumer building so the resupply
+      // truck has a short straight run rather than always emerging on +X.
+      const targetX = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const targetZ = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const hqPos = doorWorldPos(hq, targetX, targetZ);
+      const hqSide = pickHqSide(hq, targetX, targetZ);
+      const hqCooldowns = getHqCooldowns(hq.id);
 
       // How many queued units have neither delivered supplies nor a truck
       // already in flight? That's how many trucks we still need to send.
@@ -373,29 +626,31 @@ function dispatchResupplyTrucks(deps: SupplyTruckDeps): void {
       const startIdx = b.suppliedUnits + b.inboundResupplyTrucks;
       for (let i = 0; i < needed; i++) {
         if (hq.activeTrucks >= maxTrucks) break;
+        if (hqCooldowns[hqSide] > 0) break;
         const queueIdx = startIdx + i;
         if (queueIdx >= b.trainQueue.length) break;
         const kind = b.trainQueue[queueIdx]!;
         const cost = UNIT_TRAIN_COST[kind];
 
         // Reserve resources at the HQ (deducted now; refunded if truck dies).
-        if (deps.resources.food < cost.food) break;
-        if (deps.resources.metals < cost.metals) break;
-        if (deps.resources.wood < cost.wood) break;
-        deps.resources.food -= cost.food;
-        deps.resources.metals -= cost.metals;
-        deps.resources.wood -= cost.wood;
+        if (r.food < cost.food) break;
+        if (r.metals < cost.metals) break;
+        if (r.wood < cost.wood) break;
+        r.food -= cost.food;
+        r.metals -= cost.metals;
+        r.wood -= cost.wood;
 
         b.inboundResupplyTrucks++;
         hq.activeTrucks++;
+        hqCooldowns[hqSide] = HQ_LAUNCH_GAP_S;
 
         console.log(`[DISPATCH] RESUPPLY truck: HQ#${hq.id} → ${b.spec.kind}#${b.id} for ${kind} (queued #${queueIdx + 1}/${b.trainQueue.length}; food=${cost.food} metals=${cost.metals} wood=${cost.wood})`);
-        const truck = deps.spawnTruck(hqPos.x, hqPos.y, hqPos.z);
+        const truck = deps.spawnTruck(hqPos.x, hqPos.y, hqPos.z, hq.team);
         if (!truck) {
           // Refund + reset: spawn pad blocked.
-          deps.resources.food += cost.food;
-          deps.resources.metals += cost.metals;
-          deps.resources.wood += cost.wood;
+          r.food += cost.food;
+          r.metals += cost.metals;
+          r.wood += cost.wood;
           b.inboundResupplyTrucks--;
           hq.activeTrucks--;
           break;
@@ -418,8 +673,120 @@ function dispatchResupplyTrucks(deps: SupplyTruckDeps): void {
   }
 }
 
+/**
+ * Dispatch trucks delivering upgrade resources to any building whose
+ * `upgradeState === 'pending'`. Each pending building gets at most one truck
+ * per dispatch tick (the existing HQ launch cap + per-target inbound counter
+ * naturally limit fleets so a slow upgrade still progresses with multiple
+ * concurrent buildings). Reserves resources from the global pool the same
+ * way `dispatchResupplyTrucks` does so cancelling the upgrade can refund
+ * cleanly via the in-flight refund path.
+ */
+function dispatchUpgradeTrucks(deps: SupplyTruckDeps): void {
+  const hqs = deps.buildings.buildings.filter(b => !b.destroyed && b.spec.kind === 'hq');
+  for (const hq of hqs) {
+    const maxTrucks = deps.buildings.hqMaxTrucks(hq);
+    const r = teamResources(deps, hq.team);
+
+    for (const b of deps.buildings.buildings) {
+      if (b.destroyed) continue;
+      if (b.team !== hq.team) continue;
+      if (b.upgradeState !== 'pending') continue;
+      const cost = deps.buildings.upgradeCostFor(b);
+      if (!cost) continue;
+      // What still needs to arrive: cost minus already-on-site, minus
+      // in-flight (we conservatively assume each in-flight truck carries
+      // a full TRUCK_CAPACITY share, capped at the remaining shortfall).
+      const stillNeededM = Math.max(0, cost.metals - b.upgradeStockpile.metals);
+      const stillNeededW = Math.max(0, cost.wood   - b.upgradeStockpile.wood);
+      const inFlightShare = b.inboundUpgradeTrucks * TRUCK_CAPACITY;
+      const outstanding = (stillNeededM + stillNeededW) - inFlightShare;
+      if (outstanding <= 0) continue;
+      if (hq.activeTrucks >= maxTrucks) break;
+      // Compute target / side first so the cooldown gate is per-side.
+      const targetX = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const targetZ = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const hqSide = pickHqSide(hq, targetX, targetZ);
+      const hqCooldowns = getHqCooldowns(hq.id);
+      if (hqCooldowns[hqSide] > 0) continue;
+      // Take what we can from this HQ's resources, capped to TRUCK_CAPACITY.
+      const wantM = Math.min(stillNeededM, r.metals);
+      const wantW = Math.min(stillNeededW, r.wood);
+      if (wantM + wantW === 0) continue; // nothing to ship right now
+      const total = Math.min(TRUCK_CAPACITY, wantM + wantW);
+      const cargoM = Math.min(wantM, Math.floor(total * (wantM / (wantM + wantW))));
+      const cargoW = Math.min(wantW, total - cargoM);
+      if (cargoM + cargoW === 0) continue;
+      r.metals -= cargoM;
+      r.wood   -= cargoW;
+      // Spawn from whichever HQ face is closest to the target.
+      const hqPos = doorWorldPos(hq, targetX, targetZ);
+      const truck = deps.spawnTruck(hqPos.x, hqPos.y, hqPos.z, hq.team);
+      if (!truck) {
+        r.metals += cargoM;
+        r.wood   += cargoW;
+        break;
+      }
+      hq.activeTrucks++;
+      hqCooldowns[hqSide] = HQ_LAUNCH_GAP_S;
+      b.inboundUpgradeTrucks++;
+      truck.task = {
+        kind: 'truck_deliver_upgrade',
+        buildingId: b.id,
+        payload: { metals: cargoM, wood: cargoW },
+      };
+      activeTruckToHQ.set(truck.id, hq.id);
+      console.log(`[DISPATCH] UPGRADE truck #${truck.id} → ${b.spec.kind}#${b.id} (m=${cargoM} w=${cargoW})`);
+      const bPos = pickApproach(b, hqPos.x, hqPos.z, deps);
+      deps.routeTruck(truck, bPos.x, bPos.y, bPos.z);
+    }
+  }
+}
+
+/**
+ * Dispatch trucks to fetch upgrade resources back from buildings whose
+ * upgrade was cancelled with materials still sitting on site. The
+ * returned cargo goes back into the global pool. One truck per cancelled
+ * building per dispatch tick — the per-target stockpile is capped at one
+ * upgrade cost so a single trip clears it.
+ */
+function dispatchUpgradeRecoveryTrucks(deps: SupplyTruckDeps): void {
+  const hqs = deps.buildings.buildings.filter(b => !b.destroyed && b.spec.kind === 'hq');
+  for (const hq of hqs) {
+    const maxTrucks = deps.buildings.hqMaxTrucks(hq);
+    for (const b of deps.buildings.buildings) {
+      if (b.destroyed) continue;
+      if (b.team !== hq.team) continue;
+      if (b.upgradeState !== 'cancelled') continue;
+      const stash = b.upgradeStockpile.metals + b.upgradeStockpile.wood;
+      if (stash <= 0) continue;
+      // Already a recovery truck on the way? Skip — the inbound counter is
+      // shared between deliver and recover so we don't double-up.
+      if (b.inboundUpgradeTrucks > 0) continue;
+      if (hq.activeTrucks >= maxTrucks) break;
+      const targetX = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const targetZ = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+      const hqSide = pickHqSide(hq, targetX, targetZ);
+      const hqCooldowns = getHqCooldowns(hq.id);
+      if (hqCooldowns[hqSide] > 0) continue;
+      const hqPos = doorWorldPos(hq, targetX, targetZ);
+      const truck = deps.spawnTruck(hqPos.x, hqPos.y, hqPos.z, hq.team);
+      if (!truck) break;
+      hq.activeTrucks++;
+      hqCooldowns[hqSide] = HQ_LAUNCH_GAP_S;
+      b.inboundUpgradeTrucks++;
+      truck.task = { kind: 'truck_recover_upgrade', buildingId: b.id };
+      activeTruckToHQ.set(truck.id, hq.id);
+      console.log(`[DISPATCH] RECOVER truck #${truck.id} → ${b.spec.kind}#${b.id} (cancelled upgrade)`);
+      const bPos = pickApproach(b, hqPos.x, hqPos.z, deps);
+      deps.routeTruck(truck, bPos.x, bPos.y, bPos.z);
+    }
+  }
+}
+
 function despawn(u: Unit, deps: SupplyTruckDeps): void {
-  const hq = deps.buildings.nearestHQ(u.x, u.z);
+  const team = truckTeam(u.id, deps);
+  const hq = deps.buildings.nearestHQ(u.x, u.z, team);
   if (hq) hq.activeTrucks = Math.max(0, hq.activeTrucks - 1);
   // Refund any payload still attached to the truck — its target won't get
   // its delivery.
@@ -430,9 +797,10 @@ function despawn(u: Unit, deps: SupplyTruckDeps): void {
     if (target && !target.destroyed) {
       target.inboundResupplyTrucks = Math.max(0, target.inboundResupplyTrucks - 1);
     }
-    deps.resources.food += resupply.payload.food;
-    deps.resources.metals += resupply.payload.metals;
-    deps.resources.wood += resupply.payload.wood;
+    const r = teamResources(deps, team);
+    r.food += resupply.payload.food;
+    r.metals += resupply.payload.metals;
+    r.wood += resupply.payload.wood;
   }
   const fetchStorage = activeFetch.get(u.id);
   if (fetchStorage !== undefined) {

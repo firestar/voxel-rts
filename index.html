@@ -5,82 +5,728 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Voxel RTS</title>
     <style>
-      html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; color: #ddd; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      :root {
+        /* Mahogany / walnut wood palette tuned for an AoE3-Legacy feel:
+           panels read as carved planks under warm brass trim. */
+        --wood-deep:     #1f120a;
+        --wood-dark:     #2e1a0d;
+        --wood-mid:      #4a2a14;
+        --wood-warm:     #6b3d1c;
+        --wood-light:    #8a5a30;
+        --brass-deep:    #6e4a18;
+        --brass:         #b88a3c;
+        --brass-bright:  #f4cf6c;
+        --brass-pale:    #ffe8a8;
+        --ui-bg-darkest: #1a0e06;
+        --ui-bg-dark:    #2b170c;
+        --ui-bg-mid:     #4a2c18;
+        --ui-bg-light:   #6b4222;
+        --ui-edge-dark:  #0e0703;
+        --ui-edge-gold:  var(--brass);
+        --ui-edge-bright: var(--brass-bright);
+        --ui-text:       #f4e6c2;
+        --ui-text-dim:   #c4b292;
+        --ui-text-muted: #8a7a5c;
+        --ui-accent:     #ffcc44;
+        --ui-accent-hot: #ff9a2a;
+        --ui-fed-red:    #c0322a;
+        --ui-fed-blue:   #2b4d8a;
+        --ui-good:       #88e070;
+        --ui-warn:       #ffb84a;
+        --ui-bad:        #e85b3c;
+      }
+
+      html, body {
+        margin: 0; padding: 0; height: 100%;
+        overflow: hidden; background: #000;
+        color: var(--ui-text);
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      }
+      /* Serif headers — "Cinzel"-style display feel for selection panels.
+         Falls back to Trajan / Times so we don't ship a webfont. */
+      .ui-display {
+        font-family: "Trajan Pro", "Cinzel", "Times New Roman", Georgia, serif;
+        letter-spacing: 0.06em;
+        font-variant: small-caps;
+      }
+
       #app { position: fixed; inset: 0; }
-      #hud { position: fixed; top: 8px; left: 8px; padding: 6px 10px; background: rgba(0,0,0,0.55); border-radius: 6px; font-size: 12px; line-height: 1.4; pointer-events: none; }
-      #hud b { color: #fff; }
-      #progress { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #000; color: #ddd; font-size: 14px; }
-      #progress.hidden { display: none; }
-      #selbox { position: fixed; pointer-events: none; border: 1px solid #33ff88; background: rgba(51, 255, 136, 0.12); display: none; }
+
+      /* ---------- Top resource bar (AoE3 Legacy style) ----------
+         A long carved wooden plank running across the top, with carved
+         resource cells separated by brass dividers. The cells have a
+         beveled inner shadow so they read as recessed slots, and the
+         outer plank gets a subtle wood-grain gradient. */
+      #topbar {
+        position: fixed;
+        top: 0; left: 0; right: 0;
+        height: 30px;
+        display: flex; align-items: stretch;
+        padding: 2px 10px;
+        gap: 0;
+        background:
+          linear-gradient(180deg,
+            #4a2c14 0%,
+            #3a2010 32%,
+            #2e180a 70%,
+            #1d0e05 100%);
+        border-bottom: 1px solid var(--ui-edge-dark);
+        box-shadow:
+          0 1px 0 var(--brass) inset,        /* top brass strip */
+          0 -1px 0 var(--brass-deep) inset,  /* bottom brass strip */
+          0 4px 8px rgba(0,0,0,0.55);
+        font-size: 13px;
+        z-index: 50;
+      }
+      .res {
+        position: relative;
+        display: inline-flex; align-items: center; gap: 5px;
+        padding: 1px 10px 1px 6px;
+        min-width: 64px;
+        font-variant-numeric: tabular-nums;
+      }
+      /* Brass divider drawn after every resource cell except the spacer. */
+      .res::after {
+        content: "";
+        position: absolute; top: 4px; bottom: 4px; right: 0;
+        width: 2px;
+        background: linear-gradient(180deg,
+          rgba(0,0,0,0.0) 0%,
+          var(--brass) 25%,
+          var(--brass-bright) 50%,
+          var(--brass) 75%,
+          rgba(0,0,0,0.0) 100%);
+        box-shadow: 1px 0 0 rgba(0,0,0,0.5);
+        border-radius: 1px;
+      }
+      .res:last-of-type::after { display: none; }
+      .res-icon {
+        width: 12px; height: 12px;
+        border: 1px solid var(--ui-edge-dark);
+        box-shadow:
+          0 1px 0 rgba(255,255,255,0.30) inset,
+          0 -1px 0 rgba(0,0,0,0.4) inset,
+          0 0 0 1px var(--brass-deep);
+        border-radius: 2px;
+      }
+      .res-food   { background: linear-gradient(180deg, #ffd766 0%, #b07a1a 100%); }
+      .res-metals { background: linear-gradient(180deg, #d8d8de 0%, #6b6b78 100%); }
+      .res-wood   { background: linear-gradient(180deg, #b07a3a 0%, #5a3818 100%); }
+      .res-pop    { background: linear-gradient(180deg, #88e070 0%, #2a6a18 100%); }
+      .res-val {
+        color: var(--brass-pale);
+        font-weight: bold;
+        font-size: 11px;
+        text-shadow: 0 1px 0 rgba(0,0,0,0.7);
+      }
+      .res-label {
+        color: var(--ui-text-muted);
+        font-size: 9px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+
+      .topbar-spacer { flex: 1; }
+      /* Tier / age cluster on the right end of the topbar — Roman numeral
+         in a brass medallion + a serif label + "STANDARD" subtitle. */
+      #age-cluster {
+        align-self: center;
+        display: flex; align-items: center; gap: 6px;
+        padding: 0 10px 0 8px;
+        position: relative;
+      }
+      #age-cluster::before {
+        /* Vertical brass divider on the left so it visually separates
+           from the resource band. */
+        content: "";
+        position: absolute; top: 4px; bottom: 4px; left: 0;
+        width: 2px;
+        background: linear-gradient(180deg,
+          rgba(0,0,0,0.0), var(--brass), var(--brass-bright), var(--brass), rgba(0,0,0,0.0));
+        border-radius: 1px;
+      }
+      #age-medallion {
+        width: 20px; height: 20px;
+        display: flex; align-items: center; justify-content: center;
+        border-radius: 50%;
+        background:
+          radial-gradient(circle at 35% 30%, #ffe6a0 0%, var(--brass-bright) 35%, var(--brass) 65%, var(--brass-deep) 100%);
+        color: #1d0e05;
+        font-family: "Trajan Pro", "Cinzel", Georgia, serif;
+        font-weight: bold; font-size: 12px;
+        box-shadow:
+          0 0 0 1px var(--ui-edge-dark),
+          0 1px 2px rgba(0,0,0,0.5);
+        text-shadow: 0 1px 0 rgba(255,255,255,0.4);
+      }
+      #age-label-stack {
+        display: flex; flex-direction: column; gap: 0;
+        line-height: 1;
+      }
+      #age-name {
+        color: var(--brass-pale);
+        font-family: "Trajan Pro", "Cinzel", Georgia, serif;
+        font-variant: small-caps;
+        font-size: 10px;
+        letter-spacing: 0.06em;
+      }
+      #age-time {
+        color: var(--ui-text-muted);
+        font-size: 9px;
+        letter-spacing: 0.05em;
+        font-variant-numeric: tabular-nums;
+      }
+
+      #stats {
+        align-self: center;
+        color: var(--ui-text-muted);
+        font-size: 11px;
+        padding: 0 8px;
+      }
+      .topbar-btn {
+        align-self: center;
+        width: 20px; height: 20px;
+        display: flex; align-items: center; justify-content: center;
+        background: radial-gradient(circle at 35% 30%, var(--brass-bright) 0%, var(--brass) 50%, var(--brass-deep) 100%);
+        color: var(--ui-edge-dark);
+        border: 1px solid var(--ui-edge-dark);
+        box-shadow: 0 1px 0 var(--brass-pale) inset;
+        border-radius: 50%;
+        font-family: serif;
+        font-weight: bold;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .topbar-btn:hover {
+        background: radial-gradient(circle at 35% 30%, var(--brass-pale) 0%, var(--brass-bright) 60%, var(--brass) 100%);
+      }
+
+      /* ---------- Mode readout (under topbar) ---------- */
+      #mode {
+        position: fixed; top: 32px; left: 8px;
+        padding: 3px 8px;
+        background: rgba(20,12,6,0.75);
+        border: 1px solid var(--ui-edge-dark);
+        box-shadow: 0 1px 0 rgba(255,210,140,0.15) inset;
+        border-radius: 3px;
+        font-size: 11px;
+        color: var(--ui-text-dim);
+        pointer-events: none;
+        z-index: 40;
+      }
+
+      /* ---------- Bottom command bar (carved wood) ---------- */
+      #bottombar {
+        position: fixed;
+        left: 0; right: 0; bottom: 0;
+        height: 150px;
+        display: flex; align-items: stretch;
+        padding: 4px 8px 6px 8px;
+        gap: 5px;
+        background:
+          linear-gradient(180deg,
+            #1f1108 0%,
+            #2c1a0c 12%,
+            #3a210f 35%,
+            #2c1a0c 78%,
+            #18090a 100%);
+        border-top: 1px solid var(--ui-edge-dark);
+        box-shadow:
+          0 1px 0 var(--brass) inset,
+          0 -1px 0 var(--brass-deep) inset,
+          0 -4px 12px rgba(0,0,0,0.7);
+        z-index: 50;
+      }
+      .panel {
+        position: relative;
+        background:
+          linear-gradient(180deg, #3a2010 0%, #1f100a 100%);
+        border: 1px solid var(--ui-edge-dark);
+        /* Inner brass frame — slimmer than the previous double inset so
+           panels read as distinct without eating layout. */
+        box-shadow:
+          0 1px 0 var(--brass) inset,
+          0 0 0 1px var(--brass-deep) inset,
+          0 2px 5px rgba(0,0,0,0.55);
+        border-radius: 4px;
+        padding: 5px 8px;
+        color: var(--ui-text);
+      }
+      .panel-title {
+        color: var(--brass-pale);
+        font-family: "Trajan Pro", "Cinzel", Georgia, serif;
+        font-variant: small-caps;
+        font-weight: bold;
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        margin-bottom: 4px;
+        padding-bottom: 2px;
+        border-bottom: 1px solid var(--brass-deep);
+        text-shadow: 0 1px 0 rgba(0,0,0,0.5);
+      }
+
+      /* ---------- Minimap (circular brass medallion) ---------- */
+      /* ---------- Minimap (square wood plate with brass border) ----- */
+      #bottombar-mini {
+        width: 138px; height: 138px;
+        flex-shrink: 0;
+        position: relative;
+        padding: 0;
+        background: linear-gradient(180deg, #3a2010 0%, #1f100a 100%);
+        border: 1px solid var(--ui-edge-dark);
+        border-radius: 4px;
+        /* Same brass-inset framing as the other panels so the minimap
+           reads as a sibling tile, just sized to a square. */
+        box-shadow:
+          0 1px 0 var(--brass) inset,
+          0 0 0 1px var(--brass-deep) inset,
+          0 2px 5px rgba(0,0,0,0.55);
+        overflow: hidden;
+      }
+      /* Minimap canvas pinned inside the wood plate. */
+      #bottombar-mini canvas {
+        position: absolute !important;
+        top: 6px !important;
+        left: 6px !important;
+        bottom: auto !important;
+        right: auto !important;
+        width: 124px !important;
+        height: 124px !important;
+        border: 1px solid var(--ui-edge-dark) !important;
+        border-radius: 2px !important;
+        box-shadow: 0 0 0 1px var(--brass-deep) inset !important;
+      }
+
+      #bottombar-center {
+        flex: 1;
+        display: flex; flex-direction: column;
+        min-width: 0;
+      }
       #actions {
-        position: fixed; right: 8px; bottom: 8px; max-width: 320px;
-        padding: 6px 10px; background: rgba(0,0,0,0.65); border-radius: 6px;
-        font-size: 12px; line-height: 1.4; color: #ddd;
-        display: none;
+        flex: 1;
+        overflow-y: auto;
+        display: block;
       }
-      #actions .actions-title { color: #fff; font-weight: bold; margin-bottom: 4px; }
-      #actions .actions-sub { color: #aaa; font-size: 11px; margin-bottom: 6px; }
+      #actions .actions-title {
+        color: var(--ui-edge-bright);
+        font-weight: bold;
+        font-size: 11px;
+        margin-bottom: 1px;
+      }
+      #actions .actions-sub {
+        color: var(--ui-text-muted);
+        font-size: 10px;
+        margin-bottom: 4px;
+      }
       #actions .action-row {
-        display: flex; gap: 8px; align-items: center;
-        padding: 2px 4px; cursor: pointer; border-radius: 3px;
+        display: flex; gap: 6px; align-items: center;
+        padding: 2px 5px;
+        margin-bottom: 1px;
+        cursor: pointer;
+        border-radius: 2px;
+        border: 1px solid transparent;
+        background: linear-gradient(180deg, #2a1f12 0%, #16100a 100%);
+        font-size: 11px;
       }
-      #actions .action-row:hover { background: rgba(51, 255, 136, 0.18); }
+      #actions .action-row:hover {
+        background: linear-gradient(180deg, #4a3a28 0%, #2a1f12 100%);
+        border-color: var(--ui-edge-gold);
+      }
       #actions .action-key {
         display: inline-block; min-width: 22px; text-align: center;
-        padding: 1px 5px; border: 1px solid #33ff88; border-radius: 3px;
-        color: #33ff88; font-weight: bold;
+        padding: 1px 6px;
+        background: linear-gradient(180deg, #6b5236 0%, #3a2c1c 100%);
+        border: 1px solid var(--ui-edge-dark);
+        box-shadow: 0 1px 0 rgba(255,210,140,0.25) inset;
+        border-radius: 3px;
+        color: var(--ui-edge-bright);
+        font-weight: bold;
+        font-size: 11px;
       }
-      #actions .action-label { flex: 1; }
+      #actions .action-label {
+        flex: 1;
+        color: var(--ui-text);
+      }
+      #actions .storage-stockpile {
+        color: var(--ui-text-dim);
+        font-size: 11px;
+        padding: 2px 6px;
+      }
+      /* Portrait tiles — small SVG swatches used for build buttons + selection grids. */
+      #actions .portrait-grid {
+        display: flex; flex-wrap: wrap; gap: 4px;
+        margin: 4px 0 6px 0;
+      }
+      #actions .portrait-tile {
+        display: inline-flex; align-items: center; gap: 4px;
+        padding: 2px 5px 2px 2px;
+        background: linear-gradient(180deg, #2a1f12 0%, #16100a 100%);
+        border: 1px solid var(--ui-edge-dark);
+        border-radius: 3px;
+        cursor: pointer;
+        color: var(--ui-text);
+        font-family: inherit;
+        font-size: 10px;
+        line-height: 1;
+      }
+      #actions button.portrait-tile { color: var(--ui-text); }
+      #actions .portrait-tile:hover { border-color: var(--ui-edge-gold); background: linear-gradient(180deg, #4a3a28 0%, #2a1f12 100%); }
+      #actions .portrait-tile-static {
+        cursor: default;
+        padding: 2px;
+        position: relative;
+      }
+      #actions .portrait-tile-static:hover { border-color: var(--ui-edge-dark); background: linear-gradient(180deg, #2a1f12 0%, #16100a 100%); }
+      #actions .portrait-art { display: inline-flex; flex: 0 0 auto; }
+      #actions .portrait-art svg { display: block; }
+      #actions .portrait-meta {
+        display: inline-flex; flex-direction: column; gap: 2px;
+      }
+      #actions .portrait-label { font-weight: bold; color: var(--ui-edge-bright); }
+      #actions .portrait-key {
+        display: inline-block; padding: 1px 5px;
+        background: linear-gradient(180deg, #6b5236 0%, #3a2c1c 100%);
+        border: 1px solid var(--ui-edge-dark);
+        border-radius: 3px;
+        color: var(--ui-edge-bright);
+        font-size: 10px; font-weight: bold;
+        align-self: flex-start;
+      }
+      #actions .portrait-badge {
+        position: absolute; right: 1px; bottom: 1px;
+        font-size: 9px; color: var(--ui-edge-bright);
+        background: rgba(0,0,0,0.6);
+        padding: 0 3px; border-radius: 2px;
+      }
+      #actions .portrait-section-title {
+        color: var(--ui-text-muted);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin: 6px 0 2px 0;
+      }
+
+      /* ---------- Selection portrait panel (between actions and tasks) --- */
+      #bottombar-selection {
+        width: 220px;
+        flex-shrink: 0;
+        display: flex; flex-direction: column;
+      }
+      #selection-panel {
+        flex: 1;
+        display: flex; flex-direction: column;
+        gap: 6px;
+      }
+      #selection-panel.empty .selection-empty { display: block; }
+      #selection-panel.empty .selection-content { display: none; }
+      #selection-panel .selection-empty {
+        display: none;
+        color: var(--ui-text-muted);
+        font-style: italic;
+        font-size: 12px;
+      }
+      #selection-panel .selection-content {
+        display: flex; flex-direction: column;
+        gap: 4px;
+      }
+      #selection-panel .sel-header {
+        display: flex; align-items: center; gap: 10px;
+        padding-bottom: 6px;
+        border-bottom: 1px solid var(--brass-deep);
+      }
+      #selection-panel .sel-portrait {
+        width: 44px; height: 44px;
+        flex-shrink: 0;
+        background: linear-gradient(180deg, #2a1f12 0%, #16100a 100%);
+        border: 1px solid var(--ui-edge-dark);
+        box-shadow:
+          0 0 0 1px var(--brass-deep),
+          0 1px 0 var(--brass-bright) inset;
+        border-radius: 3px;
+        display: flex; align-items: center; justify-content: center;
+      }
+      #selection-panel .sel-portrait svg { width: 38px; height: 38px; }
+      #selection-panel .sel-name-stack {
+        display: flex; flex-direction: column; gap: 1px;
+        line-height: 1.0; min-width: 0;
+      }
+      #selection-panel .sel-name {
+        color: var(--brass-pale);
+        font-family: "Trajan Pro", "Cinzel", Georgia, serif;
+        font-variant: small-caps;
+        font-size: 12px;
+        letter-spacing: 0.06em;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      #selection-panel .sel-sub {
+        color: var(--ui-text-muted);
+        font-size: 10px;
+        letter-spacing: 0.04em;
+      }
+      #selection-panel .sel-stats {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 1px 6px;
+        font-size: 10px;
+        font-variant-numeric: tabular-nums;
+      }
+      #selection-panel .sel-stat-key {
+        color: var(--ui-text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      #selection-panel .sel-stat-val {
+        color: var(--ui-text);
+        font-weight: bold;
+      }
+
+      #bottombar-tasks {
+        width: 180px;
+        flex-shrink: 0;
+        display: flex; flex-direction: column;
+      }
       #tasks {
-        position: fixed; right: 8px; top: 8px; width: 280px;
-        max-height: 60vh; overflow-y: auto;
-        padding: 6px 10px; background: rgba(0,0,0,0.65); border-radius: 6px;
-        font-size: 12px; line-height: 1.4; color: #ddd;
+        flex: 1;
+        overflow-y: auto;
+        font-size: 10px;
+        line-height: 1.35;
         pointer-events: none;
       }
-      #tasks .tasks-title { color: #fff; font-weight: bold; margin-bottom: 4px; }
-      #tasks .tasks-empty { color: #888; font-style: italic; }
+      #tasks .tasks-title {
+        color: var(--ui-edge-bright);
+        font-weight: bold;
+        font-size: 13px;
+        margin-bottom: 4px;
+        padding-bottom: 3px;
+        border-bottom: 1px solid var(--ui-bg-mid);
+      }
+      #tasks .tasks-empty {
+        color: var(--ui-text-muted);
+        font-style: italic;
+      }
       #tasks .task-row {
         display: flex; gap: 6px; align-items: baseline;
         padding: 1px 0;
       }
       #tasks .task-row.claimed { color: #b8e3ff; }
-      #tasks .task-row.pending { color: #ffd58a; }
+      #tasks .task-row.pending { color: var(--ui-warn); }
       #tasks .task-kind {
         display: inline-block; min-width: 64px;
         text-align: left; opacity: 0.85;
+        font-size: 11px;
       }
       #tasks .task-detail { flex: 1; }
-      #tasks .task-claim { color: #aaa; font-size: 11px; }
+      #tasks .task-claim { color: var(--ui-text-muted); font-size: 11px; }
+
+      /* ---------- Path info debug overlay ---------- */
       #pathinfo {
-        position: fixed; left: 8px; bottom: 8px;
-        padding: 6px 10px; background: rgba(0,0,0,0.65); border-radius: 6px;
-        font-size: 12px; line-height: 1.4; color: #ddd;
-        display: none; pointer-events: none;
+        position: fixed; left: 8px; bottom: 160px;
+        padding: 5px 8px;
+        background: rgba(20,12,6,0.85);
+        border: 1px solid var(--ui-edge-dark);
+        box-shadow: 0 1px 0 rgba(255,210,140,0.18) inset;
+        border-radius: 3px;
+        font-size: 11px;
+        color: var(--ui-text-dim);
+        max-width: 360px;
+        display: none;
+        pointer-events: none;
+        z-index: 40;
       }
-      #pathinfo b { color: #fff; }
+      #pathinfo b { color: var(--ui-edge-bright); }
+
+      /* ---------- Help drawer (hidden by default; toggled with `?`) ---------- */
+      #help-drawer {
+        position: fixed;
+        top: 50%; left: 50%;
+        transform: translate(-50%, -50%);
+        max-width: 720px; max-height: 70vh;
+        overflow-y: auto;
+        padding: 16px 20px;
+        background: linear-gradient(180deg, #3a2c1c 0%, #1f150b 100%);
+        border: 2px solid var(--ui-edge-gold);
+        box-shadow:
+          0 1px 0 rgba(255,210,140,0.3) inset,
+          0 0 0 4px var(--ui-edge-dark),
+          0 8px 32px rgba(0,0,0,0.7);
+        border-radius: 6px;
+        font-size: 12px;
+        line-height: 1.55;
+        color: var(--ui-text);
+        z-index: 200;
+      }
+      #help-drawer.hidden { display: none; }
+      #help-drawer h2 {
+        margin: 0 0 8px 0;
+        color: var(--ui-edge-bright);
+        font-size: 15px;
+        letter-spacing: 0.5px;
+      }
+      #help-drawer h3 {
+        margin: 12px 0 4px 0;
+        color: var(--ui-accent);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+      }
+      #help-drawer kbd {
+        display: inline-block;
+        padding: 0 5px;
+        background: linear-gradient(180deg, #6b5236 0%, #3a2c1c 100%);
+        border: 1px solid var(--ui-edge-dark);
+        box-shadow: 0 1px 0 rgba(255,210,140,0.25) inset;
+        border-radius: 3px;
+        color: var(--ui-edge-bright);
+        font-family: inherit;
+        font-size: 11px;
+      }
+      #help-close {
+        position: absolute; top: 8px; right: 10px;
+        background: transparent; border: none;
+        color: var(--ui-text-muted);
+        font-size: 18px; cursor: pointer;
+        padding: 0; line-height: 1;
+      }
+      #help-close:hover { color: var(--ui-edge-bright); }
+
+      /* ---------- Selection box (drag-select rectangle) ---------- */
+      #selbox {
+        position: fixed; pointer-events: none;
+        border: 1px solid var(--ui-good);
+        background: rgba(136, 224, 112, 0.15);
+        display: none;
+      }
+
+      /* ---------- Loading splash ---------- */
+      #progress {
+        position: fixed; inset: 0;
+        display: flex; align-items: center; justify-content: center;
+        background: #000; color: var(--ui-text);
+        font-size: 14px;
+        z-index: 999;
+      }
+      #progress.hidden { display: none; }
     </style>
   </head>
   <body>
     <div id="app"></div>
-    <div id="hud">
-      <div><b>Voxel RTS</b></div>
-      <div>WASD / edge scroll &middot; RMB drag yaw &middot; wheel zoom</div>
-      <div>LMB click unit = select &middot; LMB click building = select (action panel, lower-right) &middot; LMB drag = box-select (shift adds, military prefer) &middot; LMB on terrain = move &middot; shift+LMB click = detonate</div>
-      <div>RMB hold = aim &amp; fire (armed units) &middot; RMB click on a farm with a worker selected = assign farmer &middot; harvesters auto-collect ripe farms</div>
-      <div>Selection actions (panel, lower-right) &middot; H = stop &middot; X = cancel task / clear queue &middot; F = hold fire &middot; V/C = aggressive/defensive &middot; J = plant &middot; Q = soldier &middot; A = sniper &middot; S = gunner &middot; O = worker (barracks) &middot; R = tank &middot; T/Y/U/N = tunneler/worm/dozer/rocket truck (depot)</div>
-      <div>B = build &middot; 1-6 = pick (Barracks / Farm / Storage / Power / Refinery / Tech Lab) &middot; P = plant &middot; Tab = cycle &middot; Esc = cancel &middot; E = enemy soldier &middot; Shift+E = enemy tank &middot; Alt+E = enemy rocket truck &middot; Ctrl+E = enemy RPG soldier</div>
-      <div>G = terrain edit (sandbox / map editor) &middot; in mode: LMB paint / Shift+LMB carve, 1-7 material, , and . brush size</div>
-      <div>[ = lower Y-cutoff (see underground) &middot; ] = raise &middot; \ = reset (Shift multiplies step &times;4)</div>
-      <div>Click an armed building to see its weapon range (green dome &middot; AA shows cone + dome)</div>
-      <div id="mode"></div>
+
+    <div id="topbar">
+      <div class="res" title="Food">
+        <span class="res-icon res-food"></span>
+        <span class="res-label">F</span>
+        <span class="res-val" id="res-food">0</span>
+      </div>
+      <div class="res" title="Metals">
+        <span class="res-icon res-metals"></span>
+        <span class="res-label">M</span>
+        <span class="res-val" id="res-metals">0</span>
+      </div>
+      <div class="res" title="Wood">
+        <span class="res-icon res-wood"></span>
+        <span class="res-label">W</span>
+        <span class="res-val" id="res-wood">0</span>
+      </div>
+      <div class="res" title="Population (units)">
+        <span class="res-icon res-pop"></span>
+        <span class="res-label">Pop</span>
+        <span class="res-val" id="res-pop">0</span>
+      </div>
+      <div class="topbar-spacer"></div>
       <div id="stats"></div>
+      <div id="age-cluster" title="Headquarters tier &amp; elapsed time">
+        <div id="age-medallion">I</div>
+        <div id="age-label-stack">
+          <span id="age-name">Founding Age</span>
+          <span id="age-time">00:00</span>
+        </div>
+      </div>
+      <button class="topbar-btn" id="help-toggle" title="Controls (?)">?</button>
     </div>
+
+    <div id="mode"></div>
+
+    <div id="bottombar">
+      <div id="bottombar-mini"></div>
+      <div id="bottombar-center" class="panel">
+        <div id="actions"></div>
+      </div>
+      <div id="bottombar-selection" class="panel">
+        <div id="selection-panel" class="empty">
+          <div class="selection-empty">Click a unit or building.</div>
+          <div class="selection-content">
+            <div class="sel-header">
+              <div class="sel-portrait" id="sel-portrait"></div>
+              <div class="sel-name-stack">
+                <div class="sel-name" id="sel-name">—</div>
+                <div class="sel-sub" id="sel-sub">—</div>
+              </div>
+            </div>
+            <div class="sel-stats" id="sel-stats"></div>
+          </div>
+        </div>
+      </div>
+      <div id="bottombar-tasks" class="panel">
+        <div id="tasks"></div>
+      </div>
+    </div>
+
+    <div id="pathinfo"></div>
+
+    <div id="help-drawer" class="hidden">
+      <button id="help-close" title="Close (?)">×</button>
+      <h2>Voxel RTS — Controls</h2>
+
+      <h3>Camera</h3>
+      <div><kbd>WASD</kbd> / edge scroll · <kbd>RMB</kbd>+drag yaw · <kbd>wheel</kbd> zoom</div>
+
+      <h3>Selection</h3>
+      <div><kbd>LMB</kbd> click unit/building · <kbd>LMB</kbd>+drag box-select (<kbd>Shift</kbd> add) · <kbd>Tab</kbd> cycle</div>
+
+      <h3>Orders</h3>
+      <div><kbd>LMB</kbd> on terrain = move · <kbd>RMB</kbd> hold = aim &amp; fire · <kbd>RMB</kbd> on farm w/ worker = assign farmer</div>
+      <div><kbd>H</kbd> stop · <kbd>X</kbd> cancel/clear queue · <kbd>F</kbd> hold fire · <kbd>V</kbd>/<kbd>C</kbd> aggressive/defensive · <kbd>J</kbd> plant</div>
+
+      <h3>Train (with building selected)</h3>
+      <div>Barracks: <kbd>Q</kbd> soldier · <kbd>A</kbd> sniper · <kbd>S</kbd> gunner · <kbd>O</kbd> worker</div>
+      <div>Vehicle Depot: <kbd>R</kbd> tank · <kbd>T</kbd>/<kbd>Y</kbd>/<kbd>U</kbd> tunneler/worm/dozer · <kbd>N</kbd> rocket truck · <kbd>I</kbd> AA vehicle</div>
+
+      <h3>Build mode</h3>
+      <div><kbd>B</kbd> toggle · <kbd>1</kbd>–<kbd>9</kbd> pick (Barracks / Vehicle Depot / Farm / Storage / Power / Refinery / Tech Lab / Turret / AA / Silo) · <kbd>P</kbd> plant · <kbd>Esc</kbd> cancel</div>
+
+      <h3>Sandbox</h3>
+      <div><kbd>E</kbd> spawn enemy soldier · <kbd>Shift+E</kbd> tank · <kbd>Alt+E</kbd> rocket truck · <kbd>Ctrl+E</kbd> RPG soldier</div>
+      <div><kbd>G</kbd> terrain edit · in mode: <kbd>LMB</kbd> paint / <kbd>Shift+LMB</kbd> carve · <kbd>1</kbd>–<kbd>7</kbd> material · <kbd>,</kbd>/<kbd>.</kbd> brush size</div>
+
+      <h3>Y-cutoff (see underground)</h3>
+      <div><kbd>[</kbd> lower · <kbd>]</kbd> raise · <kbd>\</kbd> reset (<kbd>Shift</kbd> ×4)</div>
+    </div>
+
     <div id="progress">Generating world&hellip;</div>
     <div id="selbox"></div>
-    <div id="actions"></div>
-    <div id="tasks"></div>
-    <div id="pathinfo"></div>
+
     <script type="module" src="/src/main.ts"></script>
+    <script>
+      // Help drawer toggle. Bound here so it's available before the game
+      // bootstraps; the game itself doesn't need to know about it.
+      (function () {
+        const drawer = document.getElementById('help-drawer');
+        const open = document.getElementById('help-toggle');
+        const close = document.getElementById('help-close');
+        const toggle = () => drawer.classList.toggle('hidden');
+        open.addEventListener('click', toggle);
+        close.addEventListener('click', toggle);
+        window.addEventListener('keydown', (e) => {
+          if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+          if (e.key === '?' || (e.key === '/' && e.shiftKey)) {
+            e.preventDefault();
+            toggle();
+          }
+          if (e.key === 'Escape' && !drawer.classList.contains('hidden')) {
+            drawer.classList.add('hidden');
+          }
+        });
+      })();
+    </script>
   </body>
 </html>

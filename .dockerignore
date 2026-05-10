@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+.tmp-screenshots
+*.log
+log-server.cjs
+log-server.js
+monitor.cjs
+.claude

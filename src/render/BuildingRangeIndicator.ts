@@ -89,7 +89,8 @@ export class BuildingRangeIndicator {
     }
 
     if (b.spec.kind === 'hq' && b.spec.buildRangeMeters) {
-      const range = b.spec.buildRangeMeters;
+      const rangeTier = b.upgradeTracks?.range ?? 0;
+      const range = b.spec.buildRangeMeters * (1 + rangeTier * 0.5);
       const cx = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
       const cz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
       const groundY = (b.floorY + 1) * VOXEL_SIZE + 0.15;

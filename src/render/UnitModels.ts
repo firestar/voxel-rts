@@ -282,6 +282,48 @@ export function buildGunnerLegGeometry(): THREE.BufferGeometry {
   return buildVoxelModel(blocks);
 }
 
+// ---------- Civilian ---------------------------------------------------------
+// Unarmed resident in plain white clothes. Same proportions as the soldier
+// (so the leg pivot is identical) but stripped of helmet, vest, ruck, and
+// rifle — just a shirt, trousers, and a head. Reads cleanly as a non-combatant
+// among the army-coloured infantry.
+
+const CIVILIAN_SHIRT = { r: 0.94, g: 0.94, b: 0.96 };  // off-white shirt
+const CIVILIAN_PANTS = { r: 0.86, g: 0.86, b: 0.90 };  // light pale trousers
+const CIVILIAN_BOOT  = { r: 0.30, g: 0.22, b: 0.16 };  // brown shoes
+
+export const CIVILIAN_HIP_Y = 0.55;
+export const CIVILIAN_LEG_X = 0.10;
+
+export function buildCivilianBodyGeometry(): THREE.BufferGeometry {
+  const skin = { r: 0.85, g: 0.70, b: 0.55 };
+  const hair = { r: 0.32, g: 0.22, b: 0.14 };
+
+  const blocks: VoxelBlock[] = [
+    { x: 0.00, y: 0.78, z: 0.00, sx: 0.46, sy: 0.50, sz: 0.28, ...CIVILIAN_SHIRT },
+    { x: 0.00, y: 1.07, z: 0.00, sx: 0.16, sy: 0.10, sz: 0.16, ...skin },
+    { x: 0.00, y: 1.22, z: 0.00, sx: 0.32, sy: 0.30, sz: 0.32, ...skin },
+    // Plain dark hair so the bare head reads as a person, not a mannequin.
+    { x: 0.00, y: 1.37, z: 0.00, sx: 0.34, sy: 0.06, sz: 0.34, ...hair },
+    { x: 0.00, y: 1.34, z: 0.10, sx: 0.30, sy: 0.10, sz: 0.10, ...hair },
+    // Both arms hang at the sides — no rifle, no forward grip.
+    { x: -0.30, y: 0.78, z: 0.00, sx: 0.14, sy: 0.46, sz: 0.18, ...CIVILIAN_SHIRT },
+    { x:  0.30, y: 0.78, z: 0.00, sx: 0.14, sy: 0.46, sz: 0.18, ...CIVILIAN_SHIRT },
+    // Hands.
+    { x: -0.30, y: 0.54, z: 0.00, sx: 0.14, sy: 0.06, sz: 0.18, ...skin },
+    { x:  0.30, y: 0.54, z: 0.00, sx: 0.14, sy: 0.06, sz: 0.18, ...skin },
+  ];
+  return buildVoxelModel(blocks);
+}
+
+export function buildCivilianLegGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [
+    { x: 0.0, y: -0.25, z: 0.0, sx: 0.18, sy: 0.50, sz: 0.20, ...CIVILIAN_PANTS },
+    { x: 0.0, y: -0.55, z: 0.04, sx: 0.20, sy: 0.10, sz: 0.26, ...CIVILIAN_BOOT },
+  ];
+  return buildVoxelModel(blocks);
+}
+
 // ---------- Worker -----------------------------------------------------------
 // Civilian harvester / transporter. Same scale as the soldier (~1.6 m tall)
 // but in distinctive blue work clothes + yellow hard hat. Same hip pivot so
@@ -383,18 +425,22 @@ export function buildWorkerLegGeometry(): THREE.BufferGeometry {
   return buildVoxelModel(blocks);
 }
 
+export type WorkerCargoKind = 'wood' | 'metal' | 'food';
+
 /**
  * Carry pack — a small crate that floats above the worker's back when
- * carrying anything. Two variants (wood / metal) are colour-coded so the
- * player can tell at a glance what each worker is holding.
+ * carrying anything. Three variants (wood / metal / food) are colour-coded
+ * so the player can tell at a glance what each worker is hauling.
  */
-export function buildWorkerCrateGeometry(metal: boolean): THREE.BufferGeometry {
-  const wood = { r: 0.40, g: 0.28, b: 0.16 };
-  const metalCol = { r: 0.50, g: 0.55, b: 0.65 };
-  const c = metal ? metalCol : wood;
-  const trim = metal ? { r: 0.30, g: 0.32, b: 0.36 } : { r: 0.22, g: 0.16, b: 0.10 };
+export function buildWorkerCrateGeometry(kind: WorkerCargoKind): THREE.BufferGeometry {
+  const palette: Record<WorkerCargoKind, { body: { r: number; g: number; b: number }; trim: { r: number; g: number; b: number } }> = {
+    wood:  { body: { r: 0.40, g: 0.28, b: 0.16 }, trim: { r: 0.22, g: 0.16, b: 0.10 } },
+    metal: { body: { r: 0.50, g: 0.55, b: 0.65 }, trim: { r: 0.30, g: 0.32, b: 0.36 } },
+    food:  { body: { r: 0.85, g: 0.65, b: 0.20 }, trim: { r: 0.45, g: 0.30, b: 0.10 } },
+  };
+  const { body, trim } = palette[kind];
   const blocks: VoxelBlock[] = [
-    { x: 0, y: 0, z: 0, sx: 0.34, sy: 0.30, sz: 0.26, ...c },
+    { x: 0, y: 0, z: 0, sx: 0.34, sy: 0.30, sz: 0.26, ...body },
     { x: 0, y: 0.16, z: 0, sx: 0.36, sy: 0.04, sz: 0.28, ...trim },
   ];
   return buildVoxelModel(blocks);
@@ -900,6 +946,99 @@ export function buildRocketTruckPodGeometry(): THREE.BufferGeometry {
 /** Pod pivot in unit-local coords — sits in the centre of the rear deck. */
 export const ROCKET_TRUCK_POD_PIVOT_Y = 1.00;
 export const ROCKET_TRUCK_POD_PIVOT_Z = 0.55;
+
+// ---------- AA vehicle ---------------------------------------------------
+// Wheeled anti-air platform. Same chassis silhouette as the rocket truck so
+// the model shares the road-physics feel, but with a quad-barrel flak gun
+// where the rocket pod would be. Federation red/white/blue trim distinguishes
+// it from the navy rocket truck.
+
+const AA_HULL      = { r: 0.18, g: 0.30, b: 0.20 }; // olive drab
+const AA_HULL_DARK = { r: 0.10, g: 0.18, b: 0.12 };
+const AA_HULL_HI   = { r: 0.72, g: 0.14, b: 0.16 }; // red trim band
+const AA_DECK      = { r: 0.85, g: 0.85, b: 0.88 }; // white deck
+const AA_TIRE      = { r: 0.08, g: 0.08, b: 0.10 };
+const AA_HUB       = { r: 0.45, g: 0.45, b: 0.45 };
+const AA_GLASS     = { r: 0.20, g: 0.45, b: 0.55 };
+const AA_GUN_BODY  = { r: 0.28, g: 0.32, b: 0.28 };
+const AA_GUN_RIM   = { r: 0.55, g: 0.55, b: 0.58 };
+const AA_BARREL    = { r: 0.18, g: 0.20, b: 0.18 };
+const AA_RADAR     = { r: 0.95, g: 0.95, b: 0.95 };
+
+export function buildAAVehicleHullGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Wheels: four tires.
+  for (const sx of [-0.95, 0.95]) {
+    for (const sz of [-1.05, 1.05]) {
+      blocks.push({ x: sx, y: 0.40, z: sz, sx: 0.40, sy: 0.80, sz: 0.80, ...AA_TIRE });
+      blocks.push({ x: sx, y: 0.40, z: sz, sx: 0.30, sy: 0.40, sz: 0.40, ...AA_HUB });
+    }
+  }
+  // Lower frame.
+  blocks.push({ x: 0.0, y: 0.50, z: 0.0, sx: 1.70, sy: 0.30, sz: 2.70, ...AA_HULL_DARK });
+  // Cab over the front wheels — slightly shorter than rocket truck so the
+  // gun mount has more clearance.
+  blocks.push({ x: 0.0, y: 0.95, z: -1.00, sx: 1.40, sy: 0.80, sz: 0.90, ...AA_HULL });
+  blocks.push({ x: 0.0, y: 1.36, z: -1.00, sx: 1.45, sy: 0.10, sz: 0.95, ...AA_HULL_DARK });
+  // Cab windscreen.
+  blocks.push({ x: 0.0, y: 1.06, z: -1.42, sx: 1.10, sy: 0.40, sz: 0.05, ...AA_GLASS });
+  // Side windows.
+  blocks.push({ x: -0.73, y: 1.06, z: -1.00, sx: 0.05, sy: 0.36, sz: 0.65, ...AA_GLASS });
+  blocks.push({ x:  0.73, y: 1.06, z: -1.00, sx: 0.05, sy: 0.36, sz: 0.65, ...AA_GLASS });
+  // Front bumper + red Federation trim band on the cab roof.
+  blocks.push({ x: 0.0, y: 0.55, z: -1.50, sx: 1.60, sy: 0.20, sz: 0.10, ...AA_GUN_RIM });
+  blocks.push({ x: 0.0, y: 1.42, z: -0.70, sx: 1.20, sy: 0.04, sz: 0.10, ...AA_HULL_HI });
+  // Rear deck base where the gun mount sits.
+  blocks.push({ x: 0.0, y: 0.85, z: 0.55, sx: 1.50, sy: 0.18, sz: 1.40, ...AA_DECK });
+  // Turntable ring.
+  blocks.push({ x: 0.0, y: 0.95, z: 0.55, sx: 1.20, sy: 0.05, sz: 1.20, ...AA_GUN_RIM });
+  return buildVoxelModel(blocks);
+}
+
+/**
+ * The flak gun mount — a yawing quad-barrel cannon with a small acquisition
+ * radar dish above the breech. Origin is at the centre of the turntable so
+ * a Y rotation on this geometry yaws the gun freely. Faces -Z by default so
+ * the barrels point forward.
+ */
+export function buildAAVehiclePodGeometry(): THREE.BufferGeometry {
+  const blocks: VoxelBlock[] = [];
+  // Mount base + breech housing.
+  blocks.push({ x: 0, y: 0.06, z: 0.0, sx: 1.10, sy: 0.12, sz: 1.10, ...AA_GUN_RIM });
+  blocks.push({ x: 0, y: 0.18, z: 0.0, sx: 0.95, sy: 0.20, sz: 0.95, ...AA_GUN_BODY });
+  // Breech / gunner shield rises behind the barrels.
+  blocks.push({ x: 0, y: 0.55, z: 0.30, sx: 0.85, sy: 0.55, sz: 0.20, ...AA_GUN_BODY });
+  blocks.push({ x: 0, y: 0.85, z: 0.40, sx: 0.95, sy: 0.10, sz: 0.05, ...AA_GUN_RIM });
+  // Quad barrels — 2x2 arrangement pointing -Z.
+  const barrelLen = 1.60;
+  const barrelR = 0.07;
+  for (const bx of [-0.20, 0.20]) {
+    for (const by of [0.45, 0.70]) {
+      blocks.push({
+        x: bx, y: by, z: -0.30,
+        sx: barrelR * 2, sy: barrelR * 2, sz: barrelLen,
+        ...AA_BARREL,
+      });
+      // Muzzle brake at the front of each barrel.
+      blocks.push({
+        x: bx, y: by, z: -0.30 - barrelLen * 0.5 - 0.04,
+        sx: barrelR * 2.6, sy: barrelR * 2.6, sz: 0.10,
+        ...AA_GUN_RIM,
+      });
+    }
+  }
+  // Cross-yoke that holds the barrel pairs together at the muzzle.
+  blocks.push({ x: 0, y: 0.575, z: -1.00, sx: 0.55, sy: 0.06, sz: 0.06, ...AA_GUN_RIM });
+  // Radar / sight cluster on top of the breech.
+  blocks.push({ x: 0, y: 1.05, z: 0.40, sx: 0.10, sy: 0.30, sz: 0.10, ...AA_GUN_BODY });
+  blocks.push({ x: 0, y: 1.22, z: 0.40, sx: 0.55, sy: 0.05, sz: 0.30, ...AA_RADAR });
+  return buildVoxelModel(blocks);
+}
+
+/** Pod pivot in unit-local coords — same as the rocket truck so the chassis
+ *  shares the rear-deck mount geometry. */
+export const AA_VEHICLE_POD_PIVOT_Y = 1.00;
+export const AA_VEHICLE_POD_PIVOT_Z = 0.55;
 
 // ---------- Supply truck -------------------------------------------------
 // Unarmed logistics flatbed. Hull is built at 0.5× the original design scale.

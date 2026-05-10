@@ -24,12 +24,20 @@ import {
 import { UnitGrid } from './UnitGrid';
 import { FourAryHeap } from '../util/Heap';
 
+// World is 384 × 20 × 384 nav cells (3072 × 160 × 3072 voxels at
+// 8 voxels per cell). CLUSTER_Y must divide GRID_Y evenly — when the
+// world's vertical was 24 cells (192 voxels) we used CLUSTER_Y = 8;
+// after WORLD_Y dropped to 160, a CLUSTER_Y of 8 left the top
+// 4 rows (cy = 16..19) outside every cluster, which made
+// `clusterOfCell` overflow into past-end mask reads in FlowField.
+// 10 keeps the same coarse 2-tier vertical partitioning at the new
+// height: cy = 0..9 lives in cuy 0, cy = 10..19 in cuy 1.
 export const CLUSTER_X = 16;
-export const CLUSTER_Y = 8;
+export const CLUSTER_Y = 10;
 export const CLUSTER_Z = 16;
-export const CLUSTERS_X = (GRID_X / CLUSTER_X) | 0;          // 8
-export const CLUSTERS_Y = (GRID_Y / CLUSTER_Y) | 0;          // 3
-export const CLUSTERS_Z = (GRID_Z / CLUSTER_Z) | 0;          // 8
+export const CLUSTERS_X = (GRID_X / CLUSTER_X) | 0;          // 24
+export const CLUSTERS_Y = (GRID_Y / CLUSTER_Y) | 0;          // 2
+export const CLUSTERS_Z = (GRID_Z / CLUSTER_Z) | 0;          // 24
 export const CLUSTER_COUNT = CLUSTERS_X * CLUSTERS_Y * CLUSTERS_Z;
 
 export function clusterIndex(cux: number, cuy: number, cuz: number): number {

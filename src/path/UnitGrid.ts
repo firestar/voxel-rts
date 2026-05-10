@@ -105,6 +105,24 @@ export function isUnitCellPassable(vg: VolumeGrid, p: UnitProfile, cx: number, c
     }
   }
 
+  // Tree-trunk/canopy mask — any column inside the unit's footprint that
+  // SurfaceNav flagged as tree-blocked is unpassable for non-diggers at
+  // EVERY cy. Without this, the path planner finds the air cell directly
+  // above the canopy "passable" (it sits on top of the leaf voxels which
+  // count as solid ground); the worker physics then walks at the real
+  // surface Y *below* the canopy and `pushOutOfTree` shoves them away every
+  // tick. Diggers are exempt — they tunnel through whatever the cutter
+  // touches.
+  if (!p.canDig) {
+    const tm = vg.treeMask;
+    for (let z = z0; z <= z1; z++) {
+      const zOff = z * GRID_X;
+      for (let x = x0; x <= x1; x++) {
+        if (tm[zOff + x] !== 0) return false;
+      }
+    }
+  }
+
   for (let dy = 0; dy < h; dy++) {
     const y = cy + dy;
     const yOff = y * Y_STRIDE;

@@ -21,11 +21,13 @@ export type WeaponKind =
   | 'sniper'
   | 'machine_gun'
   | 'rpg_launcher'
+  | 'mortar'
   | 'tank_cannon'
   | 'rocket_pod'
   | 'cluster_pod'
   | 'building_turret'
   | 'aa_turret'
+  | 'aa_flak'
   | 'silo_launcher';
 
 export type WeaponMount = 'hull' | 'turret';
@@ -123,6 +125,20 @@ export const WEAPONS: Record<WeaponKind, WeaponConfig> = {
     velocityScale: 1.0,
     muzzleFlashRadius: 0.7, muzzleFlashSeconds: 0.20,
   },
+  mortar: {
+    // Indirect-fire infantry mortar. High arc, long cooldown, big terrain
+    // dent. The mortar shell carries the same scale of explosive damage as
+    // a tank shell but with the slow bouncing arc of the building turret —
+    // perfect for digging into a fortified position from outside its line
+    // of sight.
+    kind: 'mortar', label: 'Light infantry mortar',
+    projectile: 'mortar_shell', aimedBy: 'hull',
+    aimToleranceRad: 0.05, aimSlewRadPerSec: 2.5,
+    fireInterval: 5.5, rangeMeters: 110, spreadRad: 0.03,
+    shotsPerBurst: 1, burstInterval: 0,
+    velocityScale: 1.0,
+    muzzleFlashRadius: 0.75, muzzleFlashSeconds: 0.18,
+  },
   tank_cannon: {
     kind: 'tank_cannon', label: 'Tank cannon',
     // Turret aim — tank yaws its turret to the target while the hull keeps
@@ -186,6 +202,21 @@ export const WEAPONS: Record<WeaponKind, WeaponConfig> = {
     muzzleFlashRadius: 1.2, muzzleFlashSeconds: 0.30,
   },
   /**
+   * Mobile AA flak gun. Faster cycle than the static AA missile (a vehicle
+   * can reposition, so it leans on rate-of-fire rather than per-shot blast
+   * to cover its column). Same interceptor projectile, slewed by a much
+   * livelier turret so it keeps up with crossing rounds.
+   */
+  aa_flak: {
+    kind: 'aa_flak', label: 'AA Flak Cannon',
+    projectile: 'aa_missile', aimedBy: 'turret',
+    aimToleranceRad: 0.18, aimSlewRadPerSec: 5.0,
+    fireInterval: 2.0, rangeMeters: 110, spreadRad: 0.015,
+    shotsPerBurst: 1, burstInterval: 0,
+    velocityScale: 1.0,
+    muzzleFlashRadius: 0.8, muzzleFlashSeconds: 0.12,
+  },
+  /**
    * Silo launcher. The heaviest weapon in the catalog — long cooldown, huge
    * blast, and a long range backed by the silo's high launcherMaxStrength. Aim
    * is 'turret' but the silo's "turret" is the missile cluster on top; the
@@ -210,11 +241,14 @@ export const WEAPONS: Record<WeaponKind, WeaponConfig> = {
  */
 export function defaultWeaponFor(kind: string): WeaponKind | null {
   switch (kind) {
-    case 'soldier':      return 'rifle';
-    case 'sniper':       return 'sniper';
-    case 'gunner':       return 'machine_gun';
-    case 'tank':         return 'tank_cannon';
-    case 'rocket_truck': return 'cluster_pod';
-    default:             return null;
+    case 'soldier':         return 'rifle';
+    case 'sniper':          return 'sniper';
+    case 'gunner':          return 'machine_gun';
+    case 'mortar_soldier':  return 'mortar';
+    case 'rocket_soldier':  return 'rpg_launcher';
+    case 'tank':            return 'tank_cannon';
+    case 'rocket_truck':    return 'cluster_pod';
+    case 'aa_vehicle':      return 'aa_flak';
+    default:                return null;
   }
 }

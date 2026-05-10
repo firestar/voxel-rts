@@ -9,6 +9,7 @@ import { raycastVoxel } from '../voxel/Raycast';
 import { VOXEL_SIZE, WORLD_Y, WORLD_X, WORLD_Z, AIR } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
 import { Pathfinder, profileFromUnit } from '../path/Pathfinder';
+import { syncTreeMask } from '../path/VolumeGrid';
 import { PathWorkerClient } from '../path/PathWorkerClient';
 import type { PathTelemetry } from '../path/PathWorkerClient';
 import { sharedBuffersAvailable } from '../util/Shared';
@@ -22,17 +23,18 @@ import {
 } from '../path/VolumeNav';
 import {
   UnitManager, Unit, UnitKind, CarveRequest, WorldEditRequest, LevelRequest, TrampleRequest,
-  unitConfig, UNIT_KINDS,
+  unitConfig, UNIT_KINDS, UNIT_POP_COST, UNIT_THREAT, Team,
 } from '../sim/Units';
 import { UnitRenderer } from '../render/UnitRenderer';
 import {
   trackDamageFor,
-  M_DIRT, M_WOOD, M_METAL, M_FARM,
+  M_DIRT, M_WOOD, M_LEAF, M_METAL, M_FARM,
   M_GRASS, M_STONE, M_PATH, M_MUD,
 } from '../voxel/Materials';
 import type { MaterialId } from '../voxel/types';
-import { BuildingManager, BARRACKS, STORAGE, HQ, ALL_BUILDINGS, BuildingSpec, Building, checkFootprint } from '../sim/Buildings';
+import { BuildingManager, BARRACKS, STORAGE, HQ, ALL_BUILDINGS, BuildingSpec, Building, checkFootprint, buildingThreatLevel, doorWorldPos } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
+import { ConstructionOverlay } from '../render/ConstructionOverlay';
 import { BuildingRenderer } from '../render/BuildingRenderer';
 import { BuildingRangeIndicator } from '../render/BuildingRangeIndicator';
 import { UnitRangeIndicator } from '../render/UnitRangeIndicator';
@@ -42,10 +44,14 @@ import { ProcessingBoxOverlay, ProcessBox } from '../render/ProcessingBoxOverlay
 import { TargetMarker } from '../render/TargetMarker';
 import { Resources } from '../sim/Resources';
 import { SaplingManager } from '../sim/Saplings';
-import { tickWorkers, approachPos } from '../sim/Workers';
+import { LeafDecay } from '../sim/LeafDecay';
+import { CivilianSystem } from '../sim/Civilians';
+import { RemoteAIClient } from '../sim/RemoteAIClient';
+import { tickWorkers, approachPos, WORKER_CHOP_REACH_M } from '../sim/Workers';
 import { tickSupplyTrucks } from '../sim/SupplyTrucks';
+import { PathTracer } from '../sim/PathTracer';
 import { WorkerTaskBoard, describeOrder } from '../sim/WorkerTasks';
-import { ProjectileManager, PROJECTILES, muzzleOrigin, ProjectileImpact } from '../sim/Projectiles';
+import { ProjectileManager, PROJECTILES, PROJECTILE_GRAVITY, muzzleOrigin, ProjectileImpact } from '../sim/Projectiles';
 import { WEAPONS, WeaponKind } from '../sim/Weapons';
 import { tickWeapons } from '../sim/WeaponTick';
 import {
@@ -61,6 +67,8 @@ import {
   ActionContext, BuildingAction, UnitAction,
   buildingActionsFor, unitActionsFor,
 } from './Actions';
+import { makeUnitPortraitButton, makeUnitPortraitTile, makeBuildingPortraitTile, makeUpgradePortraitButton } from './Portraits';
+import { upgradeOptionById } from '../sim/Buildings';
 
 /**
  * Player UI mode. `build*` modes preview a building footprint; `plant` mode
@@ -105,6 +113,7 @@ export class Game {
   readonly buildingRange = new BuildingRangeIndicator();
   readonly unitRange = new UnitRangeIndicator();
   readonly ghost = new BuildingGhost();
+  readonly constructionOverlay = new ConstructionOverlay();
   /** The spec the user will place next while in build mode. Cycled via 1..N keys. */
   private buildSpec: BuildingSpec = BARRACKS;
   readonly pathPreview = new PathPreview();
@@ -127,8 +136,39 @@ export class Game {
   private readonly lastPathStatsByUnit = new Map<number, { kind: string; start: { cx: number; cy: number; cz: number }; goal: { cx: number; cy: number; cz: number }; reached: boolean; expanded: number; waypointCount: number; timings: PathTelemetry | undefined; timestamp: number }>();
   readonly target = new TargetMarker();
   readonly resources = new Resources();
+  /** Enemy-team resources, mirroring the player's. Workers + the
+   *  AI brain accumulate / spend out of this pool independently. */
+  readonly enemyResources = new Resources();
   readonly saplings = new SaplingManager();
   readonly taskBoard = new WorkerTaskBoard();
+  readonly leafDecay = new LeafDecay();
+  readonly civilians = new CivilianSystem();
+  /** Bridge to the standalone AI server (`ai-server.cjs`). When the
+   *  server is offline this stays dormant — the rest of the game works
+   *  unchanged. */
+  readonly aiClient = new RemoteAIClient();
+  /** How many AI opponents to seed at game start. Set by main.ts from
+   *  the lobby's `aiCount` setting before `generate()` runs. */
+  numAi = 1;
+  /** Phase 2 of the zero-trust migration: when true, every spawned
+   *  unit is mirrored into the authoritative `game-server` and its
+   *  position is reconciled against the server's snapshot every
+   *  frame. Off by default until `attachAuthoritativeServer` runs so
+   *  legacy single-player paths keep working. */
+  zeroTrustEnabled = false;
+  /** The authoritative-server bridge (set by main.ts). Null when the
+   *  game is running in pure single-player mode. */
+  gameClient: import('../net/GameClient').GameClient | null = null;
+  /** Mirrors authoritative voxel-edit deltas from the server into the
+   *  local voxel buffer. Lazy-loaded inside `attachAuthoritativeServer`
+   *  so the import only fires when zero-trust mode is on. */
+  private voxelEditMirror: import('../net/VoxelEditMirror').VoxelEditMirror | null = null;
+  /** Throttle for the periodic mirror-push of building state +
+   *  resources. Pushed at this interval rather than on every change
+   *  because building HP / resources tick at 60 Hz and we don't need
+   *  the network volume that implies. */
+  private bridgePushTimer = 0;
+  private static readonly BRIDGE_PUSH_INTERVAL_S = 0.5;
   readonly projectiles = new ProjectileManager();
   readonly projectileRenderer = new ProjectileRenderer();
   readonly muzzleFlashes = new FlashPool(256);
@@ -141,6 +181,10 @@ export class Game {
   readonly rallyMarkers = new RallyMarkerRenderer();
   readonly minimap = new MinimapRenderer();
   readonly powerLines = new PowerLineRenderer();
+  /** Off by default; enabled with `?trace=1` query param. Records every unit's
+   *  position over time and dumps a top-down PNG on page-unload so the user
+   *  can verify pathfinding visually. */
+  readonly pathTracer = new PathTracer();
   private metalClusters: MetalCluster[] = [];
   // Remaining metal per voxel (worldIndex → count). Defaults to METAL_PER_VOXEL on first access.
   private metalVoxelRemaining = new Map<number, number>();
@@ -178,6 +222,20 @@ export class Game {
   /** Last rendered task-panel signature. Same purpose as `actionsRenderedKey`. */
   private tasksRenderedKey = '';
   private pathInfoEl: HTMLElement | null = null;
+  private resFoodEl: HTMLElement | null = null;
+  private resMetalsEl: HTMLElement | null = null;
+  private resWoodEl: HTMLElement | null = null;
+  private resPopEl: HTMLElement | null = null;
+  private ageMedallionEl: HTMLElement | null = null;
+  private ageNameEl: HTMLElement | null = null;
+  private ageTimeEl: HTMLElement | null = null;
+  private selPanelEl: HTMLElement | null = null;
+  private selPortraitEl: HTMLElement | null = null;
+  private selNameEl: HTMLElement | null = null;
+  private selSubEl: HTMLElement | null = null;
+  private selStatsEl: HTMLElement | null = null;
+  private selRenderedKey = '';
+  private gameElapsedSeconds = 0;
   private mode: Mode = 'play';
   /** Stance to assign when the next LMB click commits a rally waypoint. */
   private pendingWaypointStance: 'aggressive' | 'defensive' = 'aggressive';
@@ -198,8 +256,155 @@ export class Game {
    * (clamped); `\` resets it to the world top (= effectively no cut).
    */
   private hideAboveY = WORLD_Y * VOXEL_SIZE;
+  /** Fog-of-war: chunk fragments outside every player unit / building
+   *  sphere are discarded. Default unit radius is 100-voxel diameter
+   *  → 50-voxel radius → 6.25 m at the world's 0.125 m/voxel.
+   *  Building radius is per-kind, computed from the building's
+   *  footprint half-diagonal + a per-kind sight bonus so a 6×6 HQ
+   *  reveals its full footprint plus a generous ring around it. */
+  fowEnabled = true;
+  fowUnitRadiusMeters = 50 * VOXEL_SIZE;
+  /** Per-kind sight bonus (cells = metres at NAV_CELL_METERS = 1)
+   *  added on top of each building's footprint half-diagonal. Tuned
+   *  to match `SIGHT_RADIUS_BY_BUILDING_KIND` on the server so the
+   *  visual disc roughly matches the server's per-viewer entity
+   *  visibility filter. */
+  static readonly FOW_BUILDING_SIGHT_BY_KIND: Record<string, number> = {
+    hq: 42, barracks: 18, vehicle_depot: 18, farm: 10,
+    neighborhood: 16, storage: 16,
+  };
+  /** Reused flat (x, y, z, radius) Float32Array for FoW vision
+   *  sources. Capacity matches ChunkMeshRegistry.MAX_FOW_SOURCES to
+   *  avoid per-frame growth; only the prefix [0..4*count) is
+   *  meaningful each frame. */
+  private fowFlatBuf = new Float32Array(ChunkMeshRegistry.MAX_FOW_SOURCES * 4);
+  /** Sticky 1-byte-per-cell map: a bit is set the first time any
+   *  player vision source covers that XZ nav cell, and never cleared.
+   *  Drives the chunk shader's "was seen → grey fog" branch. The
+   *  matching THREE.DataTexture wraps this buffer directly so the
+   *  GPU sees writes after we flag `needsUpdate`. Sized to
+   *  NAV_W × NAV_H. */
+  private exploredXZ = new Uint8Array(NAV_W * NAV_H);
+  private exploredTex: THREE.DataTexture | null = null;
+  private exploredDirty = false;
+  /** Per-frame visibility test: world XZ → currently inside any FoW
+   *  source. Used to hide enemy units / buildings that the player has
+   *  no live vision on. The matching `fowSourcePackedXyzR` array is a
+   *  rebuild of `fowFlatBuf` snapshotted at the end of each frame's
+   *  pack so probe code, unit renderer, etc can query the same set. */
+  private currentFowFlat = new Float32Array(ChunkMeshRegistry.MAX_FOW_SOURCES * 4);
+  private currentFowCount = 0;
   private readonly explosionRadiusBigMeters = 3.0;
   private readonly explosionPeak = 90;
+
+  /**
+   * Returns true when world position (wx, wz) is inside any of the
+   * player's current vision spheres. Caller decides what y to use; we
+   * test against the source's recorded y so a worker on the surface
+   * doesn't reveal a unit hovering 30 m above. Cheap O(MAX_FOW_SOURCES).
+   */
+  isInsideCurrentFoW(wx: number, wy: number, wz: number): boolean {
+    const buf = this.currentFowFlat;
+    const n = this.currentFowCount;
+    for (let i = 0; i < n; i++) {
+      const sx = buf[i * 4]!;
+      const sy = buf[i * 4 + 1]!;
+      const sz = buf[i * 4 + 2]!;
+      const rsq = buf[i * 4 + 3]!;
+      const dx = wx - sx, dy = wy - sy, dz = wz - sz;
+      if (dx * dx + dy * dy + dz * dz <= rsq) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Per-frame: pack the player's live vision sources (units +
+   * buildings) into the FoW uniform buffer, push to the chunk
+   * material, snapshot for cross-system queries, and OR each source's
+   * XZ disc into the sticky `exploredXZ` bitmap. The snapshot's
+   * `.w` slot holds radius² so subsequent distance tests in
+   * `isInsideCurrentFoW` skip the per-source square.
+   */
+  private packFoWAndExplored(): void {
+    const cap = ChunkMeshRegistry.MAX_FOW_SOURCES;
+    const buf = this.fowFlatBuf;
+    let n = 0;
+    for (const u of this.units.units) {
+      if (u.team !== 'player') continue;
+      if (u.hp <= 0) continue;
+      if (n >= cap) break;
+      const i = n * 4;
+      buf[i] = u.x;
+      buf[i + 1] = u.y + 0.5;
+      buf[i + 2] = u.z;
+      buf[i + 3] = this.fowUnitRadiusMeters;
+      n++;
+    }
+    for (const b of this.buildings.buildings) {
+      if (b.team !== 'player') continue;
+      if (b.destroyed) continue;
+      if (n >= cap) break;
+      const i = n * 4;
+      const cellsW = b.spec.cellsW;
+      const cellsD = b.spec.cellsD;
+      const cx = (b.ox + cellsW * 0.5) * NAV_CELL_METERS;
+      const cz = (b.oz + cellsD * 0.5) * NAV_CELL_METERS;
+      const cy = (b.floorY + 4) * VOXEL_SIZE;
+      const halfDiag = Math.hypot(cellsW * 0.5, cellsD * 0.5) * NAV_CELL_METERS;
+      const sight = Game.FOW_BUILDING_SIGHT_BY_KIND[b.spec.kind] ?? 14;
+      buf[i] = cx;
+      buf[i + 1] = cy;
+      buf[i + 2] = cz;
+      buf[i + 3] = halfDiag + sight;
+      n++;
+    }
+    this.meshes.setFow(this.fowEnabled, buf, n);
+
+    // Snapshot the packed sources with `w` swapped from radius to
+    // radius² so `isInsideCurrentFoW` can do a single dot-vs-rsq
+    // compare per source instead of squaring inside the loop.
+    this.currentFowCount = n;
+    for (let i = 0; i < n; i++) {
+      const r = buf[i * 4 + 3]!;
+      this.currentFowFlat[i * 4]     = buf[i * 4]!;
+      this.currentFowFlat[i * 4 + 1] = buf[i * 4 + 1]!;
+      this.currentFowFlat[i * 4 + 2] = buf[i * 4 + 2]!;
+      this.currentFowFlat[i * 4 + 3] = r * r;
+    }
+
+    if (this.fowEnabled && this.exploredTex) {
+      const map = this.exploredXZ;
+      let dirty = false;
+      for (let s = 0; s < n; s++) {
+        const sx = buf[s * 4]!;
+        const sz = buf[s * 4 + 2]!;
+        const r = buf[s * 4 + 3]!;
+        const r2 = r * r;
+        const cxF = sx / NAV_CELL_METERS;
+        const czF = sz / NAV_CELL_METERS;
+        const rCell = Math.ceil(r / NAV_CELL_METERS) + 1;
+        const cx0 = Math.max(0, Math.floor(cxF - rCell));
+        const cx1 = Math.min(NAV_W - 1, Math.floor(cxF + rCell));
+        const cz0 = Math.max(0, Math.floor(czF - rCell));
+        const cz1 = Math.min(NAV_H - 1, Math.floor(czF + rCell));
+        for (let cz = cz0; cz <= cz1; cz++) {
+          const wcz = (cz + 0.5) * NAV_CELL_METERS;
+          const dz = wcz - sz;
+          for (let cx = cx0; cx <= cx1; cx++) {
+            const wcx = (cx + 0.5) * NAV_CELL_METERS;
+            const dx = wcx - sx;
+            if (dx * dx + dz * dz > r2) continue;
+            const idx = cz * NAV_W + cx;
+            if (map[idx] === 0) {
+              map[idx] = 255;
+              dirty = true;
+            }
+          }
+        }
+      }
+      if (dirty) this.exploredTex.needsUpdate = true;
+    }
+  }
 
   constructor(canvas: HTMLCanvasElement, statsEl: HTMLElement | null) {
     // Relay console.log / console.warn / console.error to the local log
@@ -220,6 +425,30 @@ export class Game {
     this.input = new Input();
     this.input.attach(window);
 
+    // Path-trace mode: `?trace=1` records every unit's positions and dumps a
+    // PNG on unload. Bound here because the listener must be installed
+    // synchronously during the first frame so a refresh-while-loading dumps
+    // whatever was captured.
+    const traceParam = new URLSearchParams(window.location.search).get('trace');
+    if (traceParam === '1' || traceParam === 'true') {
+      this.pathTracer.enabled = true;
+      const dump = () => {
+        if (!this.pathTracer.enabled) return;
+        const wx = WORLD_X * VOXEL_SIZE;
+        const wz = WORLD_Z * VOXEL_SIZE;
+        // Beacon the PNG to log-server (writes to /tmp on disk) — reliable
+        // even when the page is unloading. Also kick off a download as a
+        // user-visible fallback; browsers may suppress this from beforeunload
+        // but it works when triggered manually via the console.
+        this.pathTracer.saveViaBeacon(wx, wz);
+        this.pathTracer.saveAsDownload(wx, wz);
+      };
+      window.addEventListener('beforeunload', dump);
+      window.addEventListener('pagehide', dump);
+      // Expose for manual triggering from devtools console.
+      (window as unknown as { savePathTrace: () => void }).savePathTrace = dump;
+    }
+
     const sharedAvailable = sharedBuffersAvailable();
     this.world = VoxelWorld.create(sharedAvailable);
     this.meshes = new ChunkMeshRegistry(this.renderer.scene, this.world);
@@ -234,6 +463,7 @@ export class Game {
     this.renderer.scene.add(this.buildingRange.group);
     this.renderer.scene.add(this.unitRange.group);
     this.renderer.scene.add(this.ghost.group);
+    this.renderer.scene.add(this.constructionOverlay.group);
     this.renderer.scene.add(this.pathPreview.object);
     this.renderer.scene.add(this.pendingPathPreview.object);
     this.renderer.scene.add(this.processingBoxOverlay.group);
@@ -250,7 +480,33 @@ export class Game {
     this.renderer.scene.add(this.powerLines.group);
     this.ghost.setSpec(this.buildSpec);
 
-    this.buildings.spawner = (kind, x, y, z): Unit | null => this.spawnUnit(kind, x, y, z);
+    this.exploredTex = new THREE.DataTexture(
+      this.exploredXZ, NAV_W, NAV_H, THREE.RedFormat, THREE.UnsignedByteType,
+    );
+    this.exploredTex.minFilter = THREE.LinearFilter;
+    this.exploredTex.magFilter = THREE.LinearFilter;
+    this.exploredTex.wrapS = THREE.ClampToEdgeWrapping;
+    this.exploredTex.wrapT = THREE.ClampToEdgeWrapping;
+    this.exploredTex.needsUpdate = true;
+    const worldExtentX = NAV_W * NAV_CELL_METERS;
+    const worldExtentZ = NAV_H * NAV_CELL_METERS;
+    this.meshes.setExplored(true, this.exploredTex, worldExtentX, worldExtentZ);
+
+    this.buildings.spawner = (kind, x, y, z, b): Unit | null => this.spawnUnit(kind, x, y, z, b.team);
+    this.buildings.popHasRoom = (kind, b): boolean => {
+      // Enemy production has no popcap gate — the AI manages its own
+      // fielded count via the `MAX_FIELDED_ENEMIES` ceiling on the
+      // server side. Skipping the player's cap here keeps an enemy
+      // barracks producing even after the player's pop fills.
+      if (b.team !== 'player') return true;
+      const cost = UNIT_POP_COST[kind] ?? 1;
+      let used = 0;
+      for (const u of this.units.units) {
+        if (u.team !== 'player' || u.hp <= 0) continue;
+        used += UNIT_POP_COST[u.kind] ?? 1;
+      }
+      return used + cost <= (this.resources.popCap ?? 0);
+    };
     this.buildings.afterSpawn = (unit, building): void => {
       if (!building.rallyPoint) return;
       const rp = building.rallyPoint;
@@ -258,8 +514,12 @@ export class Game {
       void this.routePath(unit, rp.x, rp.y, rp.z, { forceSurface: true });
     };
     // Farms feed the resource counter via the manager's foodSink hook so the
-    // sim doesn't have to know about Resources directly.
-    this.buildings.foodSink = (amount): void => { this.resources.food += amount; };
+    // sim doesn't have to know about Resources directly. Routes food to
+    // the producing farm's team so an enemy farm fills the AI's pool.
+    this.buildings.foodSink = (amount, b): void => {
+      const r = b.team !== 'player' ? this.enemyResources : this.resources;
+      r.food += amount;
+    };
     // Buildings with weapons (turret, silo) drop their projectiles into the
     // shared manager and route their muzzle flashes into the same FlashPool
     // unit shots use, so the visual feels uniform.
@@ -273,6 +533,26 @@ export class Game {
     // shared VolumeGrid (SAB) so the path worker sees the same bits.
     this.buildings.onBuildingPlaced = (b): void => this.applyBuildingFootprintMask(b, true);
     this.buildings.onBuildingDestroyed = (b): void => this.applyBuildingFootprintMask(b, false);
+    // Destruction-ring explosions: fired several times per killed building.
+    // Carve voxels via the same `damageSphere` path projectiles use, and
+    // spawn a flash so the player sees each pop. We also rebuild nav
+    // around the affected area so units immediately path through the
+    // freshly-blown rubble.
+    this.buildings.onBuildingExplosion = (vx, vy, vz, radiusVoxels, peakDamage): void => {
+      const result = this.world.damageSphere(vx, vy, vz, radiusVoxels, peakDamage);
+      const cx = vx * VOXEL_SIZE;
+      const cy = vy * VOXEL_SIZE;
+      const cz = vz * VOXEL_SIZE;
+      const flashR = radiusVoxels * VOXEL_SIZE * 1.2;
+      this.impactFlashes.spawn(cx, cy, cz, flashR, 0.28, 1.0, 0.55, 0.20);
+      this.muzzleFlashes.spawn(cx, cy, cz, flashR * 0.55, 0.10, 1.0, 0.85, 0.45);
+      // Refresh nav around the crater so units stop pathing through the
+      // wreckage on stale data. AABB widened by the blast radius + 2 m so
+      // the surface nav passes pick up the new topY readings.
+      const r = radiusVoxels * VOXEL_SIZE + 2.0;
+      this.requestNavRebuildAround(cx - r, cy - r, cz - r, cx + r, cy + r, cz + r, false);
+      void result;
+    };
 
     this.fpsEl = statsEl;
     this.modeEl = document.getElementById('mode');
@@ -280,20 +560,45 @@ export class Game {
     this.actionsEl = document.getElementById('actions');
     this.tasksEl = document.getElementById('tasks');
     this.pathInfoEl = document.getElementById('pathinfo');
-    document.body.appendChild(this.minimap.canvas);
+    this.resFoodEl   = document.getElementById('res-food');
+    this.resMetalsEl = document.getElementById('res-metals');
+    this.resWoodEl   = document.getElementById('res-wood');
+    this.resPopEl    = document.getElementById('res-pop');
+    this.ageMedallionEl = document.getElementById('age-medallion');
+    this.ageNameEl      = document.getElementById('age-name');
+    this.ageTimeEl      = document.getElementById('age-time');
+    this.selPanelEl     = document.getElementById('selection-panel');
+    this.selPortraitEl  = document.getElementById('sel-portrait');
+    this.selNameEl      = document.getElementById('sel-name');
+    this.selSubEl       = document.getElementById('sel-sub');
+    this.selStatsEl     = document.getElementById('sel-stats');
+    // Dock the minimap inside the bottom-bar slot. Fall back to <body> if the
+    // slot is missing so existing unit tests / older HTML still work.
+    const miniSlot = document.getElementById('bottombar-mini');
+    (miniSlot ?? document.body).appendChild(this.minimap.canvas);
     this.minimap.onPan((wx, wz) => { this.camera.target.set(wx, 0, wz); });
 
     this.onResize();
     window.addEventListener('resize', this.onResize);
   }
 
-  async generate(seed: number, onProgress?: (done: number, total: number) => void): Promise<void> {
-    this.metalClusters = await generateWorld(this.world, seed, p => onProgress?.(p.done, p.total));
+  async generate(
+    seed: number,
+    onProgress?: (done: number, total: number) => void,
+    /** Pluggable worldgen source. Default is the local browser pipeline
+     *  (`src/voxel/WorldGen.ts:generateWorld`). Phase 6d wires
+     *  `streamWorldFromServer` here when the lobby launches with
+     *  `?streamWorld=1`. */
+    provider?: (world: VoxelWorld, seed: number, onProgress?: (p: { done: number; total: number }) => void) => Promise<MetalCluster[]>,
+  ): Promise<void> {
+    const gen = provider ?? generateWorld;
+    this.metalClusters = await gen(this.world, seed, p => onProgress?.(p.done, p.total));
     const useShared = sharedBuffersAvailable();
     // Surface projection — used by buildings, render code, Y-snap. Independent
     // of the per-unit-type 3D pathfinding grids below.
     this.surfaceNav = allocateNav(useShared);
     buildSurfaceNav(this.world.buffers.voxels, this.surfaceNav);
+    // Pathfinder is allocated below — defer the treeMask sync until after.
     // Volume summary — exposed for diggers' "is the next cell still solid?"
     // mid-tick check inside Units.tickVolume. Same shape the legacy code used.
     this.vnav = allocateVolumeNav(useShared);
@@ -306,6 +611,11 @@ export class Game {
     // worker that shares the same bitmaps zero-copy.
     this.pathfinder = new Pathfinder(useShared);
     this.pathfinder.attach(this.world);
+    // Mirror SurfaceNav's tree-blocked columns into the volume grid so unit
+    // grids reject any cy in a tree column for non-diggers (they walk at
+    // surface Y; a path "above the canopy" is unreachable in practice).
+    syncTreeMask(this.pathfinder.volume, this.surfaceNav.treeBlocked, 0, 0, NAV_W - 1, NAV_H - 1);
+    this.pathfinder.rebuildAllUnitGrids();
     const profiles = [];
     for (const kind of UNIT_KINDS) {
       const cfg = unitConfig(kind);
@@ -332,22 +642,40 @@ export class Game {
     this.spawnInitialUnits();
   }
 
-  private spawnInitialUnits(): void {
-    if (!this.pathfinder) return;
+  /**
+   * Search a square window of `radius` nav cells around (cx, cz) for the
+   * unblocked cell with the highest `flatness`. Falls back to the
+   * window centre when every cell in the window is blocked, so the
+   * caller still has a coordinate to feed into `checkFootprint`.
+   */
+  private findFlatSpawnCell(cx: number, cz: number, radius: number): { cx: number; cz: number } {
     const nav = this.surfaceNav!;
-    const cx = NAV_W >> 1, cz = NAV_H >> 1;
-    let found = { cx, cz };
+    let best = { cx, cz };
     let bestFlat = -1;
-    for (let dz = -8; dz <= 8; dz++) {
-      for (let dx = -8; dx <= 8; dx++) {
+    for (let dz = -radius; dz <= radius; dz++) {
+      for (let dx = -radius; dx <= radius; dx++) {
         const x = cx + dx, z = cz + dz;
         if (x < 0 || z < 0 || x >= NAV_W || z >= NAV_H) continue;
         const i = navIndex(x, z);
         if (nav.blocked[i]) continue;
         const f = nav.flatness[i]!;
-        if (f > bestFlat) { bestFlat = f; found = { cx: x, cz: z }; }
+        if (f > bestFlat) { bestFlat = f; best = { cx: x, cz: z }; }
       }
     }
+    return best;
+  }
+
+  private spawnInitialUnits(): void {
+    if (!this.pathfinder) return;
+    const nav = this.surfaceNav!;
+    // Pick the player's spawn cell from the NW corner of the map. The
+    // enemy HQ ends up in the opposite (SE) corner via `placeEnemyHQ`,
+    // so the two factions start at the long-diagonal extremes.
+    const found = this.findFlatSpawnCell(
+      Math.floor(NAV_W * 0.10),
+      Math.floor(NAV_H * 0.10),
+      Math.floor(NAV_W * 0.20),
+    );
     const c = navCenter(nav, found.cx, found.cz);
     // Six workers to seed the economy loop from the start.
     this.spawnWorker(c.x - 2.0, c.y, c.z + 1.0);
@@ -401,6 +729,13 @@ export class Game {
       }
     }
 
+    // Place enemy bases on the opposite side of the map. The lobby
+    // sets `numAi`; we lay one HQ down at each pre-defined "AI corner"
+    // until the count is satisfied. If every candidate footprint
+    // fails on a particular spot (rare on rough terrain) we just
+    // skip — the EnemyAI tick is a no-op when no enemy HQ is alive.
+    this.placeEnemyBases(this.numAi);
+
     this.camera.target.set(c.x, 0, c.z);
     // Compute power-line routes now that HQ is placed.
     this.recomputePowerLinePaths();
@@ -409,6 +744,146 @@ export class Game {
     this.resources.food    = 200;
     this.resources.metals  = 100;
     this.resources.wood    = 100;
+  }
+
+  /**
+   * Find a flat cell roughly 60 % of the map diagonal away from the
+   * player's spawn and stamp an enemy HQ there. Falls back through
+   * progressively closer offsets so worlds with extreme terrain still
+   * end up with a valid enemy footprint somewhere.
+   */
+  /** Pre-defined AI corner / edge anchors expressed as fractions of the
+   *  nav grid. We pick the first `count` of these — they're sorted by
+   *  distance from the player's NW spawn, so a 1-AI game gets the
+   *  classic SE diagonal opponent and adding more AIs spreads them
+   *  around the perimeter. The list is long enough (8 entries) for
+   *  the `MAX_AI = 7` cap the lobby surfaces. */
+  private static AI_BASE_RATIOS: ReadonlyArray<readonly [number, number]> = [
+    [0.90, 0.90],
+    [0.90, 0.10],
+    [0.10, 0.90],
+    [0.90, 0.50],
+    [0.50, 0.90],
+    [0.75, 0.25],
+    [0.25, 0.75],
+    [0.65, 0.65],
+  ];
+
+  private placeEnemyBases(count: number): void {
+    if (!this.surfaceNav || count <= 0) return;
+    const search = Math.max(8, Math.floor(NAV_W * 0.10));
+    for (let i = 0; i < Math.min(count, Game.AI_BASE_RATIOS.length); i++) {
+      const [rx, rz] = Game.AI_BASE_RATIOS[i]!;
+      const targetCx = Math.floor(NAV_W * rx);
+      const targetCz = Math.floor(NAV_H * rz);
+      const best = this.findFlatSpawnCell(targetCx, targetCz, search);
+      const offsets: [number, number][] = [
+        [0, 0], [-4, 0], [4, 0], [0, -4], [0, 4],
+        [-8, 0], [8, 0], [0, -8], [0, 8],
+        [-8, -8], [8, 8], [-8, 8], [8, -8],
+      ];
+      // Alternate teams so multiple AIs are hostile to each other.
+      // Index 0 is plain 'enemy' (the legacy single-AI team), index 1+
+      // becomes 'enemy2'. The targeting pass already keys off
+      // `team !== mine.team` so any pair across these labels engages.
+      const baseTeam: Team = i % 2 === 0 ? 'enemy' : 'enemy2';
+      let placed = false;
+      for (const [dx, dz] of offsets) {
+        const ox = Math.max(0, Math.min(NAV_W - HQ.cellsW, best.cx + dx - (HQ.cellsW >> 1)));
+        const oz = Math.max(0, Math.min(NAV_H - HQ.cellsD, best.cz + dz - (HQ.cellsD >> 1)));
+        const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, HQ, ox, oz, this.buildings.buildings);
+        if (!fp.ok) continue;
+        this.buildings.place(this.world, HQ, ox, oz, fp.floorY, { team: baseTeam });
+        const pad = NAV_CELL_METERS;
+        const bx0 = ox * NAV_CELL_METERS;
+        const bz0 = oz * NAV_CELL_METERS;
+        const bx1 = (ox + HQ.cellsW) * NAV_CELL_METERS;
+        const bz1 = (oz + HQ.cellsD) * NAV_CELL_METERS;
+        const by0 = fp.floorY * VOXEL_SIZE;
+        const by1 = (fp.floorY + HQ.headroomVoxels + 4) * VOXEL_SIZE;
+        this.requestNavRebuildAround(bx0 - pad, by0 - pad, bz0 - pad, bx1 + pad, by1 + pad, bz1 + pad, false);
+        this.seedEnemyEconomy(ox, oz, fp.floorY, baseTeam);
+        placed = true;
+        break;
+      }
+      if (!placed) {
+        // Couldn't fit a base at this anchor — log and skip; remaining
+        // AIs still get their shot at later anchors.
+        console.warn(`[ai] could not place enemy HQ #${i + 1} at (${rx}, ${rz})`);
+      }
+    }
+  }
+
+  /**
+   * Stamp an enemy storage near the just-placed enemy HQ and spawn the
+   * starter worker squad. Mirrors the player's `spawnInitialUnits`
+   * starter kit so the AI begins with a comparable economy.
+   *
+   * The storage gets a try-list of cardinal offsets just like the
+   * player's. If every footprint fails on rough terrain we silently
+   * skip — the AI can still build later, the workers will just stand
+   * idle until a delivery target exists.
+   */
+  private seedEnemyEconomy(hqOx: number, hqOz: number, hqFloorY: number, baseTeam: Team = 'enemy'): void {
+    if (!this.surfaceNav) return;
+    const startCx = hqOx + (HQ.cellsW >> 1);
+    const startCz = hqOz + (HQ.cellsD >> 1);
+    const offsets: [number, number][] = [[5, 0], [-5, 0], [0, 5], [0, -5], [4, 4], [-4, -4]];
+    for (const [dx, dz] of offsets) {
+      const ox = Math.max(0, Math.min(NAV_W - STORAGE.cellsW, startCx + dx - (STORAGE.cellsW >> 1)));
+      const oz = Math.max(0, Math.min(NAV_H - STORAGE.cellsD, startCz + dz - (STORAGE.cellsD >> 1)));
+      const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, STORAGE, ox, oz, this.buildings.buildings);
+      if (!fp.ok) continue;
+      this.buildings.place(this.world, STORAGE, ox, oz, fp.floorY, { team: baseTeam });
+      const pad = NAV_CELL_METERS;
+      const bx0 = ox * NAV_CELL_METERS;
+      const bz0 = oz * NAV_CELL_METERS;
+      const bx1 = (ox + STORAGE.cellsW) * NAV_CELL_METERS;
+      const bz1 = (oz + STORAGE.cellsD) * NAV_CELL_METERS;
+      const by0 = fp.floorY * VOXEL_SIZE;
+      const by1 = (fp.floorY + STORAGE.headroomVoxels + 4) * VOXEL_SIZE;
+      this.requestNavRebuildAround(bx0 - pad, by0 - pad, bz0 - pad, bx1 + pad, by1 + pad, bz1 + pad, false);
+      break;
+    }
+    // Spawn 4 enemy workers a couple of cells off the HQ door so they
+    // don't collide with the structure's footprint at frame 0. Two are
+    // dedicated farmers (focus = 'farm') so the AI's farms get tended
+    // and harvested without the brain having to issue per-worker
+    // commands. The other two stay on auto so they keep grinding the
+    // metal economy.
+    const cxw = (hqOx + HQ.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+    const czw = (hqOz + HQ.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+    const halfW = HQ.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE * 0.5;
+    // Six AI workers per base: 4 auto-focus (mine ore by default,
+    // pick up farm orders when boards offer them) + 2 chop-focus.
+    // Auto-focus workers always prefer ore over wood, so without a
+    // dedicated chopper pair the AI can't accumulate wood and stalls
+    // out building barracks/farms (both need 30-60 wood each).
+    const seed: Array<{ wx: number; wz: number; focus: 'auto' | 'farm' | 'chop' | 'mine' }> = [
+      { wx: cxw + halfW + 2, wz: czw - 2, focus: 'auto' },
+      { wx: cxw + halfW + 2, wz: czw + 2, focus: 'auto' },
+      { wx: cxw + halfW + 4, wz: czw - 1, focus: 'auto' },
+      { wx: cxw + halfW + 4, wz: czw + 1, focus: 'auto' },
+      { wx: cxw + halfW + 3, wz: czw - 3, focus: 'chop' },
+      { wx: cxw + halfW + 3, wz: czw + 3, focus: 'chop' },
+    ];
+    for (const { wx, wz, focus } of seed) {
+      const wy = this.surfaceWorldY(wx, wz);
+      const safe = this.safeSpawnXZ(wx, wz);
+      const w = this.units.spawn('worker', safe.x, wy, safe.z, { team: baseTeam, stance: 'defensive' });
+      if (w) w.workerFocus = focus;
+    }
+    // Seed enemy resources just enough to place a barracks + first farm
+    // without waiting for workers to grind out the cost. Production
+    // beyond that must come from real gathering — workers mining
+    // metals, chopping wood, harvesting farms — same rule the player
+    // operates under. AI cheating its bank is a game-rule violation.
+    // `+=` because seedEnemyEconomy runs once per AI base; each fresh
+    // base contributes its own slice without zeroing previous earnings.
+    this.enemyResources.food   += 200;
+    this.enemyResources.metals += 100;
+    this.enemyResources.wood   += 100;
+    void hqFloorY;
   }
 
   /**
@@ -466,9 +941,12 @@ export class Game {
     }
   }
 
-  private spawnUnit(kind: UnitKind, x: number, y: number, z: number): Unit | null {
+  private spawnUnit(kind: UnitKind, x: number, y: number, z: number, team: Team = 'player'): Unit | null {
     ({ x, z } = this.safeSpawnXZ(x, z));
-    return this.units.spawn(kind, x, y, z);
+    // Enemy production rolls out in aggressive stance so the unit
+    // immediately starts auto-engaging once it leaves the door.
+    const stance = team !== 'player' ? 'aggressive' : 'defensive';
+    return this.units.spawn(kind, x, y, z, { team, stance });
   }
 
   private spawnWorker(x: number, y: number, z: number): Unit | null {
@@ -484,8 +962,13 @@ export class Game {
     const r = this.resources;
     const trucks = this.units.units.filter(u => u.kind === 'supply_truck' && u.hp > 0);
     const hqs = this.buildings.buildings.filter(b => b.spec.kind === 'hq' && !b.destroyed);
-    console.log(`[RESOURCES] food=${r.food.toFixed(0)} metals=${r.metals.toFixed(0)} wood=${r.wood.toFixed(0)} | active_trucks=${trucks.length} | HQ activeTrucks=${hqs.map(h => `${h.activeTrucks}/${h.spec.maxTrucks ?? 5}`).join(',')}`);
+    console.log(`[RESOURCES] food=${r.food.toFixed(0)} metals=${r.metals.toFixed(0)} wood=${r.wood.toFixed(0)} | active_trucks=${trucks.length} | HQ activeTrucks=${hqs.map(h => `${h.activeTrucks}/${this.buildings.hqMaxTrucks(h)}`).join(',')}`);
   }
+
+  /** When false, the tick loop renders the world but does not advance
+   *  any sim systems — units freeze, AI sleeps, projectiles hold. The
+   *  lobby flips this true once every player has reported `loaded`. */
+  paused = true;
 
   start(): void {
     const loop = (t: number) => {
@@ -639,8 +1122,9 @@ export class Game {
       }
     }
 
-    if (this.pathfinder) {
+    if (this.pathfinder && !this.paused) {
       this.units.tick(dt, this.surfaceNav!, this.vnav!, this.world.buffers.voxels, (req) => this.handleWorldEdit(req));
+      this.pathTracer.tick(dt, this.units.units);
       // Any unit that latched needsRepath this frame (because it has been
       // collision-stuck long enough) gets a fresh route around the offending peer.
       this.servicePendingRepaths();
@@ -651,6 +1135,14 @@ export class Game {
       // Runs before tickWeapons so any new firingTarget assignments slew the
       // turret this same frame.
       this.tickAggressiveStance(dt);
+      // Enemy hunt-and-attack lives on the AI server now — see
+      // `aiClient.tick` below. The server emits route_unit actions
+      // for idle enemies and the client just executes them.
+      // AA vehicles: lock onto incoming enemy projectiles and emit a
+      // lead-solved firingTarget so tickWeapons fires the flak gun this
+      // frame. Runs after aggressive stance (which targets ground units) so
+      // a fresh AA lock overrides any stale ground target.
+      this.tickAAVehicles();
       // Evasion pass: any unit with an inbound enemy round about to land near
       // it side-steps perpendicular to the projectile direction. Runs after
       // aggressive stance so the new target lock survives the dodge — we
@@ -678,6 +1170,16 @@ export class Game {
       }
       // Sweep out anything that died from the impacts processed this frame.
       this.removeDeadUnits();
+      // Phase 2 zero-trust: snap local positions to the server's
+      // authoritative snapshot when drift exceeds the threshold. Runs
+      // after the local sim has finished its frame so we correct the
+      // most-recent local prediction, not an intermediate state.
+      this.reconcileFromAuthoritativeSnapshot();
+      // Phase 3 zero-trust: mirror building state + resources up to
+      // the server on a fixed cadence so other clients (and any
+      // future server-side validators) see a consistent canonical
+      // pool.
+      this.pushBridgeMirror(dt);
       // Worker automation: drive harvesters / transporters. Routing is
       // delegated back to routePath via the routeWorker callback so the
       // existing path client is reused unchanged.
@@ -687,6 +1189,7 @@ export class Game {
         buildings: this.buildings,
         saplings: this.saplings,
         resources: this.resources,
+        enemyResources: this.enemyResources,
         taskBoard: this.taskBoard,
         routeWorker: (u, wx, wy, wz): void => { void this.routePath(u, wx, wy, wz); },
         onVoxelEdit: (wx: number, wy: number, wz: number): void => {
@@ -694,20 +1197,39 @@ export class Game {
           // full world rescan — a single mine event only affects a small region.
           const r = 2;
           this.requestNavRebuildAround(wx - r, wy - r, wz - r, wx + r, wy + r, wz + r, false);
+          // Tell the leaf-decay system about the edit; if a wood voxel was
+          // just felled, leaves attached to that branch will lose their
+          // connection and start rotting.
+          // Phase 5a: under zero-trust the server runs leaf decay
+          // off its own voxel-edit + projectile-impact triggers and
+          // broadcasts the canopy removal as a `set` voxel_edit, so
+          // we'd be doing duplicate work to also schedule it locally.
+          if (!this.zeroTrustEnabled) {
+            const VS = 0.125;
+            this.leafDecay.onVoxelRemoved(
+              this.world,
+              Math.floor(wx / VS),
+              Math.floor(wy / VS),
+              Math.floor(wz / VS),
+            );
+          }
         },
+        surfaceY: (wx, wz) => this.surfaceWorldY(wx, wz),
         findMetalCluster: (vx, vy, vz) => this.findMetalCluster(vx, vy, vz),
         onClusterVoxelChipped: (c, wx, wz) => this.onClusterVoxelChipped(c, wx, wz),
         tryClaimClusterSlot: (c, uid) => this.tryClaimClusterSlot(c, uid),
         releaseClusterSlot: (cid, uid) => this.releaseClusterSlot(cid, uid),
         clusterSlotPos: (c, si) => this.clusterSlotPos(c, si),
         findAlternateClusterTarget: (excl, fx, fz) => this.findAlternateClusterTarget(excl, fx, fz),
-        findBestMineTarget: (fx, fz) => this.findBestMineTarget(fx, fz),
+        findBestMineTarget: (fx, fz, exclude) => this.findBestMineTarget(fx, fz, exclude),
+        findChopApproach: (wx, wz, tx, tz) => this.findChopApproach(wx, wz, tx, tz),
       });
       tickSupplyTrucks(dt, {
         units: this.units,
         buildings: this.buildings,
         resources: this.resources,
-        spawnTruck: (x, y, z) => { ({ x, z } = this.safeSpawnXZ(x, z)); return this.units.spawn('supply_truck', x, y, z); },
+        enemyResources: this.enemyResources,
+        spawnTruck: (x, y, z, team) => { ({ x, z } = this.safeSpawnXZ(x, z)); return this.units.spawn('supply_truck', x, y, z, { team, stance: 'defensive' }); },
         routeTruck: (u, wx, wy, wz) => { void this.routePath(u, wx, wy, wz); },
         isPassable: (x, z) => {
           const nav = this.surfaceNav;
@@ -734,18 +1256,96 @@ export class Game {
         },
       });
       this.debugLogResources(dt);
-      const grow = this.saplings.tick(dt, this.world);
-      if (grow.matured > 0) this.requestNavRebuild(false);
+      // Phase 5b: server is canonical for sapling maturation under
+      // zero-trust; the broadcast voxel_edit lands in our voxel
+      // buffer via VoxelEditMirror and the renderer picks up dirty
+      // chunks the same way. Skip the local mature step so we don't
+      // double-stamp the canopy.
+      let matured = 0;
+      if (!this.zeroTrustEnabled) {
+        const grow = this.saplings.tick(dt, this.world);
+        matured = grow.matured;
+      }
+      if (matured > 0) this.requestNavRebuild(false);
+      // Disconnected leaves rot at 0.3 s per voxel — when this fires it
+      // edits world voxels, so refresh the nav around any chop site that
+      // was active this frame.
+      // Phase 5a: server is canonical for leaf decay under zero-trust;
+      // the timer drain + voxel removal land here via the
+      // VoxelEditMirror's broadcast handler, so our local tick is a
+      // no-op (and would otherwise spawn duplicate timers from any
+      // pre-attach trees the local sim still tracked).
+      const decayBefore = this.leafDecay.size();
+      if (!this.zeroTrustEnabled) {
+        this.leafDecay.tick(this.world, dt);
+      }
+      // City life — civilian spawning + wandering. Phase 5 of the
+      // zero-trust migration moved this to the authoritative server,
+      // so we skip the local tick when zero-trust is on; civilians
+      // arrive via snapshot reconciliation.
+      if (!this.zeroTrustEnabled) {
+        this.civilians.tick(dt, {
+          units: this.units,
+          buildings: this.buildings,
+          spawnCivilian: (x, y, z): import('../sim/Units').Unit | null => this.units.spawn('civilian', x, y, z),
+          routeCivilian: (u, wx, wy, wz): void => { void this.routePath(u, wx, wy, wz); },
+          surfaceY: (wx, wz): number => this.surfaceWorldY(wx, wz),
+        });
+      }
+      // Enemy AI: pulses the backend AI server (ai-server.cjs) with
+      // the enemy state and applies whatever actions come back. The
+      // `tickEnemyAttackMove` pass earlier in the frame handles their
+      // movement once they exist; the server just decides production.
+      //
+      // The host browser drives the AI brain (single AI source per
+      // session). Mutations made by `applyAction` flow back through
+      // the server via the `onBuildingPlaced` / `pushBridgeMirror`
+      // hooks. Server-to-server AI is the long-term plan; until that
+      // lands, gating this off entirely meant the AI never produced
+      // anything in zero-trust mode.
+      if (this.surfaceNav) {
+        this.aiClient.tick(dt, {
+          units: this.units,
+          buildings: this.buildings,
+          world: this.world,
+          surfaceNav: this.surfaceNav,
+          enemyResources: this.enemyResources,
+          spawnEnemy: (kind, x, y, z) => this.units.spawn(kind, x, y, z, { team: 'enemy', stance: 'aggressive' }),
+          surfaceY: (wx, wz) => this.surfaceWorldY(wx, wz),
+          routeUnit: (u, wx, wy, wz) => { void this.routePath(u, wx, wy, wz); },
+          requestNavRebuildAround: (bx0, by0, bz0, bx1, by1, bz1) =>
+            this.requestNavRebuildAround(bx0, by0, bz0, bx1, by1, bz1, false),
+        });
+      }
+      if (decayBefore > 0 && this.leafDecay.size() < decayBefore) {
+        // Cheap way to re-mesh: the voxel set already marked chunks dirty,
+        // and the surface nav refresh box is already widened by the worker
+        // edit hooks. Nothing more to do here.
+      }
       // Drain the per-tick accumulated nav-rebuild AABB: one sync main-thread
       // refresh + one applyDamage to the worker, regardless of how many
       // impacts / tracks triggered requestNavRebuildAround this frame.
       this.flushNavRebuild();
     }
-    this.unitRenderer.update(this.units);
+    // Pack FoW sources / explored-map BEFORE the renderer updates so
+    // the unit + building cull predicates can use this frame's
+    // visibility data instead of last frame's stale snapshot.
+    this.packFoWAndExplored();
+    const enemyHidden = (u: Unit): boolean =>
+      u.team !== 'player' && !this.isInsideCurrentFoW(u.x, u.y, u.z);
+    const enemyBuildingHidden = (b: import('../sim/Buildings').Building): boolean => {
+      if (b.team !== 'enemy') return false;
+      const cx = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_METERS;
+      const cz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_METERS;
+      const cy = (b.floorY + 4) * VOXEL_SIZE;
+      return !this.isInsideCurrentFoW(cx, cy, cz);
+    };
+    this.unitRenderer.update(this.units, enemyHidden);
     this.healthBars.update(this.units.units, this.buildings.buildings, this.metalClusters);
+    this.constructionOverlay.update(this.buildings.buildings);
     this.rallyMarkers.update(this.buildings.buildings);
     this.minimap.update(this.units.units, this.buildings.buildings, this.metalClusters, this.camera);
-    this.buildingRenderer.update(this.buildings.buildings);
+    this.buildingRenderer.update(this.buildings.buildings, enemyBuildingHidden);
     // Power lines are recomputed lazily (on building place/destroy), not every frame.
     this.buildingRange.show(this.buildings.getSelected());
     this.unitRange.show(this.units.units);
@@ -786,10 +1386,75 @@ export class Game {
     this.fpsAcc += dt;
     this.fpsCount += 1;
     this.fpsTimer += dt;
+    if (!this.paused) this.gameElapsedSeconds += dt;
     if (this.fpsTimer >= 0.5 && this.fpsEl) {
       const fps = this.fpsCount / this.fpsAcc;
       const r = this.resources;
-      this.fpsEl.textContent = `FPS ${fps.toFixed(0)} | meshed ${this.meshes.getMeshCount()} | inflight ${this.meshes.getInflight()} | units ${this.units.units.length} | buildings ${this.buildings.buildings.length} | wood ${r.wood} metals ${r.metals} food ${r.food}`;
+      const traceTag = this.pathTracer.enabled
+        ? ` · trace ${this.pathTracer.unitCount()}u/${this.pathTracer.sampleCount()}s`
+        : '';
+      this.fpsEl.textContent = `FPS ${fps.toFixed(0)} · meshed ${this.meshes.getMeshCount()} · units ${this.units.units.length} · bldgs ${this.buildings.buildings.length}${traceTag}`;
+      // Resource cells refresh on the same cadence as the stats line.
+      if (this.resFoodEl)   this.resFoodEl.textContent   = `${r.food | 0}`;
+      if (this.resMetalsEl) this.resMetalsEl.textContent = `${r.metals | 0}`;
+      if (this.resWoodEl)   this.resWoodEl.textContent   = `${r.wood | 0}`;
+      if (this.resPopEl) {
+        // Supply trucks are infrastructure, not population — they spawn,
+        // ferry, and despawn automatically and shouldn't eat into the
+        // player's pop budget. Other units consume their UNIT_POP_COST
+        // slot count (a tank is 5, a soldier is 1, etc.) so heavy armour
+        // stacks correctly against the player's cap.
+        let friendly = 0;
+        for (const u of this.units.units) {
+          if (u.team !== 'player' || u.hp <= 0) continue;
+          friendly += UNIT_POP_COST[u.kind] ?? 1;
+        }
+        // PopCap = 10 bootstrap + barracks contribution + one slot for
+        // every alive civilian. Neighborhoods set their per-house quota
+        // (`tier × 5`) inside CivilianSystem; the cap rises one tick at a
+        // time as those civilians actually spawn in. A death drops the
+        // count by 1 (cap drops by 1) and the neighborhood queues a
+        // short-cooldown replacement that brings it back up.
+        let cap = 10; // bootstrap
+        let liveCivilians = 0;
+        for (const u of this.units.units) {
+          if (u.team !== 'player' || u.hp <= 0) continue;
+          if (u.kind === 'civilian') liveCivilians++;
+        }
+        cap += liveCivilians;
+        for (const b of this.buildings.buildings) {
+          if (b.destroyed) continue;
+          if (b.healthRefVoxels <= 0) continue;
+          if (b.spec.kind === 'barracks') {
+            // Each barracks bunkhouse: 25 base + 10 per `barracks_expand` upgrade
+            // (up to 2 upgrades = 45 max per barracks).
+            cap += 25 + (b.upgradeTracks.barracks_expand ?? 0) * 10;
+          }
+        }
+        this.resources.popCap = cap;
+        this.resPopEl.textContent = `${friendly} / ${cap}`;
+      }
+      // Top-right age cluster: HQ tier as Roman numeral + a flavour name +
+      // elapsed game time (HH:MM:SS).
+      const liveHq = this.buildings.buildings.find(b => !b.destroyed && b.spec.kind === 'hq');
+      const ageRomans = ['I', 'II', 'III', 'IV', 'V', 'VI'];
+      const ageNames = ['Founding Age', 'Settled Age', 'Industrial Age', 'Modern Age', 'Atomic Age', 'Future Age'];
+      const tier = liveHq ? Math.min(5, liveHq.tier ?? 0) : 0;
+      if (this.ageMedallionEl) this.ageMedallionEl.textContent = ageRomans[tier]!;
+      if (this.ageNameEl)      this.ageNameEl.textContent      = ageNames[tier]!;
+      if (this.ageTimeEl) {
+        const tSec = Math.floor(this.gameElapsedSeconds);
+        const hh = Math.floor(tSec / 3600);
+        const mm = Math.floor((tSec % 3600) / 60);
+        const ss = tSec % 60;
+        const pad = (n: number): string => n < 10 ? `0${n}` : `${n}`;
+        this.ageTimeEl.textContent = hh > 0
+          ? `${pad(hh)}:${pad(mm)}:${pad(ss)}`
+          : `${pad(mm)}:${pad(ss)}`;
+      }
+      // Selection portrait pane — refreshes only when the lead selected
+      // entity changes (or its kind changes).
+      this.renderSelectionPortrait();
       this.fpsAcc = 0; this.fpsCount = 0; this.fpsTimer = 0;
     }
     if (this.modeEl) {
@@ -1401,7 +2066,11 @@ export class Game {
       const inRange = liveHQs.some(hq => {
         const hqCx = (hq.ox + hq.spec.cellsW * 0.5) * NAV_CELL_METERS;
         const hqCz = (hq.oz + hq.spec.cellsD * 0.5) * NAV_CELL_METERS;
-        return Math.hypot(propCx - hqCx, propCz - hqCz) <= hq.spec.buildRangeMeters!;
+        // Per-track scaling: each "Increase range" upgrade extends the
+        // perimeter by 50% so the player can claim more ground after
+        // investing in that specific track.
+        const range = this.buildings.hqBuildRange(hq);
+        return Math.hypot(propCx - hqCx, propCz - hqCz) <= range;
       });
       if (!inRange) return;
     }
@@ -1431,6 +2100,7 @@ export class Game {
     const cy = hit.y + 0.5 - hit.ny * 0.5;
     const cz = hit.z + 0.5 - hit.nz * 0.5;
     const result = this.world.damageSphere(cx, cy, cz, radiusVoxels, this.explosionPeak * TERRAIN_DAMAGE_GLOBAL_SCALE);
+    this.mirrorVoxelSphere(cx * VOXEL_SIZE, cy * VOXEL_SIZE, cz * VOXEL_SIZE, this.explosionRadiusBigMeters, AIR);
     if (result.destroyed.length > 0) {
       const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
       const wx = cx * VOXEL_SIZE, wy = cy * VOXEL_SIZE, wz = cz * VOXEL_SIZE;
@@ -1452,7 +2122,9 @@ export class Game {
       const dist = Math.hypot(dxu, dyu, dzu);
       if (dist >= blastR) continue;
       const falloff = 1 - dist / blastR;
-      u.hp -= this.explosionPeak * 0.4 * falloff;
+      const dmg = this.explosionPeak * 0.4 * falloff;
+      u.hp -= dmg;
+      this.mirrorEntityDamage(u.id, dmg);
     }
     this.removeDeadUnits();
   }
@@ -1703,6 +2375,12 @@ export class Game {
     const sx1 = Math.floor(maxX / NAV_CELL_METERS);
     const sz1 = Math.floor(maxZ / NAV_CELL_METERS);
     refreshSurfaceNavBox(voxels, this.surfaceNav, sx0, sz0, sx1, sz1);
+    // Tree-blocked surface columns must propagate into the unit-grid mask
+    // (otherwise a tree felled at runtime keeps blocking paths, or a sapling
+    // grown after generation never starts blocking). Slop one cell on each
+    // side to match the surface refresh's slope-pass widening.
+    syncTreeMask(this.pathfinder.volume, this.surfaceNav.treeBlocked,
+      sx0 - 1, sz0 - 1, sx1 + 1, sz1 + 1);
     // Volume nav alias (Game.vnav is a separate copy of the volume summary
     // from the one Pathfinder owns; both must be kept in sync).
     const c0 = worldToVolumeCell(minX, minY, minZ);
@@ -1785,7 +2463,7 @@ export class Game {
    *     through dirt, the graph search is overkill for the common "go
    *     dig over there" command.
    */
-  private async routePath(unit: Unit, wx: number, wy: number, wz: number, opts?: { forceSurface?: boolean }): Promise<void> {
+  private async routePath(unit: Unit, wx: number, wy: number, wz: number, opts?: { forceSurface?: boolean; fallbackToHq?: boolean }): Promise<void> {
     if (!this.pathfinder || !this.pathWorker) return;
     const startSurfaceY = this.surfaceWorldY(unit.x, unit.z);
     const startUnderground = unit.y < startSurfaceY - 0.5;
@@ -1807,9 +2485,20 @@ export class Game {
     // search ring is widened for wide-footprint units (trucks, vehicles) so a
     // spawn next to a thick wall / building cluster can still find a clear
     // standing cell within reach.
-    const passableRing = unit.footprintRadius >= 2 ? 10 : 5;
+    // Search ring for the start-cell snap. The default 5 cells was
+    // too tight for workers whose physical position lands inside a
+    // tree-blocked column (the unit walked there, then the column got
+    // marked impassable on a later refresh). 30 cells still snaps to
+    // the unit's local neighbourhood, but lets the pathfinder hop
+    // over a 2-3-cell tree line before giving up.
+    const passableRing = unit.footprintRadius >= 2 ? 40 : 80;
     let start = this.pathfinder.cellAt(unit.x, unit.y, unit.z);
-    const startGround = this.pathfinder.groundCellAt(unit.kind, unit.x, unit.z);
+    // Cap the search ceiling at ~1 nav cell above the unit's current y so
+    // columns whose only passable cell lives above the canopy don't snap the
+    // start onto an unreachable air cell. Same reasoning as the goal cap
+    // below — the unit walks at the real surface, so its start cell must be
+    // at surface level, not on top of nearby leaves.
+    const startGround = this.pathfinder.groundCellAt(unit.kind, unit.x, unit.z, unit.y + NAV_CELL_METERS);
     if (startGround && !this.isUnitCellPassable(unit.kind, start)) {
       start = startGround;
     }
@@ -1819,7 +2508,11 @@ export class Game {
     // edge, ceiling), pull the goal toward the nearest cell where the unit's
     // body actually fits. Vertical fallback: scan the column from the picked
     // y upward for a passable layer (handles surface clicks in the cave overlay).
-    const groundCell = this.pathfinder.groundCellAt(unit.kind, wx, wz);
+    // Cap the search ceiling at ~1 nav cell above the requested wy so columns
+    // whose only passable cell lives ABOVE a tree canopy don't escape upward
+    // (the worker can't actually reach a cell above the leaves; A* would
+    // exhaust its expansion budget trying to climb to it).
+    const groundCell = this.pathfinder.groundCellAt(unit.kind, wx, wz, wy + NAV_CELL_METERS);
     if (groundCell && !this.isUnitCellPassable(unit.kind, goal)) {
       goal = groundCell;
     }
@@ -1841,7 +2534,7 @@ export class Game {
       // fall back to grid A* internally (line-of-sight on a fat footprint
       // becomes its own bottleneck and the path quality difference is tiny).
       anyAngle: unit.footprintRadius <= 1,
-      maxExpansions: 30000,
+      maxExpansions: 750000,
     });
     this.pendingPathRequests.delete(unit.id);
     if (this.latestPathReqByUnit.get(unit.id) !== reqId) return;
@@ -2194,27 +2887,56 @@ export class Game {
    */
   private findBestMineTarget(
     fromX: number, fromZ: number,
-  ): { wx: number; wy: number; wz: number } | null {
+    excludeClusterIds?: ReadonlySet<number>,
+  ): { wx: number; wy: number; wz: number; clusterId: number } | null {
+    // Count en-route assignees per cluster — workers that have set
+    // `claimedClusterId` but haven't yet reached the cluster and
+    // claimed a slot. Otherwise multiple idle workers all pick the
+    // same cluster on the same tick, then arrive together and have
+    // to redirect once the slots fill up. Counting both occupied
+    // slots AND en-route workers enforces the per-cluster max
+    // immediately at assignment time.
+    const enRoute = new Map<number, number>();
+    for (const u of this.units.units) {
+      if (u.kind !== 'worker' || u.hp <= 0) continue;
+      if (u.claimedClusterId < 0) continue;
+      enRoute.set(u.claimedClusterId, (enRoute.get(u.claimedClusterId) ?? 0) + 1);
+    }
     let best: MetalCluster | null = null;
     let bestScore = Infinity;
     for (const c of this.metalClusters) {
       if (c.destroyed) continue;
-      if (!c.workerSlots.some(s => s === 0)) continue;
+      if (excludeClusterIds && excludeClusterIds.has(c.id)) continue;
+      const occupied = c.workerSlots.filter(s => s !== 0).length;
+      const inbound = enRoute.get(c.id) ?? 0;
+      // Inbound includes workers already holding a slot — don't double-count.
+      const totalCommitted = Math.max(occupied, inbound);
+      if (totalCommitted >= c.maxWorkers) continue;
       const score = this.clusterScore(c, fromX, fromZ);
       if (score < bestScore) { bestScore = score; best = c; }
     }
-    return best ? this.clusterVoxelTarget(best) : null;
+    if (!best) return null;
+    const target = this.clusterVoxelTarget(best);
+    return target ? { ...target, clusterId: best.id } : null;
   }
 
   /** Load-balanced fallback when a worker reaches a full cluster and needs redirection. */
   private findAlternateClusterTarget(
     excludeId: number, fromX: number, fromZ: number,
   ): { wx: number; wy: number; wz: number } | null {
+    const enRoute = new Map<number, number>();
+    for (const u of this.units.units) {
+      if (u.kind !== 'worker' || u.hp <= 0) continue;
+      if (u.claimedClusterId < 0) continue;
+      enRoute.set(u.claimedClusterId, (enRoute.get(u.claimedClusterId) ?? 0) + 1);
+    }
     let best: MetalCluster | null = null;
     let bestScore = Infinity;
     for (const c of this.metalClusters) {
       if (c.id === excludeId || c.destroyed) continue;
-      if (!c.workerSlots.some(s => s === 0)) continue;
+      const occupied = c.workerSlots.filter(s => s !== 0).length;
+      const inbound = enRoute.get(c.id) ?? 0;
+      if (Math.max(occupied, inbound) >= c.maxWorkers) continue;
       const score = this.clusterScore(c, fromX, fromZ);
       if (score < bestScore) { bestScore = score; best = c; }
     }
@@ -2330,9 +3052,25 @@ export class Game {
     if (this.mode !== 'play') return;
     const armed = this.units.units.filter(u => u.selected && u.weapon !== null);
     if (armed.length === 0) {
-      // Worker → farm gesture only fires on a short click (no drag), so the
-      // existing camera-yaw drag still works for unarmed selections.
+      // Civilian → refinery gesture (and worker → farm below) only fires on
+      // a short click so the camera-yaw drag still works for unarmed
+      // selections.
       if (this.isDragging(release.startX, release.startY, release.endX, release.endY)) return;
+      const civilians = this.units.units.filter(u => u.selected && u.kind === 'civilian');
+      if (civilians.length > 0) {
+        const b = this.pickBuildingAt(release.startX, release.startY, w, h);
+        if (b && b.spec.kind === 'refinery' && b.upgradeState === 'enabled') {
+          // Route every selected civilian to the refinery's centre. They
+          // arrive, idle there, and the wandering AI is suspended for
+          // assigned civilians until the user re-selects them and clicks
+          // somewhere else.
+          this.civilians.assignToWorkplace(civilians.map(c => c.id), b.id);
+          const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+          const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+          for (const c of civilians) void this.routePath(c, cxw, c.y, czw);
+          return;
+        }
+      }
       const worker = this.units.units.find(u => u.selected && u.kind === 'worker');
       if (!worker) return;
       const b = this.pickBuildingAt(release.startX, release.startY, w, h);
@@ -2462,6 +3200,444 @@ export class Game {
    * Splice any unit whose HP has dropped to zero out of the manager. Called
    * once per frame after projectile impacts have been applied.
    */
+  /**
+   * Wire the authoritative game-server into the local sim. After this
+   * runs every `units.spawn(...)` mirrors into the server's entity
+   * table, every new path is forwarded as a `set_path` command, and
+   * dead units issue a `despawn_entity`. The per-frame reconciliation
+   * (`reconcileFromAuthoritativeSnapshot`) snaps a unit back to the
+   * server's position when the local sim drifts more than a couple
+   * of metres — a teleport-cheat client gets visibly corrected.
+   *
+   * Idempotent: calling it twice replaces the hooks; single-player
+   * paths that never call it still run unchanged.
+   */
+  attachAuthoritativeServer(client: import('../net/GameClient').GameClient): void {
+    this.gameClient = client;
+    this.zeroTrustEnabled = true;
+
+    // Phase 4.2: subscribe to the server's voxel_edit broadcast so
+    // peer destruction lands in our local voxel buffer in real time.
+    // Echoes of our own writes are filtered by playerId inside the
+    // mirror, so the local sim's own damageSphere isn't double-applied.
+    void (async () => {
+      const { VoxelEditMirror } = await import('../net/VoxelEditMirror');
+      this.voxelEditMirror = new VoxelEditMirror(this.world, client.playerId);
+      this.voxelEditMirror.attach(client);
+    })();
+
+    // Phase 5b: mirror sapling plants to the server. The local plant
+    // (above) draws the placeholder marker for snappy feedback;
+    // server is authoritative for both the marker (re-broadcast as a
+    // voxel_edit) and the eventual maturation, both of which arrive
+    // back to the local voxel buffer via VoxelEditMirror.
+    this.saplings.onAfterPlant = (wx, wz, seed) => {
+      if (!this.zeroTrustEnabled || !this.gameClient) return;
+      this.gameClient.send({
+        type: 'plant_sapling',
+        owner: this.gameClient.playerId,
+        wx, wz, seed,
+      });
+    };
+
+    // Phase 4.1: mirror projectile spawns to the server so its entity
+    // table tracks the same in-flight rounds the local sim renders.
+    // Hit detection still resolves client-side; the server-tracked
+    // copy is the foundation for future authoritative impact gating.
+    this.projectiles.onAfterSpawn = (p) => {
+      if (!this.zeroTrustEnabled || !this.gameClient) return;
+      const cfg = PROJECTILES[p.kind];
+      this.gameClient.send({
+        type: 'spawn_projectile',
+        clientTag: `proj-${this.gameClient.playerId}-${p.id}`,
+        owner: this.gameClient.playerId,
+        kind: p.kind,
+        x: p.x, y: p.y, z: p.z,
+        vx: p.vx, vy: p.vy, vz: p.vz,
+        dragPerSecond: p.dragPerSecond,
+        gravityScale: cfg.gravityScale ?? 1,
+        maxLifeSeconds: p.maxLifeSeconds,
+        ownerId: p.ownerId,
+        // Phase 4.1c — server uses these on raycast hit to emit the
+        // canonical voxel sphere op for crater + pit destruction.
+        hitRadiusMeters: cfg.hitRadiusMeters,
+        explosive: cfg.explosive,
+        explosionRadiusMeters: cfg.explosionRadiusMeters,
+        // Phase 4.1d — direct-hit / splash damage values used by the
+        // server's per-tick entity sweep.
+        hitDamage: cfg.hitDamage,
+        damagePeak: cfg.explosive ? cfg.explosionPeak : cfg.hitDamage,
+      });
+    };
+
+    this.units.onAfterSpawn = (u) => {
+      if (!this.zeroTrustEnabled || !this.gameClient) return;
+      const tag = this.unitClientTag(u.id);
+      this.mirroredUnitIds.add(u.id);
+      this.localUnitsByTag.set(tag, u.id);
+      this.gameClient.send({
+        type: 'spawn_entity',
+        clientTag: tag,
+        owner: u.team !== 'player' ? u.team : this.gameClient.playerId,
+        kind: u.kind,
+        x: u.x, y: u.y, z: u.z,
+        speed: u.speed,
+        hp: u.hp,
+      });
+    };
+
+    this.units.onSetPath = (u) => {
+      if (!this.zeroTrustEnabled || !this.gameClient) return;
+      this.gameClient.send({
+        type: 'set_path',
+        clientTag: this.unitClientTag(u.id),
+        owner: u.team !== 'player' ? u.team : this.gameClient.playerId,
+        waypoints: u.path.map(w => ({ x: w.x, y: w.y, z: w.z })),
+      });
+    };
+
+    // Pre-existing units (e.g. starter workers spawned before attach)
+    // get back-filled so the server learns about everyone alive. The
+    // owner must reflect the unit's team — seeded enemy workers are
+    // owned by their AI faction, not the watcher.
+    for (const u of this.units.units) {
+      if (u.hp <= 0) continue;
+      const tag = this.unitClientTag(u.id);
+      this.mirroredUnitIds.add(u.id);
+      this.localUnitsByTag.set(tag, u.id);
+      client.send({
+        type: 'spawn_entity',
+        clientTag: tag,
+        owner: u.team !== 'player' ? u.team : client.playerId,
+        kind: u.kind,
+        x: u.x, y: u.y, z: u.z,
+        speed: u.speed,
+        hp: u.hp,
+      });
+      if (u.path.length > 0) {
+        client.send({
+          type: 'set_path',
+          clientTag: this.unitClientTag(u.id),
+          owner: client.playerId,
+          waypoints: u.path.map(w => ({ x: w.x, y: w.y, z: w.z })),
+        });
+      }
+    }
+
+    // Building lifecycle: place / destroy ride existing
+    // BuildingManager hooks. Non-destructive composition — if Game
+    // already wired these we keep the previous handler running so the
+    // path-system mask updates aren't lost.
+    const prevPlaced = this.buildings.onBuildingPlaced;
+    this.buildings.onBuildingPlaced = (b) => {
+      try { prevPlaced?.(b); } catch (_e) { /* ignore */ }
+      if (!this.zeroTrustEnabled || !this.gameClient) return;
+      this.gameClient.send({
+        type: 'place_building',
+        clientTag: this.buildingClientTag(b.id),
+        owner: b.team !== 'player' ? b.team : this.gameClient.playerId,
+        kind: b.spec.kind,
+        ox: b.ox, oz: b.oz, floorY: b.floorY,
+        cellsW: b.spec.cellsW, cellsD: b.spec.cellsD,
+        upgradeState: b.upgradeState,
+        hp: b.hp, maxHp: b.maxHp,
+        trainQueue: b.trainQueue,
+      });
+    };
+    const prevDestroyed = this.buildings.onBuildingDestroyed;
+    this.buildings.onBuildingDestroyed = (b) => {
+      try { prevDestroyed?.(b); } catch (_e) { /* ignore */ }
+      if (!this.zeroTrustEnabled || !this.gameClient) return;
+      this.gameClient.send({
+        type: 'update_building',
+        clientTag: this.buildingClientTag(b.id),
+        owner: b.team !== 'player' ? b.team : this.gameClient.playerId,
+        hp: 0,
+        destroyed: true,
+      });
+    };
+
+    // Back-fill existing buildings so the server learns about the
+    // starter HQ / storage / enemy bases that placed before attach.
+    for (const b of this.buildings.buildings) {
+      if (b.destroyed) continue;
+      client.send({
+        type: 'place_building',
+        clientTag: this.buildingClientTag(b.id),
+        owner: b.team !== 'player' ? b.team : client.playerId,
+        kind: b.spec.kind,
+        ox: b.ox, oz: b.oz, floorY: b.floorY,
+        cellsW: b.spec.cellsW, cellsD: b.spec.cellsD,
+        upgradeState: b.upgradeState,
+        hp: b.hp, maxHp: b.maxHp,
+        trainQueue: b.trainQueue,
+      });
+    }
+  }
+
+  /** Push building state + per-team resource pools to the server on a
+   *  fixed interval. HP / queues / resources tick locally at 60 Hz —
+   *  re-mirroring everything every frame would flood the proxy.
+   *  500 ms is fine-grained enough that another connected player sees
+   *  base state moving with their attacks. */
+  private pushBridgeMirror(dt: number): void {
+    if (!this.zeroTrustEnabled || !this.gameClient) return;
+    this.bridgePushTimer -= dt;
+    if (this.bridgePushTimer > 0) return;
+    this.bridgePushTimer = Game.BRIDGE_PUSH_INTERVAL_S;
+    const pid = this.gameClient.playerId;
+    for (const b of this.buildings.buildings) {
+      if (b.destroyed) continue;
+      this.gameClient.send({
+        type: 'update_building',
+        clientTag: this.buildingClientTag(b.id),
+        owner: b.team !== 'player' ? b.team : pid,
+        hp: b.hp,
+        upgradeState: b.upgradeState,
+        trainQueue: b.trainQueue,
+      });
+    }
+    this.gameClient.send({
+      type: 'set_resources',
+      owner: pid,
+      food: this.resources.food | 0,
+      metals: this.resources.metals | 0,
+      wood: this.resources.wood | 0,
+      popCap: this.resources.popCap | 0,
+    });
+    // Phase 6+: under zero-trust, the server is authoritative for
+    // the AI's economy — it debits cost on `place_building` /
+    // `queue_train` and accrues `tickFarmIncome` per tick. Mirroring
+    // the browser's static `enemyResources` would clobber those
+    // server-side mutations every BRIDGE_PUSH_INTERVAL_S. Future
+    // work: stop tracking enemyResources locally entirely and let
+    // the snapshot drive any UI that reads it.
+  }
+
+  /** Phase 4.3b: ship the local unit's WEAPONS + PROJECTILES catalog
+   *  values to the server as a single arm_unit. Sender is gated by
+   *  `zeroTrustEnabled` upstream, so by the time we get here we know
+   *  there's a live GameClient. */
+  private sendArmUnit(u: Unit): void {
+    if (!this.gameClient || u.weapon === null) return;
+    const w = WEAPONS[u.weapon];
+    const cfg = PROJECTILES[w.projectile];
+    this.gameClient.send({
+      type: 'arm_unit',
+      clientTag: this.unitClientTag(u.id),
+      owner: this.gameClient.playerId,
+      kind: w.projectile,
+      rangeMeters: w.rangeMeters,
+      fireIntervalSec: w.fireInterval,
+      projectileSpeed: cfg.muzzleVelocity * w.velocityScale,
+      projectileDrag: cfg.dragPerSecond,
+      projectileGravityScale: cfg.gravityScale ?? 1,
+      projectileMaxLife: cfg.maxLifeSeconds,
+      projectileHitRadius: cfg.hitRadiusMeters,
+      projectileHitDamage: cfg.hitDamage,
+      projectileExplosive: cfg.explosive,
+      projectileExplosionRadius: cfg.explosionRadiusMeters,
+      projectileDamagePeak: cfg.explosive ? cfg.explosionPeak : cfg.hitDamage,
+    });
+  }
+
+  /** Push an authoritative damage event for `unitId`. Server reduces
+   *  HP; if the entity vanishes from the snapshot the next reconcile
+   *  will kill the local unit too. */
+  private mirrorEntityDamage(unitId: number, amount: number): void {
+    if (!this.zeroTrustEnabled || !this.gameClient) return;
+    if (!Number.isFinite(amount) || amount <= 0) return;
+    this.gameClient.send({
+      type: 'damage_entity',
+      clientTag: this.unitClientTag(unitId),
+      amount,
+    });
+  }
+
+  /** Phase 6: log a sphere voxel mutation with the server so the
+   *  authoritative edit log captures every projectile crater. We
+   *  send the sphere centre + radius (cheap O(1) bytes) rather than
+   *  the per-voxel diff because a single tank shell can edit
+   *  hundreds of voxels. The server replays this against connecting
+   *  clients via /world/edits. */
+  private mirrorVoxelSphere(wx: number, wy: number, wz: number, radiusMeters: number, mat: number): void {
+    if (!this.zeroTrustEnabled || !this.gameClient) return;
+    if (!Number.isFinite(radiusMeters) || radiusMeters <= 0) return;
+    this.gameClient.send({
+      type: 'voxel_edit',
+      owner: this.gameClient.playerId,
+      x: wx, y: wy, z: wz,
+      radius: radiusMeters,
+      mat,
+    });
+  }
+
+  /** Reconcile local units against the authoritative snapshot. Three
+   *  flavours of behaviour:
+   *
+   *   - Server-driven units (server originated, e.g. civilians): the
+   *     local unit is just a render proxy. Position is *always*
+   *     copied — no drift threshold.
+   *   - Client-driven mirrored units (the player's own units that
+   *     ran through the spawn hook): drift > 2 m snaps to server.
+   *     HP is monotonic-down. A despawn on the server kills the
+   *     local unit.
+   *   - Pre-attach / never-mirrored units: untouched.
+   *
+   *  This is also the only place server-only entities (those with no
+   *  matching local unit) get adopted into the local sim. */
+  private reconcileFromAuthoritativeSnapshot(): void {
+    if (!this.zeroTrustEnabled || !this.gameClient) return;
+    // Cross-cutting Phase: use the interpolation buffer for visual
+    // positions and the latest snapshot for discrete state (hp,
+    // liveness). The interpolated snapshot is ~100 ms behind the
+    // wall clock, which hides SSE jitter without smearing damage
+    // ticks or delaying death + drift detection.
+    const latest = this.gameClient.latestSnapshot();
+    if (!latest) return;
+    const interp = this.gameClient.interpolatedSnapshot() ?? latest;
+    const interpById = new Map<number, typeof latest.entities[number]>();
+    for (const e of interp.entities) interpById.set(e.id, e);
+    const DRIFT_M = 2.0;
+    const drift2 = DRIFT_M * DRIFT_M;
+    const liveLocalIds = new Set<number>();
+    for (const e of latest.entities) {
+      const tag = e.clientTag;
+      if (!tag) continue;
+      let localId = this.localUnitsByTag.get(tag);
+      let u = localId !== undefined ? this.units.units.find(x => x.id === localId) : undefined;
+      if (!u) {
+        // Server-originated entity — adopt with the spawn hook
+        // suppressed so we don't echo a duplicate spawn back.
+        u = this.adoptServerEntity(e) ?? undefined;
+        if (!u) continue;
+        localId = u.id;
+      }
+      liveLocalIds.add(u.id);
+      // Server has now reported this unit at least once — eligible for
+      // the "missing from snapshot" kill loop below. Until ack, the
+      // local unit stays alive even when the snapshot says nothing
+      // about it (back-fill POSTs are still in flight).
+      this.serverAckedUnitIds.add(u.id);
+      if (e.hp < u.hp) u.hp = e.hp;
+      const serverDriven = this.serverDrivenUnitIds.has(u.id);
+      if (serverDriven) {
+        // Full server proxy — no local sim. Render via the
+        // interpolated position so 20 Hz tick boundaries don't show
+        // up as visible jitter; fall back to `latest` for entities
+        // that just appeared (no bracketing snapshot has them yet).
+        const pos = interpById.get(e.id) ?? e;
+        u.x = pos.x;
+        u.y = pos.y;
+        u.z = pos.z;
+      } else {
+        // Client-mirrored unit — the local 60 Hz sim is the source
+        // of truth for position. Server reconciliation must respect
+        // the 1-voxel-per-tick rule, so instead of snapping the unit
+        // to `e.{x,y,z}` (which would visually teleport it across
+        // up to 2 m of drift), we nudge by at most VOXEL_SIZE each
+        // tick along the correction vector. Over a few seconds the
+        // local position lerps onto the server's value without ever
+        // violating the voxel-by-voxel rule.
+        const dx = e.x - u.x, dz = e.z - u.z;
+        const driftSq = dx * dx + dz * dz;
+        if (driftSq > drift2) {
+          const drift = Math.sqrt(driftSq);
+          const step = Math.min(drift, VOXEL_SIZE);
+          const s = step / drift;
+          u.x += dx * s;
+          u.z += dz * s;
+          // Drive `distanceWalked` so the renderer's per-frame walk
+          // animation sees the reconciler nudge as movement and
+          // plays the leg swing.
+          u.distanceWalked += step;
+          // Face the direction we're being nudged so the unit isn't
+          // moonwalking sideways during reconciliation.
+          u.heading = Math.atan2(-dx, -dz);
+          // y is allowed to snap (terrain follow handles small Y
+          // changes anyway, and the rule is voxel-by-voxel in XZ).
+          u.y = e.y;
+        }
+      }
+    }
+    // Kill any locally-mirrored unit whose tag the server has dropped.
+    // Gate on `serverAckedUnitIds` so back-fill spawn POSTs that are
+    // still in flight don't immediately kill every starter unit on
+    // the very first snapshot (which arrives before the POSTs land).
+    // Server-driven units bypass the gate — they originate on the
+    // server, so being absent from the snapshot is unambiguous.
+    for (const u of this.units.units) {
+      if (u.hp <= 0) continue;
+      if (!this.mirroredUnitIds.has(u.id) && !this.serverDrivenUnitIds.has(u.id)) continue;
+      if (liveLocalIds.has(u.id)) continue;
+      const serverDriven = this.serverDrivenUnitIds.has(u.id);
+      if (!serverDriven && !this.serverAckedUnitIds.has(u.id)) continue;
+      u.hp = 0;
+    }
+  }
+
+  /** Build a local Unit for a server-spawned entity. Subsequent ticks
+   *  treat the unit as server-driven (always sync from snapshot,
+   *  never echo commands back). */
+  private adoptServerEntity(e: { id: number; clientTag: string | null; kind: string; owner: string; x: number; y: number; z: number; hp: number }): Unit | null {
+    if (!e.clientTag) return null;
+    if (!UNIT_KINDS.includes(e.kind as Unit['kind'])) return null;
+    const team: Team = e.owner === 'enemy' ? 'enemy' : e.owner === 'enemy2' ? 'enemy2' : 'player';
+    const stance = team !== 'player' ? 'aggressive' : 'defensive';
+    const u = this.units.spawn(
+      e.kind as Unit['kind'],
+      e.x, e.y, e.z,
+      { team, stance, weapon: null, noHook: true },
+    );
+    this.localUnitsByTag.set(e.clientTag, u.id);
+    this.serverDrivenUnitIds.add(u.id);
+    return u;
+  }
+
+  /** Tracks the set of unit ids the server has acknowledged at least
+   *  once. Without this, the very first snapshot (which arrives before
+   *  the back-fill spawn POST has been processed) would mark every
+   *  local unit as dead. */
+  private mirroredUnitIds = new Set<number>();
+  /** Subset of `mirroredUnitIds` whose existence has been confirmed
+   *  by at least one snapshot from the server. Without this, the
+   *  reconciler's "missing from the snapshot → kill" loop fires
+   *  before back-fill `spawn_entity` POSTs round-trip, killing every
+   *  starter unit. */
+  private serverAckedUnitIds = new Set<number>();
+  private serverHasSeenUnit(id: number): boolean {
+    return this.mirroredUnitIds.has(id);
+  }
+  /** Stable, per-player clientTag for a local unit. The server's
+   *  entity table is shared across every lobby that ever connected,
+   *  so two sessions both spawning a unit with local id `1` would
+   *  collide on the bare `u-1` tag — `spawnEntity`'s idempotency
+   *  check would hand the second session the first session's
+   *  entity, and FoW would then drop everything from the new
+   *  player's snapshot. Prefixing with the playerId keeps tags
+   *  globally unique across the game-server's lifetime. */
+  private unitClientTag(id: number): string {
+    const pid = this.gameClient?.playerId ?? 'anon';
+    return `u-${pid}-${id}`;
+  }
+  private buildingClientTag(id: number): string {
+    const pid = this.gameClient?.playerId ?? 'anon';
+    return `b-${pid}-${id}`;
+  }
+  /** Phase 4.3b: ids of mirrored units we've sent `arm_unit` for. The
+   *  reconciler in `tickAggressiveStance` keeps this in sync with the
+   *  unit's local stance + weapon, sending `disarm_unit` when the
+   *  player flips to hold-fire or the unit gets a `null` weapon. */
+  private serverArmedUnitIds = new Set<number>();
+  /** clientTag → local unit id, used by the snapshot reconciler to
+   *  match server entities back to local units in O(1). */
+  private localUnitsByTag = new Map<string, number>();
+  /** Local unit ids whose authoritative source is the server (e.g.
+   *  civilians spawned by `tickCivilians` server-side). Reconciliation
+   *  always copies position from the snapshot for these — they never
+   *  ran the local sim, so there's no prediction to preserve. */
+  private serverDrivenUnitIds = new Set<number>();
+
   private removeDeadUnits(): void {
     const arr = this.units.units;
     let w = 0;
@@ -2473,6 +3649,25 @@ export class Game {
         // Death VFX — a small debris burst at the unit's torso so the player
         // sees a clear loss event tied to the round that killed them.
         this.debris.spawnBurst(u.x, u.y + 0.6, u.z, 24, M_DIRT);
+        // Tell the authoritative server the entity is gone so its
+        // table doesn't grow without bound.
+        if (this.gameClient && this.zeroTrustEnabled) {
+          const tag = this.unitClientTag(u.id);
+          // Drop stale tag → id mapping so the reconciler doesn't
+          // re-adopt this entity from the next snapshot if the
+          // server's despawn round-trip is in flight.
+          this.localUnitsByTag.delete(tag);
+          this.mirroredUnitIds.delete(u.id);
+          this.serverArmedUnitIds.delete(u.id);
+          // The owner here MUST match what was sent at spawn; the
+          // server rejects despawns whose owner doesn't match the
+          // entity's recorded owner.
+          this.gameClient.send({
+            type: 'despawn_entity',
+            clientTag: tag,
+            owner: u.team !== 'player' ? u.team : this.gameClient.playerId,
+          });
+        }
       }
     }
     arr.length = w;
@@ -2502,7 +3697,18 @@ export class Game {
     // base, plus a global TERRAIN_DAMAGE_GLOBAL_SCALE that softens craters
     // across the board. Unit damage below ignores both scales.
     const terrainPeak = imp.damagePeak * imp.terrainDamageScale * TERRAIN_DAMAGE_GLOBAL_SCALE;
-    const result = this.world.damageSphere(cx, cy, cz, radiusMeters / VOXEL_SIZE, terrainPeak);
+    const radiusVoxels = radiusMeters / VOXEL_SIZE;
+    const result = this.world.damageSphere(cx, cy, cz, radiusVoxels, terrainPeak);
+    // Phase 4.1c: under zero-trust the server runs its own raycast
+    // against this projectile and emits the canonical voxel_edit on
+    // impact. The local damageSphere above stays as a prediction so
+    // the firing player sees the crater on the same frame, but
+    // mirroring our own sphere would produce a duplicate broadcast.
+    // Pre-zero-trust path keeps the explicit mirror so single-player
+    // and earlier migrations stay observable to the server log.
+    if (!this.zeroTrustEnabled) {
+      this.mirrorVoxelSphere(imp.x, imp.y, imp.z, radiusMeters, AIR);
+    }
     if (result.destroyed.length > 0) {
       const sample = result.destroyed[Math.floor(result.destroyed.length / 2)]!;
       const burst = imp.explosive
@@ -2530,9 +3736,18 @@ export class Game {
     // Direct projectile hit on a unit. Apply the round's full `hitDamage`
     // — for non-explosive bullets that's the only damage; explosive rounds
     // additionally splash blast damage below.
-    if (imp.directHitUnitId >= 0) {
+    //
+    // Under zero-trust the server runs its own per-tick segment-vs-
+    // entity sweep and applies the canonical hp damage; deducting
+    // here would double-count when the snapshot reconciliation
+    // arrives. Visual effects above (flash, ring, debris) still play
+    // for snappy feedback.
+    if (imp.directHitUnitId >= 0 && !this.zeroTrustEnabled) {
       const hit = this.units.units.find(u => u.id === imp.directHitUnitId);
-      if (hit) hit.hp -= imp.hitDamage;
+      if (hit) {
+        hit.hp -= imp.hitDamage;
+        this.mirrorEntityDamage(hit.id, imp.hitDamage);
+      }
     }
     // Building damage. Direct-hit (impact lands inside a footprint AABB)
     // takes hitDamage; explosive splash applies falloff to every building
@@ -2546,7 +3761,7 @@ export class Game {
     // miss. The directly hit unit, if any, also catches the splash on top of
     // the impact damage — taking a tank shell to the face is supposed to be
     // brutal.
-    if (imp.explosive && imp.explosionRadiusMeters > 0) {
+    if (imp.explosive && imp.explosionRadiusMeters > 0 && !this.zeroTrustEnabled) {
       const blastR = imp.explosionRadiusMeters;
       for (const u of this.units.units) {
         const torsoY = u.y + Math.max(0.7, u.widthMeters * 0.6);
@@ -2556,7 +3771,9 @@ export class Game {
         const dist = Math.hypot(dx, dy, dz);
         if (dist >= blastR) continue;
         const falloff = 1 - dist / blastR;
-        u.hp -= imp.damagePeak * 0.4 * falloff;
+        const dmg = imp.damagePeak * 0.4 * falloff;
+        u.hp -= dmg;
+        this.mirrorEntityDamage(u.id, dmg);
       }
     }
     // Cluster: spawn submunitions in a random downward cone from the burst
@@ -2585,6 +3802,59 @@ export class Game {
     const i = navIndex(cell.cx, cell.cz);
     const top = this.surfaceNav!.topY[i]!;
     return top < 0 ? 0 : (top + 1) * VOXEL_SIZE;
+  }
+
+  /**
+   * Pick a passable nav cell adjacent to the trunk's nav cell so a worker can
+   * chop without needing the path planner to land inside a tree-blocked
+   * column. Walks the 8 neighbours (and a 5×5 fallback ring), filters by
+   * `groundCellAt` constrained to ~1 m above the local surface so the
+   * candidate is at ground level rather than above the canopy, and picks the
+   * one nearest the worker. Returns null when every candidate is blocked —
+   * the caller should drop the trunk and find another tree.
+   */
+  private findChopApproach(
+    workerX: number, workerZ: number, trunkX: number, trunkZ: number,
+  ): { x: number; y: number; z: number } | null {
+    if (!this.pathfinder) return null;
+    const tcx = Math.max(0, Math.min(NAV_W - 1, Math.floor(trunkX / NAV_CELL_METERS)));
+    const tcz = Math.max(0, Math.min(NAV_H - 1, Math.floor(trunkZ / NAV_CELL_METERS)));
+    let best: { x: number; y: number; z: number } | null = null;
+    let bestD = Infinity;
+    const reach = WORKER_CHOP_REACH_M;
+    const reach2 = reach * reach;
+    for (let ring = 1; ring <= 2 && best === null; ring++) {
+      for (let dz = -ring; dz <= ring; dz++) {
+        for (let dx = -ring; dx <= ring; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== ring) continue;
+          const ncx = tcx + dx, ncz = tcz + dz;
+          if (ncx < 0 || ncz < 0 || ncx >= NAV_W || ncz >= NAV_H) continue;
+          const cellX = (ncx + 0.5) * NAV_CELL_METERS;
+          const cellZ = (ncz + 0.5) * NAV_CELL_METERS;
+          // Cell must be within chop reach of the trunk so the worker can
+          // actually swing once it arrives. Past ring 1 most diagonals
+          // already fail this gate, but the explicit check makes the intent
+          // clear and keeps the function correct if reach changes.
+          const tdx = cellX - trunkX, tdz = cellZ - trunkZ;
+          if (tdx * tdx + tdz * tdz > reach2) continue;
+          const sy = this.surfaceWorldY(cellX, cellZ);
+          const ground = this.pathfinder.groundCellAt('worker', cellX, cellZ, sy + NAV_CELL_METERS);
+          if (!ground) continue;
+          const wdx = cellX - workerX, wdz = cellZ - workerZ;
+          const d = wdx * wdx + wdz * wdz;
+          if (d < bestD) {
+            bestD = d;
+            // Return the *ground cell's* y-centre, not the surface metres,
+            // so `cellAt(wx, wy, wz)` resolves to the same cy `groundCellAt`
+            // already proved passable. Otherwise `nearestPassable` snaps the
+            // goal to a different cy and the worker lands in a cell that
+            // happens to be passable but isn't adjacent to the trunk.
+            best = { x: cellX, y: (ground.cy + 0.5) * NAV_CELL_METERS, z: cellZ };
+          }
+        }
+      }
+    }
+    return best;
   }
 
   /**
@@ -2658,6 +3928,107 @@ export class Game {
    * is keyed on a string signature so we skip DOM work when nothing
    * structural has changed — that keeps existing click handlers attached.
    */
+  /**
+   * Refresh the AoE3-style selection portrait panel between the action
+   * grid and the task list. Shows the lead-selected unit / building's
+   * portrait, name, and a small stat block. The panel is keyed on (lead
+   * id, lead kind, hp) so it only re-renders when the visible content
+   * actually changes.
+   */
+  private renderSelectionPortrait(): void {
+    const panel = this.selPanelEl;
+    if (!panel) return;
+    const selBuilding = this.buildings.getSelected();
+    const selUnits = this.units.units.filter(u => u.selected);
+    const lead: Building | Unit | null =
+      selBuilding ?? (selUnits.length > 0 ? selUnits[0]! : null);
+    if (!lead) {
+      if (this.selRenderedKey !== 'empty') {
+        panel.classList.add('empty');
+        this.selRenderedKey = 'empty';
+      }
+      return;
+    }
+    const isBuilding = 'spec' in lead && 'maxHp' in lead && 'wallVoxelsAtBuild' in (lead as Building);
+    const hpInt = Math.max(0, Math.ceil((lead as { hp: number }).hp));
+    const maxHp = (lead as { maxHp: number }).maxHp ?? 0;
+    const id = (lead as { id: number }).id;
+    const kindOrLabel = isBuilding ? (lead as Building).spec.kind : (lead as Unit).kind;
+    const groupCount = isBuilding ? 1 : selUnits.length;
+    const key = `${isBuilding ? 'b' : 'u'}:${id}:${kindOrLabel}:${groupCount}:${hpInt}:${maxHp}`;
+    if (key === this.selRenderedKey) return;
+    this.selRenderedKey = key;
+    panel.classList.remove('empty');
+
+    // Portrait artwork.
+    if (this.selPortraitEl) {
+      this.selPortraitEl.innerHTML = '';
+      if (isBuilding) {
+        this.selPortraitEl.appendChild(makeBuildingPortraitTile(lead as Building));
+      } else {
+        // Reuse the static portrait tile (no key label, just the SVG).
+        this.selPortraitEl.appendChild(makeUnitPortraitTile((lead as Unit).kind));
+      }
+    }
+
+    // Name + subtitle.
+    if (this.selNameEl) {
+      this.selNameEl.textContent = isBuilding
+        ? `${(lead as Building).spec.label} #${id}`
+        : groupCount > 1
+          ? `${groupCount} ${kindOrLabel}s`
+          : `${kindOrLabel} #${id}`;
+    }
+    if (this.selSubEl) {
+      if (isBuilding) {
+        const b = lead as Building;
+        const stateBits: string[] = [];
+        if (b.upgradeState !== 'enabled') stateBits.push(b.upgradeState);
+        if (b.spec.kind === 'hq') stateBits.push(`tier ${b.tier}`);
+        this.selSubEl.textContent = stateBits.join(' · ') || 'operational';
+      } else {
+        const u = lead as Unit;
+        const armed = u.weapon !== null;
+        this.selSubEl.textContent = armed
+          ? `stance: ${u.stance}`
+          : u.kind === 'worker' ? `focus: ${u.workerFocus}` : 'civilian';
+      }
+    }
+
+    // Stat block.
+    if (this.selStatsEl) {
+      this.selStatsEl.innerHTML = '';
+      const addStat = (k: string, v: string): void => {
+        const ke = document.createElement('span');
+        ke.className = 'sel-stat-key';
+        ke.textContent = k;
+        const ve = document.createElement('span');
+        ve.className = 'sel-stat-val';
+        ve.textContent = v;
+        this.selStatsEl!.appendChild(ke);
+        this.selStatsEl!.appendChild(ve);
+      };
+      addStat('HP', `${hpInt} / ${maxHp}`);
+      if (isBuilding) {
+        const b = lead as Building;
+        if (b.spec.kind === 'hq') addStat('Trucks', `${b.activeTrucks} / ${this.buildings.hqMaxTrucks(b)}`);
+        if (b.spec.kind === 'storage') addStat('Stock', `M${b.stockpile.metals} W${b.stockpile.wood}`);
+        if (b.spec.produces.length > 0 && b.trainQueue.length > 0) addStat('Queue', b.trainQueue.length.toString());
+        if (b.upgradeState === 'pending' && b.constructionTotal > 0) {
+          const pct = Math.round((1 - b.constructionTimer / b.constructionTotal) * 100);
+          addStat('Build', `${pct}%`);
+        }
+      } else {
+        const u = lead as Unit;
+        if (u.weapon !== null) addStat('Weapon', u.weapon);
+        if (u.kind === 'worker') {
+          const carry = u.carrying.wood + u.carrying.metals + u.carrying.food;
+          if (carry > 0) addStat('Carry', `${u.carrying.wood}W ${u.carrying.metals}M ${u.carrying.food}F`);
+        }
+      }
+    }
+  }
+
   private renderActionPanel(): void {
     if (!this.actionsEl) return;
     const selBuilding = this.buildings.getSelected();
@@ -2681,7 +4052,11 @@ export class Game {
       }
 
       const acts = buildingActionsFor(selBuilding);
-      const key = `b:${selBuilding.id}:${selBuilding.spec.kind}:${acts.map(a => a.id).join(',')}`;
+      // Cache key includes per-track tiers so completing a range/trucks
+      // upgrade re-renders the panel with the bumped "+1" badge instead of
+      // serving a stale snapshot.
+      const trackKey = Object.entries(selBuilding.upgradeTracks ?? {}).map(([k, v]) => `${k}=${v}`).sort().join(',');
+      const key = `b:${selBuilding.id}:${selBuilding.spec.kind}:${selBuilding.upgradeState}:${trackKey}:${acts.map(a => a.id).join(',')}`;
       if (key !== this.actionsRenderedKey) {
         this.buildActionsDom(
           `${selBuilding.spec.label} (#${selBuilding.id})`,
@@ -2690,6 +4065,7 @@ export class Game {
             id: a.id, label: a.label, keyLabel: a.keyLabel,
             run: (): void => this.runBuildingAction(a),
           })),
+          { upgradeBuilding: selBuilding },
         );
         this.actionsRenderedKey = key;
       }
@@ -2710,7 +4086,11 @@ export class Game {
     if (selUnits.length > 0) {
       const acts = unitActionsFor(selUnits);
       const lead = selUnits[0]!;
-      const key = `u:${selUnits.length}:${lead.id}:${lead.kind}:${acts.map(a => a.id).join(',')}`;
+      // Include the kind composition in the cache key so a swap from a
+      // soldier-only selection to soldier+sniper re-renders the portrait
+      // grid.
+      const kindKey = selUnits.map(u => u.kind).sort().join('|');
+      const key = `u:${selUnits.length}:${lead.id}:${kindKey}:${acts.map(a => a.id).join(',')}`;
       if (key !== this.actionsRenderedKey) {
         const title = selUnits.length > 1
           ? `${selUnits.length} units selected`
@@ -2722,6 +4102,11 @@ export class Game {
             id: a.id, label: a.label, keyLabel: a.keyLabel,
             run: (): void => this.runUnitAction(a),
           })),
+          {
+            selectionPortraits: selUnits.length > 1
+              ? selUnits.map(u => ({ kind: u.kind, id: u.id }))
+              : undefined,
+          },
         );
         this.actionsRenderedKey = key;
       }
@@ -2749,11 +4134,23 @@ export class Game {
       return;
     }
 
-    if (this.actionsRenderedKey !== '') {
+    // Empty selection — render a quiet placeholder rather than hiding the
+    // panel. The bottom command bar always shows the same three regions
+    // (minimap / selection / tasks) so the layout doesn't jump when the
+    // player clicks empty terrain.
+    if (this.actionsRenderedKey !== 'empty') {
       this.actionsEl.innerHTML = '';
-      this.actionsRenderedKey = '';
+      const t = document.createElement('div');
+      t.className = 'actions-title';
+      t.textContent = 'No selection';
+      this.actionsEl.appendChild(t);
+      const s = document.createElement('div');
+      s.className = 'actions-sub';
+      s.textContent = 'Click a unit or building.';
+      this.actionsEl.appendChild(s);
+      this.actionsRenderedKey = 'empty';
     }
-    this.actionsEl.style.display = 'none';
+    this.actionsEl.style.display = 'block';
   }
 
   /** Construct the DOM rows for the actions panel from a list of entries. */
@@ -2761,6 +4158,10 @@ export class Game {
     title: string,
     subtitle: string,
     rows: { id: string; label: string; keyLabel: string; run: () => void }[],
+    opts: {
+      selectionPortraits?: { kind: import('../sim/Units').UnitKind; id: number }[];
+      upgradeBuilding?: import('../sim/Buildings').Building;
+    } = {},
   ): void {
     if (!this.actionsEl) return;
     this.actionsEl.innerHTML = '';
@@ -2772,6 +4173,78 @@ export class Game {
     s.className = 'actions-sub';
     s.textContent = subtitle;
     this.actionsEl.appendChild(s);
+
+    // Selection portraits (multi-unit). Renders one tile per selected unit
+    // so the player gets a quick visual census without expanding the panel.
+    if (opts.selectionPortraits && opts.selectionPortraits.length > 0) {
+      const grid = document.createElement('div');
+      grid.className = 'portrait-grid';
+      // Cap at 24 tiles so a giant select doesn't blow out the panel; the
+      // textual title already says "N units selected".
+      const cap = 24;
+      const list = opts.selectionPortraits.slice(0, cap);
+      for (const u of list) {
+        grid.appendChild(makeUnitPortraitTile(u.kind, undefined));
+      }
+      if (opts.selectionPortraits.length > cap) {
+        const more = document.createElement('div');
+        more.className = 'portrait-tile portrait-tile-static';
+        more.textContent = `+${opts.selectionPortraits.length - cap}`;
+        grid.appendChild(more);
+      }
+      this.actionsEl.appendChild(grid);
+    }
+
+    // Split actions into three buckets — portrait-style train and upgrade
+    // sections, plus the legacy keyrow list for everything else. Action id
+    // prefixes drive the routing: `train-*` → train portraits, `upgrade-*`
+    // → upgrade portraits (skipping the dedicated cancel button which
+    // stays in the keyrow), all others → keyrow.
+    const trainRows = rows.filter(r => r.id.startsWith('train-'));
+    const upgradeRows = rows.filter(r => r.id.startsWith('upgrade-') && r.id !== 'upgrade-cancel');
+    const otherRows = rows.filter(r => !r.id.startsWith('train-') && !(r.id.startsWith('upgrade-') && r.id !== 'upgrade-cancel'));
+    if (trainRows.length > 0) {
+      const sectionTitle = document.createElement('div');
+      sectionTitle.className = 'portrait-section-title';
+      sectionTitle.textContent = 'Train';
+      this.actionsEl.appendChild(sectionTitle);
+      const grid = document.createElement('div');
+      grid.className = 'portrait-grid';
+      for (const r of trainRows) {
+        const kind = r.id.slice('train-'.length) as import('../sim/Units').UnitKind;
+        const btn = makeUnitPortraitButton(kind, { keyLabel: r.keyLabel });
+        btn.addEventListener('click', r.run);
+        grid.appendChild(btn);
+      }
+      this.actionsEl.appendChild(grid);
+    }
+
+    if (upgradeRows.length > 0) {
+      const sectionTitle = document.createElement('div');
+      sectionTitle.className = 'portrait-section-title';
+      sectionTitle.textContent = 'Upgrades';
+      this.actionsEl.appendChild(sectionTitle);
+      const grid = document.createElement('div');
+      grid.className = 'portrait-grid';
+      for (const r of upgradeRows) {
+        const optId = r.id.slice('upgrade-'.length);
+        const opt = upgradeOptionById(optId);
+        if (!opt) continue;
+        const tier = opts.upgradeBuilding?.upgradeTracks[opt.id] ?? 0;
+        const cost = opts.upgradeBuilding ? this.buildings.upgradeCostFor({
+          ...opts.upgradeBuilding, activeUpgradeId: opt.id,
+        } as import('../sim/Buildings').Building) ?? undefined : undefined;
+        const btn = makeUpgradePortraitButton({
+          label: opt.label, keyLabel: r.keyLabel,
+          portrait: opt.portrait, description: opt.description,
+          tier, cost,
+        });
+        btn.addEventListener('click', r.run);
+        grid.appendChild(btn);
+      }
+      this.actionsEl.appendChild(grid);
+    }
+
     if (rows.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'action-row';
@@ -2779,7 +4252,7 @@ export class Game {
       this.actionsEl.appendChild(empty);
       return;
     }
-    for (const r of rows) {
+    for (const r of otherRows) {
       const row = document.createElement('div');
       row.className = 'action-row';
       const k = document.createElement('span');
@@ -3012,12 +4485,125 @@ export class Game {
     }
   }
 
+  /**
+   * Per-frame anti-air targeting for friendly `aa_vehicle` units. Walks every
+   * live enemy projectile (skipping AA missiles to avoid an interception
+   * loop), assigns each one to the nearest in-range AA vehicle, and emits a
+   * lead-solved firing target — same lead pipeline as the static AA turret,
+   * just per-unit. The vehicle's flak gun (`aa_flak`) takes it from there
+   * via `tickWeapons`.
+   *
+   * Skipped silently when there are no friendly AA vehicles, no enemy
+   * projectiles, or the unit already holds a target this frame (the player
+   * may have manually issued one).
+   */
+  private tickAAVehicles(): void {
+    const projectiles = this.projectiles.projectiles;
+    if (projectiles.length === 0) return;
+    type AAEntry = { u: Unit; r2: number; flak: number };
+    const aaUnits: AAEntry[] = [];
+    for (const u of this.units.units) {
+      if (u.kind !== 'aa_vehicle' || u.hp <= 0) continue;
+      if (u.team !== 'player') continue;
+      if (u.weapon === null) continue;
+      if (u.firingTarget) continue;
+      if (u.fireCooldown > 0) continue;
+      const w = WEAPONS[u.weapon];
+      const flak = Math.min(
+        PROJECTILES[w.projectile].muzzleVelocity * w.velocityScale,
+        u.launcherMaxStrength,
+      );
+      aaUnits.push({ u, r2: w.rangeMeters * w.rangeMeters, flak });
+    }
+    if (aaUnits.length === 0) return;
+
+    // Per-vehicle "best assigned projectile" pass. Each projectile attaches
+    // to the nearest in-range AA vehicle so two vehicles never waste shots
+    // on the same threat.
+    const assignedToVehicle = new Map<number, { p: typeof projectiles[number]; d2: number }>();
+    for (const p of projectiles) {
+      if (p.dead) continue;
+      if (p.kind === 'aa_missile') continue;
+      // Friendly-fire gate: only engage rounds owned by enemies.
+      if (p.ownerId >= 0) {
+        const owner = this.units.units.find(o => o.id === p.ownerId);
+        if (owner && owner.team === 'player') continue;
+      } else if (p.ownerId !== -1) {
+        continue; // negative non-(-1) = friendly building
+      }
+
+      let bestIdx = -1;
+      let bestD2 = Infinity;
+      for (let i = 0; i < aaUnits.length; i++) {
+        const { u, r2 } = aaUnits[i]!;
+        const dx = p.x - u.x, dy = p.y - (u.y + 1.6), dz = p.z - u.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > r2) continue;
+        if (d2 < bestD2) { bestD2 = d2; bestIdx = i; }
+      }
+      if (bestIdx < 0) continue;
+      const u = aaUnits[bestIdx]!.u;
+      const prev = assignedToVehicle.get(u.id);
+      if (!prev || bestD2 < prev.d2) assignedToVehicle.set(u.id, { p, d2: bestD2 });
+    }
+
+    for (const [unitId, { p }] of assignedToVehicle) {
+      const u = aaUnits.find(e => e.u.id === unitId)!.u;
+      const flak = aaUnits.find(e => e.u.id === unitId)!.flak;
+      const muzzleY = u.y + 1.6;
+      const dxNow = p.x - u.x;
+      const dyNow = p.y - muzzleY;
+      const dzNow = p.z - u.z;
+      const distNow = Math.hypot(dxNow, dyNow, dzNow);
+      const tof = Math.max(0.05, distNow / Math.max(20, flak));
+      const targetGrav = PROJECTILE_GRAVITY * (PROJECTILES[p.kind].gravityScale ?? 1);
+      const leadX = p.x + p.vx * tof;
+      const leadY = Math.max(0.5, p.y + p.vy * tof - 0.5 * targetGrav * tof * tof - 1.0);
+      const leadZ = p.z + p.vz * tof;
+      u.firingTarget = { x: leadX, y: leadY, z: leadZ };
+    }
+  }
+
   private tickAggressiveStance(dt: number): void {
     const liveUnits = this.units.units.filter(u => u.hp > 0);
     const liveBuildings = this.buildings.buildings.filter(b => !b.destroyed);
+    // Phase 4.3b: reconcile server-side weapon arming for every
+    // mirrored unit. If the unit is in aggressive stance and has a
+    // weapon, the server should be firing it; we send arm_unit on
+    // first transition. Hold-fire / no-weapon → disarm_unit. Issued
+    // only on transitions, so steady-state cost is zero.
+    if (this.zeroTrustEnabled && this.gameClient) {
+      for (const u of this.units.units) {
+        if (!this.mirroredUnitIds.has(u.id)) continue;
+        // Server-side firing currently only fires for player-team
+        // entities. Letting enemy AI units be added to
+        // `serverArmedUnitIds` makes the local engage pass skip them
+        // (it expects the server to fire), but the server won't.
+        // Net: enemy aggression silently dies.  Keep enemies on the
+        // local firing path.
+        if (u.team !== 'player') continue;
+        const eligible = u.hp > 0 && u.weapon !== null && u.stance === 'aggressive';
+        const armed = this.serverArmedUnitIds.has(u.id);
+        if (eligible && !armed) {
+          this.sendArmUnit(u);
+          this.serverArmedUnitIds.add(u.id);
+        } else if (!eligible && armed) {
+          this.gameClient.send({
+            type: 'disarm_unit',
+            clientTag: this.unitClientTag(u.id),
+            owner: this.gameClient.playerId,
+          });
+          this.serverArmedUnitIds.delete(u.id);
+        }
+      }
+    }
     for (const u of this.units.units) {
       if (u.weapon === null) continue;
       if (u.stance !== 'aggressive') continue;
+      // Phase 4.3b: server is firing this unit. Local target picking
+      // + projectile spawn is suppressed for armed mirrored units —
+      // visuals come from the server's projectile snapshot stream.
+      if (this.zeroTrustEnabled && this.serverArmedUnitIds.has(u.id)) continue;
       if (u.firingTarget) continue;
       if (u.burstShotsRemaining > 0) continue;
       if (u.autoEngageCooldown > 0) {
@@ -3027,58 +4613,82 @@ export class Game {
       const w = WEAPONS[u.weapon];
       const range2 = w.rangeMeters * w.rangeMeters;
 
-      // Priority targeting: enemy turrets first (highest threat), then
-      // cross-team units, then other enemy buildings. We pick the best
-      // candidate from each tier and only fall through if the tier is empty.
-      // Distance is the tiebreaker inside a tier.
-      let bestUnit: Unit | null = null;
-      let bestUnitD2 = range2;
+      // Threat-based target picking with a proximity bonus folded in.
+      // Score = baseThreat + PROXIMITY_BONUS_MAX × (1 − dist/range), so:
+      //   - a touching target gets a +PROXIMITY_BONUS_MAX boost,
+      //   - a target at the edge of range gets +0,
+      //   - the linear falloff is small enough that a higher-threat
+      //     target still wins when the threat gap exceeds the
+      //     proximity gap (e.g. a far-but-in-range tank beats a
+      //     touching worker; an in-your-face soldier beats a far one
+      //     of the same kind).
+      const range = w.rangeMeters;
+      const PROXIMITY_BONUS_MAX = 20;
+      let targetUnit: Unit | null = null;
+      let targetBuilding: Building | null = null;
+      let bestScore = -Infinity;
       for (const e of liveUnits) {
         if (e.team === u.team) continue;
         const dx = e.x - u.x, dz = e.z - u.z;
         const d2 = dx * dx + dz * dz;
-        if (d2 < bestUnitD2) { bestUnitD2 = d2; bestUnit = e; }
+        if (d2 > range2) continue;
+        const proximity = PROXIMITY_BONUS_MAX * Math.max(0, 1 - Math.sqrt(d2) / range);
+        const score = (UNIT_THREAT[e.kind] ?? 30) + proximity;
+        if (score > bestScore) {
+          bestScore = score;
+          targetUnit = e; targetBuilding = null;
+        }
       }
-      let bestTurret: Building | null = null;
-      let bestTurretD2 = range2;
-      let bestBuilding: Building | null = null;
-      let bestBuildingD2 = range2;
       for (const b of liveBuildings) {
         if (b.team === u.team) continue;
         const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_METERS;
         const czw = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_METERS;
         const dx = cxw - u.x, dz = czw - u.z;
         const d2 = dx * dx + dz * dz;
-        if (b.spec.kind === 'turret') {
-          if (d2 < bestTurretD2) { bestTurretD2 = d2; bestTurret = b; }
-        } else {
-          if (d2 < bestBuildingD2) { bestBuildingD2 = d2; bestBuilding = b; }
+        if (d2 > range2) continue;
+        const proximity = PROXIMITY_BONUS_MAX * Math.max(0, 1 - Math.sqrt(d2) / range);
+        const score = buildingThreatLevel(b) + proximity;
+        if (score > bestScore) {
+          bestScore = score;
+          targetBuilding = b; targetUnit = null;
         }
       }
-
-      const targetUnit = bestTurret ? null : bestUnit;
-      const targetBuilding = bestTurret ?? (bestUnit ? null : bestBuilding);
       if (!targetUnit && !targetBuilding) continue;
 
       // Pick a torso point to aim at. For unit targets that's the torso
-      // sphere centre; for buildings we aim slightly above the floor centre
-      // so the round lands on the wall, not the roof.
+      // sphere centre; for buildings we aim at the structure's voxel
+      // centroid so the round actually lands on a wall / roof.
       let tx: number, ty: number, tz: number;
-      let buildingBodyR = 0;
+      // Tolerance the trajectory needs to come within to count as
+      // "reaching" the target. For units that's the body sphere; for
+      // buildings we use the AABB half-diagonal so any voxel the
+      // trajectory clips counts as a hit (a near wall belongs to the
+      // building too).
+      let reachR: number;
       if (targetUnit) {
         tx = targetUnit.x;
         ty = targetUnit.y + Math.max(0.7, targetUnit.widthMeters * 0.6);
         tz = targetUnit.z;
+        reachR = targetUnit.widthMeters * 0.55 + 0.35;
       } else {
         const b = targetBuilding!;
-        tx = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
-        tz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
-        ty = (b.floorY + Math.min(b.spec.headroomVoxels - 2, 8)) * VOXEL_SIZE;
-        buildingBodyR = Math.max(b.spec.cellsW, b.spec.cellsD) * NAV_CELL_METERS * 0.5;
+        tx = b.aimWX;
+        ty = b.aimWY;
+        tz = b.aimWZ;
+        const halfW = b.spec.cellsW * NAV_CELL_METERS * 0.5;
+        const halfD = b.spec.cellsD * NAV_CELL_METERS * 0.5;
+        reachR = Math.hypot(halfW, halfD);
       }
       const cfg = PROJECTILES[w.projectile];
       const explosionR = cfg.explosive ? cfg.explosionRadiusMeters : 0;
 
+      // Predict the projectile's actual trajectory (gravity, drag) and
+      // see whether it clips the target sphere anywhere along the arc.
+      // If yes, fire. If the round arcs short — typical for a
+      // launcher pointed at the edge of its range — we step a little
+      // closer and try again next tick. The body sphere covers the
+      // building's footprint so a shot that's going to hit a wall
+      // counts as reach: that's still damage to the structure.
       const muzzleX = u.x;
       const muzzleY = u.y + 1.2;
       const muzzleZ = u.z;
@@ -3097,34 +4707,24 @@ export class Game {
         w.velocityScale,
         u.launcherMaxStrength,
       );
-      const willHit = targetUnit
-        ? arcCoversTarget(points, targetUnit, explosionR)
-        : arcCoversPoint(points, tx, ty, tz, buildingBodyR + explosionR);
-      if (willHit) {
+      const reaches = arcReachesPoint(points, tx, ty, tz, reachR + explosionR);
+      if (reaches) {
         u.firingTarget = { x: tx, y: ty, z: tz };
         u.autoEngageCooldown = 0.25;
         continue;
       }
-      // Trajectory blocked — reposition to a clear firing spot.
+      // Arc fell short. Step closer and retry — don't fire a wasted
+      // shot. We move ~25 % of the remaining gap (min 2 m), capped so a
+      // single step never overshoots the target. The 0.6 s cooldown
+      // gives the path time to resolve before the next reach check.
       u.autoEngageCooldown = 0.6;
       if (u.path.length > 0) continue;
-      const stopRange = w.rangeMeters * AUTO_ENGAGE_STOP_FRACTION;
-      const dxToTarget = tx - u.x;
-      const dzToTarget = tz - u.z;
-      const distToTarget = Math.hypot(dxToTarget, dzToTarget);
-      let goalX: number, goalZ: number;
-      if (distToTarget > stopRange) {
-        // Beyond firing range — advance toward the target, stopping at stopRange.
-        const scale = (distToTarget - stopRange) / distToTarget;
-        goalX = u.x + dxToTarget * scale;
-        goalZ = u.z + dzToTarget * scale;
-      } else {
-        // Already within firing range but blocked (e.g. around a corner) —
-        // route straight to the target so the path system navigates around
-        // the obstruction rather than retreating away from the enemy.
-        goalX = tx;
-        goalZ = tz;
-      }
+      const distToTarget = Math.hypot(tx - u.x, tz - u.z);
+      const step = Math.min(distToTarget - 1, Math.max(2, distToTarget * 0.25));
+      if (step <= 0) continue;
+      const scale = step / distToTarget;
+      const goalX = u.x + (tx - u.x) * scale;
+      const goalZ = u.z + (tz - u.z) * scale;
       void this.routePath(u, goalX, u.y, goalZ);
     }
   }
@@ -3234,6 +4834,38 @@ const NAV_MERGE_PAD = 16;
 const AUTO_ENGAGE_STOP_FRACTION = 0.7;
 
 /**
+ * Does any segment of the predicted projectile arc come within `tol` of
+ * the target point? Used by the aggressive-stance pipeline to decide
+ * whether the round will physically reach — if the arc dies short
+ * (gravity dropping the round on a closer voxel, drag stopping it
+ * before the target), the unit advances rather than wasting ammo.
+ *
+ * For explosive rounds the caller should pass `bodyR + explosionRadius`
+ * as `tol` so a near-miss inside the blast still counts as reach.
+ */
+function arcReachesPoint(
+  points: { x: number; y: number; z: number }[],
+  tx: number, ty: number, tz: number,
+  tol: number,
+): boolean {
+  if (points.length < 2) return false;
+  const tol2 = tol * tol;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1]!, b = points[i]!;
+    const sx = b.x - a.x, sy = b.y - a.y, sz = b.z - a.z;
+    const ssq = sx * sx + sy * sy + sz * sz;
+    if (ssq < 1e-8) continue;
+    const txa = tx - a.x, tya = ty - a.y, tza = tz - a.z;
+    let t = (txa * sx + tya * sy + tza * sz) / ssq;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    const cx = a.x + sx * t, cy = a.y + sy * t, cz = a.z + sz * t;
+    const dxs = cx - tx, dys = cy - ty, dzs = cz - tz;
+    if (dxs * dxs + dys * dys + dzs * dzs <= tol2) return true;
+  }
+  return false;
+}
+
+/**
  * Evasion tuning. We project each live projectile to its closest approach to
  * each non-engaged unit; if the predicted miss distance is within
  * `EVADE_DANGER_METERS` and the time-to-closest-approach is shorter than
@@ -3246,74 +4878,3 @@ const EVADE_LOOKAHEAD_SECONDS = 1.4;
 const EVADE_DISTANCE_METERS = 2.5;
 const EVADE_REARM_SECONDS = 1.2;
 
-/**
- * Decide whether a sampled trajectory `points` would actually affect `target`.
- * For explosive rounds we treat the last sample (impact location) as the
- * blast centre and check the target sits inside an extended explosion radius
- * (target body + explosion). For direct-fire rounds we walk every segment
- * and accept the line if it passes through the target's body sphere.
- *
- * Used by both the unit aggressive-stance pipeline and (in spirit) the
- * building turret hittability gate — they share the same shape because the
- * gameplay intent is identical: don't waste shots that won't reach.
- */
-function arcCoversTarget(
-  points: { x: number; y: number; z: number }[],
-  target: Unit,
-  explosionRadiusMeters: number,
-): boolean {
-  if (points.length < 2) return false;
-  const tx = target.x;
-  const ty = target.y + Math.max(0.7, target.widthMeters * 0.6);
-  const tz = target.z;
-  const bodyR = target.widthMeters * 0.55 + 0.35;
-  if (explosionRadiusMeters > 0) {
-    const r = explosionRadiusMeters + bodyR;
-    for (const p of points) {
-      const d = Math.hypot(p.x - tx, p.y - ty, p.z - tz);
-      if (d <= r) return true;
-    }
-    return false;
-  }
-  const r2 = bodyR * bodyR;
-  for (let i = 1; i < points.length; i++) {
-    const a = points[i - 1]!, b = points[i]!;
-    const sx = b.x - a.x, sy = b.y - a.y, sz = b.z - a.z;
-    const ssq = sx * sx + sy * sy + sz * sz;
-    if (ssq < 1e-8) continue;
-    const txa = tx - a.x, tya = ty - a.y, tza = tz - a.z;
-    let t = (txa * sx + tya * sy + tza * sz) / ssq;
-    if (t < 0) t = 0; else if (t > 1) t = 1;
-    const cx = a.x + sx * t, cy = a.y + sy * t, cz = a.z + sz * t;
-    const dxs = cx - tx, dys = cy - ty, dzs = cz - tz;
-    if (dxs * dxs + dys * dys + dzs * dzs <= r2) return true;
-  }
-  return false;
-}
-
-/**
- * Variant of `arcCoversTarget` for non-unit targets: takes a point and a
- * sphere radius. Used by the aggressive-stance pipeline when the target is a
- * building (no Unit struct available).
- */
-function arcCoversPoint(
-  points: { x: number; y: number; z: number }[],
-  tx: number, ty: number, tz: number,
-  bodyR: number,
-): boolean {
-  if (points.length < 2) return false;
-  const r2 = bodyR * bodyR;
-  for (let i = 1; i < points.length; i++) {
-    const a = points[i - 1]!, b = points[i]!;
-    const sx = b.x - a.x, sy = b.y - a.y, sz = b.z - a.z;
-    const ssq = sx * sx + sy * sy + sz * sz;
-    if (ssq < 1e-8) continue;
-    const txa = tx - a.x, tya = ty - a.y, tza = tz - a.z;
-    let t = (txa * sx + tya * sy + tza * sz) / ssq;
-    if (t < 0) t = 0; else if (t > 1) t = 1;
-    const cx = a.x + sx * t, cy = a.y + sy * t, cz = a.z + sz * t;
-    const dxs = cx - tx, dys = cy - ty, dzs = cz - tz;
-    if (dxs * dxs + dys * dys + dzs * dzs <= r2) return true;
-  }
-  return false;
-}

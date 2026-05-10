@@ -17,7 +17,8 @@ export type BuildingKind =
   | 'tech_lab'
   | 'turret'
   | 'silo'
-  | 'hq';
+  | 'hq'
+  | 'neighborhood';
 
 /**
  * Faction the building belongs to. Mirrors the unit `Team` type — buildings
@@ -25,7 +26,7 @@ export type BuildingKind =
  * the attack pipeline. Projectile damage is team-agnostic (any round that
  * lands inside / near the AABB hurts the building's HP).
  */
-export type BuildingTeam = 'player' | 'enemy';
+export type BuildingTeam = 'player' | 'enemy' | 'enemy2';
 
 export interface BuildingSpec {
   kind: BuildingKind;
@@ -36,7 +37,7 @@ export interface BuildingSpec {
   cellsD: number;
   /** Required headroom in voxels above the floor. */
   headroomVoxels: number;
-  /** Primary wall material — used for the perimeter + countLivingWalls sample. */
+  /** Primary wall material — used for the structure-voxel snapshot. */
   wall: MaterialId;
   /**
    * Hit-point pool the building starts with. Drained by projectile impacts
@@ -50,7 +51,7 @@ export interface BuildingSpec {
   /** Cycled through on each spawn. Empty array = doesn't produce units. */
   produces: UnitKind[];
   /** Voxel stamper for this building. Returns the wall-voxel count for liveness math. */
-  stamp: (world: VoxelWorld, ox: number, oz: number, floorY: number) => number;
+  stamp: (world: VoxelWorld, ox: number, oz: number, floorY: number, building?: Building) => number;
   /**
    * Extra nav-cell columns reserved in the +X direction for the spawn pad.
    * These cells are validated by `checkFootprint` (same floor height, not
@@ -114,6 +115,30 @@ export interface BuildingSpec {
    * Only meaningful for HQ buildings.
    */
   maxTrucks?: number;
+  /**
+   * Resource cost to bring a freshly-placed building online. Producer
+   * buildings start in `pending` state and only flip to `enabled` once
+   * trucks have delivered this many resources to the building's upgrade
+   * stockpile. Defaults to a modest 30 metals + 30 wood when omitted; HQ
+   * and storage have `enabledOnPlace = true` and never request an initial
+   * upgrade.
+   */
+  upgradeCost?: { metals: number; wood: number };
+  /**
+   * When true the building is fully operational the moment it's placed —
+   * skips the upgrade-pending state. Set on HQ + storage so the very first
+   * base the player drops can already function.
+   */
+  enabledOnPlace?: boolean;
+  /**
+   * Wall-clock seconds the initial construction takes once the upgrade is
+   * started. The visible voxel growth and the `enabled` flip both wait for
+   * this timer to elapse, so the player gets a deliberate "factory rolling
+   * up" feel rather than a building that pops complete the moment its
+   * resources arrive. Default 30 s when omitted; see per-spec values for
+   * the heavy-armour / weapons buildings.
+   */
+  constructionSeconds?: number;
 }
 
 export const BARRACKS: BuildingSpec = {
@@ -124,13 +149,22 @@ export const BARRACKS: BuildingSpec = {
   headroomVoxels: 6, // 0.75 m — flat low-profile bunker silhouette
   wall: M_WOOD,
   maxHp: 600,
-  productionInterval: 6.0,
-  // Infantry only — vehicles come out of the dedicated VEHICLE_DEPOT now so a
-  // barracks reads as the personnel facility (soldier + worker bunks).
-  produces: ['soldier', 'sniper', 'gunner', 'worker'],
+  // Was 6 s. Lowered to 1 s so 1-2 barracks can sustain the harness's
+  // drought rule (-50/s every second without a new unit) on their
+  // own. With one barracks per AI plus a per-AI worker queue, output
+  // matches the floor without needing 3+ barracks per HQ.
+  productionInterval: 1.0,
+  // Personnel-only roster: every infantry kind (worker included) trains here
+  // so the player has one obvious place for "people" production.
+  produces: ['soldier', 'sniper', 'gunner', 'mortar_soldier', 'rocket_soldier', 'worker'],
   stamp: stampBarracks,
   spawnPadCells: 2,
   spawnPadSafeStart: 1, // skip cell 0 (overlaps barracks porch canopy)
+  upgradeCost: { metals: 40, wood: 40 },
+  // Tuned for the gradual voxel build: at this duration you can watch the
+  // structure assemble row by row without waiting an uncomfortable beat
+  // between issuing the order and being able to train units.
+  constructionSeconds: 40,
 };
 
 /**
@@ -148,10 +182,14 @@ export const VEHICLE_DEPOT: BuildingSpec = {
   wall: M_METAL,
   maxHp: 900,
   productionInterval: 9.0,
-  produces: ['tank', 'dozer', 'tunneler', 'worm', 'rocket_truck'],
+  // Every drivable chassis the player can field rolls out of here: tanks,
+  // tunnelers, worms, dozers, rocket trucks, and the AA vehicle.
+  produces: ['tank', 'dozer', 'tunneler', 'worm', 'rocket_truck', 'aa_vehicle'],
   stamp: stampVehicleDepot,
   spawnPadCells: 3,
   spawnPadSafeStart: 2, // skip cells 0-1 so wide chassis (tunneler 3.6 m) clear the east wall
+  upgradeCost: { metals: 70, wood: 50 },
+  constructionSeconds: 75,
 };
 
 /**
@@ -172,6 +210,34 @@ export const FARM: BuildingSpec = {
   produces: [],
   stamp: stampFarm,
   spawnPadCells: 0,
+  upgradeCost: { metals: 20, wood: 30 },
+  constructionSeconds: 25,
+};
+
+/**
+ * Neighborhood — a city block of 1-3 small houses around a single dirt
+ * street. Each completed `expand_neighborhood` upgrade adds another house
+ * to the lot and bumps the player's `popCap` by 5. Residents (civilians)
+ * idle on the street and wander between neighborhood blocks.
+ *
+ * Footprint is a 6x6 nav-cell square. Houses are 2x2 cell blobs spread
+ * across the lot; the street runs centre-line W→E so a civilian can walk
+ * between the blocks without colliding with the buildings.
+ */
+export const NEIGHBORHOOD: BuildingSpec = {
+  kind: 'neighborhood',
+  label: 'Neighborhood',
+  cellsW: 6,
+  cellsD: 6,
+  headroomVoxels: 12,
+  wall: M_WOOD,
+  maxHp: 350,
+  productionInterval: 0,
+  produces: [],
+  stamp: stampNeighborhood,
+  spawnPadCells: 0,
+  upgradeCost: { metals: 30, wood: 60 },
+  constructionSeconds: 35,
 };
 
 /**
@@ -192,6 +258,7 @@ export const STORAGE: BuildingSpec = {
   produces: [],
   stamp: stampStorage,
   spawnPadCells: 0,
+  enabledOnPlace: true, // resource hub: must work the moment it's dropped.
 };
 
 export const POWER_PLANT: BuildingSpec = {
@@ -209,6 +276,8 @@ export const POWER_PLANT: BuildingSpec = {
   stamp: stampPowerPlant,
   spawnPadCells: 0,
   isEnergySource: true,
+  upgradeCost: { metals: 50, wood: 30 },
+  constructionSeconds: 35,
 };
 
 export const REFINERY: BuildingSpec = {
@@ -223,6 +292,8 @@ export const REFINERY: BuildingSpec = {
   produces: [],
   stamp: stampRefinery,
   spawnPadCells: 0,
+  upgradeCost: { metals: 80, wood: 40 },
+  constructionSeconds: 60,
 };
 
 export const TECH_LAB: BuildingSpec = {
@@ -237,6 +308,8 @@ export const TECH_LAB: BuildingSpec = {
   produces: [],
   stamp: stampTechLab,
   spawnPadCells: 0,
+  upgradeCost: { metals: 60, wood: 60 },
+  constructionSeconds: 50,
 };
 
 /**
@@ -264,6 +337,10 @@ export const TURRET: BuildingSpec = {
   // barrel, not the floor.
   weaponMuzzleHeight: (12 + 4) * VOXEL_SIZE,
   spawnPadCells: 0,
+  upgradeCost: { metals: 50, wood: 30 },
+  // Defensive turrets are commonly dropped under fire — quick to put up so
+  // the player has tactical agency when a wave hits.
+  constructionSeconds: 45,
 };
 
 /**
@@ -290,6 +367,8 @@ export const AA_TURRET: BuildingSpec = {
   launcherMaxStrength: 130,
   weaponMuzzleHeight: (12 + 4) * VOXEL_SIZE,
   spawnPadCells: 0,
+  upgradeCost: { metals: 60, wood: 30 },
+  constructionSeconds: 55,
 };
 
 /**
@@ -317,6 +396,10 @@ export const SILO: BuildingSpec = {
   // Top of the missile cluster sits ~6 voxels above the parapet.
   weaponMuzzleHeight: (32 + 6) * VOXEL_SIZE,
   spawnPadCells: 0,
+  upgradeCost: { metals: 100, wood: 50 },
+  // Heaviest building — long enough that committing to a silo is a real
+  // decision but not so long the player loses the tempo of the engagement.
+  constructionSeconds: 90,
 };
 
 /**
@@ -338,23 +421,171 @@ export const HQ: BuildingSpec = {
   spawnPadCells: 0,
   buildRangeMeters: 60,
   maxTrucks: 5,
+  enabledOnPlace: true,
+  // Each HQ tier upgrade: +50 metals + 50 wood. Tier scaling lives on the
+  // building instance (`tier` field), not the spec, so a single HQ can be
+  // upgraded multiple times.
+  upgradeCost: { metals: 50, wood: 50 },
 };
 
 /** All building specs in the order they appear on the build-mode hotkeys (1..N). */
-export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, VEHICLE_DEPOT, FARM, STORAGE, POWER_PLANT, REFINERY, TECH_LAB, TURRET, AA_TURRET, SILO];
+export const ALL_BUILDINGS: BuildingSpec[] = [BARRACKS, VEHICLE_DEPOT, FARM, NEIGHBORHOOD, STORAGE, POWER_PLANT, REFINERY, TECH_LAB, TURRET, AA_TURRET, SILO];
+
+// ---------------------------------------------------------------------------
+// Upgrade options
+// ---------------------------------------------------------------------------
+
+/**
+ * One discrete upgrade a player can buy at a building. Each option owns its
+ * own cost (which scales by the current tier in that track), a portrait
+ * spec for the action panel, and the effect that applies on completion.
+ *
+ * `applicable(b)` decides whether the option appears in the panel for this
+ * particular building — for HQ this is gated on the building kind and lets
+ * the player pick repeatedly; for non-HQ producers there is only the
+ * one-shot `initial` option that flips the building from disabled to
+ * enabled.
+ */
+export interface UpgradeOption {
+  id: string;
+  label: string;
+  description: string;
+  /** Base resource cost — multiplied by `(1 + tier * 0.75)` per existing tier. */
+  baseCost: { metals: number; wood: number };
+  /** Default keyboard shortcut for the action panel. */
+  keyLabel: string;
+  /** Portrait artwork — same SVG-glyph format as unit/building portraits. */
+  portrait: { bg: string; fg: string; glyph: string };
+  /**
+   * Wall-clock seconds the upgrade takes once started. For `initial` this
+   * is sourced from the spec instead so per-spec construction durations
+   * apply to the build animation. HQ-track upgrades use the value here.
+   */
+  constructionSeconds?: number;
+  applicable: (b: Building) => boolean;
+  apply: (b: Building) => void;
+}
+
+/**
+ * Catalog of upgrades. The action layer in `Actions.ts` filters this by
+ * `applicable(b)` to decide which buttons to surface for the current
+ * selection. `apply(b)` runs once the cost has been delivered; it should
+ * mutate the building's persistent state (track counters, runtime caps)
+ * without touching the upgrade flag plumbing — that stays in
+ * `BuildingManager.tick`.
+ */
+export const UPGRADE_OPTIONS: UpgradeOption[] = [
+  {
+    id: 'initial',
+    label: 'Construct',
+    description: 'Bring this building online so it can start training units.',
+    baseCost: { metals: 0, wood: 0 }, // overridden per-spec below
+    keyLabel: 'B',
+    portrait: { bg: '#5a4a2a', fg: '#e8c890',
+      glyph: 'M6 26 V14 L16 6 L26 14 V26 Z M14 26 V18 H18 V26 Z' },
+    // Only relevant for buildings that ship with `enabledOnPlace` falsy AND
+    // a non-zero upgrade cost. HQ stays operational so this never fires for
+    // it; it gets the per-track upgrades below.
+    applicable: (b) => !b.spec.enabledOnPlace && b.spec.upgradeCost !== undefined && b.spec.kind !== 'hq',
+    apply: (b) => {
+      // Effect lives in the per-tick completion code — flipping
+      // `upgradeState` to `enabled` and snapping HP to maxHp. The
+      // function body is the place future per-spec hooks would land.
+      void b;
+    },
+  },
+  {
+    id: 'range',
+    label: 'Increase range',
+    description: 'Extend the HQ build perimeter by 50 %.',
+    baseCost: { metals: 50, wood: 50 },
+    keyLabel: 'R',
+    portrait: { bg: '#3a4a6a', fg: '#bcd8ff',
+      // Crosshair-in-circle glyph so "range" reads at a glance.
+      glyph: 'M16 4 V12 M16 20 V28 M4 16 H12 M20 16 H28 M16 8 a8 8 0 1 1 0 16 a8 8 0 1 1 0 -16 Z' },
+    constructionSeconds: 60,
+    applicable: (b) => b.spec.kind === 'hq',
+    apply: (b) => { b.upgradeTracks.range = (b.upgradeTracks.range ?? 0) + 1; },
+  },
+  {
+    id: 'trucks',
+    label: 'Add 5 trucks',
+    description: 'Raise the HQ supply-truck cap by 5.',
+    baseCost: { metals: 60, wood: 30 },
+    keyLabel: 'T',
+    portrait: { bg: '#3a3a3a', fg: '#d8d8d8',
+      glyph: 'M4 14 H18 V22 H4 Z M18 16 H26 V22 H18 Z M6 22 a2 2 0 1 0 4 0 a2 2 0 1 0 -4 0 M20 22 a2 2 0 1 0 4 0 a2 2 0 1 0 -4 0' },
+    constructionSeconds: 60,
+    applicable: (b) => b.spec.kind === 'hq',
+    apply: (b) => { b.upgradeTracks.trucks = (b.upgradeTracks.trucks ?? 0) + 1; },
+  },
+  {
+    // Neighborhood expansion — adds another house to the lot and raises
+    // pop cap by 5. Capped at tier 3 (3 houses on the lot).
+    id: 'expand',
+    label: 'Expand neighborhood',
+    description: 'Build another house and add +5 population cap.',
+    baseCost: { metals: 25, wood: 50 },
+    keyLabel: 'E',
+    portrait: { bg: '#3a5a3a', fg: '#cfeac0',
+      // Two side-by-side houses with a "+1" outline cue.
+      glyph: 'M4 24 V14 L8 10 L12 14 V24 Z M14 24 V14 L18 10 L22 14 V24 Z M24 6 H28 M26 4 V8' },
+    constructionSeconds: 40,
+    applicable: (b) => b.spec.kind === 'neighborhood' && (b.upgradeTracks.expand ?? 0) < 2,
+    apply: (b) => {
+      b.upgradeTracks.expand = (b.upgradeTracks.expand ?? 0) + 1;
+    },
+  },
+  {
+    // Barracks bunkhouse upgrade — extra cots for soldiers and workers
+    // billeted at this barracks. Each tier adds +10 pop cap on top of the
+    // base 25 contributed by the barracks itself. Capped at +20 (two
+    // upgrades), giving a single barracks a max housing of 45.
+    id: 'barracks_expand',
+    label: 'Add bunks',
+    description: 'Expand the barracks to house +10 more soldiers / workers.',
+    baseCost: { metals: 30, wood: 30 },
+    keyLabel: 'H',
+    portrait: { bg: '#5a4a2a', fg: '#e8c890',
+      // Three stacked bunks + a "+" cue.
+      glyph: 'M4 8 H22 V12 H4 Z M4 14 H22 V18 H4 Z M4 20 H22 V24 H4 Z M26 6 H30 M28 4 V8' },
+    constructionSeconds: 35,
+    applicable: (b) => b.spec.kind === 'barracks' && (b.upgradeTracks.barracks_expand ?? 0) < 2,
+    apply: (b) => {
+      b.upgradeTracks.barracks_expand = (b.upgradeTracks.barracks_expand ?? 0) + 1;
+    },
+  },
+];
+
+/** Lookup by id; returns null if the id is unknown. */
+export function upgradeOptionById(id: string): UpgradeOption | null {
+  return UPGRADE_OPTIONS.find(o => o.id === id) ?? null;
+}
+
+/** Return the upgrade options applicable to this building. */
+export function upgradeOptionsFor(b: Building): UpgradeOption[] {
+  return UPGRADE_OPTIONS.filter(o => o.applicable(b));
+}
 
 /** Resource cost to train each unit kind. Deducted when HQ dispatches a supply truck. */
 export const UNIT_TRAIN_COST: Record<UnitKind, { food: number; metals: number; wood: number }> = {
-  soldier:      { food: 40,  metals: 10,  wood: 10  },
-  sniper:       { food: 50,  metals: 20,  wood: 15  },
-  gunner:       { food: 60,  metals: 30,  wood: 0   },
-  tank:         { food: 20,  metals: 80,  wood: 0   },
-  tunneler:     { food: 20,  metals: 120, wood: 0   },
-  worm:         { food: 20,  metals: 100, wood: 0   },
-  worker:       { food: 30,  metals: 0,   wood: 10  },
-  dozer:        { food: 20,  metals: 60,  wood: 0   },
-  rocket_truck: { food: 20,  metals: 80,  wood: 0   },
-  supply_truck: { food: 0,   metals: 0,   wood: 0   },
+  soldier:        { food: 40,  metals: 10,  wood: 10  },
+  sniper:         { food: 50,  metals: 20,  wood: 15  },
+  gunner:         { food: 60,  metals: 30,  wood: 0   },
+  mortar_soldier: { food: 60,  metals: 35,  wood: 5   },
+  rocket_soldier: { food: 60,  metals: 40,  wood: 0   },
+  tank:           { food: 20,  metals: 80,  wood: 0   },
+  tunneler:       { food: 20,  metals: 120, wood: 0   },
+  worm:           { food: 20,  metals: 100, wood: 0   },
+  worker:         { food: 30,  metals: 0,   wood: 10  },
+  dozer:          { food: 20,  metals: 60,  wood: 0   },
+  rocket_truck:   { food: 20,  metals: 80,  wood: 0   },
+  aa_vehicle:     { food: 20,  metals: 90,  wood: 0   },
+  supply_truck:   { food: 0,   metals: 0,   wood: 0   },
+  // Civilians are auto-spawned by neighborhoods, not built from a UI.
+  // The cost stays at 0 so the resupply / dispatch code paths skip them
+  // cleanly when filtered.
+  civilian:       { food: 0,   metals: 0,   wood: 0   },
 };
 
 export interface FootprintHit {
@@ -394,6 +625,36 @@ export interface Building {
   /** Snapshot of `spec.maxHp` taken at place-time — exposed on the instance
    *  so renderers / HUD don't need to walk back to the spec. */
   maxHp: number;
+  /**
+   * Baseline structural voxel count, captured at completion of the
+   * initial build. The runtime HP fraction is derived from it and the
+   * current `countAliveStructureVoxels` reading: a building stands while
+   * at most 30 % of its structural voxels have been chewed away. Zero
+   * while the building hasn't finished its initial upgrade (HP stays at
+   * 0 then).
+   */
+  healthRefVoxels: number;
+  /**
+   * World indices of every structural voxel snapshotted at construction
+   * completion. Excludes ground/road/path infrastructure so the HP curve
+   * only reacts when the actual buildings (walls, roofs, foundations,
+   * scaffolding) are damaged — destroying the dirt road that runs
+   * through a neighborhood lot does not chip away at its hp.
+   *
+   * Null while the building is still pending its initial upgrade; size
+   * matches `healthRefVoxels` once populated.
+   */
+  structureVoxelIdx: Uint32Array | null;
+  /**
+   * World-space (meters) aim point for projectiles targeting this building.
+   * Set to the centroid of the structural voxels at construction
+   * completion so aim lands on actual buildings even when the lot center
+   * is air or road (e.g. a neighborhood's central street). Falls back to
+   * the geometric lot centre while the building hasn't been stamped yet.
+   */
+  aimWX: number;
+  aimWY: number;
+  aimWZ: number;
   /** True when this building is the player's currently selected building. */
   selected: boolean;
   /**
@@ -521,6 +782,84 @@ export interface Building {
    * returning). Capped at `spec.maxTrucks`.
    */
   activeTrucks: number;
+  /**
+   * Lifecycle stage. `enabled` = fully operational. `pending` = needs an
+   * upgrade run; trucks are dispatching resources to the building's
+   * `upgradeStockpile` and the building doesn't accept training orders.
+   * `cancelled` = the player aborted the upgrade; in-flight trucks turn
+   * around with their cargo and any resources already dropped sit in the
+   * stockpile waiting for a recovery truck to ferry them back to HQ.
+   * Buildings stay `cancelled` after recovery completes so the player can
+   * re-arm a fresh upgrade whenever they like.
+   */
+  upgradeState: 'enabled' | 'pending' | 'cancelled';
+  /** Resources delivered toward the next upgrade. Compared against the spec
+   *  (or HQ tier-scaled) cost; on completion this is reset and the
+   *  building flips to `enabled` (or HQ.tier increments). */
+  upgradeStockpile: { metals: number; wood: number };
+  /** Trucks currently en route delivering resources to `upgradeStockpile`. */
+  inboundUpgradeTrucks: number;
+  /**
+   * Legacy combined tier counter — kept for save/log compatibility but
+   * superseded by the per-track `upgradeTracks` map. Reads at the count of
+   * the highest individual track so old call sites still get a sane "how
+   * upgraded is this" number.
+   */
+  tier: number;
+  /**
+   * Per-track upgrade counters. Each call to "Increase X" finishes by
+   * bumping `upgradeTracks[X]` so the matching effect formula (build range
+   * scaling, max-trucks add, etc.) reads the right tier. Non-HQ buildings
+   * use the single `initial` track to model the build-it-once flow.
+   */
+  upgradeTracks: Record<string, number>;
+  /**
+   * Which upgrade option the building is currently accepting deliveries
+   * for. `null` when no upgrade is in progress; the truck dispatcher only
+   * sends loads to buildings whose `upgradeState === 'pending'` AND have
+   * a non-null `activeUpgradeId`.
+   */
+  activeUpgradeId: string | null;
+  /**
+   * Per-voxel build queue. Captured at place time by walking the building's
+   * AABB right after the spec's stamp wrote its voxels: every non-AIR voxel
+   * inside the AABB lands in `buildVoxels` (linear world index) +
+   * `buildMaterials` (the material to restore). The whole footprint is
+   * then carved to AIR so the building starts visually empty. Each tick
+   * during pending, the upgrade tick advances `buildIndex` through this
+   * queue at a rate proportional to combined progress, re-writing one
+   * voxel of the original structure per step. Buildings placed with
+   * `enabledOnPlace` skip the queue and start fully stamped.
+   */
+  buildVoxels: Uint32Array | null;
+  buildMaterials: Uint8Array | null;
+  /**
+   * Pre-stamp material for each queued voxel — kept so a cancel can walk
+   * the already-stamped portion of the queue and revert each voxel to
+   * what was there before the upgrade started. Lined up index-for-index
+   * with `buildVoxels` / `buildMaterials`.
+   */
+  buildBeforeMaterials: Uint8Array | null;
+  /** Number of queue entries already stamped back into the world. */
+  buildIndex: number;
+  /**
+   * World-voxel indices of the cancel-time "temp pile" — a visible cluster
+   * of M_METAL + M_WOOD voxels stamped on the lot when an upgrade is
+   * cancelled with resources still on site. Clears automatically once a
+   * recovery truck drains `upgradeStockpile`. Null when no pile exists.
+   */
+  tempPileVoxels: Uint32Array | null;
+  /**
+   * Wall-clock seconds remaining on the current upgrade. Counts down each
+   * tick while `upgradeState === 'pending'`; the visible voxel growth and
+   * the eventual `enabled` flip read this so a vehicle depot takes ~2 min
+   * to assemble even when its resource trucks arrive in the first tick.
+   * Zero when no upgrade is active.
+   */
+  constructionTimer: number;
+  /** Total seconds the active construction was budgeted for (denominator
+   *  for the time-progress fraction). */
+  constructionTotal: number;
 }
 
 /**
@@ -647,6 +986,256 @@ export function checkFootprint(
  * of `spec.wall`; interior is air; a 2-voxel-wide door cut from the +X wall.
  * Returns the count of wall voxels written.
  */
+/**
+ * Snapshot the AABB, run the spec's stamp for the target tier, and capture
+ * every voxel that CHANGED into a per-building build queue (sorted bottom-
+ * up with a deterministic per-row shuffle). Each captured voxel is then
+ * restored to its pre-stamp value so the building visually rolls back to
+ * the previous structural state; the upgrade tick then advances the queue
+ * to re-write the captured voxels one by one.
+ *
+ * Diff-based capture means a tier-up only animates the NEW voxels —
+ * existing tier-1 walls don't get torn down and re-built when the player
+ * orders an expansion.
+ */
+function captureAndCarveBuildQueue(world: VoxelWorld, b: Building): void {
+  const wxStart = b.ox * NAV_CELL_VOXELS;
+  const wxEnd   = wxStart + b.spec.cellsW * NAV_CELL_VOXELS;
+  const wzStart = b.oz * NAV_CELL_VOXELS;
+  const wzEnd   = wzStart + b.spec.cellsD * NAV_CELL_VOXELS;
+  const yMin = b.floorY + 1;
+  const yMax = b.floorY + b.spec.headroomVoxels;
+  const voxels = world.buffers.voxels;
+  const cw = wxEnd - wxStart;
+  const cd = wzEnd - wzStart;
+  const ch = yMax - yMin + 1;
+  // Snapshot the AABB before the stamp so we can diff after.
+  const before = new Uint8Array(cw * cd * ch);
+  for (let oy = 0; oy < ch; oy++) {
+    const y = yMin + oy;
+    if (y < 0 || y >= WORLD_Y) continue;
+    for (let oz2 = 0; oz2 < cd; oz2++) {
+      const z = wzStart + oz2;
+      if (z < 0 || z >= WORLD_Z) continue;
+      for (let ox2 = 0; ox2 < cw; ox2++) {
+        const x = wxStart + ox2;
+        if (x < 0 || x >= WORLD_X) continue;
+        before[(oy * cd + oz2) * cw + ox2] = voxels[worldIndex(x, y, z)]!;
+      }
+    }
+  }
+  // Run the spec stamp at the target tier (the stamp may consult `b` for
+  // tier / track info).
+  b.spec.stamp(world, b.ox, b.oz, b.floorY, b);
+  // Two passes: count diff, then build typed arrays sized exactly.
+  let count = 0;
+  for (let oy = 0; oy < ch; oy++) {
+    const y = yMin + oy;
+    if (y < 0 || y >= WORLD_Y) continue;
+    for (let oz2 = 0; oz2 < cd; oz2++) {
+      const z = wzStart + oz2;
+      if (z < 0 || z >= WORLD_Z) continue;
+      for (let ox2 = 0; ox2 < cw; ox2++) {
+        const x = wxStart + ox2;
+        if (x < 0 || x >= WORLD_X) continue;
+        const beforeMat = before[(oy * cd + oz2) * cw + ox2]!;
+        const afterMat  = voxels[worldIndex(x, y, z)]!;
+        if (afterMat !== beforeMat) count++;
+      }
+    }
+  }
+  if (count === 0) {
+    b.buildVoxels = new Uint32Array(0);
+    b.buildMaterials = new Uint8Array(0);
+    b.buildBeforeMaterials = new Uint8Array(0);
+    b.buildIndex = 0;
+    return;
+  }
+  const idxArr = new Uint32Array(count);
+  const matArr = new Uint8Array(count);
+  const beforeArr = new Uint8Array(count);
+  let cursor = 0;
+  // Deterministic per-voxel ordering — building id mixed in so multiple
+  // simultaneous builds don't all sprinkle in the same pattern.
+  const seed = (b.id * 0x9E3779B1) >>> 0;
+  const hashOrder = (x: number, y: number, z: number): number => {
+    let h = seed;
+    h = ((h ^ x) * 0x85EBCA6B) >>> 0;
+    h = ((h ^ (y * 0x100)) * 0xC2B2AE35) >>> 0;
+    h = ((h ^ z) * 0x27D4EB2F) >>> 0;
+    return h >>> 0;
+  };
+  // Walk Y rows ascending; within each row build a sub-list, sort by hash,
+  // append. The result: queue is Y-asc with random row-internal order so
+  // the build looks like blocks sprinkling in row by row.
+  const rowEntries: { idx: number; mat: number; before: number; ord: number }[] = [];
+  for (let oy = 0; oy < ch; oy++) {
+    const y = yMin + oy;
+    if (y < 0 || y >= WORLD_Y) continue;
+    rowEntries.length = 0;
+    for (let oz2 = 0; oz2 < cd; oz2++) {
+      const z = wzStart + oz2;
+      if (z < 0 || z >= WORLD_Z) continue;
+      for (let ox2 = 0; ox2 < cw; ox2++) {
+        const x = wxStart + ox2;
+        if (x < 0 || x >= WORLD_X) continue;
+        const beforeMat = before[(oy * cd + oz2) * cw + ox2]!;
+        const idx = worldIndex(x, y, z);
+        const afterMat  = voxels[idx]!;
+        if (afterMat === beforeMat) continue;
+        rowEntries.push({ idx, mat: afterMat, before: beforeMat, ord: hashOrder(x, y, z) });
+      }
+    }
+    rowEntries.sort((a, b2) => a.ord - b2.ord);
+    for (const e of rowEntries) {
+      idxArr[cursor] = e.idx;
+      matArr[cursor] = e.mat;
+      beforeArr[cursor] = e.before;
+      cursor++;
+    }
+  }
+  b.buildVoxels = idxArr;
+  b.buildMaterials = matArr;
+  b.buildBeforeMaterials = beforeArr;
+  b.buildIndex = 0;
+  // Restore each captured voxel to its pre-stamp value. The queue advance
+  // then re-writes the post-stamp value one at a time — this is what the
+  // player sees as "the new houses sprinkle in".
+  for (let oy = 0; oy < ch; oy++) {
+    const y = yMin + oy;
+    if (y < 0 || y >= WORLD_Y) continue;
+    for (let oz2 = 0; oz2 < cd; oz2++) {
+      const z = wzStart + oz2;
+      if (z < 0 || z >= WORLD_Z) continue;
+      for (let ox2 = 0; ox2 < cw; ox2++) {
+        const x = wxStart + ox2;
+        if (x < 0 || x >= WORLD_X) continue;
+        const beforeMat = before[(oy * cd + oz2) * cw + ox2]!;
+        const idx = worldIndex(x, y, z);
+        if (voxels[idx]! !== beforeMat) {
+          world.set(x, y, z, beforeMat);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Stamp a visible "temp pile" of resource voxels at the building's lot
+ * centre, holding whatever's currently in `upgradeStockpile`. Used after a
+ * cancel so the player can SEE the resources sitting on site before a
+ * recovery truck arrives. The pile is a small column — metals on the -X
+ * side of centre, wood on the +X side — capped at PILE_MAX_VOXELS so a
+ * massive cancelled silo upgrade doesn't sprawl across the map.
+ *
+ * No-op when there's nothing to stockpile or a pile is already standing.
+ */
+function spawnUpgradeStockpilePile(world: VoxelWorld, b: Building): void {
+  if (b.tempPileVoxels) return;
+  const totalRes = b.upgradeStockpile.metals + b.upgradeStockpile.wood;
+  if (totalRes <= 0) return;
+  // Voxels per resource: 1 voxel per 5 resources, capped per side so a
+  // huge cancel doesn't blanket the lot. 12 voxels per side = a 2×2×3
+  // pile for each material.
+  const PILE_MAX_VOXELS = 12;
+  const metalVox = Math.min(PILE_MAX_VOXELS, Math.ceil(b.upgradeStockpile.metals / 5));
+  const woodVox  = Math.min(PILE_MAX_VOXELS, Math.ceil(b.upgradeStockpile.wood   / 5));
+  const cx = (b.ox * NAV_CELL_VOXELS) + (b.spec.cellsW * NAV_CELL_VOXELS >> 1);
+  const cz = (b.oz * NAV_CELL_VOXELS) + (b.spec.cellsD * NAV_CELL_VOXELS >> 1);
+  const yFloor = b.floorY + 1;
+  const indices: number[] = [];
+  // Metal column on the -X side: a 2×2 base stacked into a small tower.
+  for (let n = 0; n < metalVox; n++) {
+    const layer = Math.floor(n / 4);
+    const slot = n % 4;
+    const dx = -3 + (slot & 1);
+    const dz = -1 + ((slot >> 1) & 1);
+    const x = cx + dx, y = yFloor + layer, z = cz + dz;
+    if (x < 0 || x >= WORLD_X || y >= WORLD_Y || z < 0 || z >= WORLD_Z) continue;
+    world.set(x, y, z, M_METAL);
+    indices.push(worldIndex(x, y, z));
+  }
+  // Wood column on the +X side, mirrored layout.
+  for (let n = 0; n < woodVox; n++) {
+    const layer = Math.floor(n / 4);
+    const slot = n % 4;
+    const dx = 2 + (slot & 1);
+    const dz = -1 + ((slot >> 1) & 1);
+    const x = cx + dx, y = yFloor + layer, z = cz + dz;
+    if (x < 0 || x >= WORLD_X || y >= WORLD_Y || z < 0 || z >= WORLD_Z) continue;
+    world.set(x, y, z, M_WOOD);
+    indices.push(worldIndex(x, y, z));
+  }
+  b.tempPileVoxels = new Uint32Array(indices);
+}
+
+/**
+ * Carve every voxel of the temp pile back to AIR. Called once the
+ * recovery truck has drained `upgradeStockpile` so the pile visibly
+ * disappears with the cargo.
+ */
+function clearUpgradeStockpilePile(world: VoxelWorld, b: Building): void {
+  if (!b.tempPileVoxels) return;
+  const idxArr = b.tempPileVoxels;
+  for (let i = 0; i < idxArr.length; i++) {
+    const idx = idxArr[i]!;
+    const x = idx % WORLD_X;
+    const tmp = (idx - x) / WORLD_X;
+    const z = tmp % WORLD_Z;
+    const y = (tmp - z) / WORLD_Z;
+    world.set(x, y, z, AIR);
+  }
+  b.tempPileVoxels = null;
+}
+
+/**
+ * Roll the already-stamped portion of the queue back to its pre-upgrade
+ * state. Called from the cancel action so the player gets a clean revert
+ * instead of a half-built shell that lingers in the world. Voxels still
+ * queued (`>= buildIndex`) are already at their pre-stamp value so we
+ * leave them alone.
+ */
+export function rollbackBuildQueue(world: VoxelWorld, b: Building): void {
+  if (!b.buildVoxels || !b.buildBeforeMaterials) return;
+  const idxArr = b.buildVoxels;
+  const beforeArr = b.buildBeforeMaterials;
+  const stamped = b.buildIndex;
+  for (let i = 0; i < stamped; i++) {
+    const idx = idxArr[i]!;
+    const beforeMat = beforeArr[i]!;
+    const x = idx % WORLD_X;
+    const tmp = (idx - x) / WORLD_X;
+    const z = tmp % WORLD_Z;
+    const y = (tmp - z) / WORLD_Z;
+    world.set(x, y, z, beforeMat);
+  }
+}
+
+/**
+ * Stamp the next batch of queued build voxels back into the world. Called
+ * each tick during pending state with `targetIndex` derived from combined
+ * time × resource progress. Idempotent: when `targetIndex` ≤ current,
+ * nothing happens.
+ */
+function advanceBuildQueue(world: VoxelWorld, b: Building, targetIndex: number): void {
+  if (!b.buildVoxels || !b.buildMaterials) return;
+  const total = b.buildVoxels.length;
+  if (targetIndex > total) targetIndex = total;
+  if (targetIndex <= b.buildIndex) return;
+  const idxArr = b.buildVoxels;
+  const matArr = b.buildMaterials;
+  for (let i = b.buildIndex; i < targetIndex; i++) {
+    const idx = idxArr[i]!;
+    const mat = matArr[i]!;
+    const x = idx % WORLD_X;
+    const tmp = (idx - x) / WORLD_X;
+    const z = tmp % WORLD_Z;
+    const y = (tmp - z) / WORLD_Z;
+    world.set(x, y, z, mat);
+  }
+  b.buildIndex = targetIndex;
+}
+
 function stampHollowBox(
   world: VoxelWorld,
   spec: BuildingSpec,
@@ -1117,6 +1706,132 @@ export function stampFarm(
     world.set(wxEnd - 1, yField + 1, gateZ + 1, AIR);
   }
 
+  return count;
+}
+
+/**
+ * Resolve the neighborhood's target tier (1..3). On `initial` we always
+ * stamp tier 1 (one house). During an in-progress `expand` the target is
+ * the post-completion tier, so we look at the existing track count + 1.
+ * After completion `apply()` has already incremented the track, so we
+ * just read it directly.
+ */
+function neighborhoodTargetTier(b: Building | undefined): number {
+  if (!b) return 1;
+  const expandTrack = b.upgradeTracks?.expand ?? 0;
+  if (b.activeUpgradeId === 'initial') return 1;
+  if (b.activeUpgradeId === 'expand') return Math.min(3, expandTrack + 1 + 1);
+  // No active upgrade — display the tier we've actually completed.
+  return Math.min(3, 1 + expandTrack);
+}
+
+/**
+ * Stamp a neighborhood (tier 1..3) into the world. The 6×6 lot is split
+ * by a single dirt road running east-west across its centre, with 1, 2,
+ * or 3 small wood-and-stone houses arranged in fixed quadrants depending
+ * on tier. Each house is a 2×2 cell stub with a flat roof; the
+ * arrangement is the same across tiers (just more houses revealed) so
+ * subsequent expansions visually fill in around the original block.
+ */
+export function stampNeighborhood(
+  world: VoxelWorld,
+  ox: number, oz: number,
+  floorY: number,
+  building?: Building,
+): number {
+  const spec = NEIGHBORHOOD;
+  const wxStart = ox * NAV_CELL_VOXELS;
+  const wzStart = oz * NAV_CELL_VOXELS;
+  const wxEnd   = wxStart + spec.cellsW * NAV_CELL_VOXELS;
+  const wzEnd   = wzStart + spec.cellsD * NAV_CELL_VOXELS;
+  const tier = neighborhoodTargetTier(building);
+  const yFloor = floorY + 1;
+  let count = 0;
+  // Street lane: middle 2 rows of voxels, full width — laid as packed
+  // dirt-road. Acts both as the visual road and as a clear walkway for
+  // civilians wandering between houses.
+  const streetZ0 = (wzStart + wzEnd) >> 1;
+  const streetZ1 = streetZ0 + 1;
+  for (let z = streetZ0; z <= streetZ1; z++) {
+    if (z >= WORLD_Z) break;
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (x >= WORLD_X) continue;
+      world.set(x, yFloor, z, M_DIRT_ROAD);
+      count++;
+    }
+  }
+  // Decide which house slots to stamp. Layout is fixed: slot 0 NW, slot 1
+  // NE, slot 2 SW. Slots stay vacant until their tier comes online so
+  // expansions visibly fill in around the original house.
+  const slotsByTier = [
+    [], // tier 0 — never reached
+    [{ qx: 0, qz: 0 }],                                              // tier 1 — NW only
+    [{ qx: 0, qz: 0 }, { qx: 1, qz: 0 }],                             // tier 2 — NW + NE
+    [{ qx: 0, qz: 0 }, { qx: 1, qz: 0 }, { qx: 0, qz: 1 }],           // tier 3 — NW + NE + SW
+  ];
+  const slots = slotsByTier[tier] ?? slotsByTier[1]!;
+  // House dims: 12 voxels wide (1.5 nav cells) — narrower than the slot
+  // width so adjacent houses (NW / NE) leave a visible 8-voxel alley
+  // between them. Z-depth is similar so the north and south rows have
+  // matching breathing room around the street.
+  const houseW = 12;
+  const houseD = 12;
+  const sideMargin = 8;   // voxels from the lot edge to the first house
+  const innerGap = 8;     // voxels of grass between the two houses on the same row
+  for (const slot of slots) {
+    const isNorth = slot.qz === 0;
+    // Z range: 4-voxel buffer between the house and the street so the
+    // dirt road reads as separate from the building wall.
+    const zBuffer = 4;
+    const houseWzStart = isNorth
+      ? wzStart + sideMargin
+      : streetZ1 + 1 + zBuffer;
+    const houseWzEnd = houseWzStart + houseD;
+    // X range: NW = side margin + houseW; NE = NW end + innerGap +
+    // houseW. Symmetric around the lot centre when both slots are present.
+    const houseWxStart = slot.qx === 0
+      ? wxStart + sideMargin
+      : wxStart + sideMargin + houseW + innerGap;
+    const houseWxEnd = houseWxStart + houseW;
+    count += stampNeighborhoodHouse(
+      world, houseWxStart, Math.min(wxEnd, houseWxEnd),
+      Math.max(wzStart, houseWzStart), Math.min(wzEnd, houseWzEnd),
+      yFloor, spec,
+    );
+  }
+  return count;
+}
+
+/** Single 2x2-cell house — flat-roofed wood box with a stone foundation strip. */
+function stampNeighborhoodHouse(
+  world: VoxelWorld,
+  wxStart: number, wxEnd: number,
+  wzStart: number, wzEnd: number,
+  yFloor: number, spec: BuildingSpec,
+): number {
+  let count = 0;
+  if (wxEnd <= wxStart || wzEnd <= wzStart) return count;
+  // House is 1.0 m tall foundation + 0.875 m walls + 1 voxel roof = 9 voxels.
+  // Keep tower-height under the spec headroom (12) so two-story expansions
+  // can stack later without breaching the building's headroom envelope.
+  const yRoof = Math.min(yFloor + 8, yFloor + spec.headroomVoxels);
+  for (let z = wzStart; z < wzEnd; z++) {
+    if (z >= WORLD_Z) continue;
+    for (let x = wxStart; x < wxEnd; x++) {
+      if (x >= WORLD_X) continue;
+      const onPerimeter = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
+      // Floor + raised stone foundation around the perimeter.
+      world.set(x, yFloor, z, onPerimeter ? M_STONE : M_WOOD); count++;
+      for (let y = yFloor + 1; y <= yRoof; y++) {
+        if (y >= WORLD_Y) break;
+        if (y === yRoof) {
+          world.set(x, y, z, spec.wall); count++;
+        } else if (onPerimeter) {
+          world.set(x, y, z, spec.wall); count++;
+        }
+      }
+    }
+  }
   return count;
 }
 
@@ -2132,26 +2847,122 @@ export function stampHQ(
 }
 
 /**
- * Sample wall voxels and return roughly how many remain. Used for "destroyed" check.
- * Cheap: only checks perimeter columns of the main hall (ignores chimneys / domes —
- * those are accents, the building is "alive" while the perimeter still stands).
+ * Per-building-kind threat to a ground attacker. Mirrors `UNIT_THREAT` —
+ * higher-threat buildings get prioritised by the aggressive-stance
+ * target picker. The numeric scale is consistent across units and
+ * buildings so a unit's threat can be compared directly to a building's.
+ *
+ * Anti-ground turrets and silos are deadliest (they can shoot the
+ * attacker now). Production buildings rank next because clearing them
+ * starves the player's army. Population / economy buildings rank
+ * lowest. AA-only turrets are scored by `buildingThreatLevel` rather
+ * than this table so they read as low-threat to ground units even
+ * though their kind is `'turret'`.
  */
-export function countLivingWalls(world: VoxelWorld, b: Building): number {
+const BUILDING_THREAT: Record<BuildingKind, number> = {
+  silo:          95,
+  turret:        88,   // anti-ground; aa_turret is overridden in buildingThreatLevel
+  hq:            70,
+  vehicle_depot: 65,
+  barracks:      60,
+  tech_lab:      48,
+  refinery:      42,
+  power_plant:   38,
+  storage:       30,
+  farm:          22,
+  neighborhood:  20,
+};
+
+/**
+ * Threat score for a specific building. Reads `BUILDING_THREAT` for the
+ * spec kind, then de-rates AA turrets — they don't shoot ground units,
+ * so attackers should ignore them when an actual anti-ground threat is
+ * on the map.
+ */
+export function buildingThreatLevel(b: Building): number {
+  const base = BUILDING_THREAT[b.spec.kind] ?? 30;
+  if (b.spec.kind === 'turret' && b.spec.weapon === 'aa_turret') return 18;
+  return base;
+}
+
+/**
+ * Materials that aren't part of a building's "structure" for HP purposes —
+ * floor markings, drill yards, the dirt road that runs through a
+ * neighborhood lot. These are stamped by the building but represent
+ * infrastructure / cosmetics, not the walls, foundation, and roof that
+ * make a building a building. Excluded both at snapshot time and from
+ * the runtime alive-count, so destroying a road voxel never moves the
+ * HP needle.
+ */
+function isStructuralMaterial(mat: number): boolean {
+  if (mat === AIR) return false;
+  if (mat === M_DIRT_ROAD) return false;
+  if (mat === M_PATH) return false;
+  return true;
+}
+
+/**
+ * Snapshot a building's structural voxels — the ones that will count
+ * toward HP from now on. Walks the headroom AABB and records every
+ * non-AIR, non-infrastructure voxel index. Returns the index array plus
+ * the centroid (in world meters) of those voxels for use as the
+ * projectile aim point.
+ *
+ * Captured at construction completion. Anything stamped after that
+ * (terrain regrowth, etc.) doesn't bump HP because it isn't in the
+ * snapshot. Damage = (snapshot indices that are now AIR) / (snapshot
+ * size), capped at the 30 % collapse threshold.
+ */
+export function snapshotBuildingStructure(
+  world: VoxelWorld,
+  b: Building,
+): { idx: Uint32Array; aim: { x: number; y: number; z: number } | null } {
   const wxStart = b.ox * NAV_CELL_VOXELS;
   const wzStart = b.oz * NAV_CELL_VOXELS;
   const wxEnd = wxStart + b.spec.cellsW * NAV_CELL_VOXELS;
   const wzEnd = wzStart + b.spec.cellsD * NAV_CELL_VOXELS;
   const yFloor = b.floorY + 1;
   const yRoof = b.floorY + b.spec.headroomVoxels;
-  let alive = 0;
+  const indices: number[] = [];
+  let sx = 0, sy = 0, sz = 0;
   for (let z = wzStart; z < wzEnd; z++) {
+    if (z < 0 || z >= WORLD_Z) continue;
     for (let x = wxStart; x < wxEnd; x++) {
-      const onPerimeter = x === wxStart || x === wxEnd - 1 || z === wzStart || z === wzEnd - 1;
-      if (!onPerimeter) continue;
+      if (x < 0 || x >= WORLD_X) continue;
       for (let y = yFloor; y <= yRoof; y++) {
-        if (world.get(x, y, z) !== AIR) alive++;
+        if (y < 0 || y >= WORLD_Y) continue;
+        const mat = world.get(x, y, z);
+        if (!isStructuralMaterial(mat)) continue;
+        indices.push(worldIndex(x, y, z));
+        sx += x; sy += y; sz += z;
       }
     }
+  }
+  const idx = new Uint32Array(indices);
+  if (idx.length === 0) return { idx, aim: null };
+  const n = idx.length;
+  // +0.5 so each voxel index maps to its centre rather than its corner.
+  const aim = {
+    x: (sx / n + 0.5) * VOXEL_SIZE,
+    y: (sy / n + 0.5) * VOXEL_SIZE,
+    z: (sz / n + 0.5) * VOXEL_SIZE,
+  };
+  return { idx, aim };
+}
+
+/**
+ * Count how many of the building's snapshotted structural voxels are
+ * still standing (non-AIR). Linear scan over the saved index array — no
+ * AABB walk, so the cost scales with structure size rather than the
+ * full volume.
+ */
+export function countAliveStructureVoxels(world: VoxelWorld, b: Building): number {
+  const idx = b.structureVoxelIdx;
+  if (!idx) return 0;
+  const voxels = world.buffers.voxels;
+  let alive = 0;
+  for (let i = 0; i < idx.length; i++) {
+    if (voxels[idx[i]!] !== AIR) alive++;
   }
   return alive;
 }
@@ -2185,13 +2996,16 @@ export function doorWorldPos(b: Building, fromX?: number, fromZ?: number): DoorW
   // the building face for delivery.
   const gap     = 4;
 
-  // For storage (4-sided doors), pick the nearest face when caller pos is given.
-  if (b.spec.kind === 'storage' && fromX !== undefined && fromZ !== undefined) {
+  // Pick whichever cardinal face is closest to the caller — applies to every
+  // building so a truck/worker doesn't always wrap around to the +X side.
+  // Falls back to +X when no caller position is supplied (for the few
+  // callers that just need any door).
+  if (fromX !== undefined && fromZ !== undefined) {
     const candidates: DoorWorldPos[] = [
-      { x: (wxEnd   + gap) * VOXEL_SIZE, y, z: wzMid  * VOXEL_SIZE },  // +X
-      { x: (wxStart - gap) * VOXEL_SIZE, y, z: wzMid  * VOXEL_SIZE },  // -X
-      { x: wxMid * VOXEL_SIZE, y, z: (wzEnd   + gap) * VOXEL_SIZE },   // +Z
-      { x: wxMid * VOXEL_SIZE, y, z: (wzStart - gap) * VOXEL_SIZE },   // -Z
+      { x: (wxEnd   + gap) * VOXEL_SIZE, y, z: wzMid  * VOXEL_SIZE },  // +X (east)
+      { x: (wxStart - gap) * VOXEL_SIZE, y, z: wzMid  * VOXEL_SIZE },  // -X (west)
+      { x: wxMid * VOXEL_SIZE, y, z: (wzEnd   + gap) * VOXEL_SIZE },   // +Z (south)
+      { x: wxMid * VOXEL_SIZE, y, z: (wzStart - gap) * VOXEL_SIZE },   // -Z (north)
     ];
     let best = candidates[0]!;
     let bestD2 = Infinity;
@@ -2347,8 +3161,24 @@ export function padSpawnPos(b: Building): DoorWorldPos {
 export class BuildingManager {
   buildings: Building[] = [];
   private nextId = 1;
-  /** Called when a building wants to spawn a unit. Returns true if accepted. */
-  spawner: ((kind: UnitKind, x: number, y: number, z: number) => Unit | null) | null = null;
+  /**
+   * Called when a building wants to spawn a unit. The producing
+   * building is passed so the spawner can pick the right team / stance
+   * — enemy barracks need to produce hostile units in aggressive
+   * stance, player barracks the opposite. Returns the spawned Unit
+   * or null when the spawn was refused.
+   */
+  spawner:
+    | ((kind: UnitKind, x: number, y: number, z: number, building: Building) => Unit | null)
+    | null = null;
+  /**
+   * Pop-cap gate consulted right before a producer building tries to spawn
+   * a queued unit. Returns true when the player has at least one open
+   * pop slot of the right size. When the gate refuses, the production
+   * timer is held at full so the building waits cleanly until population
+   * frees up (e.g. a soldier dies or the player upgrades a neighborhood).
+   */
+  popHasRoom: ((kind: UnitKind, building: Building) => boolean) | null = null;
   /** Called immediately after a unit spawns, with the new unit and the producing building. */
   afterSpawn: ((unit: Unit, building: Building) => void) | null = null;
   /**
@@ -2382,6 +3212,14 @@ export class BuildingManager {
   onBuildingPlaced: ((b: Building) => void) | null = null;
   onBuildingDestroyed: ((b: Building) => void) | null = null;
   /**
+   * Hook for the destruction-ring explosions. Called several times per
+   * destroyed building with voxel-space coordinates and a small radius;
+   * Game wires it to `world.damageSphere` (so the wreckage gets blown
+   * apart further and the surrounding terrain craters) plus an
+   * `impactFlashes.spawn()` for the visual flash.
+   */
+  onBuildingExplosion: ((vx: number, vy: number, vz: number, radiusVoxels: number, peakDamage: number) => void) | null = null;
+  /**
    * Per-tick AA network assignment: maps projectile.id → the building.id of
    * the nearest live AA turret in range. Populated by `buildAAAssignments`
    * at the start of each tick before the per-building loop runs. Each AA
@@ -2402,13 +3240,56 @@ export class BuildingManager {
     this.onBuildingDestroyed?.(b);
   }
 
+  /**
+   * Spawn a ring of small explosions inside and around the building's
+   * footprint when its HP hits zero. Each blast is a short-radius
+   * `damageSphere` call (so the wreckage falls apart further and the
+   * surrounding terrain visibly craters) plus an impact flash for the
+   * visual punch. Count + radius scale with the building's footprint so a
+   * silo doesn't get the same amount of fireworks as a turret.
+   */
+  private spawnDestructionExplosions(b: Building): void {
+    if (!this.onBuildingExplosion) return;
+    const wxStart = b.ox * NAV_CELL_VOXELS;
+    const wxEnd   = wxStart + b.spec.cellsW * NAV_CELL_VOXELS;
+    const wzStart = b.oz * NAV_CELL_VOXELS;
+    const wzEnd   = wzStart + b.spec.cellsD * NAV_CELL_VOXELS;
+    const yMin = b.floorY + 1;
+    const yMax = b.floorY + b.spec.headroomVoxels;
+    const footprintArea = b.spec.cellsW * b.spec.cellsD;
+    const count = Math.max(4, Math.min(12, Math.round(footprintArea * 0.55)));
+    // Per-blast radius / peak — 3 voxels = ~0.4 m crater, 130 peak chews
+    // through dirt+grass cleanly without shaving the bedrock floor.
+    const radiusVoxels = 3.0;
+    const peakDamage = 130;
+    // Deterministic spread across the footprint + a slight outward halo so
+    // some blasts spill into the immediate terrain. Uses Math.random for
+    // the angle jitter — destruction events are visual and one-shot, so a
+    // little non-determinism just adds variety frame-to-frame.
+    for (let i = 0; i < count; i++) {
+      // Mix of "inside the AABB" and "just outside" so the surrounding
+      // ground catches part of the blast too.
+      const halo = Math.random() < 0.4 ? 4 : 0; // voxels outside the AABB
+      const x = wxStart - halo + Math.random() * (wxEnd - wxStart + halo * 2);
+      const z = wzStart - halo + Math.random() * (wzEnd - wzStart + halo * 2);
+      const y = yMin + Math.random() * Math.max(1, (yMax - yMin));
+      this.onBuildingExplosion(x, y, z, radiusVoxels, peakDamage);
+    }
+  }
+
   place(
     world: VoxelWorld,
     spec: BuildingSpec,
     ox: number, oz: number, floorY: number,
     opts?: { team?: BuildingTeam },
   ): Building {
-    const wallCount = spec.stamp(world, ox, oz, floorY);
+    // Bootstrap buildings (HQ / storage) stamp immediately; everything
+    // else defers stamping to `captureAndCarveBuildQueue`, which produces
+    // the same voxel state but accompanied by a queue + carve so the
+    // structure visually grows in. wallCount is meaningful only for
+    // bootstrap buildings — others read their integrity from
+    // `healthRefVoxels` (snapshotted at upgrade completion).
+    const wallCount = spec.enabledOnPlace ? spec.stamp(world, ox, oz, floorY) : 0;
     const b: Building = {
       id: this.nextId++,
       spec,
@@ -2418,8 +3299,19 @@ export class BuildingManager {
       wallVoxelsAtBuild: wallCount,
       destroyed: false,
       team: opts?.team ?? 'player',
-      hp: spec.maxHp,
+      // Buildings start at 0 HP while their initial upgrade is pending so a
+      // player who places a barracks in a contested spot has a real
+      // construction-vulnerability window. HP snaps to maxHp the moment the
+      // upgrade completes.
+      hp: spec.enabledOnPlace ? spec.maxHp : 0,
       maxHp: spec.maxHp,
+      healthRefVoxels: 0, // populated below after stamp / on upgrade complete
+      structureVoxelIdx: null,
+      // Default aim is the geometric lot centre; refreshed to the centroid
+      // of structural voxels once the building is stamped.
+      aimWX: ((ox + spec.cellsW * 0.5) * NAV_CELL_VOXELS) * VOXEL_SIZE,
+      aimWY: (floorY + Math.min(spec.headroomVoxels - 2, 8)) * VOXEL_SIZE,
+      aimWZ: ((oz + spec.cellsD * 0.5) * NAV_CELL_VOXELS) * VOXEL_SIZE,
       selected: false,
       trainQueue: [],
       cropProgress: 0,
@@ -2442,47 +3334,118 @@ export class BuildingManager {
       suppliedUnits: 0,
       inboundResupplyTrucks: 0,
       activeTrucks: 0,
+      upgradeState: spec.enabledOnPlace ? 'enabled' : 'pending',
+      upgradeStockpile: { metals: 0, wood: 0 },
+      inboundUpgradeTrucks: 0,
+      tier: 0,
+      upgradeTracks: {},
+      // Freshly-placed non-bootstrap buildings auto-target the `initial`
+      // upgrade so trucks start delivering without the player having to
+      // click "Construct". HQ has no `initial` track (it's enabled on
+      // place); player picks `range` or `trucks` from the panel later.
+      activeUpgradeId: spec.enabledOnPlace ? null : 'initial',
+      buildVoxels: null,
+      buildMaterials: null,
+      buildBeforeMaterials: null,
+      buildIndex: 0,
+      tempPileVoxels: null,
+      constructionTimer: 0,
+      constructionTotal: 0,
     };
+    if (!spec.enabledOnPlace) {
+      // Initial-build timer comes from the spec — barracks 60 s, depot
+      // 120 s, etc. Stored on the instance so a future restart can read
+      // the original budget for percentage math.
+      const seconds = spec.constructionSeconds ?? 30;
+      b.constructionTimer = seconds;
+      b.constructionTotal = seconds;
+    }
     this.buildings.push(b);
+    // Voxel-by-voxel build animation: snapshot every voxel the spec stamp
+    // wrote into a per-building queue, sorted bottom-up with a deterministic
+    // shuffle within each row, then carve them all to AIR. The upgrade tick
+    // restores them one batch at a time so the structure visibly assembles.
+    // Buildings placed with `enabledOnPlace` skip this step and stay fully
+    // stamped.
+    if (spec.enabledOnPlace) {
+      // Bootstrap building (HQ / storage) — structure already stamped,
+      // snapshot its voxels so HP can be derived from them immediately
+      // after generation.
+      const snap = snapshotBuildingStructure(world, b);
+      b.structureVoxelIdx = snap.idx;
+      b.healthRefVoxels = snap.idx.length;
+      if (snap.aim) { b.aimWX = snap.aim.x; b.aimWY = snap.aim.y; b.aimWZ = snap.aim.z; }
+    }
+    // Non-bootstrap buildings: queue capture is deferred to the first tick
+    // where `state === 'pending'` and no queue exists yet. The same lazy
+    // path also handles tier-up upgrades, so the place flow does nothing
+    // more for those.
     this.onBuildingPlaced?.(b);
     return b;
   }
 
   /**
-   * Apply a projectile impact's damage to every building in range. Direct
-   * hits — impact point lying inside the building's footprint AABB — take
-   * the round's full `hitDamage`. Explosive blasts apply falloff damage to
-   * every building whose AABB lies within `explosionRadiusMeters`, scaled
-   * linearly to zero at the blast edge (same shape as the unit splash math
-   * in Game.handleProjectileImpact). HP that drops to zero flips
-   * `destroyed`, mirroring the existing wall-count threshold.
-   *
-   * Buildings are not team-filtered here — anyone's projectile can damage
-   * anyone's structure. Friendly-fire on your own base is the player's
-   * problem, just like turret placement next to a barracks.
+   * Cost to deliver the building's currently-active upgrade. For the
+   * one-shot `initial` upgrade we use `spec.upgradeCost` directly; for
+   * keyed HQ upgrades the option's `baseCost` is scaled by the existing
+   * tier in that track. Returns null when no upgrade is active.
    */
-  applyImpactDamage(impact: ProjectileImpact): void {
-    for (const b of this.buildings) {
-      if (b.destroyed) continue;
-      const dist = aabbDistance(b, impact.x, impact.y, impact.z);
-      let damage = 0;
-      // Direct hit: impact point lies inside the AABB. Full direct damage.
-      if (dist <= 0) damage += impact.hitDamage;
-      // Explosive splash: any AABB-overlap within the blast radius takes a
-      // falloff fraction of the explosion peak. The directly-hit building
-      // (dist == 0) catches the splash on top of the direct hit, mirroring
-      // the unit pipeline.
-      if (impact.explosive && impact.explosionRadiusMeters > 0 && dist < impact.explosionRadiusMeters) {
-        const falloff = 1 - dist / impact.explosionRadiusMeters;
-        damage += impact.damagePeak * falloff;
-      }
-      if (damage <= 0) continue;
-      b.hp -= damage;
-      if (b.hp <= 0) {
-        b.hp = 0;
-        this.markDestroyed(b);
-      }
+  upgradeCostFor(b: Building): { metals: number; wood: number } | null {
+    if (!b.activeUpgradeId) return null;
+    if (b.activeUpgradeId === 'initial') {
+      const base = b.spec.upgradeCost;
+      if (!base) return null;
+      return { metals: base.metals, wood: base.wood };
     }
+    const opt = upgradeOptionById(b.activeUpgradeId);
+    if (!opt) return null;
+    const tier = b.upgradeTracks[opt.id] ?? 0;
+    const scale = 1 + tier * 0.75;
+    return {
+      metals: Math.round(opt.baseCost.metals * scale),
+      wood:   Math.round(opt.baseCost.wood   * scale),
+    };
+  }
+
+  /** Effective `maxTrucks` after applying the truck-upgrade track. */
+  hqMaxTrucks(b: Building): number {
+    const base = b.spec.maxTrucks ?? 5;
+    const tier = b.upgradeTracks.trucks ?? 0;
+    return base + tier * 5;
+  }
+
+  /** Effective build range for an HQ after applying the range-upgrade track. */
+  hqBuildRange(b: Building): number {
+    const base = b.spec.buildRangeMeters ?? 0;
+    const tier = b.upgradeTracks.range ?? 0;
+    return base * (1 + tier * 0.5);
+  }
+
+  /**
+   * Seconds the building's currently-active upgrade is supposed to take.
+   * For `initial` we read the spec; for HQ-track upgrades we read the
+   * option's own `constructionSeconds`. Defaults to 30 s when neither has
+   * a value defined.
+   */
+  constructionSecondsFor(b: Building): number {
+    if (!b.activeUpgradeId) return 0;
+    if (b.activeUpgradeId === 'initial') return b.spec.constructionSeconds ?? 30;
+    const opt = upgradeOptionById(b.activeUpgradeId);
+    return opt?.constructionSeconds ?? 30;
+  }
+
+  /**
+   * Building HP is now derived from voxel destruction (perimeter wall
+   * count), so this method is intentionally a no-op for buildings — the
+   * projectile's `damageSphere` already chews voxels in parallel and the
+   * per-tick `recomputeHpFromWalls` step picks up the result. Kept around
+   * (and accepting `_impact`) so projectile dispatch can still call into
+   * it without branching, in case future damage types want to skip the
+   * voxel pipeline (e.g. an EMP that takes a building offline without
+   * touching its walls).
+   */
+  applyImpactDamage(_impact: ProjectileImpact): void {
+    // No-op. See doc comment above.
   }
 
   /**
@@ -2545,8 +3508,154 @@ export class BuildingManager {
     // one the logistics system is offline and buildings produce freely, so the
     // base doesn't freeze if the HQ is destroyed or missing in tests.
     const hasLiveHQ = this.buildings.some(b => !b.destroyed && b.spec.kind === 'hq');
+    // Buildings flagged for true deletion this tick (not just `destroyed`).
+    // Currently only initial-cancel + pile-cleared buildings end up here.
+    const buildingsToRemove: number[] = [];
     for (const b of this.buildings) {
       if (b.destroyed) continue;
+
+      // HP from voxel survival: the building's snapshotted structural
+      // voxels are the source of truth. We tolerate up to 30 % of them
+      // being chewed away before the structure collapses — anything
+      // destroyed beyond that flips `destroyed` and triggers a ring of
+      // small explosions for visual impact + secondary terrain damage.
+      // Skip pending buildings; they intentionally sit at hp = 0 until
+      // construction finishes.
+      if (b.upgradeState === 'enabled' && b.healthRefVoxels > 0) {
+        const alive = countAliveStructureVoxels(world, b);
+        const destroyedVoxels = Math.max(0, b.healthRefVoxels - alive);
+        const threshold = b.healthRefVoxels * 0.30;
+        const integrity = threshold > 0 ? Math.max(0, (threshold - destroyedVoxels) / threshold) : 0;
+        b.hp = integrity * b.maxHp;
+        if (integrity <= 0) {
+          this.spawnDestructionExplosions(b);
+          this.markDestroyed(b);
+          continue;
+        }
+      }
+
+      // Upgrade completion — check every tick: when the building's stockpile
+      // of dropped resources meets the cost for its next tier, flip it to
+      // enabled (or, for HQ, increment its tier). Resources sit in the
+      // building during pending or paused states; once consumed they zero out.
+      // Cancelled with a pending queue still on hand → roll the
+      // already-stamped portion back to its pre-upgrade material so the
+      // building visually reverts. Then drop the queue. Any leftover
+      // resources sit in the upgradeStockpile and the recovery
+      // dispatcher (started elsewhere) will ferry them home.
+      if (b.upgradeState === 'cancelled' && b.buildVoxels) {
+        rollbackBuildQueue(world, b);
+        b.buildVoxels = null;
+        b.buildMaterials = null;
+        b.buildBeforeMaterials = null;
+        b.buildIndex = 0;
+      }
+      // Cancel-time temp pile: spawn a visible cluster of resource voxels
+      // on the lot once the rollback is done so the player can see what's
+      // sitting on the ground. Clear the pile when a recovery truck has
+      // drained the stockpile.
+      if (b.upgradeState === 'cancelled') {
+        const stash = b.upgradeStockpile.metals + b.upgradeStockpile.wood;
+        if (stash > 0 && !b.tempPileVoxels) spawnUpgradeStockpilePile(world, b);
+        else if (stash <= 0 && b.tempPileVoxels) clearUpgradeStockpilePile(world, b);
+        // If this was a cancelled INITIAL build (never completed once —
+        // `healthRefVoxels === 0`) and the recovery truck has drained the
+        // pile, delete the building entirely. The lot is back to terrain
+        // and the player can drop a fresh footprint anywhere.
+        if (b.healthRefVoxels === 0 && stash <= 0 && !b.tempPileVoxels) {
+          this.markDestroyed(b);
+          buildingsToRemove.push(b.id);
+          continue;
+        }
+      }
+      // Any other transition out of cancelled (initial == 'enabled' from a
+      // re-armed upgrade, etc.) should also drop the pile so the lot is
+      // clean for the new build.
+      if (b.upgradeState !== 'cancelled' && b.tempPileVoxels) {
+        clearUpgradeStockpilePile(world, b);
+      }
+
+      if (b.upgradeState === 'pending') {
+        // Lazy queue capture — runs on the first tick of any pending
+        // upgrade (initial build OR a tier-up). Snapshots the AABB,
+        // re-stamps at the target tier, and carves the diff so only the
+        // new voxels animate in.
+        if (!b.buildVoxels) {
+          captureAndCarveBuildQueue(world, b);
+        }
+        const cost = this.upgradeCostFor(b);
+        // Tick the wall-clock construction timer down regardless of resource
+        // status. Time is one of two gates on completion (alongside
+        // resources delivered) so a freshly-placed building sits at low
+        // phases until both gates relax.
+        if (b.constructionTimer > 0) {
+          b.constructionTimer = Math.max(0, b.constructionTimer - dt);
+        }
+        if (cost) {
+          // Voxel-by-voxel growth — combine time progress and resource
+          // progress so the slowest of the two paces the visible build.
+          // For a barracks placed in a base that already has 100m+wood in
+          // the global pool, trucks deliver in seconds but the 60 s timer
+          // still gates the structure so the player sees a deliberate
+          // assembly animation. The advance step is a tiny linear walk
+          // across the queue (a few voxels per frame for a 60-second
+          // construction).
+          const total = cost.metals + cost.wood;
+          const onSite = Math.min(b.upgradeStockpile.metals, cost.metals)
+                       + Math.min(b.upgradeStockpile.wood,   cost.wood);
+          const resProgress = total > 0 ? onSite / total : 1;
+          const timeProgress = b.constructionTotal > 0
+            ? 1 - b.constructionTimer / b.constructionTotal : 1;
+          const progress = Math.min(resProgress, timeProgress);
+          if (b.buildVoxels) {
+            const target = Math.floor(progress * b.buildVoxels.length);
+            if (target > b.buildIndex) advanceBuildQueue(world, b, target);
+          }
+        }
+        const timeReady = b.constructionTotal === 0 || b.constructionTimer <= 0;
+        if (cost && timeReady && b.upgradeStockpile.metals >= cost.metals && b.upgradeStockpile.wood >= cost.wood) {
+          b.upgradeStockpile.metals -= cost.metals;
+          b.upgradeStockpile.wood   -= cost.wood;
+          // Apply the option-specific effect, then bump the legacy `tier`
+          // counter to whatever the highest individual track is now.
+          if (b.activeUpgradeId) {
+            const opt = upgradeOptionById(b.activeUpgradeId);
+            opt?.apply(b);
+            // `initial` is a one-shot that just enables the building —
+            // doesn't accumulate as its own track in the HUD-visible sense.
+            // Other upgrades populate `upgradeTracks` via their `apply`.
+          }
+          let maxTier = 0;
+          for (const v of Object.values(b.upgradeTracks)) maxTier = Math.max(maxTier, v);
+          b.tier = maxTier;
+          // Final phase: re-stamp without carving so the building reads at
+          // its full volume. HP snaps to maxHp now that the structure is
+          // complete; during pending it sat at 0 to model the construction-
+          // vulnerability window.
+          // Flush any remaining queue entries so a building that finished
+          // ahead of its time budget still ends up structurally complete.
+          // Then drop the queue — it's no longer needed once enabled.
+          if (b.buildVoxels) advanceBuildQueue(world, b, b.buildVoxels.length);
+          b.spec.stamp(world, b.ox, b.oz, b.floorY);
+          b.buildVoxels = null;
+          b.buildMaterials = null;
+          b.buildBeforeMaterials = null;
+          b.buildIndex = 0;
+          // Snapshot perimeter walls now that the structure is complete —
+          // this is the baseline the runtime HP fraction is derived from.
+          // For HQ tier upgrades the walls were already there; we re-snap
+          // to pick up any walls that were carved out and rebuilt.
+          const snap = snapshotBuildingStructure(world, b);
+          b.structureVoxelIdx = snap.idx;
+          b.healthRefVoxels = snap.idx.length;
+          if (snap.aim) { b.aimWX = snap.aim.x; b.aimWY = snap.aim.y; b.aimWZ = snap.aim.z; }
+          b.hp = b.maxHp;
+          b.upgradeState = 'enabled';
+          b.activeUpgradeId = null;
+          b.constructionTimer = 0;
+          b.constructionTotal = 0;
+        }
+      }
 
       // Weapon-bearing buildings (turret, silo, AA): auto-target and fire on
       // cooldown. Anti-air uses a different targeting pipeline (incoming
@@ -2562,6 +3671,11 @@ export class BuildingManager {
       // an unattended farm eventually ripen; an assigned + co-located
       // farmer multiplies the rate so dedicating a worker is worthwhile.
       if (b.spec.kind === 'farm') {
+        // Pending farms don't grow crops yet — the field is being
+        // stamped voxel by voxel and there's no soil for the worker
+        // to tend. Tick crop progress only once the build completes
+        // and the farm flips to 'enabled'.
+        if (b.upgradeState !== 'enabled') continue;
         this.tickFarm(b, dt, world, units);
         continue;
       }
@@ -2570,6 +3684,15 @@ export class BuildingManager {
       // turret, silo) carry an Infinity interval so the spawn loop never fires
       // for them.
       if (b.spec.kind === 'storage' || b.spec.productionInterval <= 0 || !isFinite(b.spec.productionInterval)) continue;
+      // Disabled until upgraded — flush any queue so the building doesn't
+      // accumulate orders while it can't act, and hold the timer. HQ stays
+      // operational during its own (re-)upgrade so an in-progress tier-up
+      // doesn't paralyse the rest of the base.
+      if (b.upgradeState !== 'enabled' && b.spec.kind !== 'hq') {
+        if (b.trainQueue.length > 0) b.trainQueue.length = 0;
+        b.productionTimer = b.spec.productionInterval;
+        continue;
+      }
       // Producer buildings (barracks) only train units the player has
       // explicitly queued. With nothing queued, the timer is held at the full
       // interval so a freshly-queued kind still takes the configured time to
@@ -2590,16 +3713,22 @@ export class BuildingManager {
       b.productionTimer -= dt;
       if (b.productionTimer > 0) continue;
 
+      // Pop gate: if the queued unit wouldn't fit in the player's
+      // population cap, hold the timer at full and try again next tick.
+      // The resources have already been delivered (suppliedUnits > 0) so
+      // they sit waiting at the building until pop frees up.
+      const headKind = b.trainQueue[0];
+      if (headKind && this.popHasRoom && !this.popHasRoom(headKind, b)) {
+        b.productionTimer = b.spec.productionInterval;
+        continue;
+      }
+
       b.productionTimer += b.spec.productionInterval;
       if (hasLiveHQ) b.suppliedUnits = Math.max(0, b.suppliedUnits - 1);
 
-      // Liveness check: structures whose perimeter has been chewed below 25%
-      // count as destroyed and stop ticking.
-      const alive = countLivingWalls(world, b);
-      if (alive < b.wallVoxelsAtBuild * 0.25) {
-        this.markDestroyed(b);
-        continue;
-      }
+      // Liveness check: handled centrally at the top of the per-building
+      // loop now (HP derived from `countAliveStructureVoxels`). No
+      // per-section re-check here.
 
       // Barracks: spawn the next queued unit at the door. We've already
       // gated on `trainQueue.length > 0` above, so the queue can't be empty
@@ -2608,8 +3737,18 @@ export class BuildingManager {
         const pos = padSpawnPos(b);
         b.spawnSlot++;
         const kind = b.trainQueue.shift()!;
-        const spawned = this.spawner(kind, pos.x, pos.y, pos.z);
+        const spawned = this.spawner(kind, pos.x, pos.y, pos.z, b);
         if (spawned) this.afterSpawn?.(spawned, b);
+      }
+    }
+    // Splice out any building flagged for true deletion this tick. Done
+    // after iteration so we don't mutate the array mid-loop. Each removal
+    // already had `markDestroyed` called inside the loop body so the
+    // building footprint mask has been cleared.
+    if (buildingsToRemove.length > 0) {
+      const removeSet = new Set(buildingsToRemove);
+      for (let i = this.buildings.length - 1; i >= 0; i--) {
+        if (removeSet.has(this.buildings[i]!.id)) this.buildings.splice(i, 1);
       }
     }
   }
@@ -2923,16 +4062,12 @@ export class BuildingManager {
    * whose fence has been levelled goes inert.
    */
   private tickFarm(b: Building, dt: number, world: VoxelWorld, units: UnitManager): void {
-    // Coarse liveness check, throttled to once per spec interval like other
-    // buildings — counting voxels every frame is overkill.
+    void world;
+    // Liveness is handled at the top of the per-building tick loop now;
+    // farms just advance their crop progress here.
     b.productionTimer -= dt;
     if (b.productionTimer <= 0) {
       b.productionTimer += b.spec.productionInterval;
-      const alive = countLivingWalls(world, b);
-      if (alive < b.wallVoxelsAtBuild * 0.25) {
-        this.markDestroyed(b);
-        return;
-      }
     }
     // Already ripe — wait for a harvester. collectFarm resets state.
     if (b.cropReady) return;
@@ -2950,7 +4085,15 @@ export class BuildingManager {
     for (const u of units.units) {
       if (u.hp <= 0) continue;
       if (u.kind !== 'worker') continue;
-      if (u.workerFocus !== 'farm') continue;
+      // Any worker on the plot whose current task is `farm` (the
+      // farmTend task) advances the milestone. Earlier we required
+      // workerFocus === 'farm' here, but the AI's auto-focus workers
+      // pick up farmTend orders too — they walk all the way to the
+      // plot and sit there, but the focus check ignored them, so
+      // crops stalled at 20% milestone forever and the AI starved
+      // for food. The task kind is the real signal: a worker doing
+      // a farmTend job is the farmer.
+      if (u.task.kind !== 'farm' && u.workerFocus !== 'farm') continue;
       if (u.x < wxStart || u.x >= wxEnd) continue;
       if (u.z < wzStart || u.z >= wzEnd) continue;
       farmerOnFarm = true;
@@ -3000,7 +4143,12 @@ export class BuildingManager {
   collectFarm(b: Building, harvesterId: number): { foodGained: number } {
     if (!b.cropReady) return { foodGained: 0 };
     if (b.harvesterClaimId !== null && b.harvesterClaimId !== harvesterId) return { foodGained: 0 };
-    const food = 25;
+    // Bumped from 25 → 60 so the food economy actually keeps pace with
+    // the harness's 1-unit/sec drought rule. With 2 farms producing
+    // ~60 food per ~20 s cycle = ~6 food/s, the AI can sustain 1
+    // soldier (40 food) every 7 s comfortably without running the
+    // food bank dry between rounds of training.
+    const food = 60;
     b.cropReady = false;
     b.cropProgress = 0;
     b.harvestMilestone = 0;
@@ -3054,12 +4202,13 @@ export class BuildingManager {
   }
 
   /** Lookup the nearest live storage building (in XZ). Returns null if there are none. */
-  nearestHQ(x: number, z: number): Building | null {
+  nearestHQ(x: number, z: number, team?: BuildingTeam): Building | null {
     let best: Building | null = null;
     let bestD2 = Infinity;
     for (const b of this.buildings) {
       if (b.destroyed) continue;
       if (b.spec.kind !== 'hq') continue;
+      if (team !== undefined && b.team !== team) continue;
       const dpos = doorWorldPos(b);
       const dx = dpos.x - x, dz = dpos.z - z;
       const d2 = dx * dx + dz * dz;
@@ -3068,12 +4217,13 @@ export class BuildingManager {
     return best;
   }
 
-  nearestStorage(x: number, z: number): Building | null {
+  nearestStorage(x: number, z: number, team?: BuildingTeam): Building | null {
     let best: Building | null = null;
     let bestD2 = Infinity;
     for (const b of this.buildings) {
       if (b.destroyed) continue;
       if (b.spec.kind !== 'storage') continue;
+      if (team !== undefined && b.team !== team) continue;
       const dpos = doorWorldPos(b);
       const dx = dpos.x - x, dz = dpos.z - z;
       const d2 = dx * dx + dz * dz;

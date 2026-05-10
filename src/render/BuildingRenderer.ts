@@ -89,7 +89,7 @@ export class BuildingRenderer {
     );
   }
 
-  update(buildings: Building[]): void {
+  update(buildings: Building[], isHidden?: (b: Building) => boolean): void {
     let nHub = 0, nBlade = 0, nSmoke = 0, nDish = 0, nCore = 0, nCorn = 0, nWheat = 0, nTurret = 0;
     let nAALauncher = 0, nCrane = 0, nSolar = 0, nHQDish = 0, nHQAnt = 0;
     const t = performance.now() / 1000;
@@ -101,6 +101,11 @@ export class BuildingRenderer {
 
     for (const b of buildings) {
       if (b.destroyed) continue;
+      // Cull enemy building accessories (turret heads, smoke, rotating
+      // dishes) when the player has no current vision on the
+      // structure. The voxel walls themselves are part of the world
+      // chunk meshes and obey the chunk shader's tri-state FoW.
+      if (isHidden && isHidden(b)) continue;
       const cx = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
       const cz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
       const floorTopY = (b.floorY + 1) * VOXEL_SIZE;

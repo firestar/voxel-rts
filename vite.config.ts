@@ -23,4 +23,14 @@ export default defineConfig({
   worker: { format: 'es' },
   build: { target: 'es2022' },
   optimizeDeps: { include: ['three', 'three-mesh-bvh'] },
+  // Forward /ai → ai-server (3030) and /lobby → session-server (3040)
+  // so the dev experience matches the Docker build, where nginx does
+  // the same routing. Both client modules call same-origin paths; this
+  // proxy makes those paths land on the right local Node process.
+  server: {
+    proxy: {
+      '/ai':    { target: 'http://localhost:3030', changeOrigin: false },
+      '/lobby': { target: 'http://localhost:3040', changeOrigin: false },
+    },
+  },
 });

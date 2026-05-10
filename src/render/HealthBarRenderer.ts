@@ -86,8 +86,31 @@ export class HealthBarRenderer {
         const reloadPct = b.weaponReloadTimer > 0 && reloadSecs > 0
           ? Math.round((1 - b.weaponReloadTimer / reloadSecs) * 100) : -1;
         const cropPct = b.spec.kind === 'farm' ? Math.round(b.cropProgress * 100) : -1;
+        // Upgrade progress: combined time × resource progress so the bar
+        // tracks whichever gate is slowest. Reads `constructionTotal` from
+        // the instance so the bar follows whichever upgrade is currently
+        // active (initial / range / trucks).
+        let upgradePct = -1;
+        let upgradeLabel = '';
+        if (b.upgradeState !== 'enabled') {
+          const cost = b.spec.upgradeCost;
+          let resFrac = 1;
+          if (cost) {
+            const total = cost.metals + cost.wood;
+            const onSite = Math.min(b.upgradeStockpile.metals, cost.metals)
+                         + Math.min(b.upgradeStockpile.wood,   cost.wood);
+            resFrac = total > 0 ? onSite / total : 1;
+          }
+          const timeFrac = b.constructionTotal > 0
+            ? 1 - b.constructionTimer / b.constructionTotal : 1;
+          const combined = Math.min(resFrac, timeFrac);
+          upgradePct = Math.round(combined * 100);
+          upgradeLabel = b.upgradeState === 'cancelled'
+            ? `✕ recover ${upgradePct}%`
+            : `⚒ build ${upgradePct}%`;
+        }
 
-        const hasStatus = prodPct >= 0 || reloadPct >= 0 || cropPct >= 0;
+        const hasStatus = prodPct >= 0 || reloadPct >= 0 || cropPct >= 0 || upgradePct >= 0;
         const showBar = b.hp < b.maxHp || b.selected || hasStatus || b.spec.kind === 'hq';
         if (!showBar) continue;
 
@@ -105,10 +128,10 @@ export class HealthBarRenderer {
 
         const hpInt = Math.max(0, Math.ceil(b.hp));
         const truckLine = b.spec.kind === 'hq'
-          ? `${b.activeTrucks}/${b.spec.maxTrucks ?? 5} trucks` : '';
-        const statusKey = `${hpInt}:${prodPct}:${prodLabel}:${reloadPct}:${cropPct}:${truckLine}`;
+          ? `${b.activeTrucks}/${effectiveMaxTrucks(b)} trucks` : '';
+        const statusKey = `${hpInt}:${prodPct}:${prodLabel}:${reloadPct}:${cropPct}:${truckLine}:${upgradePct}:${upgradeLabel}`;
         if (statusKey !== entry.lastStatusKey) {
-          drawBuildingBar(entry.canvas, hpInt, b.maxHp, prodPct, prodLabel, reloadPct, cropPct, truckLine);
+          drawBuildingBar(entry.canvas, hpInt, b.maxHp, prodPct, prodLabel, reloadPct, cropPct, truckLine, upgradePct, upgradeLabel);
           entry.texture.needsUpdate = true;
           entry.lastHp = hpInt;
           entry.lastMax = b.maxHp;
@@ -247,16 +270,20 @@ function carryLineFor(u: Unit): string {
  */
 function hpBarYOffset(u: Unit): number {
   switch (u.kind) {
-    case 'soldier':      return 2.4;
-    case 'sniper':       return 2.4;
-    case 'gunner':       return 2.6;
-    case 'worker':       return 2.4;
-    case 'tank':         return 3.4;
-    case 'tunneler':     return 3.6;
-    case 'worm':         return 2.4;
-    case 'dozer':        return 3.0;
-    case 'rocket_truck': return 3.6;
-    case 'supply_truck': return 2.8;
+    case 'soldier':        return 2.4;
+    case 'sniper':         return 2.4;
+    case 'gunner':         return 2.6;
+    case 'mortar_soldier': return 2.6;
+    case 'rocket_soldier': return 2.6;
+    case 'worker':         return 2.4;
+    case 'tank':           return 3.4;
+    case 'tunneler':       return 3.6;
+    case 'worm':           return 2.4;
+    case 'dozer':          return 3.0;
+    case 'rocket_truck':   return 3.6;
+    case 'aa_vehicle':     return 3.6;
+    case 'supply_truck':   return 2.8;
+    case 'civilian':       return 2.4;
   }
 }
 
@@ -273,6 +300,8 @@ function drawBuildingBar(
   reloadPct: number,
   cropPct: number,
   truckLine = '',
+  upgradePct = -1,
+  upgradeLabel = '',
 ): void {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
@@ -306,6 +335,15 @@ function drawBuildingBar(
 
   // Secondary status bars
   let nextY = 28;
+  if (upgradePct >= 0) {
+    // Construction bar: amber gradient + ⚒ glyph so the under-construction
+    // state is unmistakable next to the slim red HP bar above. Drawn first
+    // so a building under construction can still surface its production /
+    // reload status (currently impossible since pending buildings can't
+    // train, but kept consistent for the paused-then-resumed case).
+    miniBar(ctx, BX, nextY, BW, 10, upgradePct / 100, '#ffaa33', upgradeLabel);
+    nextY += 14;
+  }
   if (prodPct >= 0) {
     miniBar(ctx, BX, nextY, BW, 10, prodPct / 100, '#ffe55a', prodLabel);
     nextY += 14;
@@ -449,4 +487,16 @@ function drawBar(canvas: HTMLCanvasElement, hp: number, max: number, carryLine: 
     ctx.fillStyle = '#ffe28a';
     ctx.fillText(carryLine, barX + 28, 4);
   }
+}
+
+/**
+ * Effective max-truck count for an HQ — base + the per-track upgrade
+ * counter (5 trucks per "Add 5 trucks" upgrade). Mirrors
+ * `BuildingManager.hqMaxTrucks` but kept inline here so the renderer
+ * doesn't need a manager reference.
+ */
+function effectiveMaxTrucks(b: Building): number {
+  const base = b.spec.maxTrucks ?? 5;
+  const tier = b.upgradeTracks?.trucks ?? 0;
+  return base + tier * 5;
 }

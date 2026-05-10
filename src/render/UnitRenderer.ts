@@ -12,10 +12,14 @@ import {
   buildWorkerBodyGeometry, buildWorkerLegGeometry, buildWorkerArmGeometry,
   buildWorkerCrateGeometry, WorkerVariant,
   WORKER_HIP_Y, WORKER_LEG_X, WORKER_SHOULDER_X, WORKER_SHOULDER_Y,
+  buildCivilianBodyGeometry, buildCivilianLegGeometry,
+  CIVILIAN_HIP_Y, CIVILIAN_LEG_X,
   buildDozerHullGeometry, buildDozerBladeGeometry,
   DOZER_BLADE_PIVOT_Y, DOZER_BLADE_PIVOT_Z,
   buildRocketTruckHullGeometry, buildRocketTruckPodGeometry,
   ROCKET_TRUCK_POD_PIVOT_Y, ROCKET_TRUCK_POD_PIVOT_Z,
+  buildAAVehicleHullGeometry, buildAAVehiclePodGeometry,
+  AA_VEHICLE_POD_PIVOT_Y, AA_VEHICLE_POD_PIVOT_Z,
   buildSupplyTruckHullGeometry, buildSupplyTruckCratesGeometry,
 } from './UnitModels';
 
@@ -41,6 +45,9 @@ export class UnitRenderer {
   private gunnerBody: THREE.InstancedMesh;
   private gunnerLegL: THREE.InstancedMesh;
   private gunnerLegR: THREE.InstancedMesh;
+  private civilianBody: THREE.InstancedMesh;
+  private civilianLegL: THREE.InstancedMesh;
+  private civilianLegR: THREE.InstancedMesh;
   private tankHull: THREE.InstancedMesh;
   private tankTurret: THREE.InstancedMesh;
   private tunnelerHull: THREE.InstancedMesh;
@@ -54,13 +61,23 @@ export class UnitRenderer {
   private workerArm: THREE.InstancedMesh[] = [];
   private workerCrateWood: THREE.InstancedMesh;
   private workerCrateMetal: THREE.InstancedMesh;
+  private workerCrateFood: THREE.InstancedMesh;
   private dozerHull: THREE.InstancedMesh;
   private dozerBlade: THREE.InstancedMesh;
   private rocketTruckHull: THREE.InstancedMesh;
   private rocketTruckPod: THREE.InstancedMesh;
+  private aaVehicleHull: THREE.InstancedMesh;
+  private aaVehiclePod: THREE.InstancedMesh;
   private supplyTruckHull: THREE.InstancedMesh;
   // One crate mesh per cargo level (index 0 = level 1, index 4 = level 5).
   private supplyTruckCrates: THREE.InstancedMesh[] = [];
+
+  /** Per-unit `distanceWalked` and XZ snapshots from the previous
+   *  frame. Walk animations key off any per-frame XZ change so a
+   *  unit being nudged by the reconciler (no `path` set, no
+   *  `distanceWalked` increment) still plays its walk cycle. */
+  private lastDistanceWalked = new Map<number, number>();
+  private lastRenderXZ = new Map<number, [number, number]>();
 
   private capacity: number;
   private bodyM = new THREE.Matrix4();
@@ -81,6 +98,20 @@ export class UnitRenderer {
    */
   private playerTint = new THREE.Color(1.0, 1.0, 1.0);
   private enemyTint = new THREE.Color(1.0, 0.32, 0.30);
+  /** Second AI faction reads as cool blue so two enemy teams are
+   *  visually distinct on the map. */
+  private enemy2Tint = new THREE.Color(0.32, 0.55, 1.0);
+  /** Scratch color for truck-cargo tinting; reused per frame to avoid GC. */
+  private tmpCargoTint = new THREE.Color();
+  /** Olive-drab fatigues — distinguishes mortar soldier on the gunner chassis. */
+  private mortarTint = new THREE.Color(0.65, 0.75, 0.45);
+  /** Warm rust uniform — rocket soldier visual cue. */
+  private rocketTint = new THREE.Color(0.95, 0.55, 0.40);
+  /** Re-usable scratch for multiplying team tint × kind tint each frame. */
+  private tmpComposedTint = new THREE.Color();
+  private composeTint(team: THREE.Color, kind: THREE.Color): THREE.Color {
+    return this.tmpComposedTint.setRGB(team.r * kind.r, team.g * kind.g, team.b * kind.b);
+  }
 
   /**
    * Pool of selection rings keyed by unit kind. Each frame we lay out the
@@ -104,6 +135,9 @@ export class UnitRenderer {
     this.gunnerBody = makeIM(buildGunnerBodyGeometry(), mat, capacity);
     this.gunnerLegL = makeIM(buildGunnerLegGeometry(), mat, capacity);
     this.gunnerLegR = makeIM(buildGunnerLegGeometry(), mat, capacity);
+    this.civilianBody = makeIM(buildCivilianBodyGeometry(), mat, capacity);
+    this.civilianLegL = makeIM(buildCivilianLegGeometry(), mat, capacity);
+    this.civilianLegR = makeIM(buildCivilianLegGeometry(), mat, capacity);
     this.tankHull = makeIM(buildTankHullGeometry(), mat, capacity);
     this.tankTurret = makeIM(buildTankTurretGeometry(), mat, capacity);
     this.tunnelerHull = makeIM(buildTunnelerHullGeometry(), mat, capacity);
@@ -119,12 +153,15 @@ export class UnitRenderer {
       this.workerLegR.push(makeIM(buildWorkerLegGeometry(),   mat, capacity));
       this.workerArm.push( makeIM(buildWorkerArmGeometry(v),  mat, capacity));
     }
-    this.workerCrateWood  = makeIM(buildWorkerCrateGeometry(false), mat, capacity);
-    this.workerCrateMetal = makeIM(buildWorkerCrateGeometry(true),  mat, capacity);
+    this.workerCrateWood  = makeIM(buildWorkerCrateGeometry('wood'),  mat, capacity);
+    this.workerCrateMetal = makeIM(buildWorkerCrateGeometry('metal'), mat, capacity);
+    this.workerCrateFood  = makeIM(buildWorkerCrateGeometry('food'),  mat, capacity);
     this.dozerHull = makeIM(buildDozerHullGeometry(), mat, capacity);
     this.dozerBlade = makeIM(buildDozerBladeGeometry(), mat, capacity);
     this.rocketTruckHull = makeIM(buildRocketTruckHullGeometry(), mat, capacity);
     this.rocketTruckPod = makeIM(buildRocketTruckPodGeometry(), mat, capacity);
+    this.aaVehicleHull = makeIM(buildAAVehicleHullGeometry(), mat, capacity);
+    this.aaVehiclePod = makeIM(buildAAVehiclePodGeometry(), mat, capacity);
     this.supplyTruckHull = makeIM(buildSupplyTruckHullGeometry(), mat, capacity);
     for (let lv = 1; lv <= 5; lv++) {
       this.supplyTruckCrates.push(
@@ -136,26 +173,32 @@ export class UnitRenderer {
       this.soldierBody, this.soldierLegL, this.soldierLegR,
       this.sniperBody, this.sniperLegL, this.sniperLegR,
       this.gunnerBody, this.gunnerLegL, this.gunnerLegR,
+      this.civilianBody, this.civilianLegL, this.civilianLegR,
       this.tankHull, this.tankTurret,
       this.tunnelerHull, this.tunnelerDrill,
       this.wormHead, this.wormDrill, this.wormSegment,
       ...this.workerBody, ...this.workerLegL, ...this.workerLegR, ...this.workerArm,
-      this.workerCrateWood, this.workerCrateMetal,
+      this.workerCrateWood, this.workerCrateMetal, this.workerCrateFood,
       this.dozerHull, this.dozerBlade,
       this.rocketTruckHull, this.rocketTruckPod,
+      this.aaVehicleHull, this.aaVehiclePod,
       this.supplyTruckHull, ...this.supplyTruckCrates,
     );
 
-    this.ringTemplates.set('soldier',      { radius: 0.6,  color: 0x00ff88 });
-    this.ringTemplates.set('sniper',       { radius: 0.6,  color: 0x88cc44 });
-    this.ringTemplates.set('gunner',       { radius: 0.65, color: 0x44ddaa });
-    this.ringTemplates.set('tank',         { radius: 1.6,  color: 0xffaa33 });
-    this.ringTemplates.set('tunneler',     { radius: 0.7,  color: 0xffe066 });
-    this.ringTemplates.set('worm',         { radius: 0.9,  color: 0xc266ff });
-    this.ringTemplates.set('worker',       { radius: 0.55, color: 0x33ccff });
-    this.ringTemplates.set('dozer',        { radius: 1.7,  color: 0xffc044 });
-    this.ringTemplates.set('rocket_truck', { radius: 1.55, color: 0xff8855 });
-    this.ringTemplates.set('supply_truck', { radius: 1.30, color: 0xffdd44 });
+    this.ringTemplates.set('soldier',        { radius: 0.6,  color: 0x00ff88 });
+    this.ringTemplates.set('sniper',         { radius: 0.6,  color: 0x88cc44 });
+    this.ringTemplates.set('gunner',         { radius: 0.65, color: 0x44ddaa });
+    this.ringTemplates.set('mortar_soldier', { radius: 0.65, color: 0xb0d060 });
+    this.ringTemplates.set('rocket_soldier', { radius: 0.65, color: 0xff8866 });
+    this.ringTemplates.set('civilian',       { radius: 0.55, color: 0xffaaff });
+    this.ringTemplates.set('tank',           { radius: 1.6,  color: 0xffaa33 });
+    this.ringTemplates.set('tunneler',       { radius: 0.7,  color: 0xffe066 });
+    this.ringTemplates.set('worm',           { radius: 0.9,  color: 0xc266ff });
+    this.ringTemplates.set('worker',         { radius: 0.55, color: 0x33ccff });
+    this.ringTemplates.set('dozer',          { radius: 1.7,  color: 0xffc044 });
+    this.ringTemplates.set('rocket_truck',   { radius: 1.55, color: 0xff8855 });
+    this.ringTemplates.set('aa_vehicle',     { radius: 1.50, color: 0x66ccff });
+    this.ringTemplates.set('supply_truck',   { radius: 1.30, color: 0xffdd44 });
     for (const kind of this.ringTemplates.keys()) this.ringPools.set(kind, []);
   }
 
@@ -171,18 +214,34 @@ export class UnitRenderer {
     return pool[idx]!;
   }
 
-  update(units: UnitManager): void {
-    let nSold = 0, nSnip = 0, nGun = 0;
+  update(units: UnitManager, isHidden?: (u: Unit) => boolean): void {
+    let nSold = 0, nSnip = 0, nGun = 0, nCiv = 0;
     let nTank = 0, nTun = 0, nWorm = 0, nWormSeg = 0;
     const nWorkV = [0, 0, 0, 0];
-    let nCrateW = 0, nCrateM = 0;
-    let nDoz = 0, nRkt = 0, nSup = 0;
+    let nCrateW = 0, nCrateM = 0, nCrateF = 0;
+    let nDoz = 0, nRkt = 0, nAA = 0, nSup = 0;
     const nSupCrates = [0, 0, 0, 0, 0]; // per level 1-5
     const ringCounts = new Map<string, number>();
     const now = performance.now() / 1000;
 
     for (const u of units.units) {
-      const isMoving = u.path.length > 0;
+      // Cull units the player has no current vision on. Enemy units
+      // outside every live FoW disc are dropped here so the renderer
+      // never emits a matrix for them, making them invisible until
+      // the player gains vision again.
+      if (isHidden && isHidden(u)) continue;
+      // Animate whenever the unit actually moved since the last
+      // frame, not just when it has a path. The reconciler nudges
+      // positions toward the server with no path attached, and the
+      // worker's slot-walk also briefly sees an empty path between
+      // routes — both should still play the leg-swing.
+      const prevD = this.lastDistanceWalked.get(u.id) ?? u.distanceWalked;
+      const dwDelta = u.distanceWalked - prevD;
+      this.lastDistanceWalked.set(u.id, u.distanceWalked);
+      const prevXZ = this.lastRenderXZ.get(u.id);
+      const xzDelta = prevXZ ? Math.hypot(u.x - prevXZ[0], u.z - prevXZ[1]) : 0;
+      this.lastRenderXZ.set(u.id, [u.x, u.z]);
+      const isMoving = u.path.length > 0 || dwDelta > 1e-4 || xzDelta > 1e-3;
       // Tunneler/worm chassis stays mostly level — it's the cutter that articulates to
       // follow the dig angle. We render the body with a small fraction of u.pitch
       // so it still leans into the slope a bit, then push the rest of the pitch
@@ -205,6 +264,7 @@ export class UnitRenderer {
       const bobFreq = u.kind === 'soldier' ? 6.0
         : u.kind === 'sniper' ? 5.0           // deliberate pace
         : u.kind === 'gunner' ? 4.5           // heavy, plodding gait
+        : u.kind === 'civilian' ? 5.5
         : u.kind === 'tank' ? 3.0
         : u.kind === 'tunneler' ? 4.0
         : u.kind === 'worm' ? 5.0
@@ -214,6 +274,7 @@ export class UnitRenderer {
       const bobAmp  = u.kind === 'soldier' ? 0.08
         : u.kind === 'sniper' ? 0.06
         : u.kind === 'gunner' ? 0.06
+        : u.kind === 'civilian' ? 0.07
         : u.kind === 'tank' ? 0.04
         : u.kind === 'tunneler' ? 0.05
         : u.kind === 'worm' ? 0.03
@@ -233,12 +294,15 @@ export class UnitRenderer {
       const feetOffset = u.kind === 'soldier' ? 0.05
         : u.kind === 'sniper' ? 0.05
         : u.kind === 'gunner' ? 0.05
+        : u.kind === 'civilian' ? 0.05
         : u.kind === 'tank' ? -0.05
         : u.kind === 'worker' ? 0.05
         : 0.0;
       this.tmpV.set(u.x, u.y + feetOffset + bodyBob, u.z);
       this.bodyM.compose(this.tmpV, this.quat, new THREE.Vector3(1, 1, 1));
-      const tint = u.team === 'enemy' ? this.enemyTint : this.playerTint;
+      const tint = u.team === 'enemy' ? this.enemyTint
+        : u.team === 'enemy2' ? this.enemy2Tint
+        : this.playerTint;
 
       if (u.kind === 'soldier') {
         if (nSold >= this.capacity) continue;
@@ -250,6 +314,16 @@ export class UnitRenderer {
         this.applyLegMatrix(nSold, this.soldierLegL, swing,  +SOLDIER_LEG_X);
         this.applyLegMatrix(nSold, this.soldierLegR, -swing, -SOLDIER_LEG_X);
         nSold++;
+      } else if (u.kind === 'civilian') {
+        if (nCiv >= this.capacity) continue;
+        this.civilianBody.setMatrixAt(nCiv, this.bodyM);
+        this.civilianBody.setColorAt(nCiv, tint);
+        this.civilianLegL.setColorAt(nCiv, tint);
+        this.civilianLegR.setColorAt(nCiv, tint);
+        const swing = isMoving ? Math.sin(u.distanceWalked * 4.5 + u.id) * 0.55 : 0;
+        this.applyLegMatrix(nCiv, this.civilianLegL, swing,  +CIVILIAN_LEG_X, CIVILIAN_HIP_Y);
+        this.applyLegMatrix(nCiv, this.civilianLegR, -swing, -CIVILIAN_LEG_X, CIVILIAN_HIP_Y);
+        nCiv++;
       } else if (u.kind === 'sniper') {
         if (nSnip >= this.capacity) continue;
         this.sniperBody.setMatrixAt(nSnip, this.bodyM);
@@ -261,12 +335,19 @@ export class UnitRenderer {
         this.applyLegMatrix(nSnip, this.sniperLegL, swing,  +SNIPER_LEG_X, SNIPER_HIP_Y);
         this.applyLegMatrix(nSnip, this.sniperLegR, -swing, -SNIPER_LEG_X, SNIPER_HIP_Y);
         nSnip++;
-      } else if (u.kind === 'gunner') {
+      } else if (u.kind === 'gunner' || u.kind === 'mortar_soldier' || u.kind === 'rocket_soldier') {
         if (nGun >= this.capacity) continue;
         this.gunnerBody.setMatrixAt(nGun, this.bodyM);
-        this.gunnerBody.setColorAt(nGun, tint);
-        this.gunnerLegL.setColorAt(nGun, tint);
-        this.gunnerLegR.setColorAt(nGun, tint);
+        // Per-kind tint baked on top of the team tint so the same gunner
+        // chassis reads as three distinct heavy-infantry kinds. Mortar =
+        // olive drab, rocket = warm rust, vanilla gunner = team default.
+        const kindTint = u.kind === 'mortar_soldier' ? this.mortarTint
+                       : u.kind === 'rocket_soldier' ? this.rocketTint
+                       : tint;
+        const composedTint = u.kind === 'gunner' ? tint : this.composeTint(tint, kindTint);
+        this.gunnerBody.setColorAt(nGun, composedTint);
+        this.gunnerLegL.setColorAt(nGun, composedTint);
+        this.gunnerLegR.setColorAt(nGun, composedTint);
         // Plodding heavy gait, wider stance.
         const swing = isMoving ? Math.sin(u.distanceWalked * 3.5 + u.id) * 0.45 : 0;
         this.applyLegMatrix(nGun, this.gunnerLegL, swing,  +GUNNER_LEG_X, GUNNER_HIP_Y);
@@ -302,10 +383,19 @@ export class UnitRenderer {
         wArm.setMatrixAt(nW, this.partM);
         const carryW = u.carrying.wood;
         const carryM = u.carrying.metals;
-        if (carryW + carryM > 0) {
+        const carryF = u.carrying.food;
+        if (carryW + carryM + carryF > 0) {
           const crateLocal = new THREE.Matrix4().makeTranslation(0, 0.95, 0.18);
           this.partM.multiplyMatrices(this.bodyM, crateLocal);
-          if (carryM > carryW) {
+          // Show whichever resource is the dominant haul. Workers rarely
+          // carry mixed loads (delivery happens once a single resource hits
+          // CARRY_CAP), so this picks the right crate the vast majority of
+          // the time without needing to render multiple crates.
+          if (carryF >= carryW && carryF >= carryM) {
+            this.workerCrateFood.setMatrixAt(nCrateF, this.partM);
+            this.workerCrateFood.setColorAt(nCrateF, tint);
+            nCrateF++;
+          } else if (carryM >= carryW) {
             this.workerCrateMetal.setMatrixAt(nCrateM, this.partM);
             this.workerCrateMetal.setColorAt(nCrateM, tint);
             nCrateM++;
@@ -423,22 +513,45 @@ export class UnitRenderer {
         this.partM.multiplyMatrices(this.bodyM, podLocal);
         this.rocketTruckPod.setMatrixAt(nRkt, this.partM);
         nRkt++;
+      } else if (u.kind === 'aa_vehicle') {
+        if (nAA >= this.capacity) continue;
+        this.aaVehicleHull.setMatrixAt(nAA, this.bodyM);
+        this.aaVehicleHull.setColorAt(nAA, tint);
+        this.aaVehiclePod.setColorAt(nAA, tint);
+        // Flak gun pivots independently of the hull, same convention as the
+        // rocket truck pod.
+        const podLocalYaw = wrapAngle(u.turretYaw - u.heading);
+        const podYawM = new THREE.Matrix4().makeRotationY(podLocalYaw);
+        const podLocal = new THREE.Matrix4()
+          .makeTranslation(0, AA_VEHICLE_POD_PIVOT_Y, AA_VEHICLE_POD_PIVOT_Z)
+          .multiply(podYawM);
+        this.partM.multiplyMatrices(this.bodyM, podLocal);
+        this.aaVehiclePod.setMatrixAt(nAA, this.partM);
+        nAA++;
       } else if (u.kind === 'supply_truck') {
         if (nSup >= this.capacity) continue;
         this.supplyTruckHull.setMatrixAt(nSup, this.bodyM);
         this.supplyTruckHull.setColorAt(nSup, tint);
-        // Determine cargo amount for crate level.
-        let cargo = 0;
+        // Determine cargo amount + dominant resource for the crate level
+        // and tint. The crate geometry is wood-brown by default; we tint it
+        // toward grey for metal loads and toward warm orange for food so a
+        // glance at the truck tells you what it's hauling.
+        let woodAmt = 0, metalAmt = 0, foodAmt = 0;
         const t = u.task;
-        if (t.kind === 'truck_deliver_hq') cargo = t.payload.metals + t.payload.wood;
-        else if (t.kind === 'truck_resupply') cargo = t.payload.food + t.payload.metals + t.payload.wood;
+        if (t.kind === 'truck_deliver_hq') {
+          woodAmt = t.payload.wood; metalAmt = t.payload.metals;
+        } else if (t.kind === 'truck_resupply') {
+          woodAmt = t.payload.wood; metalAmt = t.payload.metals; foodAmt = t.payload.food;
+        }
+        const cargo = woodAmt + metalAmt + foodAmt;
         if (cargo > 0) {
           const lv = Math.min(5, Math.ceil(cargo / 20)) - 1; // index 0-4
           const cm = this.supplyTruckCrates[lv]!;
           const ci = nSupCrates[lv]!;
           if (ci < this.capacity) {
             cm.setMatrixAt(ci, this.bodyM);
-            cm.setColorAt(ci, tint);
+            const cargoTint = pickCargoTint(this.tmpCargoTint, woodAmt, metalAmt, foodAmt);
+            cm.setColorAt(ci, cargoTint);
             nSupCrates[lv] = ci + 1;
           }
         }
@@ -463,6 +576,9 @@ export class UnitRenderer {
     this.gunnerBody.count = nGun;
     this.gunnerLegL.count = nGun;
     this.gunnerLegR.count = nGun;
+    this.civilianBody.count = nCiv;
+    this.civilianLegL.count = nCiv;
+    this.civilianLegR.count = nCiv;
     this.tankHull.count = nTank;
     this.tankTurret.count = nTank;
     this.tunnelerHull.count = nTun;
@@ -478,23 +594,28 @@ export class UnitRenderer {
     }
     this.workerCrateWood.count = nCrateW;
     this.workerCrateMetal.count = nCrateM;
+    this.workerCrateFood.count = nCrateF;
     this.dozerHull.count = nDoz;
     this.dozerBlade.count = nDoz;
     this.rocketTruckHull.count = nRkt;
     this.rocketTruckPod.count = nRkt;
+    this.aaVehicleHull.count = nAA;
+    this.aaVehiclePod.count = nAA;
     this.supplyTruckHull.count = nSup;
     for (let i = 0; i < 5; i++) this.supplyTruckCrates[i]!.count = nSupCrates[i]!;
     for (const m of [
       this.soldierBody, this.soldierLegL, this.soldierLegR,
       this.sniperBody, this.sniperLegL, this.sniperLegR,
       this.gunnerBody, this.gunnerLegL, this.gunnerLegR,
+      this.civilianBody, this.civilianLegL, this.civilianLegR,
       this.tankHull, this.tankTurret,
       this.tunnelerHull, this.tunnelerDrill,
       this.wormHead, this.wormDrill, this.wormSegment,
       ...this.workerBody, ...this.workerLegL, ...this.workerLegR, ...this.workerArm,
-      this.workerCrateWood, this.workerCrateMetal,
+      this.workerCrateWood, this.workerCrateMetal, this.workerCrateFood,
       this.dozerHull, this.dozerBlade,
       this.rocketTruckHull, this.rocketTruckPod,
+      this.aaVehicleHull, this.aaVehiclePod,
       this.supplyTruckHull, ...this.supplyTruckCrates,
     ]) {
       m.instanceMatrix.needsUpdate = true;
@@ -541,6 +662,18 @@ function wrapAngle(a: number): number {
   while (a > Math.PI) a -= 2 * Math.PI;
   while (a < -Math.PI) a += 2 * Math.PI;
   return a;
+}
+
+/**
+ * Pick a tint for the truck cargo crate based on which resource dominates
+ * the load. The crate geometry is wood-brown out of the box, so we leave
+ * `wood` at white (no shift) and push the colour toward steel-grey for
+ * metal and warm orange for food.
+ */
+function pickCargoTint(scratch: THREE.Color, wood: number, metal: number, food: number): THREE.Color {
+  if (food >= metal && food >= wood) return scratch.setRGB(1.45, 1.10, 0.40); // food: warm orange
+  if (metal >= wood)                   return scratch.setRGB(0.65, 0.75, 0.95); // metal: steel-blue
+  return scratch.setRGB(1.0, 1.0, 1.0); // wood: pass through the geometry colour
 }
 
 function makeSelectionRing(radius: number, color: number): THREE.LineSegments {

@@ -4,7 +4,7 @@
 // `pressed` keys through it.
 
 import { Unit, UnitKind, WorkerFocus } from '../sim/Units';
-import { Building } from '../sim/Buildings';
+import { Building, UPGRADE_OPTIONS, upgradeOptionById } from '../sim/Buildings';
 
 /**
  * Hooks the Game exposes to actions so they can do things that require
@@ -161,16 +161,24 @@ export function unitActionsFor(units: Unit[]): UnitAction[] {
 
 /** Per-kind keybind table for "Train X" actions on a barracks. */
 const TRAIN_KEYS: Record<UnitKind, { key: string; keyLabel: string }> = {
-  soldier:      { key: 'KeyQ', keyLabel: 'Q' },
-  sniper:       { key: 'KeyA', keyLabel: 'A' },
-  gunner:       { key: 'KeyS', keyLabel: 'S' },
-  tank:         { key: 'KeyR', keyLabel: 'R' },
-  tunneler:     { key: 'KeyT', keyLabel: 'T' },
-  worm:         { key: 'KeyY', keyLabel: 'Y' },
-  dozer:        { key: 'KeyU', keyLabel: 'U' },
-  worker:       { key: 'KeyO', keyLabel: 'O' },
-  rocket_truck: { key: 'KeyN', keyLabel: 'N' },
-  supply_truck: { key: 'KeyM', keyLabel: 'M' },
+  soldier:        { key: 'KeyQ', keyLabel: 'Q' },
+  sniper:         { key: 'KeyA', keyLabel: 'A' },
+  gunner:         { key: 'KeyS', keyLabel: 'S' },
+  mortar_soldier: { key: 'KeyD', keyLabel: 'D' },
+  rocket_soldier: { key: 'KeyF', keyLabel: 'F' },
+  tank:           { key: 'KeyR', keyLabel: 'R' },
+  tunneler:       { key: 'KeyT', keyLabel: 'T' },
+  worm:           { key: 'KeyY', keyLabel: 'Y' },
+  dozer:          { key: 'KeyU', keyLabel: 'U' },
+  worker:         { key: 'KeyO', keyLabel: 'O' },
+  rocket_truck:   { key: 'KeyN', keyLabel: 'N' },
+  aa_vehicle:     { key: 'KeyI', keyLabel: 'I' },
+  supply_truck:   { key: 'KeyM', keyLabel: 'M' },
+  // Civilians aren't manually trained — they auto-spawn from neighborhoods.
+  // Defined here only to satisfy the `Record<UnitKind, …>` shape; the
+  // train-action filter never surfaces a button for `civilian` because
+  // no building's `produces` list includes it.
+  civilian:       { key: 'KeyM', keyLabel: 'M' },
 };
 
 function trainAction(kind: UnitKind): BuildingAction {
@@ -181,7 +189,12 @@ function trainAction(kind: UnitKind): BuildingAction {
     label,
     key: k.key,
     keyLabel: k.keyLabel,
-    applicable: (b) => b.spec.produces.includes(kind),
+    // Hide train buttons on buildings that haven't completed their initial
+    // upgrade — the production tick refuses to act on the queue while a
+    // building is pending/paused, so the buttons would otherwise appear to
+    // do nothing. HQ stays operational during its own re-upgrade so we
+    // never gate it (it doesn't `produces` units anyway).
+    applicable: (b) => b.spec.produces.includes(kind) && b.upgradeState === 'enabled',
     run: (b): void => {
       b.trainQueue.push(kind);
     },
@@ -192,12 +205,15 @@ export const BUILDING_ACTIONS: BuildingAction[] = [
   trainAction('soldier'),
   trainAction('sniper'),
   trainAction('gunner'),
+  trainAction('mortar_soldier'),
+  trainAction('rocket_soldier'),
   trainAction('tank'),
   trainAction('tunneler'),
   trainAction('worm'),
   trainAction('dozer'),
   trainAction('worker'),
   trainAction('rocket_truck'),
+  trainAction('aa_vehicle'),
   {
     id: 'clear-queue',
     label: 'Clear queue',
@@ -229,6 +245,59 @@ export const BUILDING_ACTIONS: BuildingAction[] = [
     keyLabel: 'Z',
     applicable: (b) => b.spec.produces.length > 0 && b.rallyPoint !== null,
     run: (b): void => { b.rallyPoint = null; },
+  },
+  // Per-option upgrade buttons — each entry expands `UPGRADE_OPTIONS` into a
+  // BuildingAction. The button only appears when the option's `applicable`
+  // filter accepts the building AND no upgrade is currently in progress.
+  // Clicking sets the building's `activeUpgradeId` and flips it to pending;
+  // the truck dispatcher takes over from there.
+  ...UPGRADE_OPTIONS.map(opt => ({
+    id: `upgrade-${opt.id}`,
+    label: opt.label,
+    key: `Key${opt.keyLabel.toUpperCase()}`,
+    keyLabel: opt.keyLabel,
+    applicable: (b: Building) => opt.applicable(b) && b.upgradeState !== 'pending',
+    run: (b: Building): void => {
+      b.activeUpgradeId = opt.id;
+      // `initial` keeps the building disabled while pending; HQ upgrades
+      // run with the building still operational. Either way the dispatcher
+      // sees `pending` and starts deliveries.
+      b.upgradeState = 'pending';
+      b.upgradeStockpile.metals = 0;
+      b.upgradeStockpile.wood = 0;
+      // Re-arm the construction timer for the chosen upgrade. `initial` for
+      // a freshly-placed building was set during `place()`; this runs on
+      // RE-starting (after pause) or on HQ track upgrades.
+      const seconds = opt.id === 'initial'
+        ? (b.spec.constructionSeconds ?? 30)
+        : (upgradeOptionById(opt.id)?.constructionSeconds ?? 30);
+      b.constructionTimer = seconds;
+      b.constructionTotal = seconds;
+    },
+  }) satisfies BuildingAction),
+  {
+    // Hard-cancel the active upgrade. Resources already delivered stay in
+    // the building's `upgradeStockpile`; the recovery dispatcher then
+    // ferries them back to HQ via `truck_recover_upgrade`. In-flight
+    // upgrade trucks see `cancelled` on arrival and return with cargo
+    // (refunded to the global pool). The active upgrade id is cleared so
+    // the player can pick a different upgrade option immediately.
+    id: 'upgrade-cancel',
+    label: 'Cancel upgrade',
+    key: 'KeyP',
+    keyLabel: 'P',
+    applicable: (b) => b.upgradeState === 'pending',
+    run: (b): void => {
+      b.upgradeState = 'cancelled';
+      b.activeUpgradeId = null;
+      b.constructionTimer = 0;
+      b.constructionTotal = 0;
+      // The actual voxel rollback (any blocks added during the upgrade)
+      // happens in the building tick where `world` is in scope. We leave
+      // the queue + before-materials intact so that path can run; the
+      // cancelled-state branch in tick will rollback any stamped voxels
+      // and then drop the queue.
+    },
   },
 ];
 

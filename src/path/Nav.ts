@@ -1,17 +1,17 @@
 /**
- * Pathfinding grid constants. The world is 1024 × 192 × 1024 voxels at
- * 0.125 m/voxel; each nav cell is an 8-voxel cube = 1 m on a side. That gives
- * a 128 × 24 × 128 grid (393,216 cells), small enough to keep a passable
- * bitmap per unit kind (~49 KB each).
+ * Pathfinding grid constants. The world is 3072 × 160 × 3072 voxels at
+ * 0.125 m/voxel; each nav cell is an 8-voxel cube = 1 m on a side.
+ * That gives a 384 × 20 × 384 grid (≈ 2.95 M cells), still cheap enough
+ * to keep a passable bitmap per unit kind (~360 KB each).
  */
 import { WORLD_X, WORLD_Y, WORLD_Z, VOXEL_SIZE } from '../voxel/types';
 
 export const NAV_CELL_VOXELS = 8;
 export const NAV_CELL_METERS = NAV_CELL_VOXELS * VOXEL_SIZE; // 1.0
-export const GRID_X = WORLD_X / NAV_CELL_VOXELS;             // 128
-export const GRID_Y = WORLD_Y / NAV_CELL_VOXELS;             // 24
-export const GRID_Z = WORLD_Z / NAV_CELL_VOXELS;             // 128
-export const GRID_COUNT = GRID_X * GRID_Y * GRID_Z;          // 393_216
+export const GRID_X = WORLD_X / NAV_CELL_VOXELS;             // 384
+export const GRID_Y = WORLD_Y / NAV_CELL_VOXELS;             // 20
+export const GRID_Z = WORLD_Z / NAV_CELL_VOXELS;             // 384
+export const GRID_COUNT = GRID_X * GRID_Y * GRID_Z;          // 2_949_120
 
 /** Linear cell index: y-major, then z, then x. */
 export function cellIndex(cx: number, cy: number, cz: number): number {

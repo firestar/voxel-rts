@@ -29,6 +29,9 @@ export interface PlantResult {
  */
 export class SaplingManager {
   saplings: Sapling[] = [];
+  /** Phase 5b: invoked after a successful plant so the Game can
+   *  mirror the sapling to the authoritative server. */
+  onAfterPlant: ((wx: number, wz: number, seed: number) => void) | null = null;
 
   /**
    * Drop a sapling at the world-space (wx, wz). Finds the topmost grass voxel
@@ -70,6 +73,7 @@ export class SaplingManager {
       ageSec: 0,
       seed: rngSeed,
     });
+    this.onAfterPlant?.(wx, wz, rngSeed);
     return { ok: true };
   }
 

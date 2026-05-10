@@ -22,6 +22,7 @@ export type ProjectileKind =
   | 'bullet_5_56mm'
   | 'bullet_7_62mm'
   | 'rpg'
+  | 'mortar_shell'
   | 'heavy_rocket'
   | 'cluster_rocket'
   | 'cluster_submunition'
@@ -152,12 +153,32 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     muzzleVelocity: 45,
     dragPerSecond: 0.08,
     hitDamage: 60, hitRadiusMeters: 0.4,
-    explosive: true, explosionPeak: 180, explosionRadiusMeters: 2.4,
-    terrainDamageScale: 0.17,
+    explosive: true, explosionPeak: 180, explosionRadiusMeters: 3.0,
+    terrainDamageScale: 0.55,
     clusterSubmunitions: 0,
     maxLifeSeconds: 5.0,
     colorR: 1.00, colorG: 0.45, colorB: 0.20,
     visualLengthMeters: 0.7, visualRadiusMeters: 0.09,
+    hasTrail: true,
+  },
+  /**
+   * Mortar shell — light infantry indirect fire. Slow muzzle, full gravity
+   * so it lobs in a high arc, and a chunky terrain-damage scale so each
+   * hit visibly craters the ground (the mortar's whole point is denial of
+   * fixed positions).
+   */
+  mortar_shell: {
+    kind: 'mortar_shell',
+    massKg: 6,
+    muzzleVelocity: 30,
+    dragPerSecond: 0.04,
+    hitDamage: 70, hitRadiusMeters: 0.5,
+    explosive: true, explosionPeak: 200, explosionRadiusMeters: 3.4,
+    terrainDamageScale: 0.7,
+    clusterSubmunitions: 0,
+    maxLifeSeconds: 12.0,
+    colorR: 0.95, colorG: 0.55, colorB: 0.25,
+    visualLengthMeters: 0.55, visualRadiusMeters: 0.08,
     hasTrail: true,
   },
   heavy_rocket: {
@@ -166,8 +187,8 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     muzzleVelocity: 12.5,
     dragPerSecond: 0.05,
     hitDamage: 80, hitRadiusMeters: 0.5,
-    explosive: true, explosionPeak: 220, explosionRadiusMeters: 4.0,
-    terrainDamageScale: 0.17,
+    explosive: true, explosionPeak: 220, explosionRadiusMeters: 5.0,
+    terrainDamageScale: 0.65,
     clusterSubmunitions: 0,
     maxLifeSeconds: 32.0,
     gravityScale: 0.25,
@@ -181,8 +202,8 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     muzzleVelocity: 12,
     dragPerSecond: 0.06,
     hitDamage: 30, hitRadiusMeters: 0.4,
-    explosive: true, explosionPeak: 100, explosionRadiusMeters: 1.6,
-    terrainDamageScale: 0.17,
+    explosive: true, explosionPeak: 100, explosionRadiusMeters: 2.0,
+    terrainDamageScale: 0.55,
     clusterSubmunitions: 8,
     maxLifeSeconds: 32.0,
     gravityScale: 0.25,
@@ -202,8 +223,8 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     muzzleVelocity: 5.5,
     dragPerSecond: 0.10,
     hitDamage: 30, hitRadiusMeters: 0.3,
-    explosive: true, explosionPeak: 90, explosionRadiusMeters: 1.4,
-    terrainDamageScale: 0.17,
+    explosive: true, explosionPeak: 90, explosionRadiusMeters: 1.8,
+    terrainDamageScale: 0.55,
     clusterSubmunitions: 0,
     maxLifeSeconds: 16.0,
     gravityScale: 0.25,
@@ -287,8 +308,8 @@ export const PROJECTILES: Record<ProjectileKind, ProjectileConfig> = {
     // the heaviest single shot on the map, but a hit is no longer instant
     // map deletion. Both direct and explosion damage are scaled together.
     hitDamage: 47, hitRadiusMeters: 0.7,
-    explosive: true, explosionPeak: 127, explosionRadiusMeters: 6.0,
-    terrainDamageScale: 0.17,
+    explosive: true, explosionPeak: 127, explosionRadiusMeters: 7.0,
+    terrainDamageScale: 0.7,
     // Vertical liftoff: the silo cluster fires straight up for 10 m before
     // tipping over toward the target. Reads visually as a launch silo, and
     // gives nearby friendlies a beat to clear the muzzle wash.
@@ -485,6 +506,12 @@ export class ProjectileManager {
    * (the live tick is unaffected).
    */
   worldForPrediction: VoxelWorld | null = null;
+  /**
+   * Phase 4.1: invoked after every successful `spawn` so the Game can
+   * mirror the projectile to the authoritative server. The hook fires
+   * once per local spawn with the freshly-allocated projectile.
+   */
+  onAfterSpawn: ((p: Projectile) => void) | null = null;
 
   /**
    * Launch a projectile from `(x,y,z)` along the unit-vector `(dx,dy,dz)` at the
@@ -547,6 +574,7 @@ export class ProjectileManager {
     };
     this.projectiles.push(p);
     if (this.worldForPrediction) this.attachPredictedArc(p, this.worldForPrediction);
+    this.onAfterSpawn?.(p);
     return p;
   }
 

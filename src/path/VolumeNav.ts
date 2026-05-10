@@ -77,6 +77,7 @@ export function buildVolumeNav(voxels: Uint8Array, vnav: VolumeNavBuffers): void
     // Pass a zero-length view so the type-check is satisfied without
     // allocating; rebuildCell never reads this field.
     buildingMask: new Uint8Array(0),
+    treeMask: new Uint8Array(0),
   };
   buildVolumeGrid(voxels, vg);
 }
@@ -88,6 +89,7 @@ export function rebuildVolumeCell(voxels: Uint8Array, vnav: VolumeNavBuffers, cx
     digCost: vnav.digCost,
     topY: vnav.topY,
     buildingMask: new Uint8Array(0),
+    treeMask: new Uint8Array(0),
   };
   rebuildCell(voxels, vg, cx, cy, cz);
 }

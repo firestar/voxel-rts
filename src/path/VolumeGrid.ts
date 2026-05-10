@@ -39,6 +39,19 @@ export interface VolumeGrid {
    * thread see the same mask.
    */
   buildingMask: Uint8Array;
+  /**
+   * 1 byte per (cx, cz) nav column — set when the column contains a tree
+   * trunk or low canopy (mirrors `SurfaceNav.treeBlocked`). Blocks non-digger
+   * ground units from being routed through the column at ANY cy. Without
+   * this, the path planner happily routes a worker above a canopy at cy
+   * where the volume cell is air with the leaf cell as solid floor below —
+   * `requiresGround` is satisfied per the volume grid, but the unit physics
+   * walks at the *real* surface Y (skipping wood/leaf), which is below the
+   * canopy. The result is a path the worker bounces against because
+   * `pushOutOfTree` shoves them out at every step. Maintained from
+   * `SurfaceNav.treeBlocked` whenever the surface nav rebuilds.
+   */
+  treeMask: Uint8Array;
 }
 
 export function allocateVolumeGrid(useShared: boolean): VolumeGrid {
@@ -50,6 +63,7 @@ export function allocateVolumeGrid(useShared: boolean): VolumeGrid {
     topY: new Uint8Array(new Buf(GRID_COUNT)),
     // GRID_X * GRID_Z = NAV_W * NAV_H — one byte per ground column.
     buildingMask: new Uint8Array(new Buf(GRID_X * GRID_Z)),
+    treeMask: new Uint8Array(new Buf(GRID_X * GRID_Z)),
   };
 }
 
@@ -97,6 +111,30 @@ export function buildVolumeGrid(voxels: Uint8Array, vg: VolumeGrid): void {
       for (let cx = 0; cx < GRID_X; cx++) {
         rebuildCell(voxels, vg, cx, cy, cz);
       }
+    }
+  }
+}
+
+/**
+ * Mirror `SurfaceNav.treeBlocked[cx, cz]` into `vg.treeMask[cx, cz]` for the
+ * given column-space AABB (inclusive). The two arrays have the same shape
+ * (one byte per nav column), so this is a direct per-column copy. Call
+ * after surface-nav rebuilds so the per-unit grids see the latest tree
+ * positions.
+ */
+export function syncTreeMask(
+  vg: VolumeGrid, treeBlocked: Uint8Array,
+  cx0: number, cz0: number, cx1: number, cz1: number,
+): void {
+  const x0 = Math.max(0, cx0);
+  const z0 = Math.max(0, cz0);
+  const x1 = Math.min(GRID_X - 1, cx1);
+  const z1 = Math.min(GRID_Z - 1, cz1);
+  if (x0 > x1 || z0 > z1) return;
+  for (let cz = z0; cz <= z1; cz++) {
+    const off = cz * GRID_X;
+    for (let cx = x0; cx <= x1; cx++) {
+      vg.treeMask[off + cx] = treeBlocked[off + cx]!;
     }
   }
 }
