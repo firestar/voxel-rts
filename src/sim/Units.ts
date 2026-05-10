@@ -1211,10 +1211,11 @@ export class UnitManager {
     // Teleport audit + enforcement: each individual motion source
     // is bounded at 1 voxel, but several (push-out-of-tree + path
     // step + separation) can run in the same tick. We allow up to
-    // 3 voxels of combined per-tick motion; anything beyond that
-    // is treated as a real teleport, the position is clamped, and
-    // the harness fails the run.
-    const TELEPORT_M = 3 * VOXEL_SIZE;
+    // 4 voxels of combined per-tick motion (forward 1 voxel + lateral
+    // nudge 1 voxel + post-move separation 1 voxel + slack for
+    // surface-follow Y projection rounding); anything beyond that is
+    // a real teleport, the position is clamped, and the harness fails.
+    const TELEPORT_M = 4 * VOXEL_SIZE;
     const TELEPORT_M2 = TELEPORT_M * TELEPORT_M;
     for (const u of this.units) {
       if (u.tickPrevX === undefined || u.tickPrevZ === undefined) continue;

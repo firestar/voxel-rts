@@ -439,12 +439,12 @@ async function main() {
       const elapsed = now - state.runStartedAt;
       const wholeSec = Math.floor(elapsed);
       // Startup grace: an AI faction needs the full economy ramp
-      // (place barracks → place 2 farms → wait 40 s for barracks
-      // construction → wait for first farm food) before it can sustain
-      // 1 unit/sec. 60 s covers the necessary build-out. The drought
-      // rule is meant to punish *ongoing* idleness, not the unavoidable
-      // opening when nothing is yet on the field.
-      const DROUGHT_GRACE_SEC = 60;
+      // (place barracks → 2 farms → 40 s construction → first farm
+      // ripening cycle → first units leaving barracks → first wave
+      // walking across the map to the enemy HQ) before HQ destruction
+      // can begin. 90 s covers the ramp; the drought rule is meant
+      // to punish *ongoing* idleness, not the unavoidable opening.
+      const DROUGHT_GRACE_SEC = 90;
       while (state.droughtAccountedSec < wholeSec) {
         state.droughtAccountedSec += 1;
         if (state.droughtAccountedSec <= DROUGHT_GRACE_SEC) continue;

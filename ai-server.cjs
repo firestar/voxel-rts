@@ -60,7 +60,10 @@ const MAX_FIELDED_ENEMIES = 200;
  *  pass routes idle enemies toward player buildings and stops short at
  *  this fraction of the unit's weapon range so the projectile arc check
  *  has room to succeed. */
-const ATTACK_STOP_FRACTION = 0.65;
+// Was 0.65. Lowered to 0.45 so attacking units crowd in closer
+// to enemy HQs — more units inside LOS distance = more shots
+// landing per second = HQ HP comes down before drought triggers.
+const ATTACK_STOP_FRACTION = 0.45;
 /** Throttle hunt-and-attack so we don't slam the path worker. The
  *  client routes a unit and the path takes a beat to resolve; rerouting
  *  every 1 s is wasteful. */
@@ -264,14 +267,28 @@ function decideActions(state, sessionId) {
         if (!u.armed) { skipUnarmed++; continue; }
         if (u.hasFiringTarget) { skipFiring++; continue; }
         if (u.pathLen > 0) { skipPath++; continue; }
+        // Prefer enemy HQs over other buildings — destroying an HQ
+        // ends the game (HQ_WIN), so concentrating fire on HQ kinds
+        // accelerates the win condition. Only fall back to "nearest
+        // anything" when no enemy HQ is in sight.
         let bestB = null;
         let bestD2 = Infinity;
         for (const b of targets) {
           if (!b || !b.alive) continue;
-          if (b.team && b.team === u.team) continue; // never target own team
+          if (b.team && b.team === u.team) continue;
+          if (b.kind !== 'hq') continue;
           const dx = b.x - u.x, dz = b.z - u.z;
           const d2 = dx * dx + dz * dz;
           if (d2 < bestD2) { bestD2 = d2; bestB = b; }
+        }
+        if (!bestB) {
+          for (const b of targets) {
+            if (!b || !b.alive) continue;
+            if (b.team && b.team === u.team) continue;
+            const dx = b.x - u.x, dz = b.z - u.z;
+            const d2 = dx * dx + dz * dz;
+            if (d2 < bestD2) { bestD2 = d2; bestB = b; }
+          }
         }
         if (!bestB) { skipNoBldg++; continue; }
         const range = APPROX_WEAPON_RANGE_M[u.kind] || 18;
