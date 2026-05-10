@@ -1,0 +1,39 @@
+# kaiad.yaml — voxel-rts.
+#
+# Single-image deploy: the repo's Dockerfile bundles the built SPA +
+# the AI/session/game Node backends behind one nginx, all on port 8080.
+# Kaiad runs `docker build` against the host daemon and pushes the
+# resulting image to its built-in registry; bound agents pull and
+# redeploy on every successful main-branch build.
+
+version: 1
+
+# Dockerfile mode — mutually exclusive with build/runtime/artifacts.
+# Image config (ENTRYPOINT, EXPOSE, etc.) comes from the Dockerfile.
+dockerfile:
+  path: Dockerfile
+  context: .
+
+ports:
+  - port: 8080
+    name: http
+
+instances: 1
+
+# voxelrts.com routes to the container's :8080. The per-agent nginx
+# LB picks this up in docker mode; k8s-mode agents would emit a
+# Service.type=ClusterIP + Ingress with the same routing.
+domains:
+  - host: voxelrts.com
+    port: 8080
+    protocol: https
+
+loadBalancer:
+  type: nginx
+
+# Single environment — the only one this repo runs in. Empty overrides
+# block means the top-level defaults (1 replica, the domain above,
+# nginx LB) apply verbatim. Add per-env overrides here later when a
+# staging/dev pipeline is needed.
+environments:
+  production: {}
