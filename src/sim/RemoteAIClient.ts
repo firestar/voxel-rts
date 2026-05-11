@@ -1,4 +1,4 @@
-import { Unit, UnitManager, UnitKind } from './Units';
+import { Unit, UnitManager, UnitKind, WorkerFocus } from './Units';
 import {
   BuildingManager, Building, BuildingKind, BuildingSpec,
   BARRACKS, FARM, VEHICLE_DEPOT, NEIGHBORHOOD,
@@ -32,7 +32,8 @@ import { VOXEL_SIZE } from '../voxel/types';
 export type AiAction =
   | { type: 'place_building'; kind: BuildingKind; anchorHqId?: number }
   | { type: 'queue_train'; buildingId: number; unitKind: UnitKind }
-  | { type: 'route_unit'; unitId: number; x: number; z: number };
+  | { type: 'route_unit'; unitId: number; x: number; z: number }
+  | { type: 'set_worker_focus'; workerId: number; focus: WorkerFocus };
 
 export interface AIClientDeps {
   units: UnitManager;
@@ -139,10 +140,19 @@ export class RemoteAIClient {
       id: number; kind: string; team: string; x: number; z: number; hp: number;
       armed: boolean; hasFiringTarget: boolean; pathLen: number;
     }> = [];
+    const workers: Array<{
+      id: number; team: string; focus: WorkerFocus; taskKind: string;
+    }> = [];
     for (const u of deps.units.units) {
       if (u.hp <= 0) continue;
       enemyUnitCount++;
-      if (u.kind === 'worker' || u.kind === 'civilian' || u.kind === 'supply_truck') continue;
+      if (u.kind === 'worker') {
+        workers.push({
+          id: u.id, team: u.team, focus: u.workerFocus, taskKind: u.task.kind,
+        });
+        continue;
+      }
+      if (u.kind === 'civilian' || u.kind === 'supply_truck') continue;
       enemyUnits.push({
         id: u.id, kind: u.kind, team: u.team,
         x: +u.x.toFixed(2), z: +u.z.toFixed(2),
@@ -230,6 +240,7 @@ export class RemoteAIClient {
       playerBuildings,
       targetBuildings,
       enemyUnits,
+      workers,
       enemyResources: {
         food: deps.enemyResources.food | 0,
         metals: deps.enemyResources.metals | 0,
@@ -245,7 +256,24 @@ export class RemoteAIClient {
       case 'place_building': return this.applyPlaceBuilding(a, deps);
       case 'queue_train': return this.applyQueueTrain(a, deps);
       case 'route_unit': return this.applyRouteUnit(a, deps);
+      case 'set_worker_focus': return this.applySetWorkerFocus(a, deps);
     }
+  }
+
+  private applySetWorkerFocus(
+    a: { workerId: number; focus: WorkerFocus },
+    deps: AIClientDeps,
+  ): void {
+    const u = deps.units.units.find(x => x.id === a.workerId);
+    if (!u || u.kind !== 'worker' || u.hp <= 0) return;
+    if (u.workerFocus === a.focus) return;
+    u.workerFocus = a.focus;
+    // Drop any in-progress task so the focus change takes effect on
+    // the next worker-scan tick instead of finishing the prior order
+    // (a mine task would otherwise keep a chop-focused worker pinned
+    // to ore until the cluster empties).
+    u.task = { kind: 'idle' };
+    u.path = [];
   }
 
   private applyRouteUnit(

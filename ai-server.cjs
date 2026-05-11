@@ -246,6 +246,66 @@ function decideActions(state, sessionId) {
     void liveFarms;
     void liveDepots;
 
+    // Dynamic worker-focus assignment. The seed gives each base 2
+    // auto + 2 farm + 2 chop. That's enough food/wood for a barracks
+    // and farms but the 30m/60w neighborhood + 70m/50w depot need a
+    // larger chop pool. Pick the next building we still need to fund
+    // and push idle/auto workers onto the bottleneck resource.
+    const myWorkers = Array.isArray(state.workers)
+      ? state.workers.filter(w => w.team === hq.team)
+      : [];
+    if (myWorkers.length > 0) {
+      // What's the next building we're saving for? Use the lowest
+      // unmet cost on the build order.
+      let needWood = 0, needMetals = 0;
+      const want = (cost) => {
+        needMetals = Math.max(needMetals, cost.metals - budget.metals);
+        needWood   = Math.max(needWood,   cost.wood   - budget.wood);
+      };
+      if (anyFarms.length < 2)    want(BUILDING_COSTS.farm);
+      if (anyHoods.length < 1)    want(BUILDING_COSTS.neighborhood);
+      if (anyDepots.length === 0) want(BUILDING_COSTS.vehicle_depot);
+      if (anyBarracks.length < 3) want(BUILDING_COSTS.barracks);
+
+      // Target focus counts: 2 farm always (food is per game rule),
+      // then split mine/chop based on shortfall. If neither resource
+      // is short, leave the rest on auto.
+      let wantChop = 0, wantMine = 0;
+      if (needWood > 0 && needMetals > 0) {
+        wantChop = needWood >= needMetals ? 3 : 2;
+        wantMine = 6 - 2 /* farm */ - wantChop;
+      } else if (needWood > 0) {
+        wantChop = 4;
+      } else if (needMetals > 0) {
+        wantMine = 4;
+      }
+      const haveFocus = (f) => myWorkers.filter(w => w.focus === f).length;
+      const reassign = (toFocus, deficit) => {
+        if (deficit <= 0) return;
+        // Pull from auto first, then from the other gathering focus.
+        const pullOrder = ['auto', 'mine', 'chop', 'farm'].filter(f => f !== toFocus);
+        for (const fromFocus of pullOrder) {
+          if (deficit <= 0) return;
+          const idle = myWorkers
+            .filter(w => w.focus === fromFocus)
+            // Don't yank a worker that's actively delivering a
+            // resource — let it finish so we don't waste the trip.
+            .filter(w => w.taskKind !== 'storage_drop' && w.taskKind !== 'deliver');
+          for (const w of idle) {
+            if (deficit <= 0) break;
+            actions.push({ type: 'set_worker_focus', workerId: w.id, focus: toFocus });
+            w.focus = toFocus; // local mirror so the next iteration sees it
+            deficit--;
+          }
+        }
+      };
+      // Keep 2 farm workers locked (game rule: only farm-focused
+      // workers tend farms).
+      reassign('farm', 2 - haveFocus('farm'));
+      reassign('chop', wantChop - haveFocus('chop'));
+      reassign('mine', wantMine - haveFocus('mine'));
+    }
+
     if (h.trainCooldown === 0 && state.enemyUnitCount < MAX_FIELDED_ENEMIES && liveBarracks.length > 0) {
       const target = liveBarracks.find(b => (b.trainQueueLen ?? 0) < 4) || liveBarracks[0];
       for (let i = 0; i < BARRACKS_PRODUCES.length; i++) {
