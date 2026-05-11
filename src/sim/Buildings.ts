@@ -2860,9 +2860,14 @@ export function stampHQ(
  * though their kind is `'turret'`.
  */
 const BUILDING_THREAT: Record<BuildingKind, number> = {
+  // HQ is now the highest-threat ground target so the auto-engage
+  // picker prefers it over enemy soldiers + tanks within weapon
+  // range. Destroying an HQ ends the match (HQ_WIN, +5.9 b score),
+  // so once attackers reach 0.30 × range they should be firing on
+  // the HQ rather than spending ammo on screening units.
+  hq:            120,
   silo:          95,
   turret:        88,   // anti-ground; aa_turret is overridden in buildingThreatLevel
-  hq:            70,
   vehicle_depot: 65,
   barracks:      60,
   tech_lab:      48,
