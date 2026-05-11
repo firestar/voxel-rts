@@ -351,6 +351,22 @@ function decideActions(state, sessionId) {
         debit(UNIT_COSTS.tank);
       }
     }
+    // Worker pump: more workers = faster gather rate = bigger army.
+    // Each base seeds 6 workers; train extras from the barracks until
+    // we hit WORKER_TARGET per team. Workers are cheap (30f / 0m /
+    // 10w) so the metal economy isn't compromised even with several
+    // queued in a row.
+    const WORKER_TARGET = 12;
+    if (!trainBlocked && h.trainCooldown === 0 && liveBarracks.length > 0
+        && myWorkers.length < WORKER_TARGET
+        && canAffordUnitB('worker')) {
+      const target = liveBarracks.find(b => (b.trainQueueLen ?? 0) < 4) || liveBarracks[0];
+      if ((target.trainQueueLen ?? 0) < 4) {
+        actions.push({ type: 'queue_train', buildingId: target.id, unitKind: 'worker' });
+        debit(UNIT_COSTS.worker);
+        h.trainCooldown = TRAIN_INTERVAL_S;
+      }
+    }
     if (!trainBlocked && h.trainCooldown === 0 && state.enemyUnitCount < MAX_FIELDED_ENEMIES && liveBarracks.length > 0) {
       const target = liveBarracks.find(b => (b.trainQueueLen ?? 0) < 4) || liveBarracks[0];
       for (let i = 0; i < BARRACKS_PRODUCES.length; i++) {
