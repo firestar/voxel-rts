@@ -43,6 +43,13 @@ const STUCK_WORKER_S = 10.0;
 const STUCK_TRUCK_S = 15.0;
 const STUCK_MOVE_M = 0.10; // ≤10 cm in the window counts as no movement
 
+// Idle-combat detection (FAILURE_IDLE_COMBAT). A combat unit within
+// 40 voxels (5 m) of an enemy unit or building MUST be firing —
+// otherwise the AI / target picker / weapon arm has a bug. A few
+// seconds of slack covers the natural acquisition/slew window;
+// past that, fail the run.
+const IDLE_COMBAT_S = 3.0;
+
 // Rubberbanding / teleport detection. Walking units cap at ~5 m/s,
 // trucks ~10 m/s. Anything snapping >12 m in one sample is either
 // reconciler overshoot or an outright teleport — both are bugs.
@@ -181,6 +188,8 @@ async function main() {
       stuckFail: null,               // { id, kind, team, secs }
       truckFail: null,               // { id, task, secs }
       rubberFail: null,              // { id, kind, team, dist, dt }
+      idleCombatFail: null,          // { id, kind, team, secs, enemyId, enemyKind, dist }
+      idleCombatSince: new Map(),    // unitId → wall-clock seconds when "close to enemy + not firing" first observed
       lastSampleAt: null,            // wall-clock of previous sample for rubberband Δ
       teleportFail: null,            // { id, kind, team, dist, from, to, at }
       hqWinner: null,                // first team to destroy an enemy HQ
@@ -212,6 +221,10 @@ async function main() {
       for (const e of ents) if ((e.hp ?? 1) > 0) liveSnap.add(e.id);
 
       const us = g?.units?.units || [];
+      // Building snapshot is captured here too so the per-unit
+      // idle-combat check below can scan enemy buildings without
+      // waiting for the buildings loop later in the tick.
+      const bldgs = g?.buildings?.buildings || [];
       const localLive = new Set();
       const SCORE = window.__autoSCORE;
       for (const u of us) {
@@ -358,6 +371,55 @@ async function main() {
           }
         }
 
+        // Idle-combat detection: a military unit within 40 voxels
+        // (5 m) of an enemy unit OR enemy building MUST be firing.
+        // If it's close enough to engage but the trigger isn't being
+        // pulled, the AI / target picker / weapon arming has a bug
+        // and the harness fails the run for fixing.
+        if (isCombat) {
+          let closeEnemy = null;
+          let closeDist = Infinity;
+          const RANGE_M = 40 * opts.VOXEL_SIZE; // 40 voxels = 5 m
+          const R2 = RANGE_M * RANGE_M;
+          for (const o of us) {
+            if (o.id === u.id || o.hp <= 0) continue;
+            if (o.team === u.team) continue;
+            const dx = o.x - u.x, dz = o.z - u.z;
+            const d2 = dx * dx + dz * dz;
+            if (d2 > R2) continue;
+            if (d2 < closeDist) { closeDist = d2; closeEnemy = o; }
+          }
+          if (!closeEnemy) {
+            for (const b of bldgs) {
+              if (b.destroyed || b.team === u.team) continue;
+              const cx = (b.ox + b.cellsW * 0.5) * 8 * opts.VOXEL_SIZE;
+              const cz = (b.oz + b.cellsD * 0.5) * 8 * opts.VOXEL_SIZE;
+              const dx = cx - u.x, dz = cz - u.z;
+              const d2 = dx * dx + dz * dz;
+              if (d2 > R2) continue;
+              if (d2 < closeDist) {
+                closeDist = d2;
+                closeEnemy = { id: b.id, kind: b.kind, isBuilding: true };
+              }
+            }
+          }
+          if (closeEnemy && !isFiring) {
+            if (!state.idleCombatSince.has(u.id)) state.idleCombatSince.set(u.id, now);
+            const secs = now - state.idleCombatSince.get(u.id);
+            if (secs > opts.IDLE_COMBAT_S && !state.idleCombatFail) {
+              state.idleCombatFail = {
+                id: u.id, kind: u.kind, team: u.team,
+                secs: +secs.toFixed(1),
+                enemyId: closeEnemy.id, enemyKind: closeEnemy.kind,
+                dist: +Math.sqrt(closeDist).toFixed(2),
+                isBuilding: !!closeEnemy.isBuilding,
+              };
+            }
+          } else {
+            state.idleCombatSince.delete(u.id);
+          }
+        }
+
         // Truck delivery stall: a truck whose task has been stuck on
         // the same {kind, target} for too long.
         if (u.kind === 'supply_truck' && u.task && u.task.kind &&
@@ -456,7 +518,7 @@ async function main() {
       // wins the +5,999,999,999,999 jackpot. We don't actually have a
       // killer attribution, so the jackpot lands in `state.score` and
       // the winner team is whichever non-victim team is still alive.
-      const bldgs = g?.buildings?.buildings || [];
+      // `bldgs` was captured at the top of this tick alongside `us`.
       for (const b of bldgs) {
         let entry = state.seenBldg.get(b.id);
         if (!entry) {
@@ -556,10 +618,11 @@ async function main() {
         truckFail: state.truckFail,
         rubberFail: state.rubberFail,
         teleportFail: state.teleportFail,
+        idleCombatFail: state.idleCombatFail,
         hqWinner: state.hqWinner,
         hqWinnerAt: state.hqWinnerAt,
       };
-    }, { STUCK_MOVE_M, STUCK_COMBAT_S, STUCK_WORKER_S, STUCK_TRUCK_S, RUBBERBAND_M_PER_S, RUBBERBAND_WARMUP_S, COMBAT_KINDS, VOXEL_SIZE: 0.125 });
+    }, { STUCK_MOVE_M, STUCK_COMBAT_S, STUCK_WORKER_S, STUCK_TRUCK_S, IDLE_COMBAT_S, RUBBERBAND_M_PER_S, RUBBERBAND_WARMUP_S, COMBAT_KINDS, VOXEL_SIZE: 0.125 });
 
     if (Object.keys(sample.combat).length > 0) combatSeen = true;
     const hqTag = sample.hqWinner ? ` HQ-WIN=${sample.hqWinner}` : '';
@@ -585,6 +648,11 @@ async function main() {
     if (sample.teleportFail) {
       outcome = 'FAILURE_TELEPORT';
       log(`FAILURE_TELEPORT ${JSON.stringify(sample.teleportFail)}`);
+      break;
+    }
+    if (sample.idleCombatFail) {
+      outcome = 'FAILURE_IDLE_COMBAT';
+      log(`FAILURE_IDLE_COMBAT ${JSON.stringify(sample.idleCombatFail)}`);
       break;
     }
     // Negative-score bailout: as soon as the running score crosses
@@ -724,6 +792,7 @@ async function main() {
   if (outcome === 'FAILURE_TELEPORT') process.exit(7);
   if (outcome === 'FAILURE_NO_COMBAT') process.exit(2);
   if (outcome === 'FAILURE_NEGATIVE_SCORE') process.exit(8);
+  if (outcome === 'FAILURE_IDLE_COMBAT') process.exit(9);
   process.exit(6); // TIMEOUT or anything else doesn't count toward target
 }
 

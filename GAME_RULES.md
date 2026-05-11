@@ -30,6 +30,12 @@ constraint the user has stated across the loop.
 
 ### Stuck detection (harness)
 
+- **Idle combat** = a combat unit within **40 voxels (5 m)** of any
+  enemy unit or enemy building AND not firing for > **3 s**. Fails
+  the run as `FAILURE_IDLE_COMBAT` (exit code 9). The trigger
+  presumes the unit has line-of-sight and weapon range to fire; if
+  it's holding fire near a viable target, the AI / target picker /
+  weapon arm has a bug and needs a code fix.
 - **Combat unit stuck** = `path.length > 0` AND no XZ movement for
   > **2 s**, *unless* it's firing OR within 3 m of its next waypoint
   ("at goal") OR in melee with an enemy combat unit (within 4 m).
