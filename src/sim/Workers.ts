@@ -711,15 +711,13 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
 }
 
 function isHarvesterOrderForFocus(o: WorkOrder, focus: WorkerFocus): boolean {
-  // Farm-focused workers handle every farm order. Auto-focus workers
-  // ALSO handle every farm order so the AI's food economy doesn't
-  // starve when nobody is explicitly set to "farm" — without this,
-  // the AI's farms never get tended past their first milestone, so
-  // crops never ripen, and unit production starves once the seeded
-  // food is spent. Mining / chopping workers stay specialized.
+  // Per game rule: only farm-focused workers do farm work. Other
+  // foci (mine, chop, auto) ignore farmTend and harvestFarm. Each
+  // base must dedicate workers to "farm" focus to keep the food
+  // economy alive.
   if (focus === 'farm') return o.kind === 'farmTend' || o.kind === 'harvestFarm';
   if (focus === 'mine' || focus === 'chop') return false;
-  return o.kind === 'plant' || o.kind === 'farmTend' || o.kind === 'harvestFarm';
+  return o.kind === 'plant';
 }
 
 function applyOrderToHarvester(u: Unit, order: WorkOrder, deps: WorkerDeps): void {

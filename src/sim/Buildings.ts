@@ -4085,15 +4085,10 @@ export class BuildingManager {
     for (const u of units.units) {
       if (u.hp <= 0) continue;
       if (u.kind !== 'worker') continue;
-      // Any worker on the plot whose current task is `farm` (the
-      // farmTend task) advances the milestone. Earlier we required
-      // workerFocus === 'farm' here, but the AI's auto-focus workers
-      // pick up farmTend orders too — they walk all the way to the
-      // plot and sit there, but the focus check ignored them, so
-      // crops stalled at 20% milestone forever and the AI starved
-      // for food. The task kind is the real signal: a worker doing
-      // a farmTend job is the farmer.
-      if (u.task.kind !== 'farm' && u.workerFocus !== 'farm') continue;
+      // Per game rule: only farm-focused workers can advance crop
+      // milestones. Auto / mine / chop workers walking through the
+      // plot are NOT farmers.
+      if (u.workerFocus !== 'farm') continue;
       if (u.x < wxStart || u.x >= wxEnd) continue;
       if (u.z < wzStart || u.z >= wzEnd) continue;
       farmerOnFarm = true;

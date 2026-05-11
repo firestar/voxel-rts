@@ -686,13 +686,21 @@ export class Game {
       Math.floor(NAV_W * 0.20),
     );
     const c = navCenter(nav, found.cx, found.cz);
-    // Six workers to seed the economy loop from the start.
-    this.spawnWorker(c.x - 2.0, c.y, c.z + 1.0);
-    this.spawnWorker(c.x - 2.5, c.y, c.z - 1.0);
-    this.spawnWorker(c.x - 1.5, c.y, c.z + 2.5);
-    this.spawnWorker(c.x + 2.0, c.y, c.z + 1.0);
-    this.spawnWorker(c.x + 2.5, c.y, c.z - 1.0);
-    this.spawnWorker(c.x + 1.5, c.y, c.z - 2.5);
+    // Six workers to seed the economy loop, mirroring the AI seed:
+    //   - 2 auto, 2 farm (food economy), 2 chop (wood for builds).
+    // Per game rule, only farm-focus workers can tend farm plots.
+    const playerSeed: Array<{ pos: [number, number, number]; focus: 'auto' | 'farm' | 'chop' }> = [
+      { pos: [c.x - 2.0, c.y, c.z + 1.0], focus: 'auto' },
+      { pos: [c.x - 2.5, c.y, c.z - 1.0], focus: 'auto' },
+      { pos: [c.x - 1.5, c.y, c.z + 2.5], focus: 'farm' },
+      { pos: [c.x + 2.0, c.y, c.z + 1.0], focus: 'farm' },
+      { pos: [c.x + 2.5, c.y, c.z - 1.0], focus: 'chop' },
+      { pos: [c.x + 1.5, c.y, c.z - 2.5], focus: 'chop' },
+    ];
+    for (const { pos, focus } of playerSeed) {
+      const w = this.spawnWorker(pos[0], pos[1], pos[2]);
+      if (w) w.workerFocus = focus;
+    }
 
     // Place a starter Storage depot near spawn so workers always have a
     // delivery target. We try a handful of candidate footprints around the
@@ -863,16 +871,17 @@ export class Game {
     const cxw = (hqOx + HQ.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
     const czw = (hqOz + HQ.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
     const halfW = HQ.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE * 0.5;
-    // Six AI workers per base: 4 auto-focus (mine ore by default,
-    // pick up farm orders when boards offer them) + 2 chop-focus.
-    // Auto-focus workers always prefer ore over wood, so without a
-    // dedicated chopper pair the AI can't accumulate wood and stalls
-    // out building barracks/farms (both need 30-60 wood each).
+    // Six AI workers per base, dedicated by focus:
+    //   - 2 auto (mine ore by default, opportunistic plant orders)
+    //   - 2 chop (wood for barracks/farms)
+    //   - 2 farm (per game rule, only farm-focus workers can tend
+    //     plots; without dedicated farmers the food economy stalls
+    //     at the 20% milestone forever)
     const seed: Array<{ wx: number; wz: number; focus: 'auto' | 'farm' | 'chop' | 'mine' }> = [
       { wx: cxw + halfW + 2, wz: czw - 2, focus: 'auto' },
       { wx: cxw + halfW + 2, wz: czw + 2, focus: 'auto' },
-      { wx: cxw + halfW + 4, wz: czw - 1, focus: 'auto' },
-      { wx: cxw + halfW + 4, wz: czw + 1, focus: 'auto' },
+      { wx: cxw + halfW + 4, wz: czw - 1, focus: 'farm' },
+      { wx: cxw + halfW + 4, wz: czw + 1, focus: 'farm' },
       { wx: cxw + halfW + 3, wz: czw - 3, focus: 'chop' },
       { wx: cxw + halfW + 3, wz: czw + 3, focus: 'chop' },
     ];
