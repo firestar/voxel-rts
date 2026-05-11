@@ -633,8 +633,12 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
         u.workerRouteCooldown = 0;
         deps.routeWorker(u, farmCx, u.y, farmCz);
       }
+      return false;
     }
-    return false;
+    // No friendly farm yet — fall through to the wood scan below so
+    // the worker chops while the AI is busy placing its first farm,
+    // rather than sitting idle and tripping the harness's worker-
+    // stuck rule.
   }
 
   // Voxel scans are expensive (~19M iterations each). Rate-limit per worker
