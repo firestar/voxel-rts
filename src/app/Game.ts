@@ -3817,16 +3817,17 @@ export class Game {
     const ringRadius = imp.explosive ? imp.explosionRadiusMeters * 1.4 : 0.6;
     const ringLife = imp.explosive ? 0.7 : 0.25;
     this.impactRings.spawn(imp.x, imp.y, imp.z, ringRadius, ringLife, cfg.colorR, cfg.colorG, cfg.colorB);
-    // Direct projectile hit on a unit. Apply the round's full `hitDamage`
-    // — for non-explosive bullets that's the only damage; explosive rounds
-    // additionally splash blast damage below.
+    // Direct projectile hit on a unit. Apply the round's full
+    // `hitDamage`. For non-explosive bullets that's the only damage;
+    // explosive rounds additionally splash blast damage below.
     //
-    // Under zero-trust the server runs its own per-tick segment-vs-
-    // entity sweep and applies the canonical hp damage; deducting
-    // here would double-count when the snapshot reconciliation
-    // arrives. Visual effects above (flash, ring, debris) still play
-    // for snappy feedback.
-    if (imp.directHitUnitId >= 0 && !this.zeroTrustEnabled) {
+    // Originally gated by !zeroTrustEnabled because the server ran
+    // its own segment-vs-entity sweep and would double-count.
+    // In the AI-vs-AI loop the local auto-engage path drives all
+    // firing (server is disarmed), so the server's sweep no longer
+    // produces canonical damage — the local sim must apply it or
+    // workers / civilians take zero hits even under sustained fire.
+    if (imp.directHitUnitId >= 0) {
       const hit = this.units.units.find(u => u.id === imp.directHitUnitId);
       if (hit) {
         hit.hp -= imp.hitDamage;
@@ -3851,7 +3852,7 @@ export class Game {
     // miss. The directly hit unit, if any, also catches the splash on top of
     // the impact damage — taking a tank shell to the face is supposed to be
     // brutal.
-    if (imp.explosive && imp.explosionRadiusMeters > 0 && !this.zeroTrustEnabled) {
+    if (imp.explosive && imp.explosionRadiusMeters > 0) {
       const blastR = imp.explosionRadiusMeters;
       for (const u of this.units.units) {
         const torsoY = u.y + Math.max(0.7, u.widthMeters * 0.6);
