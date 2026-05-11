@@ -105,21 +105,25 @@ export function tickWeapons(
       if (slewed.aligned) {
         if (u.fireCooldown === 0) {
           // Friendly-fire gate: don't pull the trigger while a same-team peer
-          // is between the muzzle and the target. We hold the firingTarget so
-          // the unit will fire as soon as the lane clears, rather than dropping
-          // the order silently.
+          // is between the muzzle and the target.
           if (!friendlyOnLineOfFire(u, tgt.x, tgt.y, tgt.z, units)) {
             fireShot(u, w, projectiles, hooks, tgt.projectileOverride);
-            // Single-shot: clear the firing target now. Burst weapons keep the
-            // remaining shots queued via burstShotsRemaining/burstShotTimer
-            // (handled below) but still drop the explicit firingTarget so the
-            // player can re-issue without another RMB hold for follow-up bursts.
             u.firingTarget = null;
             u.fireCooldown = w.fireInterval;
             if (w.shotsPerBurst > 1) {
               u.burstShotsRemaining = w.shotsPerBurst - 1;
               u.burstShotTimer = w.burstInterval;
             }
+          } else {
+            // Friendly blocking the lane. Drop the firingTarget so
+            // auto-engage repicks a different target on the next tick
+            // (or the same target after the friendly moves). Without
+            // this clear, the unit holds fire indefinitely on a target
+            // that's blocked behind an ally — caught by
+            // FAILURE_NONCOMBAT_INVULN when the target is a non-combat
+            // unit.
+            u.firingTarget = null;
+            u.autoEngageCooldown = Math.max(u.autoEngageCooldown, 0.3);
           }
         }
       }
