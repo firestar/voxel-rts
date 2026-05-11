@@ -4773,16 +4773,36 @@ export class Game {
       const cfg = PROJECTILES[w.projectile];
       const explosionR = cfg.explosive ? cfg.explosionRadiusMeters : 0;
 
-      // Predict the projectile's actual trajectory (gravity, drag) and
-      // see whether it clips the target sphere anywhere along the arc.
-      // If yes, fire. If the round arcs short — typical for a
-      // launcher pointed at the edge of its range — we step a little
-      // closer and try again next tick. The body sphere covers the
-      // building's footprint so a shot that's going to hit a wall
-      // counts as reach: that's still damage to the structure.
+      // Voxel-LoS gate. predictTrajectory is pure physics — it doesn't
+      // know about walls. If a worker is behind a building voxel the
+      // projectile would clip the wall first and never reach the
+      // worker, but arcReachesPoint would still say "reaches". Caused
+      // gunners to fire on workers behind walls for 5+ seconds with
+      // zero damage (FAILURE_NONCOMBAT_INVULN). Cast a voxel ray from
+      // muzzle to target; if a solid voxel sits between, skip this
+      // target so the auto-engage picks something else next tick OR
+      // the arc-walk tangent fires.
       const muzzleX = u.x;
       const muzzleY = u.y + 1.2;
       const muzzleZ = u.z;
+      {
+        const losDx = tx - muzzleX, losDy = ty - muzzleY, losDz = tz - muzzleZ;
+        const losLen = Math.hypot(losDx, losDy, losDz) || 1;
+        const lhit = raycastVoxel(
+          this.world,
+          { x: muzzleX, y: muzzleY, z: muzzleZ },
+          { x: losDx / losLen, y: losDy / losLen, z: losDz / losLen },
+          losLen,
+        );
+        // If a voxel sits noticeably short of the target (>0.5 m
+        // before it), treat the LoS as blocked. A voxel within 0.5 m
+        // of the target is part of the target's hit envelope and
+        // counts as "we'll hit something on the way in".
+        if (lhit && losLen - lhit.tMeters > 0.5) {
+          u.autoEngageCooldown = 0.6;
+          continue;
+        }
+      }
       const ddx = tx - muzzleX;
       const ddy = ty - muzzleY;
       const ddz = tz - muzzleZ;
