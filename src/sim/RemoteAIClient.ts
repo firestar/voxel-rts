@@ -1,7 +1,7 @@
 import { Unit, UnitManager, UnitKind } from './Units';
 import {
   BuildingManager, Building, BuildingKind, BuildingSpec,
-  BARRACKS, FARM, VEHICLE_DEPOT,
+  BARRACKS, FARM, VEHICLE_DEPOT, NEIGHBORHOOD,
   checkFootprint, snapshotBuildingStructure,
   UNIT_TRAIN_COST,
 } from './Buildings';
@@ -79,6 +79,7 @@ const BUILDING_SPECS: Partial<Record<BuildingKind, BuildingSpec>> = {
   barracks: BARRACKS,
   farm: FARM,
   vehicle_depot: VEHICLE_DEPOT,
+  neighborhood: NEIGHBORHOOD,
 };
 
 export class RemoteAIClient {

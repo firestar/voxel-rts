@@ -3527,6 +3527,13 @@ export class Game {
       let localId = this.localUnitsByTag.get(tag);
       let u = localId !== undefined ? this.units.units.find(x => x.id === localId) : undefined;
       if (!u) {
+        // If the tag is already mapped to a local id but the unit is
+        // no longer in `this.units.units`, the local unit died and
+        // was swept. Do NOT resurrect — the server's stale entity
+        // would otherwise come back as a fresh, idle proxy and
+        // accumulate (e.g. supply trucks finishing a delivery and
+        // leaking back as task=idle phantoms past the per-HQ cap).
+        if (localId !== undefined) continue;
         // Server-originated entity — adopt with the spawn hook
         // suppressed so we don't echo a duplicate spawn back.
         u = this.adoptServerEntity(e) ?? undefined;

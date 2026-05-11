@@ -33,6 +33,7 @@ const BUILDING_COSTS = {
   barracks:      { metals: 40, wood: 40 },
   vehicle_depot: { metals: 70, wood: 50 },
   farm:          { metals: 20, wood: 30 },
+  neighborhood:  { metals: 30, wood: 60 },
 };
 
 // Unit training costs. Same caveat: client owns the canonical numbers
@@ -188,6 +189,7 @@ function decideActions(state, sessionId) {
     const anyFarms     = myBldgs.filter(b => b.kind === 'farm' && b.upgradeState !== 'cancelled');
     const liveDepots   = myBldgs.filter(b => b.kind === 'vehicle_depot' && b.upgradeState === 'enabled');
     const anyDepots    = myBldgs.filter(b => b.kind === 'vehicle_depot' && b.upgradeState !== 'cancelled');
+    const anyHoods     = myBldgs.filter(b => b.kind === 'neighborhood' && b.upgradeState !== 'cancelled');
 
     // Per-team budget: this HQ's faction has its own resource pool,
     // independent of any other AI faction. Two AIs can't drain a
@@ -209,11 +211,15 @@ function decideActions(state, sessionId) {
       return budget.food >= c.food && budget.metals >= c.metals && budget.wood >= c.wood;
     };
 
-    // Build order: 1 barracks → 2 farms → more barracks.
+    // Build order: 1 barracks → 2 farms → 1 neighborhood (pop cap)
+    // → vehicle depot → more barracks → more neighborhoods.
     // Each AI faction now competes from its own bank, so identical
     // build orders mean both sides scale forces in parallel.
+    // Pop cap is 10 + (alive civilians). Without a neighborhood the
+    // base stalls at 10 (6 workers + 4 combat), so the hood goes in
+    // before the depot to unlock troop scaling.
     const wantMoreBarracks = (anyBarracks.length === 0 && anyFarms.length === 0)
-                          || (anyBarracks.length < 3 && anyFarms.length >= 2);
+                          || (anyBarracks.length < 3 && anyFarms.length >= 2 && anyHoods.length >= 1);
     if (h.placeCooldown === 0 && wantMoreBarracks && canAffordBldg('barracks')) {
       actions.push({ type: 'place_building', kind: 'barracks', anchorHqId: hq.id });
       debit(BUILDING_COSTS.barracks);
@@ -222,10 +228,17 @@ function decideActions(state, sessionId) {
       actions.push({ type: 'place_building', kind: 'farm', anchorHqId: hq.id });
       debit(BUILDING_COSTS.farm);
       h.placeCooldown = 3.0;
-    } else if (h.placeCooldown === 0 && anyDepots.length === 0 && anyFarms.length >= 2 && canAffordBldg('vehicle_depot')) {
-      // Vehicle depot once the food economy is steady. Tanks do
-      // dramatically more damage to enemy HQs than infantry, so
-      // adding even one depot accelerates HQ destruction sharply.
+    } else if (h.placeCooldown === 0 && anyHoods.length < 2 && anyFarms.length >= 2 && canAffordBldg('neighborhood')) {
+      // Neighborhoods are the ONLY pop-cap source. Place up to two
+      // so the AI can field a real army (each tier-3 hood = +15 cap).
+      actions.push({ type: 'place_building', kind: 'neighborhood', anchorHqId: hq.id });
+      debit(BUILDING_COSTS.neighborhood);
+      h.placeCooldown = 3.0;
+    } else if (h.placeCooldown === 0 && anyDepots.length === 0 && anyHoods.length >= 1 && canAffordBldg('vehicle_depot')) {
+      // Vehicle depot once the food economy is steady and we have
+      // pop-cap room from the first neighborhood. Tanks do dramatically
+      // more damage to enemy HQs than infantry, so adding even one
+      // depot accelerates HQ destruction sharply.
       actions.push({ type: 'place_building', kind: 'vehicle_depot', anchorHqId: hq.id });
       debit(BUILDING_COSTS.vehicle_depot);
       h.placeCooldown = 3.0;
