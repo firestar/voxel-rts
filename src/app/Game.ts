@@ -3650,6 +3650,13 @@ export class Game {
     // hasn't processed despawn for. Refuse adoption to prevent the
     // phantom-unit class of bug.
     if (e.kind !== 'civilian') return null;
+    // Server entities persist across browser sessions (no per-stream
+    // cleanup yet). A new game session would otherwise adopt prior-
+    // session civilians whose owner was the OLD playerId, mapping
+    // them to the new player team and overflowing the civilian
+    // quota at t = 1 s. Skip any entity whose owner isn't a known
+    // team label AND doesn't match our current session's playerId.
+    if (e.owner !== 'enemy' && e.owner !== 'enemy2' && e.owner !== this.gameClient?.playerId) return null;
     const team: Team = e.owner === 'enemy' ? 'enemy' : e.owner === 'enemy2' ? 'enemy2' : 'player';
     const stance = team !== 'player' ? 'aggressive' : 'defensive';
     const u = this.units.spawn(
