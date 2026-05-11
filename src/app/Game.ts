@@ -959,10 +959,11 @@ export class Game {
 
   private spawnUnit(kind: UnitKind, x: number, y: number, z: number, team: Team = 'player'): Unit | null {
     ({ x, z } = this.safeSpawnXZ(x, z));
-    // Enemy production rolls out in aggressive stance so the unit
-    // immediately starts auto-engaging once it leaves the door.
-    const stance = team !== 'player' ? 'aggressive' : 'defensive';
-    return this.units.spawn(kind, x, y, z, { team, stance });
+    // Every team's barracks-produced units roll out aggressive in
+    // the AI-vs-AI loop — even the player slot is brain-driven, and
+    // the user requires its units to auto-engage too. Defensive
+    // stance is reserved for the user's manual hold-fire toggle.
+    return this.units.spawn(kind, x, y, z, { team, stance: 'aggressive' });
   }
 
   private spawnWorker(x: number, y: number, z: number): Unit | null {
