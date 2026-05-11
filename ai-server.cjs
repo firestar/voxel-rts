@@ -50,28 +50,22 @@ const UNIT_COSTS = {
 
 const BARRACKS_PRODUCES = ['soldier', 'gunner', 'rocket_soldier', 'mortar_soldier'];
 
-const TRAIN_INTERVAL_S = 0.50;
-// Counts ALL non-player units (workers + combat across both AI
-// factions). 200 leaves plenty of headroom — even at full barracks
-// throughput (5 buildings × 0.5 units/s = 2.5/s) the cap holds ~80 s
-// of continuous production, so the harness's drought rule almost
-// never trips for "nothing produced this second".
-const MAX_FIELDED_ENEMIES = 200;
-/** AUTO_ENGAGE_STOP_FRACTION mirrored from the client. The hunt-and-attack
- *  pass routes idle enemies toward player buildings and stops short at
- *  this fraction of the unit's weapon range so the projectile arc check
- *  has room to succeed. */
-// Was 0.65. Lowered to 0.30 so attacking units close to within
-// 30 % of weapon range of the HQ — at that range a soldier's
-// rifle reliably has LOS over the HQ wall voxels and shots land
-// on the structure itself. iter89 spent 250 s with the player HQ
-// dropping only ~90 HP because attackers loitered at 45 % range
-// and most shots clipped wall corners.
-const ATTACK_STOP_FRACTION = 0.30;
-/** Throttle hunt-and-attack so we don't slam the path worker. The
- *  client routes a unit and the path takes a beat to resolve; rerouting
- *  every 1 s is wasteful. */
-const ATTACK_RETARGET_S = 1.75;
+// Tournament-tunable parameters. Each parallel game gets a slightly
+// different env-var seed so we can compare AI variants head-to-head
+// and breed the winner forward into the next round.
+const env = process.env;
+const envNum = (name, fallback) => {
+  const v = env[name];
+  if (v === undefined) return fallback;
+  const n = Number.parseFloat(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+const TRAIN_INTERVAL_S = envNum('AI_TRAIN_INTERVAL_S', 0.50);
+const MAX_FIELDED_ENEMIES = envNum('AI_MAX_FIELDED', 200);
+const ATTACK_STOP_FRACTION = envNum('AI_ATTACK_STOP_FRACTION', 0.30);
+const ATTACK_RETARGET_S = envNum('AI_ATTACK_RETARGET_S', 1.75);
+const WORKER_TARGET = envNum('AI_WORKER_TARGET', 12);
+process.stderr.write(`[ai-server] params train=${TRAIN_INTERVAL_S} attack=${ATTACK_STOP_FRACTION} retarget=${ATTACK_RETARGET_S} workers=${WORKER_TARGET}\n`);
 
 function ensureSession(id) {
   let s = sessions.get(id);
@@ -356,7 +350,7 @@ function decideActions(state, sessionId) {
     // we hit WORKER_TARGET per team. Workers are cheap (30f / 0m /
     // 10w) so the metal economy isn't compromised even with several
     // queued in a row.
-    const WORKER_TARGET = 12;
+    // WORKER_TARGET is now env-tunable for the tournament.
     if (!trainBlocked && h.trainCooldown === 0 && liveBarracks.length > 0
         && myWorkers.length < WORKER_TARGET
         && canAffordUnitB('worker')) {
