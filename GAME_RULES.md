@@ -36,6 +36,12 @@ constraint the user has stated across the loop.
   presumes the unit has line-of-sight and weapon range to fire; if
   it's holding fire near a viable target, the AI / target picker /
   weapon arm has a bug and needs a code fix.
+- **Non-combat invulnerability** = a civilian or worker that stays
+  within 5 m of a firing enemy combat unit for > **5 s** without
+  losing any HP. Civilians and workers MUST be killable when an
+  enemy is actively shooting at them; sustained zero-damage exposure
+  indicates a broken damage pipeline. Fails the run as
+  `FAILURE_NONCOMBAT_INVULN` (exit code 11).
 - **Combat unit stuck** = `path.length > 0` AND no XZ movement for
   > **2 s**, *unless* it's firing OR within 3 m of its next waypoint
   ("at goal") OR in melee with an enemy combat unit (within 4 m).

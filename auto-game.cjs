@@ -205,6 +205,12 @@ async function main() {
       idleCombatFail: null,          // { id, kind, team, secs, enemyId, enemyKind, dist }
       idleCombatSince: new Map(),    // unitId → wall-clock seconds when "close to enemy + not firing" first observed
       civilianOverflowFail: null,    // { team, civilians, cap, neighborhoods }
+      // Per-noncombat-unit: track when an enemy combat unit first
+      // came into ≤5 m AND was firing toward it. If 5 s elapse with
+      // no HP drop on the target, fire FAILURE_NONCOMBAT_INVULN
+      // — civilians + workers must be killable by combat fire.
+      noncombatUnderFire: new Map(), // unitId → { sinceT, startHp }
+      noncombatInvulnFail: null,     // { id, kind, team, secs, attackerId, attackerKind }
       lastSampleAt: null,            // wall-clock of previous sample for rubberband Δ
       teleportFail: null,            // { id, kind, team, dist, from, to, at }
       hqWinner: null,                // first team to destroy an enemy HQ
@@ -448,6 +454,54 @@ async function main() {
           }
         }
 
+        // Civilian / worker invulnerability detection. If a combat
+        // unit is firing AND a non-combat unit (civilian or worker)
+        // sits ≤5 m from it for >= 5 s WITHOUT HP loss, the damage
+        // pipeline is broken — civilians and workers must be
+        // killable when actively shot at. Fires
+        // FAILURE_NONCOMBAT_INVULN.
+        if (u.kind === 'civilian' || u.kind === 'worker') {
+          const RANGE_M = 5.0;
+          const R2 = RANGE_M * RANGE_M;
+          let firingAttacker = null;
+          for (const o of us) {
+            if (o.team === u.team || o.hp <= 0) continue;
+            if (!opts.COMBAT_KINDS.includes(o.kind)) continue;
+            const dx = o.x - u.x, dz = o.z - u.z;
+            if (dx * dx + dz * dz > R2) continue;
+            // Treat the attacker as "firing in our direction" if it
+            // has any firing-state (firingTarget / fireCooldown /
+            // burst / autoEngageCooldown). Same broadened state the
+            // idle-combat rule uses.
+            const isAttFiring = o.firingTarget != null ||
+              o.fireCooldown > 0 ||
+              (o.burstShotsRemaining ?? 0) > 0 ||
+              (o.autoEngageCooldown ?? 0) > 0;
+            if (isAttFiring) { firingAttacker = o; break; }
+          }
+          if (firingAttacker) {
+            let track = state.noncombatUnderFire.get(u.id);
+            if (!track) {
+              track = { sinceT: now, startHp: u.hp, attackerId: firingAttacker.id, attackerKind: firingAttacker.kind };
+              state.noncombatUnderFire.set(u.id, track);
+            }
+            if (u.hp < track.startHp) {
+              // Damage landed; reset the timer so the rule only
+              // fires for SUSTAINED zero-damage exposure.
+              track.sinceT = now;
+              track.startHp = u.hp;
+            } else if (now - track.sinceT > 5.0 && !state.noncombatInvulnFail) {
+              state.noncombatInvulnFail = {
+                id: u.id, kind: u.kind, team: u.team,
+                secs: +(now - track.sinceT).toFixed(1),
+                attackerId: track.attackerId, attackerKind: track.attackerKind,
+              };
+            }
+          } else {
+            state.noncombatUnderFire.delete(u.id);
+          }
+        }
+
         // Truck delivery stall: a truck whose task has been stuck on
         // the same {kind, target} for too long.
         if (u.kind === 'supply_truck' && u.task && u.task.kind &&
@@ -681,6 +735,7 @@ async function main() {
         teleportFail: state.teleportFail,
         idleCombatFail: state.idleCombatFail,
         civilianOverflowFail: state.civilianOverflowFail,
+        noncombatInvulnFail: state.noncombatInvulnFail,
         hqWinner: state.hqWinner,
         hqWinnerAt: state.hqWinnerAt,
       };
@@ -720,6 +775,11 @@ async function main() {
     if (sample.civilianOverflowFail) {
       outcome = 'FAILURE_CIVILIAN_OVERFLOW';
       log(`FAILURE_CIVILIAN_OVERFLOW ${JSON.stringify(sample.civilianOverflowFail)}`);
+      break;
+    }
+    if (sample.noncombatInvulnFail) {
+      outcome = 'FAILURE_NONCOMBAT_INVULN';
+      log(`FAILURE_NONCOMBAT_INVULN ${JSON.stringify(sample.noncombatInvulnFail)}`);
       break;
     }
     // Negative-score bailout: as soon as the running score crosses
@@ -861,6 +921,7 @@ async function main() {
   if (outcome === 'FAILURE_NEGATIVE_SCORE') process.exit(8);
   if (outcome === 'FAILURE_IDLE_COMBAT') process.exit(9);
   if (outcome === 'FAILURE_CIVILIAN_OVERFLOW') process.exit(10);
+  if (outcome === 'FAILURE_NONCOMBAT_INVULN') process.exit(11);
   process.exit(6); // TIMEOUT or anything else doesn't count toward target
 }
 
