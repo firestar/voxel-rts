@@ -1372,12 +1372,14 @@ function buildingCenter(b) {
   return { x: cx, y: cy, z: cz };
 }
 
-function pickWanderTarget(home, allNeighborhoods) {
-  // Bias away from the civilian's home neighborhood when there's a
-  // choice — civilians visibly migrating between blocks reads better
-  // than them milling in their own lot.
-  const others = allNeighborhoods.filter(b => b.id !== home);
-  const pool = others.length > 0 ? others : allNeighborhoods;
+function pickWanderTarget(home, owner, allNeighborhoods) {
+  // Civilians only migrate between neighborhoods owned by their own
+  // team. Without this filter an enemy civilian could wander into
+  // a player neighborhood (or vice versa) and the user would see
+  // "other players' civilians spawning from player 1's hood".
+  const sameTeam = allNeighborhoods.filter(b => b.owner === owner);
+  const others = sameTeam.filter(b => b.id !== home);
+  const pool = others.length > 0 ? others : sameTeam;
   if (pool.length === 0) return null;
   const pick = pool[Math.floor(Math.random() * pool.length)];
   const c = buildingCenter(pick);
@@ -1628,7 +1630,7 @@ function tickCivilians(dt) {
       st.idleSeconds = Math.max(0, st.idleSeconds - dt);
       continue;
     }
-    const target = pickWanderTarget(st.homeBuildingId, neighborhoods);
+    const target = pickWanderTarget(st.homeBuildingId, civ.owner, neighborhoods);
     if (!target) continue;
     civ.path = [target];
     civ.target = { x: target.x, z: target.z };
