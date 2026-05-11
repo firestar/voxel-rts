@@ -4698,6 +4698,18 @@ export class Game {
           targetUnit = e; targetBuilding = null;
         }
       }
+      // Siege units (tanks, rocket trucks, rocket / mortar soldiers)
+      // treat enemy buildings as high-priority targets — they're the
+      // demolition tools, and the user wants them tearing structures
+      // down even with screening units in the way. Infantry without
+      // explosive weapons keeps the normal building threat (so they
+      // shoot enemy soldiers first per the units-first rule).
+      const isSiege = (
+        u.kind === 'tank' ||
+        u.kind === 'rocket_truck' ||
+        u.kind === 'rocket_soldier' ||
+        u.kind === 'mortar_soldier'
+      );
       for (const b of liveBuildings) {
         if (b.team === u.team) continue;
         const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_METERS;
@@ -4706,7 +4718,10 @@ export class Game {
         const d2 = dx * dx + dz * dz;
         if (d2 > range2) continue;
         const proximity = PROXIMITY_BONUS_MAX * Math.max(0, 1 - Math.sqrt(d2) / range);
-        const score = buildingThreatLevel(b) + proximity;
+        const buildingScore = isSiege
+          ? buildingThreatLevel(b) + 100
+          : buildingThreatLevel(b);
+        const score = buildingScore + proximity;
         if (score > bestScore) {
           bestScore = score;
           targetBuilding = b; targetUnit = null;
