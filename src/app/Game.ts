@@ -3641,15 +3641,15 @@ export class Game {
   private adoptServerEntity(e: { id: number; clientTag: string | null; kind: string; owner: string; x: number; y: number; z: number; hp: number }): Unit | null {
     if (!e.clientTag) return null;
     if (!UNIT_KINDS.includes(e.kind as Unit['kind'])) return null;
-    // Client-spawned-only kinds: supply trucks are dispatched by the
-    // local SupplyTrucks system, workers are seeded at game start and
-    // never originate on the server. Any "missing locally" entity of
-    // these kinds in a snapshot is a stale entity left over from a
-    // local death whose despawn round-trip is still in flight.
-    // Adopting it resurrects a fresh task=idle proxy and the team
-    // accumulates phantom units (e.g. iter81 ended with 12 player
-    // workers vs. the 6-worker seed).
-    if (e.kind === 'supply_truck' || e.kind === 'worker') return null;
+    // Per user rule: units must be built — no random server adoption
+    // for kinds that have a build path. Only `civilian` is genuinely
+    // server-originated (tickCivilians spawns them from neighborhoods).
+    // Everything else (workers, supply trucks, combat) is born from
+    // a client-side spawn (seed or barracks/depot production), so a
+    // "missing locally" snapshot entity is a stale corpse the server
+    // hasn't processed despawn for. Refuse adoption to prevent the
+    // phantom-unit class of bug.
+    if (e.kind !== 'civilian') return null;
     const team: Team = e.owner === 'enemy' ? 'enemy' : e.owner === 'enemy2' ? 'enemy2' : 'player';
     const stance = team !== 'player' ? 'aggressive' : 'defensive';
     const u = this.units.spawn(
