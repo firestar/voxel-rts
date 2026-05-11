@@ -300,17 +300,25 @@ function decideActions(state, sessionId) {
       const needMetals = Math.max(0, totalMetals - budget.metals);
       const needWood   = Math.max(0, totalWood   - budget.wood);
 
-      // Target focus counts: 2 farm always (food is per game rule),
-      // then split mine/chop based on shortfall. If neither resource
-      // is short, leave the rest on auto.
+      // Target focus counts. Food rarely runs out (a soldier costs 40
+      // food and farms tick a +60 bag every cycle), so once the team
+      // pool has more than a comfortable buffer we drop down to 1
+      // farm worker and put the freed worker on the metal/wood
+      // shortfall. Without this the AI ends up sitting on 5000+ food
+      // while metals/wood are dry — and combat-unit production stalls.
+      const FARM_FOOD_BUFFER = 800;
+      const wantFarm = budget.food > FARM_FOOD_BUFFER ? 1 : 2;
       let wantChop = 0, wantMine = 0;
+      const otherWorkers = 6 - wantFarm;
       if (needWood > 0 && needMetals > 0) {
-        wantChop = needWood >= needMetals ? 3 : 2;
-        wantMine = 6 - 2 /* farm */ - wantChop;
+        wantChop = needWood >= needMetals
+          ? Math.ceil(otherWorkers * 0.6)
+          : Math.floor(otherWorkers * 0.4);
+        wantMine = otherWorkers - wantChop;
       } else if (needWood > 0) {
-        wantChop = 4;
+        wantChop = otherWorkers;
       } else if (needMetals > 0) {
-        wantMine = 4;
+        wantMine = otherWorkers;
       }
       const haveFocus = (f) => myWorkers.filter(w => w.focus === f).length;
       const reassign = (toFocus, deficit) => {
@@ -332,9 +340,7 @@ function decideActions(state, sessionId) {
           }
         }
       };
-      // Keep 2 farm workers locked (game rule: only farm-focused
-      // workers tend farms).
-      reassign('farm', 2 - haveFocus('farm'));
+      reassign('farm', wantFarm - haveFocus('farm'));
       reassign('chop', wantChop - haveFocus('chop'));
       reassign('mine', wantMine - haveFocus('mine'));
     }
