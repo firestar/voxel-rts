@@ -249,7 +249,12 @@ async function main() {
         // than RUBBERBAND_M_PER_S × dt is the server snapping the
         // unit's position back, not real movement. Flag once and let
         // the harness fail the run.
-        if (prev && state.lastSampleAt != null && now - state.runStartedAt > opts.RUBBERBAND_WARMUP_S) {
+        // Civilians are server-driven (wander between neighborhoods)
+        // and their position is force-snapped from the snapshot every
+        // tick; a brief SSE hiccup can leave the local mirror catching
+        // up by tens of metres in one frame. They're not gameplay-
+        // critical for the AI-vs-AI loop, so skip them here.
+        if (u.kind !== 'civilian' && prev && state.lastSampleAt != null && now - state.runStartedAt > opts.RUBBERBAND_WARMUP_S) {
           const dt = now - state.lastSampleAt;
           const cap = opts.RUBBERBAND_M_PER_S * Math.max(dt, 0.1);
           if (moved > cap && !state.rubberFail) {
@@ -677,8 +682,12 @@ async function main() {
         units: us, buildings: bldgs, clusters,
         worldExtent: 384,
         scoreEvents: window.__autoState?.scoreEvents ?? [],
-        playerResources: g?.resources ? { food: g.resources.food, metals: g.resources.metals, wood: g.resources.wood } : null,
-        enemyResources: g?.enemyResources ? { food: g.enemyResources.food, metals: g.enemyResources.metals, wood: g.enemyResources.wood } : null,
+        playerResources: g?.resources ? { food: g.resources.food, metals: g.resources.metals, wood: g.resources.wood, popCap: g.resources.popCap } : null,
+        enemyResources: g?.enemyResources ? { food: g.enemyResources.food, metals: g.enemyResources.metals, wood: g.enemyResources.wood, popCap: g.enemyResources.popCap } : null,
+        enemy2Resources: g?.enemy2Resources ? { food: g.enemy2Resources.food, metals: g.enemy2Resources.metals, wood: g.enemy2Resources.wood, popCap: g.enemy2Resources.popCap } : null,
+        storageStockpiles: (g?.buildings?.buildings || []).filter(b => !b.destroyed && b.spec.kind === 'storage').map(b => ({
+          id: b.id, team: b.team, metals: b.stockpile.metals, wood: b.stockpile.wood,
+        })),
       };
     });
     const fs = require('fs');
