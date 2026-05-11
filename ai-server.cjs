@@ -65,7 +65,21 @@ const MAX_FIELDED_ENEMIES = envNum('AI_MAX_FIELDED', 200);
 const ATTACK_STOP_FRACTION = envNum('AI_ATTACK_STOP_FRACTION', 0.30);
 const ATTACK_RETARGET_S = envNum('AI_ATTACK_RETARGET_S', 1.75);
 const WORKER_TARGET = envNum('AI_WORKER_TARGET', 12);
-process.stderr.write(`[ai-server] params train=${TRAIN_INTERVAL_S} attack=${ATTACK_STOP_FRACTION} retarget=${ATTACK_RETARGET_S} workers=${WORKER_TARGET}\n`);
+/** How many combat units each base wants to keep within
+ *  DEFENDER_RADIUS_M of its own HQ before routing the rest out to
+ *  attack. Bigger value = more defensive. Tournament-tunable. */
+const DEFENDER_QUOTA = envNum('AI_DEFENDER_QUOTA', 4);
+const DEFENDER_RADIUS_M = envNum('AI_DEFENDER_RADIUS_M', 30);
+/** Stance: 'aggressive' team routes everything, 'defensive' keeps
+ *  DEFENDER_QUOTA*2 at home and waits for attacks, 'economic' delays
+ *  the first attack until anyFarms>=2 + anyHoods>=1 so the base has
+ *  finished building up before sending units out. Per-team override
+ *  via env (AI_STANCE_player / AI_STANCE_enemy / AI_STANCE_enemy2). */
+const STANCE_DEFAULT = env.AI_STANCE_DEFAULT || 'aggressive';
+function stanceForTeam(team) {
+  return env[`AI_STANCE_${team}`] || STANCE_DEFAULT;
+}
+process.stderr.write(`[ai-server] params train=${TRAIN_INTERVAL_S} attack=${ATTACK_STOP_FRACTION} retarget=${ATTACK_RETARGET_S} workers=${WORKER_TARGET} defenders=${DEFENDER_QUOTA} stance=${STANCE_DEFAULT}\n`);
 
 function ensureSession(id) {
   let s = sessions.get(id);
@@ -412,12 +426,53 @@ function decideActions(state, sessionId) {
     }
     console.log(`[ai-attack] enemyUnits=${enemyUnits.length} armed-idle=${armedIdle} tgts=${targets.length}`);
     if (enemyUnits.length > 0 && targets.length > 0) {
-      let skipFiring = 0, skipPath = 0, skipUnarmed = 0, skipNoBldg = 0, skipInRange = 0;
+      // Per-team home HQ for the defender-quota gate. Each combat unit
+      // within DEFENDER_RADIUS_M of its team's HQ counts as a "home
+      // defender"; we hold back the first DEFENDER_QUOTA per team.
+      // Economic stance also delays the FIRST attack until the
+      // build-out is mostly done (2 farms + 1 hood on the team).
+      const homeHqByTeam = {};
+      const defendersByTeam = {};
+      const buildoutByTeam = {};
+      for (const h of hqs) homeHqByTeam[h.team] = h;
+      for (const u of enemyUnits) {
+        if (!u || u.hp <= 0) continue;
+        const hq = homeHqByTeam[u.team];
+        if (!hq) continue;
+        const dx = u.x - hq.x, dz = u.z - hq.z;
+        if (dx * dx + dz * dz <= DEFENDER_RADIUS_M * DEFENDER_RADIUS_M) {
+          defendersByTeam[u.team] = (defendersByTeam[u.team] || 0) + 1;
+        }
+      }
+      for (const team of Object.keys(homeHqByTeam)) {
+        const teamBldgs = buildings.filter(b => b.team === team && !b.destroyed && b.upgradeState !== 'cancelled');
+        const f = teamBldgs.filter(b => b.kind === 'farm').length;
+        const h = teamBldgs.filter(b => b.kind === 'neighborhood').length;
+        buildoutByTeam[team] = (f >= 2 && h >= 1);
+      }
+
+      let skipFiring = 0, skipPath = 0, skipUnarmed = 0, skipNoBldg = 0, skipInRange = 0, skipDefender = 0, skipEconomic = 0;
       for (const u of enemyUnits) {
         if (!u || u.hp <= 0) continue;
         if (!u.armed) { skipUnarmed++; continue; }
         if (u.hasFiringTarget) { skipFiring++; continue; }
         if (u.pathLen > 0) { skipPath++; continue; }
+        // Stance gate. Defensive teams hold a larger garrison home;
+        // economic teams refuse to launch the first attack until the
+        // economy build-out is in (2 farms + 1 hood + barracks).
+        const stance = stanceForTeam(u.team);
+        const quota = stance === 'defensive' ? DEFENDER_QUOTA * 2 : DEFENDER_QUOTA;
+        const hq = homeHqByTeam[u.team];
+        if (hq) {
+          const dx = u.x - hq.x, dz = u.z - hq.z;
+          const atHome = dx * dx + dz * dz <= DEFENDER_RADIUS_M * DEFENDER_RADIUS_M;
+          if (atHome && (defendersByTeam[u.team] || 0) <= quota) {
+            skipDefender++; continue;
+          }
+        }
+        if (stance === 'economic' && !buildoutByTeam[u.team]) {
+          skipEconomic++; continue;
+        }
         // Prefer enemy HQs over other buildings — destroying an HQ
         // ends the game (HQ_WIN), so concentrating fire on HQ kinds
         // accelerates the win condition. Only fall back to "nearest
