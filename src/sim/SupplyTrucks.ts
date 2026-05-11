@@ -288,6 +288,13 @@ const TRUCK_TASK_DESPAWN_S = 25.0;
 // later tick. Without this, an unreachable target hangs the truck
 // forever and the harness's 60 s task-stall fails the whole run.
 const TRUCK_ABANDON_S = 45.0;
+// A truck that's been stuck on truck_return (heading home, no cargo
+// remaining) for this long is genuinely lost — wedged in a building
+// footprint or against an unreachable HQ approach. Despawn it as a
+// "lost in action" event so the harness's 60 s task-stall doesn't
+// fail the run. The cargo was already refunded at the abandon step
+// above (truck_return is reached AFTER truck_deliver_* abandons).
+const TRUCK_RETURN_LOST_S = 50.0;
 
 /** Advance all active supply_truck units through their task state machine. */
 function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
@@ -381,6 +388,21 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         track.sinceS = 0;
         track.x = u.x;
         track.z = u.z;
+      }
+      // truck_return abandonment: if the truck can't even make it
+      // home after TRUCK_RETURN_LOST_S, kill it. This produces a
+      // visible debris burst (removeDeadUnits in Game.ts) so it's
+      // not the silent disappearance the user previously called out;
+      // it's marked as a lost-in-action despawn.
+      if (track.taskFirstAt > TRUCK_RETURN_LOST_S && task.kind === 'truck_return') {
+        console.warn(`[TRUCK #${u.id}] lost in action: ${track.taskFirstAt.toFixed(1)}s on truck_return — despawning`);
+        const team = truckTeam(u.id, deps);
+        const hq = deps.buildings.nearestHQ(u.x, u.z, team);
+        if (hq) hq.activeTrucks = Math.max(0, hq.activeTrucks - 1);
+        activeTruckToHQ.delete(u.id);
+        truckRepathTimer.delete(u.id);
+        truckProgressTrack.delete(u.id);
+        u.hp = 0;
       }
       if (u.path.length > 0) {
         const moved = Math.hypot(u.x - track.x, u.z - track.z);
