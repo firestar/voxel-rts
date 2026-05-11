@@ -2073,6 +2073,21 @@ export class UnitManager {
    */
   private separateOverlappingUnits(nav: SurfaceNavBuffers): void {
     const units = this.units;
+    // Total per-tick separation push budget for each unit, in metres.
+    // Each pair push (below) deducts from these; once a unit's budget
+    // is spent its remaining overlaps are skipped (the next tick's
+    // separation pass resolves them). This caps the cumulative
+    // per-tick XZ contribution from separation to ≤ 1 voxel per unit,
+    // so a 5-peer crowd no longer sums into 0.5+ m of motion and
+    // misfires the 4-voxel teleport detector at end-of-tick.
+    const sepBudget = new Map<number, number>();
+    const budgetOf = (id: number): number => {
+      const v = sepBudget.get(id);
+      return v === undefined ? VOXEL_SIZE : v;
+    };
+    const debit = (id: number, amt: number): void => {
+      sepBudget.set(id, Math.max(0, budgetOf(id) - amt));
+    };
     for (let i = 0; i < units.length; i++) {
       const a = units[i]!;
       if (a.hp <= 0) continue;
@@ -2114,28 +2129,33 @@ export class UnitManager {
         // uninterrupted.
         const aChop = a.kind === 'worker' && a.task.kind === 'chop' && a.path.length === 0;
         const bChop = b.kind === 'worker' && b.task.kind === 'chop' && b.path.length === 0;
-        // Voxel-by-voxel rule: each unit's TOTAL per-tick XZ move
-        // must be ≤ 1 voxel. Track the existing displacement from
-        // the pre-tick position and only push by what's left in the
-        // budget. If the budget is exhausted, the push is skipped
-        // and the units stay overlapping for one more tick — the
-        // next tick's pass clears it.
-        // Voxel-by-voxel: each separation step ≤ 1 voxel.
-        const fullPushA = Math.min(overlap, VOXEL_SIZE);
-        const fullPushB = Math.min(overlap, VOXEL_SIZE);
-        const halfPushA = Math.min(overlap * 0.5, VOXEL_SIZE);
-        const halfPushB = Math.min(overlap * 0.5, VOXEL_SIZE);
+        const aBudget = budgetOf(a.id);
+        const bBudget = budgetOf(b.id);
+        // Per-pair clamp: ≤ overlap AND ≤ VOXEL_SIZE AND ≤ remaining
+        // per-unit budget. With a cumulative budget the dense-crowd
+        // 5-peer case can't push any one unit more than VOXEL_SIZE in
+        // a single tick.
+        const fullPushA = Math.min(overlap, VOXEL_SIZE, aBudget);
+        const fullPushB = Math.min(overlap, VOXEL_SIZE, bBudget);
+        const halfPushA = Math.min(overlap * 0.5, VOXEL_SIZE, aBudget);
+        const halfPushB = Math.min(overlap * 0.5, VOXEL_SIZE, bBudget);
         if (aChop && !bChop && bFullOk) {
           b.x += nx * fullPushB; b.z += nz * fullPushB;
+          debit(b.id, fullPushB);
         } else if (bChop && !aChop && aFullOk) {
           a.x -= nx * fullPushA; a.z -= nz * fullPushA;
+          debit(a.id, fullPushA);
         } else if (aOk && bOk) {
           a.x -= nx * halfPushA; a.z -= nz * halfPushA;
           b.x += nx * halfPushB; b.z += nz * halfPushB;
+          debit(a.id, halfPushA);
+          debit(b.id, halfPushB);
         } else if (aOk) {
           a.x -= nx * fullPushA; a.z -= nz * fullPushA;
+          debit(a.id, fullPushA);
         } else if (bOk) {
           b.x += nx * fullPushB; b.z += nz * fullPushB;
+          debit(b.id, fullPushB);
         }
         // Snap surface units to terrain so a push toward a rise doesn't bury
         // their feet. Diggers handle their own vertical positioning in tickVolume.
