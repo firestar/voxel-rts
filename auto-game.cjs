@@ -73,8 +73,15 @@ const SCORE = {
   // Per-second drought penalties — fire when a wall-clock second
   // ticks over without a fresh production event. Both can apply
   // simultaneously (no production at all → -100/s).
-  noUnitPerSec:     -50,
-  noMilitaryPerSec: -50,
+  // Per-second drought penalty. Was -50, but with the per-team pop
+  // cap (10 + civilians) and resource-bound production rates the AI
+  // pace tops out at ~1 combat unit every 7-10 s — drought at -50/s
+  // wiped 7-9k points over 150 s of constant gameplay (iter90/91).
+  // -10/s still flags genuinely idle AIs (one no-unit-1s minute
+  // costs 600 points) without making the rule alone the dominant
+  // score sink.
+  noUnitPerSec:     -10,
+  noMilitaryPerSec: -10,
 };
 
 const COMBAT_KINDS = [

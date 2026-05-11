@@ -75,11 +75,15 @@ constraint the user has stated across the loop.
   HP delta on a non-player target). Sample interval is 500 ms, so
   a unit absorbing multiple shots in one window counts as one hit
   event.
-- `−50/sec` per second after the **90 s startup grace** in which
+- `−10/sec` per second after the **90 s startup grace** in which
   no unit was created (`no-unit-1s`).
-- `−50/sec` per second after the 90 s grace in which no military
+- `−10/sec` per second after the 90 s grace in which no military
   unit was created (`no-military-1s`). Both can fire in the same
-  second (= `−100/sec`).
+  second (= `−20/sec`). Originally `−50/sec` each; lowered because
+  even a fully-engaged AI with three barracks + a vehicle depot
+  only produces one combat unit every 7-10 s under realistic gather
+  rates, and the original rule drained ~9 k score over a 150 s
+  window of perfectly normal gameplay.
 - A score below **0** ends the match (`FAILURE_NEGATIVE_SCORE`).
 
 ### Population
