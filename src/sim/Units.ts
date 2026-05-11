@@ -79,9 +79,15 @@ export const UNIT_THREAT: Record<UnitKind, number> = {
   aa_vehicle:     50,   // primarily anti-air; minor ground threat
   soldier:        50,
   dozer:          30,
-  worker:         15,
+  worker:         25,
   supply_truck:   8,
-  civilian:       4,
+  // Civilians are non-combat but the user wants them prioritised
+  // over buildings (HQ=10) so attacking soldiers actually shoot them
+  // when no harder target is in range. Sits between buildings and
+  // workers so a touching civilian still loses to a touching worker
+  // (workers gather, civilians don't directly contribute to the
+  // economy beyond the pop-cap they enable).
+  civilian:       18,
 };
 
 /**
