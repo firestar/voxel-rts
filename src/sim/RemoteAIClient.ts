@@ -126,10 +126,12 @@ export class RemoteAIClient {
   }
 
   private snapshot(deps: AIClientDeps): unknown {
-    // All non-player HQs are independent factions. The brain walks
-    // them per-base and treats every other team as a target.
+    // EVERY HQ is an independent AI faction now — the host has no
+    // human at the controls in this AI-vs-AI loop, so the player
+    // team's HQ is just another brain. Each HQ runs the same per-
+    // base logic with its own resource pool (resourcesForTeam).
     const hqs = deps.buildings.buildings.filter(
-      b => !b.destroyed && b.team !== 'player' && b.spec.kind === 'hq' && b.healthRefVoxels > 0,
+      b => !b.destroyed && b.spec.kind === 'hq' && b.healthRefVoxels > 0,
     );
     let enemyUnitCount = 0;
     const enemyUnits: Array<{
@@ -137,7 +139,7 @@ export class RemoteAIClient {
       armed: boolean; hasFiringTarget: boolean; pathLen: number;
     }> = [];
     for (const u of deps.units.units) {
-      if (u.team === 'player' || u.hp <= 0) continue;
+      if (u.hp <= 0) continue;
       enemyUnitCount++;
       if (u.kind === 'worker' || u.kind === 'civilian' || u.kind === 'supply_truck') continue;
       enemyUnits.push({
@@ -175,7 +177,7 @@ export class RemoteAIClient {
       z: +(((h.oz + h.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE)).toFixed(2),
     }));
     const enemyBuildings = deps.buildings.buildings
-      .filter(b => !b.destroyed && b.team !== 'player')
+      .filter(b => !b.destroyed)
       .map(b => {
         const bx = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
         const bz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
@@ -261,18 +263,24 @@ export class RemoteAIClient {
     const spec = BUILDING_SPECS[a.kind];
     if (!spec || !spec.upgradeCost) return;
     const cost = spec.upgradeCost;
-    if (deps.enemyResources.metals < cost.metals || deps.enemyResources.wood < cost.wood) return;
     let hq = a.anchorHqId !== undefined
       ? deps.buildings.buildings.find(
-          b => b.id === a.anchorHqId && !b.destroyed && b.team !== 'player' && b.spec.kind === 'hq',
+          b => b.id === a.anchorHqId && !b.destroyed && b.spec.kind === 'hq',
         )
       : undefined;
     if (!hq) {
       hq = deps.buildings.buildings.find(
-        b => !b.destroyed && b.team !== 'player' && b.spec.kind === 'hq',
+        b => !b.destroyed && b.spec.kind === 'hq',
       );
     }
     if (!hq) return;
+    // Per-team affordability check — each AI faction spends from its
+    // own pool. Falls back to enemyResources when the lookup isn't
+    // wired (test bench).
+    const teamRes = deps.resourcesForTeam
+      ? deps.resourcesForTeam(hq.team as 'player' | 'enemy' | 'enemy2')
+      : deps.enemyResources;
+    if (teamRes.metals < cost.metals || teamRes.wood < cost.wood) return;
     const placeTeam = hq.team;
     // Walk a ring of offsets out from the HQ door (+X face) until we
     // find a footprint the world accepts. Mirrors the player's

@@ -294,14 +294,21 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         truckProgressTrack.set(u.id, track);
       }
       track.taskFirstAt += dt;
-      // Time-on-task budget kicks in regardless of small-spurt progress.
-      // truck_return is exempt — getting back to the HQ is best-effort
-      // and not load-bearing for the harness's failure conditions.
+      // Per-task long-stall: only log + clear path; don't despawn.
+      // Despawning was visible to the player as trucks "randomly
+      // disappearing" mid-route (the despawn just zeros hp without
+      // an explosion or animation). Letting the truck keep
+      // retrying is less surprising; the harness's task-stall
+      // failure (60 s) will still flag a truly stuck task.
       if (track.taskFirstAt > TRUCK_TASK_DESPAWN_S && task.kind !== 'truck_return') {
-        console.warn(`[TRUCK #${u.id}] watchdog: ${track.taskFirstAt.toFixed(1)}s on ${task.kind} (${taskKey}) without completing — despawning to break loop`);
-        despawn(u, deps);
-        truckProgressTrack.delete(u.id);
-        continue;
+        if (track.taskFirstAt < TRUCK_TASK_DESPAWN_S + dt + 0.001) {
+          console.warn(`[TRUCK #${u.id}] watchdog: ${track.taskFirstAt.toFixed(1)}s on ${task.kind} (${taskKey}) without completing — clearing path (no despawn)`);
+        }
+        u.path = [];
+        truckRepathTimer.delete(u.id);
+        track.sinceS = 0;
+        track.x = u.x;
+        track.z = u.z;
       }
       if (u.path.length > 0) {
         const moved = Math.hypot(u.x - track.x, u.z - track.z);

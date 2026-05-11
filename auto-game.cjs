@@ -286,12 +286,31 @@ async function main() {
         if (hasPath && u.path[0]) {
           const wp = u.path[0];
           const wd = Math.hypot(wp.x - u.x, wp.z - u.z);
-          if (wd <= 1.5) atGoal = true;
+          // Was 1.5 m. Bumped to 3 m so a combat unit that arrived at
+          // its firing-line goal but hasn't acquired a target yet
+          // (or is jostling among a tight cluster) isn't flagged
+          // stuck before the AI's next retarget cycle (1.75 s).
+          if (wd <= 3.0) atGoal = true;
         }
         const isFiring = (isCombat && (u.firingTarget != null || u.fireCooldown > 0));
+        // In-melee exemption: combat units physically touching an
+        // enemy combat unit are about to fire (target acquisition is
+        // 60Hz async; the harness samples at 2Hz). Exempt from stuck
+        // so the unit isn't flagged for the inter-frame gap between
+        // arrival and trigger pull.
+        let inMelee = false;
+        if (isCombat && !isFiring) {
+          for (const o of us) {
+            if (o.id === u.id || o.hp <= 0) continue;
+            if (o.team === u.team) continue;
+            if (!opts.COMBAT_KINDS.includes(o.kind)) continue;
+            const dx = o.x - u.x, dz = o.z - u.z;
+            if (dx * dx + dz * dz < 4 * 4) { inMelee = true; break; }
+          }
+        }
         const watchingForStuck = isWorker
           ? !workerWorking
-          : (isCombat || isTruck) ? (hasPath && !isFiring && !atGoal)
+          : (isCombat || isTruck) ? (hasPath && !isFiring && !atGoal && !inMelee)
           : false;
         if (watchingForStuck && moved < opts.STUCK_MOVE_M) {
           if (!state.stuckSince.has(u.id)) state.stuckSince.set(u.id, now);

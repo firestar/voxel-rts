@@ -296,8 +296,16 @@ function decideActions(state, sessionId) {
         const distToTarget = Math.sqrt(bestD2);
         if (distToTarget <= stopRange) { skipInRange++; continue; }
         const scale = (distToTarget - stopRange) / distToTarget;
-        const goalX = u.x + (bestB.x - u.x) * scale;
-        const goalZ = u.z + (bestB.z - u.z) * scale;
+        // Add a per-unit jitter offset to the firing-line goal so
+        // multiple attackers don't stack on the same XZ — without
+        // this, several units routing to the same enemy HQ all chose
+        // the same goalX/Z and the post-move separation pass couldn't
+        // disentangle them within the harness STUCK budget.
+        const jitterRad = 1.5; // ~12 voxels of spread
+        const jx = ((u.id * 2654435761) >>> 0) / 0x100000000 * 2 - 1;
+        const jz = ((u.id * 40503) >>> 0) / 0x100000000 * 2 - 1;
+        const goalX = u.x + (bestB.x - u.x) * scale + jx * jitterRad;
+        const goalZ = u.z + (bestB.z - u.z) * scale + jz * jitterRad;
         actions.push({ type: 'route_unit', unitId: u.id, x: goalX, z: goalZ });
         routedThisCycle++;
       }
