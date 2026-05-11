@@ -1216,7 +1216,13 @@ export class UnitManager {
     // surface-follow Y projection rounding); anything beyond that is
     // a real teleport, the position is clamped, and the harness fails.
     const TELEPORT_M = 4 * VOXEL_SIZE;
-    const TELEPORT_M2 = TELEPORT_M * TELEPORT_M;
+    // Game rule says "anything past 4 voxels combined per tick is a
+    // teleport". Strict `>` would fire on a legitimate 4-voxel motion
+    // when float rounding adds a sub-millimetre to the magnitude.
+    // Compare against TELEPORT_M² with a tiny epsilon so an exact
+    // 4-voxel motion (forward + lateral + separation + reconcile slack
+    // = 0.5 m) sits at the threshold instead of just over it.
+    const TELEPORT_M2 = TELEPORT_M * TELEPORT_M + 1e-4;
     for (const u of this.units) {
       if (u.tickPrevX === undefined || u.tickPrevZ === undefined) continue;
       // Civilians are server-driven and don't run the local voxel-by-
