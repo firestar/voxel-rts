@@ -59,7 +59,12 @@ const RUBBERBAND_WARMUP_S = 5.0;
 
 // Scoring table.
 const SCORE = {
-  createSoldier: 2, createTank: 8, createAA: 100,
+  // Vehicle creation bonuses. Per user direction the AI is rewarded
+  // heavily for landing a tank / rocket truck / AA vehicle on the
+  // map because each is a force multiplier worth far more than the
+  // raw "unit was made" event. Air-defence wins the biggest single
+  // bonus since one AA vehicle covers an entire wing of the base.
+  createSoldier: 2, createTank: 1000, createRocketTruck: 2000, createAA: 5000,
   killTank: 90, killSoldier: 5, killRocket: 40,
   dieTank: -50, dieSoldier: -20, dieRocket: -10,
   aaInterceptProjectile: 1000,
@@ -231,7 +236,8 @@ async function main() {
               || u.kind === 'mortar_soldier') pts = SCORE.createSoldier;
           else if (u.kind === 'tank') pts = SCORE.createTank;
           else if (u.kind === 'aa_vehicle') pts = SCORE.createAA;
-          else if (u.kind === 'rocket_soldier' || u.kind === 'rocket_truck') pts = SCORE.createSoldier;
+          else if (u.kind === 'rocket_truck') pts = SCORE.createRocketTruck;
+          else if (u.kind === 'rocket_soldier') pts = SCORE.createSoldier;
           if (pts !== 0) {
             state.score += pts;
             state.scoreEvents.push({ at: now, team: u.team, ev: 'create', kind: u.kind, pts });

@@ -428,6 +428,11 @@ export interface ProjectileImpact {
    *  peak so a round can hurt enemies more than it hurts the map (e.g. turret
    *  shells). Defaults to 1 when the catalog entry omits the field. */
   terrainDamageScale: number;
+  /** Unit id of the shooter that emitted this projectile, or -1 when the
+   *  source is a building / unknown. Used by Game.ts to issue the
+   *  "defensive chain-fire" — allies near a hit defender retarget the
+   *  shooter. */
+  ownerId: number;
 }
 
 /**
@@ -984,6 +989,7 @@ export class ProjectileManager {
       hitRadiusMeters: cfg.hitRadiusMeters,
       directHitUnitId,
       terrainDamageScale: cfg.terrainDamageScale ?? 1,
+      ownerId: p.ownerId,
     });
   }
 }

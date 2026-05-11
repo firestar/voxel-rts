@@ -41,6 +41,7 @@ function makeImpact(
     hitRadiusMeters: cfg.hitRadiusMeters,
     directHitUnitId: -1,
     terrainDamageScale: cfg.terrainDamageScale ?? 1,
+    ownerId: -1,
   };
 }
 

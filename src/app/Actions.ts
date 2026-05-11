@@ -159,26 +159,30 @@ export function unitActionsFor(units: Unit[]): UnitAction[] {
   return UNIT_ACTIONS.filter(a => units.some(u => a.applicable(u)));
 }
 
-/** Per-kind keybind table for "Train X" actions on a barracks. */
+/** Per-kind keybind table for "Train X" actions on a barracks.
+ *  All keys live on the number row so they don't collide with the
+ *  WASD camera pan or worker-focus shortcuts.  rocket_truck /
+ *  aa_vehicle / supply_truck kept on letter keys (N, I, M) because
+ *  they live on right-hand side bindings the user is used to. */
 const TRAIN_KEYS: Record<UnitKind, { key: string; keyLabel: string }> = {
-  soldier:        { key: 'KeyQ', keyLabel: 'Q' },
-  sniper:         { key: 'KeyA', keyLabel: 'A' },
-  gunner:         { key: 'KeyS', keyLabel: 'S' },
-  mortar_soldier: { key: 'KeyD', keyLabel: 'D' },
-  rocket_soldier: { key: 'KeyF', keyLabel: 'F' },
-  tank:           { key: 'KeyR', keyLabel: 'R' },
-  tunneler:       { key: 'KeyT', keyLabel: 'T' },
-  worm:           { key: 'KeyY', keyLabel: 'Y' },
-  dozer:          { key: 'KeyU', keyLabel: 'U' },
-  worker:         { key: 'KeyO', keyLabel: 'O' },
-  rocket_truck:   { key: 'KeyN', keyLabel: 'N' },
-  aa_vehicle:     { key: 'KeyI', keyLabel: 'I' },
-  supply_truck:   { key: 'KeyM', keyLabel: 'M' },
+  soldier:        { key: 'Digit1', keyLabel: '1' },
+  sniper:         { key: 'Digit2', keyLabel: '2' },
+  gunner:         { key: 'Digit3', keyLabel: '3' },
+  mortar_soldier: { key: 'Digit4', keyLabel: '4' },
+  rocket_soldier: { key: 'Digit5', keyLabel: '5' },
+  tank:           { key: 'Digit6', keyLabel: '6' },
+  tunneler:       { key: 'Digit7', keyLabel: '7' },
+  worm:           { key: 'Digit8', keyLabel: '8' },
+  dozer:          { key: 'Digit9', keyLabel: '9' },
+  worker:         { key: 'Digit0', keyLabel: '0' },
+  rocket_truck:   { key: 'KeyN',   keyLabel: 'N' },
+  aa_vehicle:     { key: 'KeyI',   keyLabel: 'I' },
+  supply_truck:   { key: 'KeyM',   keyLabel: 'M' },
   // Civilians aren't manually trained — they auto-spawn from neighborhoods.
   // Defined here only to satisfy the `Record<UnitKind, …>` shape; the
   // train-action filter never surfaces a button for `civilian` because
   // no building's `produces` list includes it.
-  civilian:       { key: 'KeyM', keyLabel: 'M' },
+  civilian:       { key: 'KeyM',   keyLabel: 'M' },
 };
 
 function trainAction(kind: UnitKind): BuildingAction {
@@ -224,9 +228,12 @@ export const BUILDING_ACTIONS: BuildingAction[] = [
   },
   {
     id: 'waypoint-aggressive',
+    // Moved off KeyW (WASD camera pan collision). KeyB is adjacent to
+    // the V/B/N cluster so the user's right hand can hit it without
+    // leaving the WASD home position.
     label: 'Set waypoint: Aggressive',
-    key: 'KeyW',
-    keyLabel: 'W',
+    key: 'KeyB',
+    keyLabel: 'B',
     applicable: (b) => b.spec.produces.length > 0,
     run: (_b, ctx): void => { ctx.enterWaypointMode('aggressive'); },
   },

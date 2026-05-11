@@ -2980,6 +2980,11 @@ export class Game {
     if (!this.input.rmbHold) return false;
     const sel = this.units.units.find(u => u.selected);
     if (!sel || sel.weapon === null) return false;
+    // AA vehicles fire automatically at incoming projectiles (the
+    // tickAAVehicles pass picks targets each frame). The player
+    // shouldn't be able to manually right-click-fire them — per
+    // user direction their gun stays on auto-intercept duty only.
+    if (sel.kind === 'aa_vehicle') return false;
     return true;
   }
 
@@ -3474,6 +3479,40 @@ export class Game {
     });
   }
 
+  /** When a unit takes a direct hit, rally allies in defensive stance
+   *  to fire on the shooter. Both the victim itself (if defensive) and
+   *  every same-team peer within DEFENSIVE_RALLY_RADIUS_M retargets
+   *  the attacker. Aggressive-stance units already pick their own
+   *  priority via tickAggressiveStance and aren't touched. Units that
+   *  already have a closer / higher-threat target keep it — we only
+   *  overwrite an empty firingTarget. */
+  private applyDefensiveChainFire(victim: Unit, attackerId: number): void {
+    if (attackerId < 0) return;
+    const attacker = this.units.units.find(u => u.id === attackerId);
+    if (!attacker || attacker.hp <= 0) return;
+    if (attacker.team === victim.team) return;
+    const ax = attacker.x;
+    const ay = attacker.y + Math.max(0.7, attacker.widthMeters * 0.6);
+    const az = attacker.z;
+    const DEFENSIVE_RALLY_RADIUS_M = 8.0;
+    const r2 = DEFENSIVE_RALLY_RADIUS_M * DEFENSIVE_RALLY_RADIUS_M;
+    for (const peer of this.units.units) {
+      if (peer.hp <= 0) continue;
+      if (peer.team !== victim.team) continue;
+      if (peer.weapon === null) continue;
+      if (peer.stance !== 'defensive') continue;
+      if (peer.firingTarget) continue;
+      // The victim itself counts as in-range by definition.
+      if (peer.id !== victim.id) {
+        const dx = peer.x - victim.x;
+        const dz = peer.z - victim.z;
+        if (dx * dx + dz * dz > r2) continue;
+      }
+      peer.firingTarget = { x: ax, y: ay, z: az };
+      peer.autoEngageCooldown = 0.25;
+    }
+  }
+
   /** Phase 6: log a sphere voxel mutation with the server so the
    *  authoritative edit log captures every projectile crater. We
    *  send the sphere centre + radius (cheap O(1) bytes) rather than
@@ -3776,6 +3815,12 @@ export class Game {
       if (hit) {
         hit.hp -= imp.hitDamage;
         this.mirrorEntityDamage(hit.id, imp.hitDamage);
+        // Defensive chain-fire: when a defender takes a hit, allies
+        // within rallyRadius retarget the shooter. Only fires in
+        // defensive stance — aggressive units already pick their own
+        // priority via tickAggressiveStance. Hits the targeted unit
+        // itself too (it stops being passive once shot at).
+        this.applyDefensiveChainFire(hit, imp.ownerId);
       }
     }
     // Building damage. Direct-hit (impact lands inside a footprint AABB)
@@ -4596,34 +4641,19 @@ export class Game {
   private tickAggressiveStance(dt: number): void {
     const liveUnits = this.units.units.filter(u => u.hp > 0);
     const liveBuildings = this.buildings.buildings.filter(b => !b.destroyed);
-    // Phase 4.3b: reconcile server-side weapon arming for every
-    // mirrored unit. If the unit is in aggressive stance and has a
-    // weapon, the server should be firing it; we send arm_unit on
-    // first transition. Hold-fire / no-weapon → disarm_unit. Issued
-    // only on transitions, so steady-state cost is zero.
+    // Per the AI-vs-AI loop user direction: every team — including
+    // the player slot — runs the LOCAL auto-engage logic for shooting
+    // + arc-walk around obstructed targets. Disarm any unit that the
+    // server is still firing for so it falls back to the local path.
     if (this.zeroTrustEnabled && this.gameClient) {
       for (const u of this.units.units) {
-        if (!this.mirroredUnitIds.has(u.id)) continue;
-        // Server-side firing currently only fires for player-team
-        // entities. Letting enemy AI units be added to
-        // `serverArmedUnitIds` makes the local engage pass skip them
-        // (it expects the server to fire), but the server won't.
-        // Net: enemy aggression silently dies.  Keep enemies on the
-        // local firing path.
-        if (u.team !== 'player') continue;
-        const eligible = u.hp > 0 && u.weapon !== null && u.stance === 'aggressive';
-        const armed = this.serverArmedUnitIds.has(u.id);
-        if (eligible && !armed) {
-          this.sendArmUnit(u);
-          this.serverArmedUnitIds.add(u.id);
-        } else if (!eligible && armed) {
-          this.gameClient.send({
-            type: 'disarm_unit',
-            clientTag: this.unitClientTag(u.id),
-            owner: this.gameClient.playerId,
-          });
-          this.serverArmedUnitIds.delete(u.id);
-        }
+        if (!this.serverArmedUnitIds.has(u.id)) continue;
+        this.gameClient.send({
+          type: 'disarm_unit',
+          clientTag: this.unitClientTag(u.id),
+          owner: u.team !== 'player' ? u.team : this.gameClient.playerId,
+        });
+        this.serverArmedUnitIds.delete(u.id);
       }
     }
     for (const u of this.units.units) {
