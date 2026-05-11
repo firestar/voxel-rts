@@ -336,6 +336,18 @@ function decideActions(state, sessionId) {
     // for the neighborhood we need to break out of the cap). Pause
     // training until the hood lands and pop opens up.
     const trainBlocked = popPressure && teamPop >= teamPopCap;
+    // Tank production first: an HQ kill takes a long time with rifles
+    // (~5 DPS each vs. 3000 HP), but a tank shell crushes wall voxels
+    // and the +90 score on a tank kill is the biggest single
+    // contributor we can earn. Spend metals on tanks before infantry
+    // when a depot is online.
+    if (!trainBlocked && liveDepots.length > 0 && canAffordUnitB('tank')) {
+      const depot = liveDepots.find(b => (b.trainQueueLen ?? 0) < 2) || liveDepots[0];
+      if ((depot.trainQueueLen ?? 0) < 2) {
+        actions.push({ type: 'queue_train', buildingId: depot.id, unitKind: 'tank' });
+        debit(UNIT_COSTS.tank);
+      }
+    }
     if (!trainBlocked && h.trainCooldown === 0 && state.enemyUnitCount < MAX_FIELDED_ENEMIES && liveBarracks.length > 0) {
       const target = liveBarracks.find(b => (b.trainQueueLen ?? 0) < 4) || liveBarracks[0];
       for (let i = 0; i < BARRACKS_PRODUCES.length; i++) {
@@ -347,16 +359,6 @@ function decideActions(state, sessionId) {
         h.pickIndex = idx + 1;
         h.trainCooldown = TRAIN_INTERVAL_S;
         break;
-      }
-    }
-    // Queue a tank at the depot when one's online and we can afford
-    // it. Tanks do massive damage to HQs (90 kill bonus + heavy
-    // shells), so even one in the field accelerates HQ destruction.
-    if (!trainBlocked && liveDepots.length > 0 && canAffordUnitB('tank')) {
-      const depot = liveDepots.find(b => (b.trainQueueLen ?? 0) < 2) || liveDepots[0];
-      if ((depot.trainQueueLen ?? 0) < 2) {
-        actions.push({ type: 'queue_train', buildingId: depot.id, unitKind: 'tank' });
-        debit(UNIT_COSTS.tank);
       }
     }
   }
