@@ -190,6 +190,7 @@ async function main() {
       rubberFail: null,              // { id, kind, team, dist, dt }
       idleCombatFail: null,          // { id, kind, team, secs, enemyId, enemyKind, dist }
       idleCombatSince: new Map(),    // unitId → wall-clock seconds when "close to enemy + not firing" first observed
+      civilianOverflowFail: null,    // { team, civilians, cap, neighborhoods }
       lastSampleAt: null,            // wall-clock of previous sample for rubberband Δ
       teleportFail: null,            // { id, kind, team, dist, from, to, at }
       hqWinner: null,                // first team to destroy an enemy HQ
@@ -594,6 +595,39 @@ async function main() {
         }
       }
 
+      // Civilian quota audit. Per game rule a tier-N neighborhood
+      // (N = expand_tier + 1, 1..3) hosts at most N×5 civilians, so
+      // per team: max civilians = Σ (expand_tier + 1) × 5 over live
+      // enabled neighborhoods. Exceeding the cap means the server's
+      // civilian spawner ignored its quota — that's a game-rule
+      // violation, fail the run.
+      {
+        const civsByTeam = new Map();
+        for (const u of us) {
+          if (u.hp <= 0 || u.kind !== 'civilian') continue;
+          civsByTeam.set(u.team, (civsByTeam.get(u.team) || 0) + 1);
+        }
+        const capByTeam = new Map();
+        const hoodsByTeam = new Map();
+        for (const b of bldgs) {
+          if (b.destroyed) continue;
+          if (b.spec?.kind !== 'neighborhood') continue;
+          if (b.upgradeState && b.upgradeState !== 'enabled') continue;
+          const tier = (b.upgradeTracks?.expand ?? 0) + 1;
+          capByTeam.set(b.team, (capByTeam.get(b.team) || 0) + tier * 5);
+          hoodsByTeam.set(b.team, (hoodsByTeam.get(b.team) || 0) + 1);
+        }
+        for (const [team, count] of civsByTeam) {
+          const cap = capByTeam.get(team) || 0;
+          if (count > cap && !state.civilianOverflowFail) {
+            state.civilianOverflowFail = {
+              team, civilians: count, cap,
+              neighborhoods: hoodsByTeam.get(team) || 0,
+            };
+          }
+        }
+      }
+
       state.lastSampleAt = now;
       // Teleport audit comes straight from the sim — UnitManager
       // captures pre-tick XZ and flags any per-tick jump > 4 voxels.
@@ -619,6 +653,7 @@ async function main() {
         rubberFail: state.rubberFail,
         teleportFail: state.teleportFail,
         idleCombatFail: state.idleCombatFail,
+        civilianOverflowFail: state.civilianOverflowFail,
         hqWinner: state.hqWinner,
         hqWinnerAt: state.hqWinnerAt,
       };
@@ -653,6 +688,11 @@ async function main() {
     if (sample.idleCombatFail) {
       outcome = 'FAILURE_IDLE_COMBAT';
       log(`FAILURE_IDLE_COMBAT ${JSON.stringify(sample.idleCombatFail)}`);
+      break;
+    }
+    if (sample.civilianOverflowFail) {
+      outcome = 'FAILURE_CIVILIAN_OVERFLOW';
+      log(`FAILURE_CIVILIAN_OVERFLOW ${JSON.stringify(sample.civilianOverflowFail)}`);
       break;
     }
     // Negative-score bailout: as soon as the running score crosses
@@ -793,6 +833,7 @@ async function main() {
   if (outcome === 'FAILURE_NO_COMBAT') process.exit(2);
   if (outcome === 'FAILURE_NEGATIVE_SCORE') process.exit(8);
   if (outcome === 'FAILURE_IDLE_COMBAT') process.exit(9);
+  if (outcome === 'FAILURE_CIVILIAN_OVERFLOW') process.exit(10);
   process.exit(6); // TIMEOUT or anything else doesn't count toward target
 }
 

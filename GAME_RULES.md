@@ -112,6 +112,12 @@ constraint the user has stated across the loop.
 - An AI brain that's within 2 slots of its cap drops everything else
   to build (or `expand_neighborhood`-upgrade) a hood. Pop-cap relief
   outranks the barracks → farm → depot order while the squeeze is on.
+- Per team the live civilian count must NEVER exceed the sum of
+  `tier × 5` over its live `enabled` neighborhoods (tier = 1 for a
+  newly placed hood, +1 per `expand_neighborhood` upgrade, capped at
+  3 → 15 civilians per fully-upgraded hood). Going over fires
+  `FAILURE_CIVILIAN_OVERFLOW` (exit code 10) — the server's civilian
+  spawner has bypassed its quota.
 
 ### Supply trucks
 
