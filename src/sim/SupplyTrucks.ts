@@ -145,6 +145,7 @@ function pickApproach(b: Building, fromX: number, fromZ: number, deps: SupplyTru
 
 export function tickSupplyTrucks(dt: number, deps: SupplyTruckDeps): void {
   reconcileCombatKills(deps);
+  reconcileActiveTruckCount(deps);
   tickRebuildQueues(dt, deps);
   tickActiveTrucks(deps, dt);
   for (const [hqId, c] of hqLaunchCooldown) {
@@ -165,6 +166,28 @@ export function tickSupplyTrucks(dt: number, deps: SupplyTruckDeps): void {
   dispatchResupplyTrucks(deps);
   dispatchUpgradeTrucks(deps);
   dispatchUpgradeRecoveryTrucks(deps);
+}
+
+/**
+ * Recompute `hq.activeTrucks` from the live truck fleet each tick. The
+ * watchdog no longer despawns stalled trucks (despawn was visible as
+ * "trucks randomly disappearing"), so the per-HQ counter could drift
+ * upward when a truck got stuck and never reached its decrement path.
+ * Counting alive trucks per HQ here is the ground truth the dispatcher
+ * cap check needs.
+ */
+function reconcileActiveTruckCount(deps: SupplyTruckDeps): void {
+  const liveByHq = new Map<number, number>();
+  for (const u of deps.units.units) {
+    if (u.kind !== 'supply_truck' || u.hp <= 0) continue;
+    const hqId = activeTruckToHQ.get(u.id);
+    if (hqId === undefined) continue;
+    liveByHq.set(hqId, (liveByHq.get(hqId) ?? 0) + 1);
+  }
+  for (const b of deps.buildings.buildings) {
+    if (b.spec.kind !== 'hq') continue;
+    b.activeTrucks = liveByHq.get(b.id) ?? 0;
+  }
 }
 
 /**

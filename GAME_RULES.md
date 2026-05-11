@@ -82,6 +82,33 @@ constraint the user has stated across the loop.
   second (= `−100/sec`).
 - A score below **0** ends the match (`FAILURE_NEGATIVE_SCORE`).
 
+### Population
+
+- Every team has its own population cap. The cap **only** comes from
+  neighborhoods: each alive civilian (spawned from a neighborhood
+  house) adds +1, so a tier-3 neighborhood (3 houses) tops up at +15.
+  No other building type contributes — barracks, vehicle depots,
+  HQs, etc. do NOT raise the cap.
+- The cap starts at **10** per team so a fresh base can field its
+  starter units.
+- `popHasRoom` gates production for **every** team, including the
+  player slot in the AI-vs-AI loop. An AI faction without
+  neighborhoods stalls at 10 population — it can't barracks-spam its
+  way past the cap.
+
+### Supply trucks
+
+- Each HQ has at most **5 active supply trucks** (`spec.maxTrucks`,
+  bumped only by the `trucks` upgrade track at +5/tier).
+- The dispatcher reconciles `hq.activeTrucks` from the live truck
+  fleet at the start of every dispatch tick. A stalled truck whose
+  watchdog cleared its path still counts toward the cap until it
+  finishes or dies — the counter cannot drift upward over a long
+  run.
+- The watchdog never despawns trucks (despawn is visible to the
+  player as a unit "randomly disappearing"). Trucks die only from
+  HP→0 from real damage or from successful task completion.
+
 ### Building rules
 
 - HQ has **3000 HP**. Cannot be lowered to "speed up wins."

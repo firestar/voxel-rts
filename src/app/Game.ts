@@ -504,18 +504,17 @@ export class Game {
 
     this.buildings.spawner = (kind, x, y, z, b): Unit | null => this.spawnUnit(kind, x, y, z, b.team);
     this.buildings.popHasRoom = (kind, b): boolean => {
-      // Enemy production has no popcap gate — the AI manages its own
-      // fielded count via the `MAX_FIELDED_ENEMIES` ceiling on the
-      // server side. Skipping the player's cap here keeps an enemy
-      // barracks producing even after the player's pop fills.
-      if (b.team !== 'player') return true;
+      // Every team — player, enemy, enemy2 — is rate-gated by its own
+      // population cap. The cap comes from neighborhoods (via the
+      // civilians they spawn); no other building type contributes.
       const cost = UNIT_POP_COST[kind] ?? 1;
       let used = 0;
       for (const u of this.units.units) {
-        if (u.team !== 'player' || u.hp <= 0) continue;
+        if (u.team !== b.team || u.hp <= 0) continue;
         used += UNIT_POP_COST[u.kind] ?? 1;
       }
-      return used + cost <= (this.resources.popCap ?? 0);
+      const cap = this.resourcesForTeam(b.team).popCap ?? 0;
+      return used + cost <= cap;
     };
     this.buildings.afterSpawn = (unit, building): void => {
       if (!building.rallyPoint) return;
@@ -971,6 +970,37 @@ export class Game {
     return this.units.spawn('worker', x, y, z);
   }
 
+  /** Total UNIT_POP_COST for one team's alive non-truck units. Supply
+   *  trucks are infrastructure and don't count against the cap. */
+  private populationUsedFor(team: import('../sim/Buildings').BuildingTeam): number {
+    let used = 0;
+    for (const u of this.units.units) {
+      if (u.team !== team || u.hp <= 0) continue;
+      used += UNIT_POP_COST[u.kind] ?? 1;
+    }
+    return used;
+  }
+
+  /** Recompute popCap for every team. The only contribution beyond the
+   *  10-unit bootstrap is +1 per alive civilian — civilians spawn from
+   *  neighborhood houses (tier × 5 per neighborhood), so neighborhoods
+   *  are the only building type that raises the cap. Barracks etc. do
+   *  NOT add population — they only train units. */
+  private recomputePopulationCaps(): void {
+    const teams: ReadonlyArray<import('../sim/Buildings').BuildingTeam> =
+      ['player', 'enemy', 'enemy2'];
+    const civiliansBy = new Map<string, number>();
+    for (const u of this.units.units) {
+      if (u.hp <= 0) continue;
+      if (u.kind !== 'civilian') continue;
+      civiliansBy.set(u.team, (civiliansBy.get(u.team) ?? 0) + 1);
+    }
+    for (const team of teams) {
+      const r = this.resourcesForTeam(team);
+      r.popCap = 10 + (civiliansBy.get(team) ?? 0);
+    }
+  }
+
   private debugLogTimer = 0;
   private debugLogResources(dt: number): void {
     this.debugLogTimer -= dt;
@@ -1274,6 +1304,7 @@ export class Game {
           return true;
         },
       });
+      this.recomputePopulationCaps();
       this.debugLogResources(dt);
       // Phase 5b: server is canonical for sapling maturation under
       // zero-trust; the broadcast voxel_edit lands in our voxel
@@ -1419,39 +1450,8 @@ export class Game {
       if (this.resMetalsEl) this.resMetalsEl.textContent = `${r.metals | 0}`;
       if (this.resWoodEl)   this.resWoodEl.textContent   = `${r.wood | 0}`;
       if (this.resPopEl) {
-        // Supply trucks are infrastructure, not population — they spawn,
-        // ferry, and despawn automatically and shouldn't eat into the
-        // player's pop budget. Other units consume their UNIT_POP_COST
-        // slot count (a tank is 5, a soldier is 1, etc.) so heavy armour
-        // stacks correctly against the player's cap.
-        let friendly = 0;
-        for (const u of this.units.units) {
-          if (u.team !== 'player' || u.hp <= 0) continue;
-          friendly += UNIT_POP_COST[u.kind] ?? 1;
-        }
-        // PopCap = 10 bootstrap + barracks contribution + one slot for
-        // every alive civilian. Neighborhoods set their per-house quota
-        // (`tier × 5`) inside CivilianSystem; the cap rises one tick at a
-        // time as those civilians actually spawn in. A death drops the
-        // count by 1 (cap drops by 1) and the neighborhood queues a
-        // short-cooldown replacement that brings it back up.
-        let cap = 10; // bootstrap
-        let liveCivilians = 0;
-        for (const u of this.units.units) {
-          if (u.team !== 'player' || u.hp <= 0) continue;
-          if (u.kind === 'civilian') liveCivilians++;
-        }
-        cap += liveCivilians;
-        for (const b of this.buildings.buildings) {
-          if (b.destroyed) continue;
-          if (b.healthRefVoxels <= 0) continue;
-          if (b.spec.kind === 'barracks') {
-            // Each barracks bunkhouse: 25 base + 10 per `barracks_expand` upgrade
-            // (up to 2 upgrades = 45 max per barracks).
-            cap += 25 + (b.upgradeTracks.barracks_expand ?? 0) * 10;
-          }
-        }
-        this.resources.popCap = cap;
+        const friendly = this.populationUsedFor('player');
+        const cap = this.resources.popCap ?? 0;
         this.resPopEl.textContent = `${friendly} / ${cap}`;
       }
       // Top-right age cluster: HQ tier as Roman numeral + a flavour name +
