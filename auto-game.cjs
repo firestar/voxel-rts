@@ -331,7 +331,20 @@ async function main() {
           // stuck before the AI's next retarget cycle (1.75 s).
           if (wd <= 3.0) atGoal = true;
         }
-        const isFiring = (isCombat && (u.firingTarget != null || u.fireCooldown > 0));
+        // "Firing" covers any state where the trigger has been pulled
+        // or the weapon hasn't cycled yet:
+        //   - firingTarget set → about to fire next tick
+        //   - fireCooldown > 0 → just fired, reloading
+        //   - burstShotsRemaining > 0 → mid-burst (gunner / mortar)
+        //   - autoEngageCooldown > 0 → just locked + fired (0.25 s)
+        // Without burst / autoEngage in the check, a soldier mid-
+        // reload reads as "idle" and trips FAILURE_IDLE_COMBAT.
+        const isFiring = (isCombat && (
+          u.firingTarget != null ||
+          u.fireCooldown > 0 ||
+          (u.burstShotsRemaining ?? 0) > 0 ||
+          (u.autoEngageCooldown ?? 0) > 0
+        ));
         // In-melee exemption: combat units physically touching an
         // enemy combat unit are about to fire (target acquisition is
         // 60Hz async; the harness samples at 2Hz). Exempt from stuck
