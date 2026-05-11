@@ -33,7 +33,8 @@ export type AiAction =
   | { type: 'place_building'; kind: BuildingKind; anchorHqId?: number }
   | { type: 'queue_train'; buildingId: number; unitKind: UnitKind }
   | { type: 'route_unit'; unitId: number; x: number; z: number }
-  | { type: 'set_worker_focus'; workerId: number; focus: WorkerFocus };
+  | { type: 'set_worker_focus'; workerId: number; focus: WorkerFocus }
+  | { type: 'upgrade_building'; buildingId: number; upgradeId: string };
 
 export interface AIClientDeps {
   units: UnitManager;
@@ -202,6 +203,7 @@ export class RemoteAIClient {
           x: +bx.toFixed(2),
           z: +bz.toFixed(2),
           anchorHqId: hi >= 0 ? enemyHqs[hi]!.id : null,
+          expandTier: b.upgradeTracks.expand ?? 0,
         };
       });
     // Targets from every AI's perspective: all live buildings the AI
@@ -224,14 +226,23 @@ export class RemoteAIClient {
     // Per-team resource pools so the brain can budget each AI's
     // spending separately. Falls back to a single shared pool when
     // resourcesForTeam isn't wired (test bench).
-    const teamResources: Record<string, { food: number; metals: number; wood: number }> = {};
+    const teamResources: Record<string, { food: number; metals: number; wood: number; popCap: number }> = {};
     for (const h of enemyHqs) {
       const r = deps.resourcesForTeam ? deps.resourcesForTeam(h.team as 'player' | 'enemy' | 'enemy2') : deps.enemyResources;
       teamResources[h.team] = {
         food: r.food | 0,
         metals: r.metals | 0,
         wood: r.wood | 0,
+        popCap: r.popCap | 0,
       };
+    }
+    // Per-team population usage. The brain compares it against
+    // teamResources[team].popCap to decide if it needs more housing.
+    const teamPopUsed: Record<string, number> = {};
+    for (const u of deps.units.units) {
+      if (u.hp <= 0) continue;
+      if (u.kind === 'supply_truck') continue; // not counted toward cap
+      teamPopUsed[u.team] = (teamPopUsed[u.team] ?? 0) + 1;
     }
     return {
       enemyHq: enemyHqs[0] ?? null, // legacy: one-HQ brains still receive the first
@@ -247,6 +258,7 @@ export class RemoteAIClient {
         wood: deps.enemyResources.wood | 0,
       },
       teamResources,
+      teamPopUsed,
       enemyUnitCount,
     };
   }
@@ -257,7 +269,27 @@ export class RemoteAIClient {
       case 'queue_train': return this.applyQueueTrain(a, deps);
       case 'route_unit': return this.applyRouteUnit(a, deps);
       case 'set_worker_focus': return this.applySetWorkerFocus(a, deps);
+      case 'upgrade_building': return this.applyUpgradeBuilding(a, deps);
     }
+  }
+
+  private applyUpgradeBuilding(
+    a: { buildingId: number; upgradeId: string },
+    deps: AIClientDeps,
+  ): void {
+    const b = deps.buildings.buildings.find(x => x.id === a.buildingId);
+    if (!b || b.destroyed) return;
+    if (b.upgradeState !== 'enabled') return; // already pending / disabled
+    b.activeUpgradeId = a.upgradeId;
+    b.upgradeState = 'pending';
+    b.upgradeStockpile.metals = 0;
+    b.upgradeStockpile.wood = 0;
+    // Same constructionSeconds default the player UI uses for HQ-track
+    // upgrades; supply trucks dispatch from the upgrade pipeline once
+    // the building is pending.
+    const seconds = deps.buildings.constructionSecondsFor(b) || 30;
+    b.constructionTimer = seconds;
+    b.constructionTotal = seconds;
   }
 
   private applySetWorkerFocus(

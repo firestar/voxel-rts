@@ -218,9 +218,38 @@ function decideActions(state, sessionId) {
     // Pop cap is 10 + (alive civilians). Without a neighborhood the
     // base stalls at 10 (6 workers + 4 combat), so the hood goes in
     // before the depot to unlock troop scaling.
+    // Pop-cap pressure: if we're within 2 slots of the cap, the next
+    // unit's production will be frozen at 99%. Top priority is to
+    // unfreeze it — either place a second hood (cheap, +5 cap per
+    // civilian) or upgrade an existing one (expand_neighborhood adds
+    // another house = another civilian quota).
+    const teamPop = (state.teamPopUsed && state.teamPopUsed[hq.team]) || 0;
+    const teamPopCap = (teamRes[hq.team] && teamRes[hq.team].popCap) || 10;
+    const popPressure = teamPop >= teamPopCap - 2;
+    const upgradableHoods = anyHoods.filter(b =>
+      b.upgradeState === 'enabled' && (b.expandTier ?? 0) < 2,
+    );
+
     const wantMoreBarracks = (anyBarracks.length === 0 && anyFarms.length === 0)
                           || (anyBarracks.length < 3 && anyFarms.length >= 2 && anyHoods.length >= 1);
-    if (h.placeCooldown === 0 && wantMoreBarracks && canAffordBldg('barracks')) {
+    if (popPressure && h.placeCooldown === 0 && anyHoods.length < 2 && canAffordBldg('neighborhood')) {
+      // Drop a second hood as soon as we're near cap, regardless of
+      // where we are in the build order.
+      actions.push({ type: 'place_building', kind: 'neighborhood', anchorHqId: hq.id });
+      debit(BUILDING_COSTS.neighborhood);
+      h.placeCooldown = 3.0;
+    } else if (popPressure && upgradableHoods.length > 0
+               && budget.metals >= 30 && budget.wood >= 60) {
+      // Both hoods exist (or one exists and the other is already
+      // pending) — push existing ones to tier-2 via expand_neighborhood.
+      // Cost mirrors a fresh hood (Buildings.ts upgradeCostFor scales
+      // baseCost by 1 + tier*0.75); for tier-0→tier-1 that's the spec's
+      // baseCost. We assume the spec's baseCost ≈ NEIGHBORHOOD.upgradeCost
+      // (30m/60w) for the conservative check.
+      const target = upgradableHoods[0];
+      actions.push({ type: 'upgrade_building', buildingId: target.id, upgradeId: 'expand' });
+      debit({ metals: 30, wood: 60 });
+    } else if (h.placeCooldown === 0 && wantMoreBarracks && canAffordBldg('barracks')) {
       actions.push({ type: 'place_building', kind: 'barracks', anchorHqId: hq.id });
       debit(BUILDING_COSTS.barracks);
       h.placeCooldown = 3.0;
@@ -255,17 +284,21 @@ function decideActions(state, sessionId) {
       ? state.workers.filter(w => w.team === hq.team)
       : [];
     if (myWorkers.length > 0) {
-      // What's the next building we're saving for? Use the lowest
-      // unmet cost on the build order.
-      let needWood = 0, needMetals = 0;
-      const want = (cost) => {
-        needMetals = Math.max(needMetals, cost.metals - budget.metals);
-        needWood   = Math.max(needWood,   cost.wood   - budget.wood);
+      // Sum the cost of every building we still plan to place. That
+      // way once wood crosses the most-expensive single cost the AI
+      // doesn't suddenly send every worker to mine — it keeps a chop
+      // contingent until the TOTAL outstanding lumber bill is met.
+      let totalWood = 0, totalMetals = 0;
+      const want = (cost, n = 1) => {
+        totalMetals += cost.metals * n;
+        totalWood   += cost.wood   * n;
       };
-      if (anyFarms.length < 2)    want(BUILDING_COSTS.farm);
-      if (anyHoods.length < 1)    want(BUILDING_COSTS.neighborhood);
+      if (anyFarms.length    < 2) want(BUILDING_COSTS.farm,         2 - anyFarms.length);
+      if (anyHoods.length    < 2) want(BUILDING_COSTS.neighborhood, 2 - anyHoods.length);
       if (anyDepots.length === 0) want(BUILDING_COSTS.vehicle_depot);
-      if (anyBarracks.length < 3) want(BUILDING_COSTS.barracks);
+      if (anyBarracks.length < 3) want(BUILDING_COSTS.barracks,     3 - anyBarracks.length);
+      const needMetals = Math.max(0, totalMetals - budget.metals);
+      const needWood   = Math.max(0, totalWood   - budget.wood);
 
       // Target focus counts: 2 farm always (food is per game rule),
       // then split mine/chop based on shortfall. If neither resource

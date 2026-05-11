@@ -651,6 +651,7 @@ async function main() {
         x: u.x, z: u.z,
         path: (u.path || []).map(w => ({ x: w.x, z: w.z })),
         task: u.task?.kind || null,
+        focus: u.workerFocus || null,
         heading: u.heading,
         firingTarget: u.firingTarget ? { x: u.firingTarget.x, z: u.firingTarget.z } : null,
         claimedClusterId: u.claimedClusterId,

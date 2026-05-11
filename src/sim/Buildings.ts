@@ -3713,13 +3713,15 @@ export class BuildingManager {
       b.productionTimer -= dt;
       if (b.productionTimer > 0) continue;
 
-      // Pop gate: if the queued unit wouldn't fit in the player's
-      // population cap, hold the timer at full and try again next tick.
-      // The resources have already been delivered (suppliedUnits > 0) so
-      // they sit waiting at the building until pop frees up.
+      // Pop gate: if the queued unit wouldn't fit in the team's
+      // population cap, freeze the production at 99% complete so the
+      // unit is visibly "almost done" and resumes the instant the cap
+      // frees up. Resetting to a full interval would force the player
+      // (or AI) to redo the wait, which the user explicitly called out
+      // as the wrong behaviour.
       const headKind = b.trainQueue[0];
       if (headKind && this.popHasRoom && !this.popHasRoom(headKind, b)) {
-        b.productionTimer = b.spec.productionInterval;
+        b.productionTimer = b.spec.productionInterval * 0.01;
         continue;
       }
 

@@ -95,6 +95,13 @@ constraint the user has stated across the loop.
   player slot in the AI-vs-AI loop. An AI faction without
   neighborhoods stalls at 10 population — it can't barracks-spam its
   way past the cap.
+- When a building's production timer would complete a unit but the
+  team is at pop cap, the timer **freezes at 99 %** of the production
+  interval. The unit is visibly "almost done" and resumes the instant
+  a slot opens — production is NOT restarted from zero.
+- An AI brain that's within 2 slots of its cap drops everything else
+  to build (or `expand_neighborhood`-upgrade) a hood. Pop-cap relief
+  outranks the barracks → farm → depot order while the squeeze is on.
 
 ### Supply trucks
 
