@@ -613,7 +613,29 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
     applyOrderToHarvester(u, order, deps);
     return false;
   }
-  if (focus === 'farm') return false;
+  if (focus === 'farm') {
+    // No farmTend / harvestFarm order on the board right now (between
+    // milestones, or pre-first-milestone). A farm-focus worker that
+    // sits idle for >10 s trips the harness's worker-stuck rule, so
+    // pick the nearest friendly farm and either route to it (if not
+    // there yet) or just adopt the `farm` task in place (so the
+    // tickFarm `farmerOnFarm` check sees the worker AND the harness
+    // sees it as "working").
+    const myFarm = (deps.buildings.buildings).find(b =>
+      !b.destroyed && b.spec.kind === 'farm' && b.team === u.team
+    );
+    if (myFarm) {
+      const farmCx = (myFarm.ox + myFarm.spec.cellsW * 0.5) * VOXEL_SIZE * 8;
+      const farmCz = (myFarm.oz + myFarm.spec.cellsD * 0.5) * VOXEL_SIZE * 8;
+      const dx = farmCx - u.x, dz = farmCz - u.z;
+      u.task = { kind: 'farm', buildingId: myFarm.id };
+      if (dx * dx + dz * dz > 1.5 * 1.5) {
+        u.workerRouteCooldown = 0;
+        deps.routeWorker(u, farmCx, u.y, farmCz);
+      }
+    }
+    return false;
+  }
 
   // Voxel scans are expensive (~19M iterations each). Rate-limit per worker
   // AND globally: at most one scan fires per tickWorkers call so that when an
