@@ -4773,19 +4773,19 @@ export class Game {
       const cfg = PROJECTILES[w.projectile];
       const explosionR = cfg.explosive ? cfg.explosionRadiusMeters : 0;
 
-      // Voxel-LoS gate. predictTrajectory is pure physics — it doesn't
-      // know about walls. If a worker is behind a building voxel the
-      // projectile would clip the wall first and never reach the
-      // worker, but arcReachesPoint would still say "reaches". Caused
-      // gunners to fire on workers behind walls for 5+ seconds with
-      // zero damage (FAILURE_NONCOMBAT_INVULN). Cast a voxel ray from
-      // muzzle to target; if a solid voxel sits between, skip this
-      // target so the auto-engage picks something else next tick OR
-      // the arc-walk tangent fires.
+      // Voxel-LoS gate for UNIT targets only. predictTrajectory is
+      // pure physics — it doesn't know about walls. If a worker is
+      // behind a building voxel, the projectile clips the wall first
+      // and never reaches the worker, but arcReachesPoint still says
+      // "reaches". For building targets we DON'T gate on LoS because
+      // the wall IS the target — clipping it counts as damage to the
+      // structure. Without this carve-out, siege units could never
+      // shoot at an HQ (always has a wall between muzzle and HQ
+      // centre), and the HQ_WIN rate dropped to 0.
       const muzzleX = u.x;
       const muzzleY = u.y + 1.2;
       const muzzleZ = u.z;
-      {
+      if (targetUnit) {
         const losDx = tx - muzzleX, losDy = ty - muzzleY, losDz = tz - muzzleZ;
         const losLen = Math.hypot(losDx, losDy, losDz) || 1;
         const lhit = raycastVoxel(
@@ -4794,11 +4794,8 @@ export class Game {
           { x: losDx / losLen, y: losDy / losLen, z: losDz / losLen },
           losLen,
         );
-        // If a voxel sits noticeably short of the target (>0.5 m
-        // before it), treat the LoS as blocked. A voxel within 0.5 m
-        // of the target is part of the target's hit envelope and
-        // counts as "we'll hit something on the way in".
         if (lhit && losLen - lhit.tMeters > 0.5) {
+          u.firingTarget = null;
           u.autoEngageCooldown = 0.6;
           continue;
         }
