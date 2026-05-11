@@ -4742,18 +4742,39 @@ export class Game {
         u.autoEngageCooldown = 0.25;
         continue;
       }
-      // Arc fell short. Step closer and retry — don't fire a wasted
-      // shot. We move ~25 % of the remaining gap (min 2 m), capped so a
-      // single step never overshoots the target. The 0.6 s cooldown
-      // gives the path time to resolve before the next reach check.
+      // Arc fell short. Two cases:
+      // 1. Out of range (distToTarget > weapon range): step closer.
+      // 2. In range but obstructed (terrain / building between
+      //    muzzle and target): step along a TANGENT around the
+      //    target so the next tick has a different firing angle.
+      // Without (2) a unit positioned behind a hill or wall keeps
+      // routing toward the target and pressing into the wall forever.
       u.autoEngageCooldown = 0.6;
       if (u.path.length > 0) continue;
       const distToTarget = Math.hypot(tx - u.x, tz - u.z);
-      const step = Math.min(distToTarget - 1, Math.max(2, distToTarget * 0.25));
-      if (step <= 0) continue;
-      const scale = step / distToTarget;
-      const goalX = u.x + (tx - u.x) * scale;
-      const goalZ = u.z + (tz - u.z) * scale;
+      let goalX: number;
+      let goalZ: number;
+      if (distToTarget > w.rangeMeters) {
+        const step = Math.min(distToTarget - 1, Math.max(2, distToTarget * 0.25));
+        if (step <= 0) continue;
+        const scale = step / distToTarget;
+        goalX = u.x + (tx - u.x) * scale;
+        goalZ = u.z + (tz - u.z) * scale;
+      } else {
+        // Tangent move: pick a perpendicular direction to the target
+        // vector, choosing the side by a per-unit jitter so a squad
+        // doesn't all sidestep the same way. Step ~3 m so the next
+        // auto-engage tick samples a meaningfully different muzzle
+        // angle. Stays within weapon range (radius ≈ distToTarget).
+        const dirToTx = (tx - u.x) / distToTarget;
+        const dirToTz = (tz - u.z) / distToTarget;
+        const sign = (((u.id * 2654435761) >>> 0) & 1) === 0 ? 1 : -1;
+        const tanX = -dirToTz * sign;
+        const tanZ =  dirToTx * sign;
+        const arcStep = 3.0;
+        goalX = u.x + tanX * arcStep;
+        goalZ = u.z + tanZ * arcStep;
+      }
       void this.routePath(u, goalX, u.y, goalZ);
     }
   }

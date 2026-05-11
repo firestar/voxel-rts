@@ -2860,22 +2860,24 @@ export function stampHQ(
  * though their kind is `'turret'`.
  */
 const BUILDING_THREAT: Record<BuildingKind, number> = {
-  // HQ is now the highest-threat ground target so the auto-engage
-  // picker prefers it over enemy soldiers + tanks within weapon
-  // range. Destroying an HQ ends the match (HQ_WIN, +5.9 b score),
-  // so once attackers reach 0.30 × range they should be firing on
-  // the HQ rather than spending ammo on screening units.
-  hq:            120,
+  // Per the AI design rule: units take priority over buildings except
+  // for ACTIVE DEFENSIVE structures that can shoot the attacker now.
+  // Silo + turret + (effective) AA turret stay high so a soldier
+  // walking past a silo turns and clears it first; everything else —
+  // HQ included — drops below every unit threat so attackers shoot
+  // screening soldiers + tanks first and only chip at the structure
+  // when no live target remains in range.
   silo:          95,
   turret:        88,   // anti-ground; aa_turret is overridden in buildingThreatLevel
-  vehicle_depot: 65,
-  barracks:      60,
-  tech_lab:      48,
-  refinery:      42,
-  power_plant:   38,
-  storage:       30,
-  farm:          22,
-  neighborhood:  20,
+  hq:            10,
+  vehicle_depot: 8,
+  barracks:      7,
+  tech_lab:      5,
+  refinery:      5,
+  power_plant:   5,
+  storage:       4,
+  farm:          3,
+  neighborhood:  3,
 };
 
 /**

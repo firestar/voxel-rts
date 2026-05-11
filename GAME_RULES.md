@@ -120,6 +120,20 @@ constraint the user has stated across the loop.
   player as a unit "randomly disappearing"). Trucks die only from
   HP→0 from real damage or from successful task completion.
 
+### Combat target priority
+
+- The aggressive-stance picker fires on **units first, buildings
+  last**. Only ACTIVE DEFENSIVE structures — silo, anti-ground
+  turret, AA turret (when an air unit is on the map) — outrank a
+  fresh enemy unit. HQ, barracks, vehicle depot, etc. drop below
+  every unit threat so attackers clear screening soldiers + tanks
+  before chipping at the structure.
+- If an attacker is in range but the muzzle arc is obstructed
+  (terrain or a building between muzzle and target), the auto-engage
+  step picks a **tangent** around the target instead of pressing
+  forward. A 3 m sidestep rotates the firing angle so the next
+  trajectory sample has a chance at a clean line.
+
 ### Building rules
 
 - HQ has **3000 HP**. Cannot be lowered to "speed up wins."
