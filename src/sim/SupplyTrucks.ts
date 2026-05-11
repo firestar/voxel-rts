@@ -341,11 +341,13 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
       }
       // Hard abandon: a delivery task that can't complete inside the
       // harness's 60 s budget needs to refund and head home before
-      // the harness fails the run.
+      // the harness fails the run. truck_fetch is similar — if the
+      // storage is unreachable, the truck would hang waiting forever.
       if (track.taskFirstAt > TRUCK_ABANDON_S
           && (task.kind === 'truck_deliver_upgrade'
               || task.kind === 'truck_recover_upgrade'
-              || task.kind === 'truck_resupply')) {
+              || task.kind === 'truck_resupply'
+              || task.kind === 'truck_fetch')) {
         console.warn(`[TRUCK #${u.id}] abandon: ${track.taskFirstAt.toFixed(1)}s on ${task.kind} — refunding cargo and returning to HQ`);
         const team = truckTeam(u.id, deps);
         const r = teamResources(deps, team);
@@ -363,6 +365,13 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
           const target = deps.buildings.buildings.find(b => b.id === task.buildingId);
           if (target) target.inboundResupplyTrucks = Math.max(0, target.inboundResupplyTrucks - 1);
           activeResupply.delete(u.id);
+        } else if (task.kind === 'truck_fetch') {
+          // The truck never reached the storage to load. Mark the
+          // storage as having no inbound truck so a fresh dispatch
+          // can retry. No payload was carried, nothing to refund.
+          const storage = deps.buildings.buildings.find(b => b.id === task.storageId);
+          if (storage) storage.supplyInbound = false;
+          activeFetch.delete(u.id);
         }
         u.task = { kind: 'truck_return' };
         u.path = [];
