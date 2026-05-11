@@ -61,10 +61,13 @@ const MAX_FIELDED_ENEMIES = 200;
  *  pass routes idle enemies toward player buildings and stops short at
  *  this fraction of the unit's weapon range so the projectile arc check
  *  has room to succeed. */
-// Was 0.65. Lowered to 0.45 so attacking units crowd in closer
-// to enemy HQs — more units inside LOS distance = more shots
-// landing per second = HQ HP comes down before drought triggers.
-const ATTACK_STOP_FRACTION = 0.45;
+// Was 0.65. Lowered to 0.30 so attacking units close to within
+// 30 % of weapon range of the HQ — at that range a soldier's
+// rifle reliably has LOS over the HQ wall voxels and shots land
+// on the structure itself. iter89 spent 250 s with the player HQ
+// dropping only ~90 HP because attackers loitered at 45 % range
+// and most shots clipped wall corners.
+const ATTACK_STOP_FRACTION = 0.30;
 /** Throttle hunt-and-attack so we don't slam the path worker. The
  *  client routes a unit and the path takes a beat to resolve; rerouting
  *  every 1 s is wasteful. */
