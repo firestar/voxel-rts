@@ -347,18 +347,31 @@ function decideActions(state, sessionId) {
     }
     // Worker pump: more workers = faster gather rate = bigger army.
     // Each base seeds 6 workers; train extras from the barracks until
-    // we hit WORKER_TARGET per team. Workers are cheap (30f / 0m /
-    // 10w) so the metal economy isn't compromised even with several
-    // queued in a row.
-    // WORKER_TARGET is now env-tunable for the tournament.
-    if (!trainBlocked && h.trainCooldown === 0 && liveBarracks.length > 0
+    // we hit WORKER_TARGET per team. Don't share `h.trainCooldown`
+    // with the combat queue — workers are tracked on a SEPARATE
+    // cadence so the barracks combat rotation isn't blocked.
+    // WORKER_TARGET is env-tunable for the tournament.
+    h.workerCooldown = Math.max(0, (h.workerCooldown ?? 0) - dt);
+    if (!trainBlocked && h.workerCooldown === 0 && liveBarracks.length > 0
         && myWorkers.length < WORKER_TARGET
         && canAffordUnitB('worker')) {
-      const target = liveBarracks.find(b => (b.trainQueueLen ?? 0) < 4) || liveBarracks[0];
-      if ((target.trainQueueLen ?? 0) < 4) {
+      // Pick the barracks with the FEWEST queued items so workers
+      // distribute and don't starve any single barracks of combat
+      // slots. Cap at 2 queued items so combat training can still
+      // share the slot.
+      let target = null;
+      let bestLen = Infinity;
+      for (const b of liveBarracks) {
+        const len = b.trainQueueLen ?? 0;
+        if (len >= 2) continue;
+        if (len < bestLen) { bestLen = len; target = b; }
+      }
+      if (target) {
         actions.push({ type: 'queue_train', buildingId: target.id, unitKind: 'worker' });
         debit(UNIT_COSTS.worker);
-        h.trainCooldown = TRAIN_INTERVAL_S;
+        // 2 s between worker queues so combat training keeps the
+        // remaining slots.
+        h.workerCooldown = 2.0;
       }
     }
     if (!trainBlocked && h.trainCooldown === 0 && state.enemyUnitCount < MAX_FIELDED_ENEMIES && liveBarracks.length > 0) {
