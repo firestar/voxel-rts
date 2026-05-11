@@ -3602,6 +3602,14 @@ export class Game {
   private adoptServerEntity(e: { id: number; clientTag: string | null; kind: string; owner: string; x: number; y: number; z: number; hp: number }): Unit | null {
     if (!e.clientTag) return null;
     if (!UNIT_KINDS.includes(e.kind as Unit['kind'])) return null;
+    // Supply trucks are dispatcher-spawned client-side only. The server
+    // never originates one, so any "missing locally" truck in a snapshot
+    // is a stale entity from a delivery that just hp=0'd locally — the
+    // server hasn't processed our despawn_entity yet. Adopting that
+    // entity would resurrect the truck as a fresh task=idle proxy, and
+    // the player team would accumulate dozens of phantom trucks past
+    // the per-HQ cap.
+    if (e.kind === 'supply_truck') return null;
     const team: Team = e.owner === 'enemy' ? 'enemy' : e.owner === 'enemy2' ? 'enemy2' : 'player';
     const stance = team !== 'player' ? 'aggressive' : 'defensive';
     const u = this.units.spawn(
