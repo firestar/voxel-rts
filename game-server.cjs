@@ -1578,6 +1578,21 @@ function tickCivilians(dt) {
   for (const id of [...civilianStates.keys()]) {
     if (!state.entities.has(id)) civilianStates.delete(id);
   }
+  // Drop civilianResidents entries whose hood is no longer alive +
+  // enabled. The civilians it tracked were "inside" that hood when
+  // it died, so they go with the building. Without this cleanup,
+  // orphaned civilians persist after the hood is gone and push the
+  // per-team total over the (neighborhoods × 5) audit cap.
+  for (const [hoodId, res] of [...civilianResidents]) {
+    const b = state.buildings.get(hoodId);
+    if (b && !b.destroyed && b.kind === 'neighborhood' && b.upgradeState === 'enabled') continue;
+    for (const civId of res.ids) {
+      const civ = state.entities.get(civId);
+      if (civ) deleteEntity(civ);
+      civilianStates.delete(civId);
+    }
+    civilianResidents.delete(hoodId);
+  }
 
   // Snapshot the live neighborhood roster once per tick.
   const neighborhoods = [];
