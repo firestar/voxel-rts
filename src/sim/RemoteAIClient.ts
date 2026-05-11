@@ -328,7 +328,6 @@ export class RemoteAIClient {
     if (!isUnitKind(a.unitKind)) return;
     const b = deps.buildings.buildings.find(x => x.id === a.buildingId);
     if (!b || b.destroyed) return;
-    if (b.team === 'player') return;
     if (b.upgradeState !== 'enabled') return;
     if (!b.spec.produces.includes(a.unitKind)) return;
     // Just push onto the train queue. The supply-truck dispatcher
