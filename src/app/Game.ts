@@ -3580,20 +3580,13 @@ export class Game {
         }
       }
     }
-    // Kill any locally-mirrored unit whose tag the server has dropped.
-    // Gate on `serverAckedUnitIds` so back-fill spawn POSTs that are
-    // still in flight don't immediately kill every starter unit on
-    // the very first snapshot (which arrives before the POSTs land).
-    // Server-driven units bypass the gate — they originate on the
-    // server, so being absent from the snapshot is unambiguous.
-    for (const u of this.units.units) {
-      if (u.hp <= 0) continue;
-      if (!this.mirroredUnitIds.has(u.id) && !this.serverDrivenUnitIds.has(u.id)) continue;
-      if (liveLocalIds.has(u.id)) continue;
-      const serverDriven = this.serverDrivenUnitIds.has(u.id);
-      if (!serverDriven && !this.serverAckedUnitIds.has(u.id)) continue;
-      u.hp = 0;
-    }
+    // Per game rule: a unit only disappears when its HP reaches 0
+    // from actual damage. The previous reconcile-kill silently
+    // zeroed HP for any locally-mirrored unit the server's snapshot
+    // had dropped — that path produced "units randomly disappearing"
+    // for the user since there was no explosion / death animation.
+    // For the AI-vs-AI loop the local sim is the source of truth;
+    // the server reconcile is now non-destructive.
   }
 
   /** Build a local Unit for a server-spawned entity. Subsequent ticks
