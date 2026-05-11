@@ -282,6 +282,12 @@ const TRUCK_PROGRESS_M = 1.0;
 // Per-task wall-clock budget. Way under the harness's 60 s
 // truckTaskAt failure so we self-heal before the run dies.
 const TRUCK_TASK_DESPAWN_S = 25.0;
+// If a delivery truck can't reach its target after this much wall
+// clock time, give up: refund the cargo to the team pool and head
+// home. The building stays pending — the dispatcher will retry on a
+// later tick. Without this, an unreachable target hangs the truck
+// forever and the harness's 60 s task-stall fails the whole run.
+const TRUCK_ABANDON_S = 45.0;
 
 /** Advance all active supply_truck units through their task state machine. */
 function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
@@ -329,6 +335,40 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         }
         u.path = [];
         truckRepathTimer.delete(u.id);
+        track.sinceS = 0;
+        track.x = u.x;
+        track.z = u.z;
+      }
+      // Hard abandon: a delivery task that can't complete inside the
+      // harness's 60 s budget needs to refund and head home before
+      // the harness fails the run.
+      if (track.taskFirstAt > TRUCK_ABANDON_S
+          && (task.kind === 'truck_deliver_upgrade'
+              || task.kind === 'truck_recover_upgrade'
+              || task.kind === 'truck_resupply')) {
+        console.warn(`[TRUCK #${u.id}] abandon: ${track.taskFirstAt.toFixed(1)}s on ${task.kind} — refunding cargo and returning to HQ`);
+        const team = truckTeam(u.id, deps);
+        const r = teamResources(deps, team);
+        if (task.kind === 'truck_deliver_upgrade' || task.kind === 'truck_recover_upgrade') {
+          if ('payload' in task && task.payload) {
+            r.metals += task.payload.metals ?? 0;
+            r.wood   += task.payload.wood   ?? 0;
+          }
+          const target = deps.buildings.buildings.find(b => b.id === task.buildingId);
+          if (target) target.inboundUpgradeTrucks = Math.max(0, target.inboundUpgradeTrucks - 1);
+        } else if (task.kind === 'truck_resupply') {
+          r.food   += task.payload.food   ?? 0;
+          r.metals += task.payload.metals ?? 0;
+          r.wood   += task.payload.wood   ?? 0;
+          const target = deps.buildings.buildings.find(b => b.id === task.buildingId);
+          if (target) target.inboundResupplyTrucks = Math.max(0, target.inboundResupplyTrucks - 1);
+          activeResupply.delete(u.id);
+        }
+        u.task = { kind: 'truck_return' };
+        u.path = [];
+        truckRepathTimer.delete(u.id);
+        track.taskKey = 'truck_return:0';
+        track.taskFirstAt = 0;
         track.sinceS = 0;
         track.x = u.x;
         track.z = u.z;
