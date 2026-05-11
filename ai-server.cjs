@@ -226,9 +226,6 @@ function decideActions(state, sessionId) {
     const teamPop = (state.teamPopUsed && state.teamPopUsed[hq.team]) || 0;
     const teamPopCap = (teamRes[hq.team] && teamRes[hq.team].popCap) || 10;
     const popPressure = teamPop >= teamPopCap - 2;
-    const upgradableHoods = anyHoods.filter(b =>
-      b.upgradeState === 'enabled' && (b.expandTier ?? 0) < 2,
-    );
 
     const wantMoreBarracks = (anyBarracks.length === 0 && anyFarms.length === 0)
                           || (anyBarracks.length < 3 && anyFarms.length >= 2 && anyHoods.length >= 1);
@@ -238,17 +235,6 @@ function decideActions(state, sessionId) {
       actions.push({ type: 'place_building', kind: 'neighborhood', anchorHqId: hq.id });
       debit(BUILDING_COSTS.neighborhood);
       h.placeCooldown = 3.0;
-    } else if (popPressure && upgradableHoods.length > 0
-               && budget.metals >= 30 && budget.wood >= 60) {
-      // Both hoods exist (or one exists and the other is already
-      // pending) — push existing ones to tier-2 via expand_neighborhood.
-      // Cost mirrors a fresh hood (Buildings.ts upgradeCostFor scales
-      // baseCost by 1 + tier*0.75); for tier-0→tier-1 that's the spec's
-      // baseCost. We assume the spec's baseCost ≈ NEIGHBORHOOD.upgradeCost
-      // (30m/60w) for the conservative check.
-      const target = upgradableHoods[0];
-      actions.push({ type: 'upgrade_building', buildingId: target.id, upgradeId: 'expand' });
-      debit({ metals: 30, wood: 60 });
     } else if (h.placeCooldown === 0 && wantMoreBarracks && canAffordBldg('barracks')) {
       actions.push({ type: 'place_building', kind: 'barracks', anchorHqId: hq.id });
       debit(BUILDING_COSTS.barracks);
