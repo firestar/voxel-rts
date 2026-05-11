@@ -3627,12 +3627,20 @@ export class Game {
       }
     }
     // Per game rule: a unit only disappears when its HP reaches 0
-    // from actual damage. The previous reconcile-kill silently
-    // zeroed HP for any locally-mirrored unit the server's snapshot
-    // had dropped — that path produced "units randomly disappearing"
-    // for the user since there was no explosion / death animation.
-    // For the AI-vs-AI loop the local sim is the source of truth;
-    // the server reconcile is now non-destructive.
+    // from actual damage. For client-spawned kinds (workers, combat,
+    // trucks) the local sim is the source of truth, so the previous
+    // reconcile-kill stayed disabled. But CIVILIANS are server-
+    // authoritative — the server fires projectiles at them and
+    // deletes them on hp=0. Without a kill follow-up here, every
+    // server-side civilian death leaves a zombie local mirror that
+    // overflows the (neighborhoods × tier × 5) audit cap and pretends
+    // its hood has 6+ civilians.
+    for (const u of this.units.units) {
+      if (u.hp <= 0 || u.kind !== 'civilian') continue;
+      if (!this.serverDrivenUnitIds.has(u.id)) continue;
+      if (liveLocalIds.has(u.id)) continue;
+      u.hp = 0;
+    }
   }
 
   /** Build a local Unit for a server-spawned entity. Subsequent ticks
