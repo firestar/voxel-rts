@@ -639,6 +639,14 @@ function dispatchResupplyTrucks(deps: SupplyTruckDeps): void {
       if (b.team !== hq.team) continue;
       if (b.spec.produces.length === 0) continue;
       if (b.trainQueue.length === 0) continue;
+      // If the head of the queue can't actually spawn because the team
+      // is at pop cap, don't keep dispatching trucks. Their cargo would
+      // sit at the building reserving resources that the AI needs to
+      // build a neighborhood and break out of the cap. Existing trucks
+      // already en route finish their delivery; we just stop adding to
+      // the convoy.
+      const headKind = b.trainQueue[0];
+      if (headKind && deps.buildings.popHasRoom && !deps.buildings.popHasRoom(headKind, b)) continue;
       // Pick the HQ face closest to this consumer building so the resupply
       // truck has a short straight run rather than always emerging on +X.
       const targetX = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;

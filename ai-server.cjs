@@ -339,7 +339,12 @@ function decideActions(state, sessionId) {
       reassign('mine', wantMine - haveFocus('mine'));
     }
 
-    if (h.trainCooldown === 0 && state.enemyUnitCount < MAX_FIELDED_ENEMIES && liveBarracks.length > 0) {
+    // While at pop cap, queueing more units just freezes them at 99%
+    // and burns resources reserved by the supply truck (= less metals
+    // for the neighborhood we need to break out of the cap). Pause
+    // training until the hood lands and pop opens up.
+    const trainBlocked = popPressure && teamPop >= teamPopCap;
+    if (!trainBlocked && h.trainCooldown === 0 && state.enemyUnitCount < MAX_FIELDED_ENEMIES && liveBarracks.length > 0) {
       const target = liveBarracks.find(b => (b.trainQueueLen ?? 0) < 4) || liveBarracks[0];
       for (let i = 0; i < BARRACKS_PRODUCES.length; i++) {
         const idx = (h.pickIndex + i) % BARRACKS_PRODUCES.length;
@@ -355,7 +360,7 @@ function decideActions(state, sessionId) {
     // Queue a tank at the depot when one's online and we can afford
     // it. Tanks do massive damage to HQs (90 kill bonus + heavy
     // shells), so even one in the field accelerates HQ destruction.
-    if (liveDepots.length > 0 && canAffordUnitB('tank')) {
+    if (!trainBlocked && liveDepots.length > 0 && canAffordUnitB('tank')) {
       const depot = liveDepots.find(b => (b.trainQueueLen ?? 0) < 2) || liveDepots[0];
       if ((depot.trainQueueLen ?? 0) < 2) {
         actions.push({ type: 'queue_train', buildingId: depot.id, unitKind: 'tank' });
