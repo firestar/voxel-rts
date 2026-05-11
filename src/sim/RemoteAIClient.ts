@@ -314,7 +314,9 @@ export class RemoteAIClient {
   ): void {
     const u = deps.units.units.find(x => x.id === a.unitId);
     if (!u || u.hp <= 0) return;
-    if (u.team === 'player') return;
+    // Per the AI-vs-AI loop, EVERY HQ team is brain-driven — including
+    // the player slot. Don't filter by team here, otherwise player
+    // soldiers idle at base while enemy soldiers march on them.
     if (u.firingTarget) return; // sticky: don't override a fresh fire order
     const y = deps.surfaceY(a.x, a.z);
     deps.routeUnit(u, a.x, y, a.z);
