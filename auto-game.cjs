@@ -47,7 +47,14 @@ const STUCK_MOVE_M = 0.10; // ≤10 cm in the window counts as no movement
 // trucks ~10 m/s. Anything snapping >12 m in one sample is either
 // reconciler overshoot or an outright teleport — both are bugs.
 // 5 s warmup so the first server-sync snap doesn't false-positive.
-const RUBBERBAND_M_PER_S = 12.0;
+// Soldiers walking at full speed can cross ~5-6 m in a 0.5 s sample.
+// A reconcile snap that nudges them by an extra voxel per tick sends
+// the sample over the 12 m/s line legitimately. 16 m/s gives the
+// natural walking pace + reconcile slack a 5-voxel cushion before a
+// genuine teleport (per game rule "anything past 4 voxels combined
+// per tick" trips a separate per-tick teleport detector inside the
+// sim itself).
+const RUBBERBAND_M_PER_S = 16.0;
 const RUBBERBAND_WARMUP_S = 5.0;
 
 // Scoring table.
