@@ -457,11 +457,17 @@ function decideActions(state, sessionId) {
         if (!u.armed) { skipUnarmed++; continue; }
         if (u.hasFiringTarget) { skipFiring++; continue; }
         if (u.pathLen > 0) { skipPath++; continue; }
-        // Stance gate. Defensive teams hold a larger garrison home;
-        // economic teams refuse to launch the first attack until the
-        // economy build-out is in (2 farms + 1 hood + barracks).
+        // Stance gate. Aggressive teams keep a token garrison (2) so
+        // their HQ isn't undefended but route almost everything else.
+        // Defensive teams hold a larger garrison home. Economic teams
+        // refuse to launch the first attack until the build-out is in
+        // (2 farms + 1 hood + barracks) but then attack at the
+        // defensive quota.
         const stance = stanceForTeam(u.team);
-        const quota = stance === 'defensive' ? DEFENDER_QUOTA * 2 : DEFENDER_QUOTA;
+        const quota = stance === 'defensive' ? DEFENDER_QUOTA * 2
+          : stance === 'economic' ? DEFENDER_QUOTA
+          : Math.min(2, DEFENDER_QUOTA); // aggressive
+
         const hq = homeHqByTeam[u.team];
         if (hq) {
           const dx = u.x - hq.x, dz = u.z - hq.z;
