@@ -186,6 +186,8 @@ function decideActions(state, sessionId) {
     const anyBarracks  = myBldgs.filter(b => b.kind === 'barracks' && b.upgradeState !== 'cancelled');
     const liveFarms    = myBldgs.filter(b => b.kind === 'farm' && b.upgradeState === 'enabled');
     const anyFarms     = myBldgs.filter(b => b.kind === 'farm' && b.upgradeState !== 'cancelled');
+    const liveDepots   = myBldgs.filter(b => b.kind === 'vehicle_depot' && b.upgradeState === 'enabled');
+    const anyDepots    = myBldgs.filter(b => b.kind === 'vehicle_depot' && b.upgradeState !== 'cancelled');
 
     // Per-team budget: this HQ's faction has its own resource pool,
     // independent of any other AI faction. Two AIs can't drain a
@@ -220,8 +222,16 @@ function decideActions(state, sessionId) {
       actions.push({ type: 'place_building', kind: 'farm', anchorHqId: hq.id });
       debit(BUILDING_COSTS.farm);
       h.placeCooldown = 3.0;
+    } else if (h.placeCooldown === 0 && anyDepots.length === 0 && anyFarms.length >= 2 && canAffordBldg('vehicle_depot')) {
+      // Vehicle depot once the food economy is steady. Tanks do
+      // dramatically more damage to enemy HQs than infantry, so
+      // adding even one depot accelerates HQ destruction sharply.
+      actions.push({ type: 'place_building', kind: 'vehicle_depot', anchorHqId: hq.id });
+      debit(BUILDING_COSTS.vehicle_depot);
+      h.placeCooldown = 3.0;
     }
     void liveFarms;
+    void liveDepots;
 
     if (h.trainCooldown === 0 && state.enemyUnitCount < MAX_FIELDED_ENEMIES && liveBarracks.length > 0) {
       const target = liveBarracks.find(b => (b.trainQueueLen ?? 0) < 4) || liveBarracks[0];
@@ -234,6 +244,16 @@ function decideActions(state, sessionId) {
         h.pickIndex = idx + 1;
         h.trainCooldown = TRAIN_INTERVAL_S;
         break;
+      }
+    }
+    // Queue a tank at the depot when one's online and we can afford
+    // it. Tanks do massive damage to HQs (90 kill bonus + heavy
+    // shells), so even one in the field accelerates HQ destruction.
+    if (liveDepots.length > 0 && canAffordUnitB('tank')) {
+      const depot = liveDepots.find(b => (b.trainQueueLen ?? 0) < 2) || liveDepots[0];
+      if ((depot.trainQueueLen ?? 0) < 2) {
+        actions.push({ type: 'queue_train', buildingId: depot.id, unitKind: 'tank' });
+        debit(UNIT_COSTS.tank);
       }
     }
   }
