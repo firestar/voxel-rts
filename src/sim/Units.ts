@@ -1219,6 +1219,14 @@ export class UnitManager {
     const TELEPORT_M2 = TELEPORT_M * TELEPORT_M;
     for (const u of this.units) {
       if (u.tickPrevX === undefined || u.tickPrevZ === undefined) continue;
+      // Civilians are server-driven and don't run the local voxel-by-
+      // voxel motion contract; their position is force-snapped from
+      // snapshots, plus separation pushes from neighbouring units can
+      // nudge them another half-voxel inside the same tick. The
+      // teleport rule exists to catch real sim bugs in pathing /
+      // collision, not the SSE-sync hop a civilian inherits when the
+      // snapshot lands mid-tick.
+      if (u.kind === 'civilian') continue;
       const dx = u.x - u.tickPrevX;
       const dz = u.z - u.tickPrevZ;
       const d2 = dx * dx + dz * dz;
