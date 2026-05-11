@@ -354,6 +354,13 @@ export class RemoteAIClient {
       [3, 0], [-3, 0],
       [3, -3], [3, 3], [-3, -3], [-3, 3],
       [6, 0], [0, -6], [0, 6],
+      // Larger buildings (6x6 neighborhood) often can't fit in the
+      // tight ring above once a barracks + farms occupy the inner
+      // cells. Widen the search out to ~12 cells in every direction.
+      [9, 0], [-9, 0], [0, -9], [0, 9],
+      [9, -6], [9, 6], [-9, -6], [-9, 6], [6, -9], [-6, -9], [6, 9], [-6, 9],
+      [12, 0], [-12, 0], [0, -12], [0, 12],
+      [12, -6], [12, 6], [-12, -6], [-12, 6],
     ];
     for (const [dx, dz] of offsets) {
       const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, baseCx + dx - (spec.cellsW >> 1)));
