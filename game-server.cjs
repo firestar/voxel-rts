@@ -1599,6 +1599,14 @@ function tickCivilians(dt) {
     res.spawnCooldown = Math.max(0, res.spawnCooldown - dt);
     if (res.ids.length >= CIVILIAN_QUOTA_PER_NEIGHBORHOOD) continue;
     if (res.spawnCooldown > 0) continue;
+    // Audit: per the user-authored game rule, a tier-N hood hosts
+    // at most N×5 civilians. CIVILIAN_QUOTA_PER_NEIGHBORHOOD is the
+    // tier-1 cap; logging a warn here surfaces any future-quota
+    // mismatch when the AI starts upgrading hoods.
+    if (res.ids.length + 1 > CIVILIAN_QUOTA_PER_NEIGHBORHOOD) {
+      console.warn(`[civ-overflow] hood ${b.id} owner=${b.owner} ids=${res.ids.length} quota=${CIVILIAN_QUOTA_PER_NEIGHBORHOOD}`);
+      continue;
+    }
     const c = buildingCenter(b);
     const tag = `civ-${state.nextId}`;
     const civ = spawnEntity({
