@@ -129,6 +129,20 @@ async function main() {
   });
   page.on('pageerror', err => browserLogs.push(`[pageerror] ${err.message}`));
 
+  // Wipe accumulated server state before the page loads. The game
+  // server is a long-running multi-tenant service; entities +
+  // buildings from prior sessions otherwise persist and trip the
+  // civilian-overflow audit at t = 1 s of the new game.
+  try {
+    const resp = await fetch(`${BASE}/game/input`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'reset_state' }),
+    });
+    if (!resp.ok) log(`reset_state failed: HTTP ${resp.status}`);
+    else log('reset_state OK');
+  } catch (e) { log(`reset_state error: ${e.message}`); }
+
   log(`navigating to ${BASE}`);
   await page.goto(BASE, { waitUntil: 'networkidle2', timeout: 60000 });
 

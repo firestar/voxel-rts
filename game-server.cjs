@@ -2050,6 +2050,23 @@ function applyCommand(cmd) {
       broadcastVoxelEdit(entry);
       return { ok: true, seq: state.voxelEditSeq };
     }
+    /** Admin-only: wipe entities + buildings + civilian rosters so a
+     *  fresh test session doesn't inherit prior-game state. The
+     *  auto-game harness sends this on browser boot. World seed and
+     *  the voxel edit log stay intact since rebuilding the chunk
+     *  cache is expensive. */
+    case 'reset_state': {
+      state.entities.clear();
+      state.byTag.clear();
+      state.buildings.clear();
+      state.buildingsByTag.clear();
+      state.projectiles.clear();
+      state.projectilesByTag.clear();
+      state.resources.clear();
+      civilianResidents.clear();
+      civilianStates.clear();
+      return { ok: true };
+    }
     default:
       return { ok: false, error: `unknown command: ${cmd.type}` };
   }
