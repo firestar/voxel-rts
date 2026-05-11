@@ -454,30 +454,24 @@ async function main() {
           }
         }
 
-        // Civilian / worker invulnerability detection. If a combat
-        // unit is firing AND a non-combat unit (civilian or worker)
-        // sits ≤5 m from it for >= 5 s WITHOUT HP loss, the damage
-        // pipeline is broken — civilians and workers must be
-        // killable when actively shot at. Fires
-        // FAILURE_NONCOMBAT_INVULN.
+        // Civilian / worker invulnerability detection. The user's
+        // rule: a military unit attacks a civilian/worker and does
+        // no damage → failure. We approximate "attacks" as: the
+        // attacker's firingTarget XYZ sits inside the target's hit
+        // sphere (1 m). If sustained for >= 5 s with no HP loss,
+        // the damage pipeline is broken.
         if (u.kind === 'civilian' || u.kind === 'worker') {
-          const RANGE_M = 5.0;
-          const R2 = RANGE_M * RANGE_M;
+          const TARGET_HIT_R = 1.0;
+          const TARGET_HIT_R2 = TARGET_HIT_R * TARGET_HIT_R;
           let firingAttacker = null;
           for (const o of us) {
             if (o.team === u.team || o.hp <= 0) continue;
             if (!opts.COMBAT_KINDS.includes(o.kind)) continue;
-            const dx = o.x - u.x, dz = o.z - u.z;
-            if (dx * dx + dz * dz > R2) continue;
-            // Treat the attacker as "firing in our direction" if it
-            // has any firing-state (firingTarget / fireCooldown /
-            // burst / autoEngageCooldown). Same broadened state the
-            // idle-combat rule uses.
-            const isAttFiring = o.firingTarget != null ||
-              o.fireCooldown > 0 ||
-              (o.burstShotsRemaining ?? 0) > 0 ||
-              (o.autoEngageCooldown ?? 0) > 0;
-            if (isAttFiring) { firingAttacker = o; break; }
+            if (!o.firingTarget) continue;
+            const tdx = o.firingTarget.x - u.x;
+            const tdz = o.firingTarget.z - u.z;
+            if (tdx * tdx + tdz * tdz > TARGET_HIT_R2) continue;
+            firingAttacker = o; break;
           }
           if (firingAttacker) {
             let track = state.noncombatUnderFire.get(u.id);
@@ -486,8 +480,7 @@ async function main() {
               state.noncombatUnderFire.set(u.id, track);
             }
             if (u.hp < track.startHp) {
-              // Damage landed; reset the timer so the rule only
-              // fires for SUSTAINED zero-damage exposure.
+              // Damage landed; reset the timer.
               track.sinceT = now;
               track.startHp = u.hp;
             } else if (now - track.sinceT > 5.0 && !state.noncombatInvulnFail) {
