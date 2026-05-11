@@ -148,36 +148,25 @@ function decideActions(state, sessionId) {
 
   if (!state) return { actions };
   // Multi-HQ aware: every enemy HQ runs its own per-base brain so
-  // multiple AI players each build their own barracks + farms.
-  // Resources are shared across all enemy bases (single Resources
-  // pool on the client) but each base independently decides whether
-  // to spend on its next placement.
+  // multiple AI players each build their own barracks + farms with
+  // their own resource pool.
   const hqs = Array.isArray(state.enemyHqs) && state.enemyHqs.length > 0
     ? state.enemyHqs
     : (state.enemyHq && state.enemyHq.alive ? [state.enemyHq] : []);
   if (hqs.length === 0) return { actions };
   const buildings = Array.isArray(state.enemyBuildings) ? state.enemyBuildings : [];
-  const res = state.enemyResources || { food: 0, metals: 0, wood: 0 };
+  const teamRes = state.teamResources || {};
+  const fallbackRes = state.enemyResources || { food: 0, metals: 0, wood: 0 };
 
-  // Track shared resources across the per-HQ loop so two AIs don't
-  // try to place a barracks at the same instant when only one
-  // affordable bundle is on the table.
-  const budget = { food: res.food, metals: res.metals, wood: res.wood };
-  const debit = (cost) => {
-    budget.food   = Math.max(0, budget.food   - (cost.food   || 0));
-    budget.metals = Math.max(0, budget.metals - (cost.metals || 0));
-    budget.wood   = Math.max(0, budget.wood   - (cost.wood   || 0));
-  };
-  const canAffordBldg = (kind) => {
-    const c = BUILDING_COSTS[kind];
-    if (!c) return false;
-    return budget.metals >= c.metals && budget.wood >= c.wood;
-  };
-  const canAffordUnitB = (kind) => {
-    const c = UNIT_COSTS[kind];
-    if (!c) return false;
-    return budget.food >= c.food && budget.metals >= c.metals && budget.wood >= c.wood;
-  };
+  // Per-team budget snapshot. Each AI's queue/place decisions debit
+  // from its own pool so two AI factions don't compete for a shared
+  // bank — that competition would let the more efficient gatherer
+  // starve the other AI of resources.
+  const teamBudgets = {};
+  for (const hq of hqs) {
+    const r = teamRes[hq.team] || fallbackRes;
+    teamBudgets[hq.team] = { food: r.food, metals: r.metals, wood: r.wood };
+  }
 
   for (const hq of hqs) {
     if (!hq || !hq.alive) continue;
@@ -198,12 +187,29 @@ function decideActions(state, sessionId) {
     const liveFarms    = myBldgs.filter(b => b.kind === 'farm' && b.upgradeState === 'enabled');
     const anyFarms     = myBldgs.filter(b => b.kind === 'farm' && b.upgradeState !== 'cancelled');
 
+    // Per-team budget: this HQ's faction has its own resource pool,
+    // independent of any other AI faction. Two AIs can't drain a
+    // shared bank.
+    const budget = teamBudgets[hq.team];
+    const debit = (cost) => {
+      budget.food   = Math.max(0, budget.food   - (cost.food   || 0));
+      budget.metals = Math.max(0, budget.metals - (cost.metals || 0));
+      budget.wood   = Math.max(0, budget.wood   - (cost.wood   || 0));
+    };
+    const canAffordBldg = (kind) => {
+      const c = BUILDING_COSTS[kind];
+      if (!c) return false;
+      return budget.metals >= c.metals && budget.wood >= c.wood;
+    };
+    const canAffordUnitB = (kind) => {
+      const c = UNIT_COSTS[kind];
+      if (!c) return false;
+      return budget.food >= c.food && budget.metals >= c.metals && budget.wood >= c.wood;
+    };
+
     // Build order: 1 barracks → 2 farms → more barracks.
-    // Putting farms before scaling barracks keeps the food economy
-    // alive — the AI's seeded metals/wood bank only covers ~5
-    // buildings total, so spending all of it on barracks first
-    // leaves nothing for farms and the AI starves the moment its
-    // food bank empties.
+    // Each AI faction now competes from its own bank, so identical
+    // build orders mean both sides scale forces in parallel.
     const wantMoreBarracks = (anyBarracks.length === 0 && anyFarms.length === 0)
                           || (anyBarracks.length < 3 && anyFarms.length >= 2);
     if (h.placeCooldown === 0 && wantMoreBarracks && canAffordBldg('barracks')) {
@@ -213,12 +219,6 @@ function decideActions(state, sessionId) {
     } else if (h.placeCooldown === 0 && anyFarms.length < 2 && anyBarracks.length > 0 && canAffordBldg('farm')) {
       actions.push({ type: 'place_building', kind: 'farm', anchorHqId: hq.id });
       debit(BUILDING_COSTS.farm);
-      // Re-arm in 3 s. If the place_building action succeeded, the
-      // building condition (anyBarracks.length === 0 / anyFarms.length < 2)
-      // turns false on the next pass and we skip the place. If it
-      // failed (footprint invalid, resources stolen by another HQ
-      // mid-frame), we retry. Setting NaN here used to leave the AI
-      // stuck waiting forever on a placement that never landed.
       h.placeCooldown = 3.0;
     }
     void liveFarms;

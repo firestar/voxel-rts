@@ -101,6 +101,9 @@ export interface SupplyTruckDeps {
    *  participating HQ / building is enemy-team and `enemyResources`
    *  is supplied. */
   resources: Resources;
+  /** Per-team resource pool lookup. If absent, all teams fall back
+   *  to the player `resources` (test bench). */
+  resourcesForTeam?: (team: 'player' | 'enemy' | 'enemy2') => Resources;
   /** Optional enemy-team resources. Wired in production; absent in
    *  tests that only exercise the player economy. */
   enemyResources?: Resources;
@@ -113,9 +116,8 @@ export interface SupplyTruckDeps {
 /** Pick the resource pool that belongs to a given team. Falls back to
  *  the player pool when an enemy pool was never wired. */
 function teamResources(deps: SupplyTruckDeps, team: BuildingTeam): Resources {
-  // All AI factions share the enemyResources pool for now — separate
-  // per-AI economies would need a Map<team, Resources>. For the test
-  // we just want them building forces, not stealing from each other.
+  if (deps.resourcesForTeam) return deps.resourcesForTeam(team as 'player' | 'enemy' | 'enemy2');
+  // Legacy fallback: tests that don't wire the team-aware accessor.
   if (team !== 'player' && deps.enemyResources) return deps.enemyResources;
   return deps.resources;
 }

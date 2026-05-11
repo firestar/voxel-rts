@@ -135,6 +135,9 @@ export interface WorkerDeps {
   /** Player-team resources. Worker food deposits land here unless the
    *  worker's team is `'enemy'` and `enemyResources` is provided. */
   resources: Resources;
+  /** Per-team resource pool lookup. If absent (test bench), all
+   *  teams fall back to `resources`. */
+  resourcesForTeam?: (team: 'player' | 'enemy' | 'enemy2') => Resources;
   /** Optional enemy-team resources. Set in production; left undefined
    *  in tests that don't exercise the enemy economy. */
   enemyResources?: Resources;
@@ -567,12 +570,13 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
         storage.stockpile.metals += u.carrying.metals;
         // Food is perishable: skip the truck run and credit the
         // worker's team resource pool directly. All non-player
-        // teams (enemy + enemy2 + …) share the enemyResources pool;
-        // omitting the enemy2 case used to route enemy2 food into
-        // the player team's bank, starving the second AI's economy.
-        const teamRes = u.team !== 'player' && deps.enemyResources
-          ? deps.enemyResources
-          : deps.resources;
+        // teams have their own pools (per-team lookup) so one AI
+        // faction can't drain the other's economy. Falls back to the
+        // legacy enemyResources or to `resources` when the host has
+        // not provided the team-aware accessor (test bench).
+        const teamRes = deps.resourcesForTeam
+          ? deps.resourcesForTeam(u.team as 'player' | 'enemy' | 'enemy2')
+          : (u.team !== 'player' && deps.enemyResources ? deps.enemyResources : deps.resources);
         teamRes.food += u.carrying.food;
         u.carrying.wood = 0;
         u.carrying.metals = 0;

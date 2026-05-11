@@ -136,9 +136,19 @@ export class Game {
   private readonly lastPathStatsByUnit = new Map<number, { kind: string; start: { cx: number; cy: number; cz: number }; goal: { cx: number; cy: number; cz: number }; reached: boolean; expanded: number; waypointCount: number; timings: PathTelemetry | undefined; timestamp: number }>();
   readonly target = new TargetMarker();
   readonly resources = new Resources();
-  /** Enemy-team resources, mirroring the player's. Workers + the
-   *  AI brain accumulate / spend out of this pool independently. */
+  /** Per-AI-faction resource pools, mirroring the player's. Each AI
+   *  team accumulates/spends out of its own pool so two AI factions
+   *  actually compete for resources rather than sharing one bank
+   *  (which lets the more-efficient AI starve the other). */
   readonly enemyResources = new Resources();
+  readonly enemy2Resources = new Resources();
+  /** Map team name → its Resources pool. Centralised so worker /
+   *  truck / foodSink lookups don't have to branch on every team. */
+  resourcesForTeam(team: import('../sim/Buildings').BuildingTeam): Resources {
+    if (team === 'enemy') return this.enemyResources;
+    if (team === 'enemy2') return this.enemy2Resources;
+    return this.resources;
+  }
   readonly saplings = new SaplingManager();
   readonly taskBoard = new WorkerTaskBoard();
   readonly leafDecay = new LeafDecay();
@@ -517,8 +527,7 @@ export class Game {
     // sim doesn't have to know about Resources directly. Routes food to
     // the producing farm's team so an enemy farm fills the AI's pool.
     this.buildings.foodSink = (amount, b): void => {
-      const r = b.team !== 'player' ? this.enemyResources : this.resources;
-      r.food += amount;
+      this.resourcesForTeam(b.team).food += amount;
     };
     // Buildings with weapons (turret, silo) drop their projectiles into the
     // shared manager and route their muzzle flashes into the same FlashPool
@@ -873,16 +882,15 @@ export class Game {
       const w = this.units.spawn('worker', safe.x, wy, safe.z, { team: baseTeam, stance: 'defensive' });
       if (w) w.workerFocus = focus;
     }
-    // Seed enemy resources just enough to place a barracks + first farm
-    // without waiting for workers to grind out the cost. Production
-    // beyond that must come from real gathering — workers mining
+    // Seed each AI faction's resource pool individually. Production
+    // beyond the seed must come from real gathering — workers mining
     // metals, chopping wood, harvesting farms — same rule the player
-    // operates under. AI cheating its bank is a game-rule violation.
-    // `+=` because seedEnemyEconomy runs once per AI base; each fresh
-    // base contributes its own slice without zeroing previous earnings.
-    this.enemyResources.food   += 200;
-    this.enemyResources.metals += 100;
-    this.enemyResources.wood   += 100;
+    // operates under. Splitting per-team prevents one AI from
+    // draining the other's economy.
+    const seedR = this.resourcesForTeam(baseTeam);
+    seedR.food   += 200;
+    seedR.metals += 100;
+    seedR.wood   += 100;
     void hqFloorY;
   }
 
@@ -1190,6 +1198,7 @@ export class Game {
         saplings: this.saplings,
         resources: this.resources,
         enemyResources: this.enemyResources,
+        resourcesForTeam: (team) => this.resourcesForTeam(team),
         taskBoard: this.taskBoard,
         routeWorker: (u, wx, wy, wz): void => { void this.routePath(u, wx, wy, wz); },
         onVoxelEdit: (wx: number, wy: number, wz: number): void => {
@@ -1229,6 +1238,7 @@ export class Game {
         buildings: this.buildings,
         resources: this.resources,
         enemyResources: this.enemyResources,
+        resourcesForTeam: (team) => this.resourcesForTeam(team),
         spawnTruck: (x, y, z, team) => { ({ x, z } = this.safeSpawnXZ(x, z)); return this.units.spawn('supply_truck', x, y, z, { team, stance: 'defensive' }); },
         routeTruck: (u, wx, wy, wz) => { void this.routePath(u, wx, wy, wz); },
         isPassable: (x, z) => {
@@ -1310,6 +1320,7 @@ export class Game {
           world: this.world,
           surfaceNav: this.surfaceNav,
           enemyResources: this.enemyResources,
+        resourcesForTeam: (team) => this.resourcesForTeam(team),
           spawnEnemy: (kind, x, y, z) => this.units.spawn(kind, x, y, z, { team: 'enemy', stance: 'aggressive' }),
           surfaceY: (wx, wz) => this.surfaceWorldY(wx, wz),
           routeUnit: (u, wx, wy, wz) => { void this.routePath(u, wx, wy, wz); },

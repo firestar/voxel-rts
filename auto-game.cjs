@@ -29,7 +29,11 @@ const NUM_AI = Number(process.env.AUTO_AI || 2);
 // stalemate doesn't pin the orchestrator; the orchestrator counts
 // TIMEOUT as a draw and retries.
 const RUN_SECONDS = Number(process.env.AUTO_SECONDS || 480);
-const SAMPLE_EVERY_MS = Number(process.env.AUTO_SAMPLE_MS || 1000);
+// Sample at 2 Hz. Was 1 Hz which undercounted the +5/hit bonus by
+// 5×; was 10 Hz briefly but jitter pushed normal-motion units into
+// the rubberband detector's edge band. 500 ms balances finer hit
+// detection against false rubberband flags.
+const SAMPLE_EVERY_MS = Number(process.env.AUTO_SAMPLE_MS || 500);
 const SHOT_PATH = process.env.AUTO_SHOT || '/tmp/auto-final.png';
 const ITERATION = process.env.AUTO_ITER || '?';
 
@@ -53,6 +57,12 @@ const SCORE = {
   dieTank: -50, dieSoldier: -20, dieRocket: -10,
   aaInterceptProjectile: 1000,
   hqDestroyed: 5999999999999, // first team to flatten an enemy HQ wins big
+  // +5 per hit on an enemy unit OR enemy building. Detected as a
+  // per-sample HP drop on a non-player entity. Each sample window
+  // bucketizes hits — a unit absorbing 3 shots in 1 s counts as 1
+  // hit-event since we only see the net HP delta — but the steady
+  // pressure adds up over the game.
+  hitOnEnemy: 5,
   // Per-second drought penalties — fire when a wall-clock second
   // ticks over without a fresh production event. Both can apply
   // simultaneously (no production at all → -100/s).
@@ -212,6 +222,15 @@ async function main() {
             state.score += pts;
             state.scoreEvents.push({ at: now, team: u.team, ev: 'create', kind: u.kind, pts });
           }
+        }
+        // Hit scoring: every per-sample HP drop on a non-player unit
+        // counts as a hit landed by the attacking side. +5 per hit
+        // (the user's bonus for keeping pressure on the enemy).
+        // Player-team units are excluded since the player is the
+        // Watcher and isn't fighting.
+        if (entry.lastHp > u.hp && u.team !== 'player') {
+          state.score += SCORE.hitOnEnemy;
+          state.scoreEvents.push({ at: now, team: 'attacker', ev: 'hit-unit', kind: u.kind, pts: SCORE.hitOnEnemy, victim: u.team });
         }
         entry.lastHp = u.hp;
 
@@ -397,9 +416,16 @@ async function main() {
       for (const b of bldgs) {
         let entry = state.seenBldg.get(b.id);
         if (!entry) {
-          entry = { team: b.team, kind: b.spec.kind, dead: false };
+          entry = { team: b.team, kind: b.spec.kind, dead: false, lastHp: b.hp };
           state.seenBldg.set(b.id, entry);
         }
+        // Hit on enemy building: per-sample HP drop = +5 (same rule
+        // as unit hits). Excludes player buildings (the Watcher).
+        if (!entry.dead && entry.lastHp > b.hp && b.team !== 'player') {
+          state.score += SCORE.hitOnEnemy;
+          state.scoreEvents.push({ at: now, team: 'attacker', ev: 'hit-bldg', kind: entry.kind, pts: SCORE.hitOnEnemy, victim: entry.team });
+        }
+        entry.lastHp = b.hp;
         if (!entry.dead && b.destroyed) {
           entry.dead = true;
           state.scoreEvents.push({ at: now, team: entry.team, ev: 'bldg-destroyed', kind: entry.kind });

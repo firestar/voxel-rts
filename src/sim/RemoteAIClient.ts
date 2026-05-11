@@ -40,6 +40,10 @@ export interface AIClientDeps {
   world: VoxelWorld;
   surfaceNav: SurfaceNavBuffers;
   enemyResources: Resources;
+  /** Per-team resource pool lookup. The snapshot publishes one
+   *  resource bag per non-player HQ so the brain budgets each AI's
+   *  spending independently rather than from a shared pool. */
+  resourcesForTeam?: (team: 'player' | 'enemy' | 'enemy2') => Resources;
   spawnEnemy: (kind: UnitKind, x: number, y: number, z: number) => Unit | null;
   surfaceY: (x: number, z: number) => number;
   /** Route a unit to (wx, wy, wz) via the same path worker the rest of
@@ -204,6 +208,18 @@ export class RemoteAIClient {
     // as a player-only filter for back-compat. New brain prefers
     // `targetBuildings` with team awareness.
     const playerBuildings = targetBuildings.filter(b => b.team === 'player');
+    // Per-team resource pools so the brain can budget each AI's
+    // spending separately. Falls back to a single shared pool when
+    // resourcesForTeam isn't wired (test bench).
+    const teamResources: Record<string, { food: number; metals: number; wood: number }> = {};
+    for (const h of enemyHqs) {
+      const r = deps.resourcesForTeam ? deps.resourcesForTeam(h.team as 'player' | 'enemy' | 'enemy2') : deps.enemyResources;
+      teamResources[h.team] = {
+        food: r.food | 0,
+        metals: r.metals | 0,
+        wood: r.wood | 0,
+      };
+    }
     return {
       enemyHq: enemyHqs[0] ?? null, // legacy: one-HQ brains still receive the first
       enemyHqs,
@@ -216,6 +232,7 @@ export class RemoteAIClient {
         metals: deps.enemyResources.metals | 0,
         wood: deps.enemyResources.wood | 0,
       },
+      teamResources,
       enemyUnitCount,
     };
   }
