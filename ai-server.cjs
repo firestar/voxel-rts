@@ -81,7 +81,8 @@ function stanceForTeam(team) {
 }
 /** Adaptive-stance override. Even with a fixed seed stance, the
  *  effective stance shifts with game state:
- *  - Under attack (enemy unit within 40 m of own HQ) → defensive.
+ *  - HEAVY attack (3+ armed enemies within 40 m of own HQ AND HQ
+ *    HP < 90 %) → defensive. Single scouts don't flip the team.
  *  - No build-out yet (< 2 farms or no hood) → economic.
  *  - Otherwise → whatever the seed says.
  *  Disable with AI_ADAPTIVE_STANCE=0 to keep the seed fixed. */
@@ -89,7 +90,7 @@ const ADAPTIVE_STANCE = envNum('AI_ADAPTIVE_STANCE', 1);
 function effectiveStance(team, ctx) {
   const seed = stanceForTeam(team);
   if (!ADAPTIVE_STANCE) return seed;
-  if (ctx.underAttackByTeam && ctx.underAttackByTeam[team]) return 'defensive';
+  if (ctx.heavyAttackByTeam && ctx.heavyAttackByTeam[team]) return 'defensive';
   if (ctx.buildoutByTeam && ctx.buildoutByTeam[team] === false) return 'economic';
   return seed;
 }
@@ -623,25 +624,28 @@ function decideActions(state, sessionId) {
         const h = teamBldgs.filter(b => b.kind === 'neighborhood').length;
         buildoutByTeam[team] = (f >= 2 && h >= 1);
       }
-      // Adaptive-stance signal: a team is "under attack" if any
-      // armed enemy unit sits within UNDER_ATTACK_RADIUS of its HQ.
-      // Used by effectiveStance() to flip the team's effective
-      // stance to defensive while the threat is parked at the gate.
-      const underAttackByTeam = {};
+      // Adaptive-stance signal: a team is in "heavy attack" only
+      // when 3+ armed enemies are within 40 m of its HQ. A single
+      // scout doesn't justify flipping the whole team to defensive
+      // — the previous 1-unit threshold caused stalemates (everyone
+      // defensive, nobody attacking).
+      const heavyAttackByTeam = {};
       const UNDER_ATTACK_R = 40;
       const UA_R2 = UNDER_ATTACK_R * UNDER_ATTACK_R;
+      const HEAVY_THRESHOLD = 3;
       for (const team of Object.keys(homeHqByTeam)) {
         const hq = homeHqByTeam[team];
+        let near = 0;
         for (const o of enemyUnits) {
           if (!o || o.hp <= 0 || o.team === team || !o.armed) continue;
           const odx = o.x - hq.x, odz = o.z - hq.z;
           if (odx * odx + odz * odz <= UA_R2) {
-            underAttackByTeam[team] = true;
-            break;
+            near++;
+            if (near >= HEAVY_THRESHOLD) { heavyAttackByTeam[team] = true; break; }
           }
         }
       }
-      const adaptiveCtx = { buildoutByTeam, underAttackByTeam };
+      const adaptiveCtx = { buildoutByTeam, heavyAttackByTeam };
 
       let skipFiring = 0, skipPath = 0, skipUnarmed = 0, skipNoBldg = 0, skipInRange = 0, skipDefender = 0, skipEconomic = 0;
       for (const u of enemyUnits) {
