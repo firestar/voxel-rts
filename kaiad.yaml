@@ -52,7 +52,7 @@ services:
     # panel.dev.kaiad.dev/voxel-rts-image:<sha> →
     # panel.dev.kaiad.dev/voxel-rts:<sha> for the deploy.
     runtime:
-      image: panel.dev.kaiad.dev/voxel-rts-image:{voxel_rts_image_version}
+      image: "{kaiad_registry_host}/voxel-rts-image:{voxel_rts_image_version}"
       command: ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 
     ports:
