@@ -79,6 +79,20 @@ const STANCE_DEFAULT = env.AI_STANCE_DEFAULT || 'aggressive';
 function stanceForTeam(team) {
   return env[`AI_STANCE_${team}`] || STANCE_DEFAULT;
 }
+/** Adaptive-stance override. Even with a fixed seed stance, the
+ *  effective stance shifts with game state:
+ *  - Under attack (enemy unit within 40 m of own HQ) → defensive.
+ *  - No build-out yet (< 2 farms or no hood) → economic.
+ *  - Otherwise → whatever the seed says.
+ *  Disable with AI_ADAPTIVE_STANCE=0 to keep the seed fixed. */
+const ADAPTIVE_STANCE = envNum('AI_ADAPTIVE_STANCE', 1);
+function effectiveStance(team, ctx) {
+  const seed = stanceForTeam(team);
+  if (!ADAPTIVE_STANCE) return seed;
+  if (ctx.underAttackByTeam && ctx.underAttackByTeam[team]) return 'defensive';
+  if (ctx.buildoutByTeam && ctx.buildoutByTeam[team] === false) return 'economic';
+  return seed;
+}
 /** Wave-timing: don't dribble attackers to the enemy one at a time.
  *  Hold idle armed units back until at least WAVE_SIZE are ready,
  *  then release the whole pack in one cycle. The defending side
@@ -609,6 +623,25 @@ function decideActions(state, sessionId) {
         const h = teamBldgs.filter(b => b.kind === 'neighborhood').length;
         buildoutByTeam[team] = (f >= 2 && h >= 1);
       }
+      // Adaptive-stance signal: a team is "under attack" if any
+      // armed enemy unit sits within UNDER_ATTACK_RADIUS of its HQ.
+      // Used by effectiveStance() to flip the team's effective
+      // stance to defensive while the threat is parked at the gate.
+      const underAttackByTeam = {};
+      const UNDER_ATTACK_R = 40;
+      const UA_R2 = UNDER_ATTACK_R * UNDER_ATTACK_R;
+      for (const team of Object.keys(homeHqByTeam)) {
+        const hq = homeHqByTeam[team];
+        for (const o of enemyUnits) {
+          if (!o || o.hp <= 0 || o.team === team || !o.armed) continue;
+          const odx = o.x - hq.x, odz = o.z - hq.z;
+          if (odx * odx + odz * odz <= UA_R2) {
+            underAttackByTeam[team] = true;
+            break;
+          }
+        }
+      }
+      const adaptiveCtx = { buildoutByTeam, underAttackByTeam };
 
       let skipFiring = 0, skipPath = 0, skipUnarmed = 0, skipNoBldg = 0, skipInRange = 0, skipDefender = 0, skipEconomic = 0;
       for (const u of enemyUnits) {
@@ -622,7 +655,7 @@ function decideActions(state, sessionId) {
         // refuse to launch the first attack until the build-out is in
         // (2 farms + 1 hood + barracks) but then attack at the
         // defensive quota.
-        const stance = stanceForTeam(u.team);
+        const stance = effectiveStance(u.team, adaptiveCtx);
         const quota = stance === 'defensive' ? DEFENDER_QUOTA * 2
           : stance === 'economic' ? DEFENDER_QUOTA
           : Math.min(2, DEFENDER_QUOTA); // aggressive
@@ -632,6 +665,30 @@ function decideActions(state, sessionId) {
           const dx = u.x - hq.x, dz = u.z - hq.z;
           const atHome = dx * dx + dz * dz <= DEFENDER_RADIUS_M * DEFENDER_RADIUS_M;
           if (atHome && (defendersByTeam[u.team] || 0) <= quota) {
+            // Phase 4 — active defense. Instead of just holding the
+            // unit at the HQ, look for an armed enemy within
+            // INTERCEPT_RADIUS_M of the HQ. If one is incoming, route
+            // the defender to intercept. The defender naturally
+            // returns to attacker status next tick (it's no longer
+            // "at home" so the quota gate stops applying).
+            const INTERCEPT_R = 60;
+            const INTERCEPT_R2 = INTERCEPT_R * INTERCEPT_R;
+            let closestEnemy = null;
+            let closestD2 = Infinity;
+            for (const o of enemyUnits) {
+              if (!o || o.hp <= 0 || o.team === u.team || !o.armed) continue;
+              const odxh = o.x - hq.x, odzh = o.z - hq.z;
+              if (odxh * odxh + odzh * odzh > INTERCEPT_R2) continue;
+              const odxu = o.x - u.x, odzu = o.z - u.z;
+              const d2u = odxu * odxu + odzu * odzu;
+              if (d2u < closestD2) { closestD2 = d2u; closestEnemy = o; }
+            }
+            if (closestEnemy) {
+              actions.push({ type: 'route_unit', unitId: u.id, x: closestEnemy.x, z: closestEnemy.z });
+              actions.push({ type: 'set_focus_fire', unitId: u.id, targetId: closestEnemy.id });
+              routedThisCycle++;
+              continue;
+            }
             skipDefender++; continue;
           }
         }
