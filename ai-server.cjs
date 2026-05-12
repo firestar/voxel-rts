@@ -652,6 +652,22 @@ function decideActions(state, sessionId) {
         }
         wave.releasing = true;
         if (ready <= Math.floor(WAVE_SIZE / 2)) wave.releasing = false;
+        // Escort-siege gate: tanks + rocket trucks don't roll out
+        // alone. They need ≥2 friendly infantry within 30 m so the
+        // soft tank cargo doesn't get melted before it cracks a wall.
+        if (u.kind === 'tank' || u.kind === 'rocket_truck') {
+          let escort = 0;
+          const ER2 = 30 * 30;
+          for (const o of enemyUnits) {
+            if (!o || o.hp <= 0) continue;
+            if (o.team !== u.team || o.id === u.id) continue;
+            if (o.kind === 'tank' || o.kind === 'rocket_truck') continue;
+            if (o.kind === 'worker' || o.kind === 'civilian' || o.kind === 'supply_truck') continue;
+            const dx = o.x - u.x, dz = o.z - u.z;
+            if (dx * dx + dz * dz <= ER2) escort++;
+          }
+          if (escort < 2) continue; // hold the tank — infantry not ready
+        }
         // ============================================================
         // Influence-map-aware target selection. HQ is ALWAYS the
         // primary target (only HQ destruction wins the game), so we
