@@ -622,15 +622,14 @@ function decideActions(state, sessionId) {
           skipEconomic++; continue;
         }
         // ============================================================
-        // Influence-map target selection. Instead of "pick nearest HQ",
-        // score every enemy building by
-        //   score = base_value × (1 / (1 + 0.05 × threat_at_cell))
-        //                       × (1 / (1 + 0.005 × dist_m))
-        // The threat term routes attackers AROUND the strongest
-        // defenses toward soft targets; the value term keeps HQs the
-        // top priority when defenses are roughly equal; the distance
-        // term breaks ties in favour of closer buildings so a unit
-        // doesn't walk across the whole map past easy targets.
+        // Influence-map-aware target selection. HQ is ALWAYS the
+        // primary target (only HQ destruction wins the game), so we
+        // pick across enemy HQs using the influence map: weakest
+        // defended → easiest to crack. The influence layer only
+        // breaks the tie between multiple HQs and discourages a
+        // suicide rush at a heavily-fortified one. Other buildings
+        // are a pure fallback when no enemy HQ is alive (or reachable
+        // from this snapshot frame).
         // ============================================================
         const threatLayer = influence[u.team] ? influence[u.team].threat : null;
         let imBest = null;
@@ -638,14 +637,16 @@ function decideActions(state, sessionId) {
         for (const b of targets) {
           if (!b || !b.alive) continue;
           if (b.team && b.team === u.team) continue;
-          const base = BUILDING_VALUE[b.kind];
-          if (!base) continue;
+          if (b.kind !== 'hq') continue;
           const localThreat = threatLayer ? imSampleAtWorld(threatLayer, b.x, b.z) : 0;
           const dx = b.x - u.x, dz = b.z - u.z;
           const distM = Math.sqrt(dx * dx + dz * dz);
-          const score = base
-            / (1 + localThreat * 0.05)
-            / (1 + distM * 0.005);
+          // Score = inv-threat × inv-dist. The HQ value is constant
+          // (only HQs are scored here), so the formula resolves to
+          // "pick the closest weakly-defended HQ".
+          const score = 1
+            / (1 + localThreat * 0.02)
+            / (1 + distM * 0.003);
           if (score > imBestScore) { imBestScore = score; imBest = b; }
         }
         // Use the influence-map pick if available, otherwise fall back
