@@ -79,6 +79,16 @@ const STANCE_DEFAULT = env.AI_STANCE_DEFAULT || 'aggressive';
 function stanceForTeam(team) {
   return env[`AI_STANCE_${team}`] || STANCE_DEFAULT;
 }
+/** Wave-timing: don't dribble attackers to the enemy one at a time.
+ *  Hold idle armed units back until at least WAVE_SIZE are ready,
+ *  then release the whole pack in one cycle. The defending side
+ *  faces a concentrated push instead of single-file traffic that
+ *  dies on the way in. Tunable per round. */
+const WAVE_SIZE = envNum('AI_WAVE_SIZE', 5);
+/** Auto-rebuild: when a barracks / farm / hood is destroyed, the AI
+ *  re-queues a place_building action so the economy stays online.
+ *  Defaults on; set AI_AUTO_REBUILD=0 to disable for ablation tests. */
+const AUTO_REBUILD = envNum('AI_AUTO_REBUILD', 1);
 process.stderr.write(`[ai-server] params train=${TRAIN_INTERVAL_S} attack=${ATTACK_STOP_FRACTION} retarget=${ATTACK_RETARGET_S} workers=${WORKER_TARGET} defenders=${DEFENDER_QUOTA} stance=${STANCE_DEFAULT}\n`);
 
 function ensureSession(id) {
@@ -576,6 +586,7 @@ function decideActions(state, sessionId) {
       const homeHqByTeam = {};
       const defendersByTeam = {};
       const buildoutByTeam = {};
+      const readyAttackersByTeam = {};
       for (const h of hqs) homeHqByTeam[h.team] = h;
       for (const u of enemyUnits) {
         if (!u || u.hp <= 0) continue;
@@ -584,6 +595,12 @@ function decideActions(state, sessionId) {
         const dx = u.x - hq.x, dz = u.z - hq.z;
         if (dx * dx + dz * dz <= DEFENDER_RADIUS_M * DEFENDER_RADIUS_M) {
           defendersByTeam[u.team] = (defendersByTeam[u.team] || 0) + 1;
+        }
+        // "Ready attacker" = armed, no path, no firing target, not at
+        // home defender slot. We tally these for wave-timing — only
+        // release the attack when the pack reaches WAVE_SIZE.
+        if (u.armed && !u.hasFiringTarget && u.pathLen === 0) {
+          readyAttackersByTeam[u.team] = (readyAttackersByTeam[u.team] || 0) + 1;
         }
       }
       for (const team of Object.keys(homeHqByTeam)) {
@@ -621,6 +638,20 @@ function decideActions(state, sessionId) {
         if (stance === 'economic' && !buildoutByTeam[u.team]) {
           skipEconomic++; continue;
         }
+        // Wave-timing gate. Hold attackers back until enough are
+        // ready (armed + idle + no path) to send out as a pack.
+        // Tracked per team via state machine: once a wave releases,
+        // we keep releasing for that cycle until the count drops
+        // below WAVE_SIZE/2, then we wait for accumulation again.
+        if (!s.waveByTeam) s.waveByTeam = {};
+        const wave = s.waveByTeam[u.team] || { releasing: false };
+        s.waveByTeam[u.team] = wave;
+        const ready = readyAttackersByTeam[u.team] || 0;
+        if (!wave.releasing && ready < WAVE_SIZE) {
+          continue; // hold — not enough attackers ready yet
+        }
+        wave.releasing = true;
+        if (ready <= Math.floor(WAVE_SIZE / 2)) wave.releasing = false;
         // ============================================================
         // Influence-map-aware target selection. HQ is ALWAYS the
         // primary target (only HQ destruction wins the game), so we
