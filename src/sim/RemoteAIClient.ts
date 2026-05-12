@@ -34,7 +34,8 @@ export type AiAction =
   | { type: 'queue_train'; buildingId: number; unitKind: UnitKind }
   | { type: 'route_unit'; unitId: number; x: number; z: number }
   | { type: 'set_worker_focus'; workerId: number; focus: WorkerFocus }
-  | { type: 'upgrade_building'; buildingId: number; upgradeId: string };
+  | { type: 'upgrade_building'; buildingId: number; upgradeId: string }
+  | { type: 'set_focus_fire'; unitId: number; targetId: number };
 
 export interface AIClientDeps {
   units: UnitManager;
@@ -270,7 +271,17 @@ export class RemoteAIClient {
       case 'route_unit': return this.applyRouteUnit(a, deps);
       case 'set_worker_focus': return this.applySetWorkerFocus(a, deps);
       case 'upgrade_building': return this.applyUpgradeBuilding(a, deps);
+      case 'set_focus_fire': return this.applySetFocusFire(a, deps);
     }
+  }
+
+  private applySetFocusFire(
+    a: { unitId: number; targetId: number },
+    deps: AIClientDeps,
+  ): void {
+    const u = deps.units.units.find(x => x.id === a.unitId);
+    if (!u || u.hp <= 0) return;
+    u.focusFireTargetId = a.targetId;
   }
 
   private applyUpgradeBuilding(

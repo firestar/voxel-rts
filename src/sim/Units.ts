@@ -817,6 +817,16 @@ export interface Unit {
    */
   autoEngageCooldown: number;
   /**
+   * Squad fire-concentration hint set by the AI server's hunt-and-
+   * attack pass. When set to a non-negative unit id, the aggressive
+   * stance target picker biases toward that unit so a squad firing
+   * on the same target kills it fast (vs. each unit picking its own
+   * nearest enemy and dribbling damage across the whole front line).
+   * Cleared automatically when the target dies or moves out of
+   * range.
+   */
+  focusFireTargetId: number;
+  /**
    * Re-arm timer for the evasion pass. Set to a positive value the moment a
    * unit dives perpendicular out of an incoming projectile's path so it
    * doesn't keep juking every single frame; ticks down at real time. The
@@ -1040,6 +1050,7 @@ export class UnitManager {
       launcherMaxStrength: cfg.launcherMaxStrength,
       stance: opts?.stance ?? 'defensive',
       autoEngageCooldown: 0,
+      focusFireTargetId: -1,
       evadeCooldown: 0,
     };
     this.units.push(u);

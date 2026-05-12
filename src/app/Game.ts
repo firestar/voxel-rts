@@ -4703,13 +4703,27 @@ export class Game {
       let targetUnit: Unit | null = null;
       let targetBuilding: Building | null = null;
       let bestScore = -Infinity;
+      // Squad fire-concentration: when the AI server set
+      // u.focusFireTargetId on this unit, treat that target as a
+      // massive threat-score boost so the picker locks onto it
+      // (provided it's alive + in range). Other targets can still
+      // win if the focus target moved out of range or died. We
+      // clear focusFireTargetId for stale ids so it doesn't leak.
+      const FOCUS_FIRE_BONUS = 500;
+      if (u.focusFireTargetId !== undefined && u.focusFireTargetId >= 0) {
+        const ft = liveUnits.find(x => x.id === u.focusFireTargetId);
+        if (!ft || ft.team === u.team) {
+          u.focusFireTargetId = -1;
+        }
+      }
       for (const e of liveUnits) {
         if (e.team === u.team) continue;
         const dx = e.x - u.x, dz = e.z - u.z;
         const d2 = dx * dx + dz * dz;
         if (d2 > range2) continue;
         const proximity = PROXIMITY_BONUS_MAX * Math.max(0, 1 - Math.sqrt(d2) / range);
-        const score = (UNIT_THREAT[e.kind] ?? 30) + proximity;
+        const focusBonus = (e.id === u.focusFireTargetId) ? FOCUS_FIRE_BONUS : 0;
+        const score = (UNIT_THREAT[e.kind] ?? 30) + proximity + focusBonus;
         if (score > bestScore) {
           bestScore = score;
           targetUnit = e; targetBuilding = null;

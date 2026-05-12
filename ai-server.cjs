@@ -740,6 +740,31 @@ function decideActions(state, sessionId) {
         const goalX = u.x + (bestB.x - u.x) * scale + jx * jitterRad;
         const goalZ = u.z + (bestB.z - u.z) * scale + jz * jitterRad;
         actions.push({ type: 'route_unit', unitId: u.id, x: goalX, z: goalZ });
+        // Squad fire-concentration: pick the highest-threat enemy
+        // unit within 25 m and broadcast it as the focus target.
+        // Multiple attackers walking together will see the same
+        // candidates and tend to pick the same one, so when they
+        // arrive in range their volley converges on one target
+        // instead of dribbling damage across the whole defending
+        // formation.
+        let focusUnit = null;
+        let focusBest = -Infinity;
+        const FOCUS_R2 = 25 * 25;
+        for (const e of enemyUnits) {
+          if (!e || e.hp <= 0 || e.team === u.team) continue;
+          const dps = UNIT_DPS[e.kind] || 0;
+          if (dps <= 0) continue;
+          const dx = e.x - u.x, dz = e.z - u.z;
+          const d2 = dx * dx + dz * dz;
+          if (d2 > FOCUS_R2) continue;
+          // Prefer highest DPS, tie-break on lower HP (finish low-
+          // health units first so they leave the fight faster).
+          const score = dps - (e.hp ?? 0) * 0.01;
+          if (score > focusBest) { focusBest = score; focusUnit = e; }
+        }
+        if (focusUnit) {
+          actions.push({ type: 'set_focus_fire', unitId: u.id, targetId: focusUnit.id });
+        }
         routedThisCycle++;
       }
       if (routedThisCycle > 0 || skipPath > 0 || skipFiring > 0) {
