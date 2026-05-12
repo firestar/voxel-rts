@@ -151,6 +151,146 @@ function canAffordUnit(res, kind) {
  *   { type: 'place_building', kind }
  *   { type: 'queue_train', buildingId, unitKind }
  */
+// ============================================================
+// Influence maps. Each tick we build a coarse 64×64 grid over the
+// world (≈ 4 m per cell). For each team we store two layers:
+//   threat[team]: stamps of enemy combat-unit DPS-falloff discs.
+//                 An attacker reads this on a candidate target's
+//                 cell to discount heavily-defended objectives.
+//   value[team]:  stamps of OWN buildings + units. Used by the
+//                 defender pass (future) and to break ties between
+//                 attack targets — high-value structures get
+//                 priority.
+// Update is O(units × disc_cells). With ~50 units stamping a 10-cell
+// disc, that's ~50×314 = ~16k float adds per tick. Cheap.
+// ============================================================
+const IM_CELL_M = 4.0;
+const IM_W = 64;
+const IM_H = 64;
+const IM_SIZE = IM_W * IM_H;
+const TEAMS_KNOWN = ['player', 'enemy', 'enemy2'];
+
+// Per-unit-kind threat radius + DPS estimate. Numbers are rough but
+// preserve the ordering: tanks dominate, soldiers/gunners next,
+// melee/utility low.
+const UNIT_DPS = {
+  soldier:        12,   sniper:         25,
+  gunner:         20,   mortar_soldier: 18,
+  rocket_soldier: 22,   tank:           60,
+  rocket_truck:   45,   aa_vehicle:     8,
+  tunneler:       8,    worm:           12,
+  worker:         0,    civilian:       0,
+  dozer:          0,    supply_truck:   0,
+};
+const UNIT_THREAT_RADIUS_M = {
+  soldier:        20,   sniper:         60,
+  gunner:         30,   mortar_soldier: 30,
+  rocket_soldier: 20,   tank:           28,
+  rocket_truck:   40,   aa_vehicle:     8,
+  tunneler:       6,    worm:           6,
+  worker:         0,    civilian:       0,
+  dozer:          0,    supply_truck:   0,
+};
+const BUILDING_VALUE = {
+  hq:            1000,
+  vehicle_depot: 250,
+  barracks:      200,
+  neighborhood:  120,
+  refinery:      90,
+  power_plant:   80,
+  tech_lab:      80,
+  farm:          70,
+  storage:       60,
+  silo:          120,
+  turret:        120,
+};
+
+function imIndex(cx, cz) { return cz * IM_W + cx; }
+function imCellOfWorld(wx, wz) {
+  const cx = Math.max(0, Math.min(IM_W - 1, Math.floor(wx / IM_CELL_M)));
+  const cz = Math.max(0, Math.min(IM_H - 1, Math.floor(wz / IM_CELL_M)));
+  return imIndex(cx, cz);
+}
+
+/** Stamp a linear-falloff disc onto `grid` centred at (cx, cz) in
+ *  cell coordinates with radius `r` cells and peak `value`. */
+function stampDisc(grid, cx, cz, r, value) {
+  if (r <= 0 || value === 0) return;
+  const r2 = r * r;
+  const x0 = Math.max(0, cx - r);
+  const x1 = Math.min(IM_W - 1, cx + r);
+  const z0 = Math.max(0, cz - r);
+  const z1 = Math.min(IM_H - 1, cz + r);
+  for (let z = z0; z <= z1; z++) {
+    const dz = z - cz;
+    const dz2 = dz * dz;
+    const row = z * IM_W;
+    for (let x = x0; x <= x1; x++) {
+      const dx = x - cx;
+      const d2 = dx * dx + dz2;
+      if (d2 > r2) continue;
+      const dist = Math.sqrt(d2);
+      const falloff = 1 - dist / r;
+      grid[row + x] += value * falloff;
+    }
+  }
+}
+
+function buildInfluenceMaps(state) {
+  const maps = {};
+  for (const team of TEAMS_KNOWN) {
+    maps[team] = {
+      threat: new Float32Array(IM_SIZE),
+      value:  new Float32Array(IM_SIZE),
+    };
+  }
+  const units = Array.isArray(state.enemyUnits) ? state.enemyUnits : [];
+  const buildings = Array.isArray(state.enemyBuildings) ? state.enemyBuildings : [];
+
+  // Threat per team: every unit stamps onto EVERY OTHER team's threat
+  // layer. (Units don't threaten their own team.) Use the unit's
+  // weapon-derived DPS + radius.
+  for (const u of units) {
+    if (!u || u.hp <= 0) continue;
+    const dps = UNIT_DPS[u.kind] || 0;
+    const radM = UNIT_THREAT_RADIUS_M[u.kind] || 0;
+    if (dps <= 0 || radM <= 0) continue;
+    const cx = Math.floor(u.x / IM_CELL_M);
+    const cz = Math.floor(u.z / IM_CELL_M);
+    const rCells = Math.max(1, Math.round(radM / IM_CELL_M));
+    for (const team of TEAMS_KNOWN) {
+      if (team === u.team) continue;
+      stampDisc(maps[team].threat, cx, cz, rCells, dps);
+    }
+  }
+
+  // Value per team: own buildings + units stamp onto own team's value
+  // layer. Buildings get the big numbers; units get a small +DPS
+  // contribution so a unit cluster near a building reads as a
+  // hard-to-kill objective.
+  for (const b of buildings) {
+    if (!b || b.destroyed || !b.team) continue;
+    const cx = Math.floor(b.x / IM_CELL_M);
+    const cz = Math.floor(b.z / IM_CELL_M);
+    const base = BUILDING_VALUE[b.kind] || 30;
+    stampDisc(maps[b.team].value, cx, cz, 3, base);
+  }
+  for (const u of units) {
+    if (!u || u.hp <= 0) continue;
+    const dps = UNIT_DPS[u.kind] || 0;
+    if (dps <= 0) continue;
+    const cx = Math.floor(u.x / IM_CELL_M);
+    const cz = Math.floor(u.z / IM_CELL_M);
+    stampDisc(maps[u.team].value, cx, cz, 2, dps);
+  }
+  return maps;
+}
+
+/** Read a layer at a world position. */
+function imSampleAtWorld(layer, wx, wz) {
+  return layer[imCellOfWorld(wx, wz)];
+}
+
 function decideActions(state, sessionId) {
   const s = ensureSession(sessionId);
   const now = Date.now();
@@ -159,6 +299,8 @@ function decideActions(state, sessionId) {
   const actions = [];
 
   if (!state) return { actions };
+  // Influence maps for the hunt-and-attack pass. Rebuilt every tick.
+  const influence = buildInfluenceMaps(state);
   // Multi-HQ aware: every enemy HQ runs its own per-base brain so
   // multiple AI players each build their own barracks + farms with
   // their own resource pool.
@@ -479,21 +621,50 @@ function decideActions(state, sessionId) {
         if (stance === 'economic' && !buildoutByTeam[u.team]) {
           skipEconomic++; continue;
         }
-        // Prefer enemy HQs over other buildings — destroying an HQ
-        // ends the game (HQ_WIN), so concentrating fire on HQ kinds
-        // accelerates the win condition. Only fall back to "nearest
-        // anything" when no enemy HQ is in sight.
-        let bestB = null;
-        let bestD2 = Infinity;
+        // ============================================================
+        // Influence-map target selection. Instead of "pick nearest HQ",
+        // score every enemy building by
+        //   score = base_value × (1 / (1 + 0.05 × threat_at_cell))
+        //                       × (1 / (1 + 0.005 × dist_m))
+        // The threat term routes attackers AROUND the strongest
+        // defenses toward soft targets; the value term keeps HQs the
+        // top priority when defenses are roughly equal; the distance
+        // term breaks ties in favour of closer buildings so a unit
+        // doesn't walk across the whole map past easy targets.
+        // ============================================================
+        const threatLayer = influence[u.team] ? influence[u.team].threat : null;
+        let imBest = null;
+        let imBestScore = -Infinity;
         for (const b of targets) {
           if (!b || !b.alive) continue;
           if (b.team && b.team === u.team) continue;
-          if (b.kind !== 'hq') continue;
+          const base = BUILDING_VALUE[b.kind];
+          if (!base) continue;
+          const localThreat = threatLayer ? imSampleAtWorld(threatLayer, b.x, b.z) : 0;
           const dx = b.x - u.x, dz = b.z - u.z;
-          const d2 = dx * dx + dz * dz;
-          if (d2 < bestD2) { bestD2 = d2; bestB = b; }
+          const distM = Math.sqrt(dx * dx + dz * dz);
+          const score = base
+            / (1 + localThreat * 0.05)
+            / (1 + distM * 0.005);
+          if (score > imBestScore) { imBestScore = score; imBest = b; }
+        }
+        // Use the influence-map pick if available, otherwise fall back
+        // to "nearest HQ / nearest anything" so a snapshot with no
+        // value-scored targets still routes attackers somewhere.
+        let bestB = imBest;
+        if (!bestB) {
+          let bestD2 = Infinity;
+          for (const b of targets) {
+            if (!b || !b.alive) continue;
+            if (b.team && b.team === u.team) continue;
+            if (b.kind !== 'hq') continue;
+            const dx = b.x - u.x, dz = b.z - u.z;
+            const d2 = dx * dx + dz * dz;
+            if (d2 < bestD2) { bestD2 = d2; bestB = b; }
+          }
         }
         if (!bestB) {
+          let bestD2 = Infinity;
           for (const b of targets) {
             if (!b || !b.alive) continue;
             if (b.team && b.team === u.team) continue;
@@ -505,6 +676,8 @@ function decideActions(state, sessionId) {
         if (!bestB) { skipNoBldg++; continue; }
         const range = APPROX_WEAPON_RANGE_M[u.kind] || 18;
         const stopRange = Math.max(1, range * ATTACK_STOP_FRACTION);
+        const bdx = bestB.x - u.x, bdz = bestB.z - u.z;
+        const bestD2 = bdx * bdx + bdz * bdz;
         const distToTarget = Math.sqrt(bestD2);
         if (distToTarget <= stopRange) { skipInRange++; continue; }
         const scale = (distToTarget - stopRange) / distToTarget;
