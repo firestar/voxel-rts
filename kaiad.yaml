@@ -67,7 +67,9 @@ services:
         protocol: https
 
     loadBalancer:
-      type: nginx
+      type: metallb
+      addressPool: first-pool
+      loadBalancerIPs: 192.168.1.62
 
     # Single environment — defaults from the top level apply verbatim.
     environments:
