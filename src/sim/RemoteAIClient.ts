@@ -2,7 +2,7 @@ import { Unit, UnitManager, UnitKind, WorkerFocus } from './Units';
 import {
   BuildingManager, Building, BuildingKind, BuildingSpec,
   BARRACKS, FARM, VEHICLE_DEPOT, NEIGHBORHOOD,
-  checkFootprint, snapshotBuildingStructure,
+  checkFootprint, snapshotBuildingStructure, hasTruckApproach,
   UNIT_TRAIN_COST,
 } from './Buildings';
 import { Resources } from './Resources';
@@ -61,12 +61,28 @@ export interface AIClientDeps {
   ) => void;
 }
 
+/** Default cadence in seconds between AI-server pulses. The debug
+ *  page lowers `tickIntervalSeconds` (typically to 0.25) so the brain
+ *  reacts faster during AI-vs-AI playback. */
 const TICK_INTERVAL_S = 1.0;
 /** Same-origin path. In dev the vite proxy forwards /ai → :3030; in
  *  production the nginx in the container does the same. Override via
  *  the `url` constructor option for one-off setups. */
 const DEFAULT_URL = '/ai/tick';
 const DEFAULT_SESSION = 'default';
+
+/** Per-action counters drained by the debug panel. Each `apply*`
+ *  handler bumps the matching field; the panel reads + resets them on
+ *  its refresh interval. Off the hot path for the normal game (panel
+ *  never reads them) so the bookkeeping is essentially free. */
+export interface AIClientStats {
+  placed: number;
+  trained: number;
+  routed: number;
+  focused: number;
+  upgraded: number;
+  workerFocus: number;
+}
 
 const KNOWN_UNIT_KINDS: ReadonlyArray<UnitKind> = [
   'soldier', 'sniper', 'gunner', 'mortar_soldier', 'rocket_soldier',
@@ -93,18 +109,28 @@ export class RemoteAIClient {
   /** True after a request fails; we throttle retries so a missing
    *  server doesn't hammer the console with errors. */
   private backoffUntil = 0;
+  /** Interval in seconds between consecutive `/ai/tick` pulses. Public
+   *  so the debug page can lower it (e.g. 0.25 s) for faster AI
+   *  reactions during AI-vs-AI playback. Defaults to {@link TICK_INTERVAL_S}. */
+  tickIntervalSeconds: number = TICK_INTERVAL_S;
+  /** Counters drained by the debug panel. Zeroed by callers after
+   *  read; the normal game never inspects them. */
+  readonly stats: AIClientStats = {
+    placed: 0, trained: 0, routed: 0,
+    focused: 0, upgraded: 0, workerFocus: 0,
+  };
 
   constructor(opts?: { url?: string; sessionId?: string }) {
     this.url = opts?.url ?? DEFAULT_URL;
     this.sessionId = opts?.sessionId ?? DEFAULT_SESSION;
   }
 
-  /** Called once per game frame. Pulses the server every TICK_INTERVAL_S. */
+  /** Called once per game frame. Pulses the server every {@link tickIntervalSeconds}. */
   tick(dt: number, deps: AIClientDeps): void {
     this.cooldown -= dt;
     if (this.cooldown > 0) return;
     if (this.inflight) return;
-    this.cooldown = TICK_INTERVAL_S;
+    this.cooldown = this.tickIntervalSeconds;
     if (performance.now() < this.backoffUntil) return;
     this.inflight = true;
     void this.pulse(deps).finally(() => { this.inflight = false; });
@@ -282,6 +308,7 @@ export class RemoteAIClient {
     const u = deps.units.units.find(x => x.id === a.unitId);
     if (!u || u.hp <= 0) return;
     u.focusFireTargetId = a.targetId;
+    this.stats.focused++;
   }
 
   private applyUpgradeBuilding(
@@ -301,6 +328,7 @@ export class RemoteAIClient {
     const seconds = deps.buildings.constructionSecondsFor(b) || 30;
     b.constructionTimer = seconds;
     b.constructionTotal = seconds;
+    this.stats.upgraded++;
   }
 
   private applySetWorkerFocus(
@@ -317,6 +345,7 @@ export class RemoteAIClient {
     // to ore until the cluster empties).
     u.task = { kind: 'idle' };
     u.path = [];
+    this.stats.workerFocus++;
   }
 
   private applyRouteUnit(
@@ -328,9 +357,23 @@ export class RemoteAIClient {
     // Per the AI-vs-AI loop, EVERY HQ team is brain-driven — including
     // the player slot. Don't filter by team here, otherwise player
     // soldiers idle at base while enemy soldiers march on them.
-    if (u.firingTarget) return; // sticky: don't override a fresh fire order
+    // Sticky-fire vs. stranding (iter84). Previously ANY unit with a
+    // firingTarget ignored route commands. A vehicle that perpetually
+    // re-acquires an in-range chaff target therefore NEVER advances — its
+    // firingTarget is always set, so every attack-move to the enemy HQ is
+    // dropped and it strands trading shots with screening units instead of
+    // pushing the objective. Only honour the skip when the route goal is
+    // essentially where the unit already stands (a hold / micro order, < 2
+    // nav cells). When the brain commands a real ADVANCE (far goal), route
+    // anyway: WeaponTick fires at firingTarget independent of movement, so the
+    // unit keeps shooting while it closes on the objective.
+    if (u.firingTarget) {
+      const dx = a.x - u.x, dz = a.z - u.z;
+      if (dx * dx + dz * dz < 16 * 16) return; // already at the goal — keep firing in place
+    }
     const y = deps.surfaceY(a.x, a.z);
     deps.routeUnit(u, a.x, y, a.z);
+    this.stats.routed++;
   }
 
   private applyPlaceBuilding(a: { kind: BuildingKind; anchorHqId?: number }, deps: AIClientDeps): void {
@@ -375,11 +418,38 @@ export class RemoteAIClient {
       [12, 0], [-12, 0], [0, -12], [0, 12],
       [12, -6], [12, 6], [-12, -6], [-12, 6],
     ];
+    let lastReason = 'no-attempt';
     for (const [dx, dz] of offsets) {
       const ox = Math.max(0, Math.min(NAV_W - spec.cellsW, baseCx + dx - (spec.cellsW >> 1)));
       const oz = Math.max(0, Math.min(NAV_H - spec.cellsD, baseCz + dz - (spec.cellsD >> 1)));
       const fp = checkFootprint(deps.world.buffers.voxels, deps.surfaceNav, spec, ox, oz, deps.buildings.buildings);
-      if (!fp.ok) continue;
+      if (!fp.ok) { lastReason = fp.reason || 'no-fit'; continue; }
+      // Storage placement must leave at least one truck-accessible face. The
+      // default ring of offsets often lands storage flush against HQ + a
+      // barracks (see iter6/iter7 layouts), with every face approach point
+      // sitting inside an adjacent building's footprint — the truck's 3×3
+      // nav-cell box overlaps the wall column and `pickApproach` falls back
+      // to an unreachable inner point, hanging the truck until it despawns
+      // 50 s later. Skip such offsets so the build order succeeds at a
+      // farther-out slot rather than stranding the team's economy.
+      if (a.kind === 'storage' && !hasTruckApproach(ox, oz, spec, deps.buildings.buildings)) {
+        lastReason = 'no truck approach (storage trapped between buildings)';
+        continue;
+      }
+      // Symmetric guard: placing a barracks / neighborhood / depot flush
+      // against the team's HQ blocks the HQ's truck approach. Trucks
+      // can't deliver `truck_deliver_hq` cargo back, the watchdog fires
+      // FAILURE_TRUCK at 60 s, and the run dies. Reject offsets that
+      // would seal off every face of the home HQ after this placement.
+      if (a.kind !== 'storage' && a.kind !== 'hq') {
+        const proposed = deps.buildings.buildings.concat([
+          { ox, oz, spec, destroyed: false } as unknown as Building,
+        ]);
+        if (!hasTruckApproach(hq.ox, hq.oz, hq.spec, proposed)) {
+          lastReason = `no truck approach (this ${a.kind} would trap HQ#${hq.id})`;
+          continue;
+        }
+      }
       // Place the footprint with team='enemy'. Same flow as a player
       // build: pending state, activeUpgradeId='initial'. Supply trucks
       // pick up the delivery from the enemy HQ and the building
@@ -396,8 +466,11 @@ export class RemoteAIClient {
       const by0 = fp.floorY * VOXEL_SIZE;
       const by1 = (fp.floorY + spec.headroomVoxels + 4) * VOXEL_SIZE;
       deps.requestNavRebuildAround(bx0 - pad, by0 - pad, bz0 - pad, bx1 + pad, by1 + pad, bz1 + pad);
+      this.stats.placed++;
+      console.warn(`[AI-PLACE] OK ${a.kind} team=${placeTeam} at ox=${ox} oz=${oz} (hq=${hq.id})`);
       return;
     }
+    console.warn(`[AI-PLACE] FAIL ${a.kind} team=${placeTeam} hq=${hq.id} (last=${lastReason}) — no offset accepted`);
     void cost;
     void NAV_CELL_VOXELS;
   }
@@ -416,6 +489,8 @@ export class RemoteAIClient {
     // resupply truck to the producer; production only begins once the
     // truck arrives. Same loop the player relies on.
     b.trainQueue.push(a.unitKind);
+    this.stats.trained++;
     void UNIT_TRAIN_COST;
   }
 }
+

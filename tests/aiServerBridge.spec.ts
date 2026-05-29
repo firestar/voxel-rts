@@ -25,8 +25,27 @@ const ai = require('../ai-server.cjs') as {
   snapshotToCommands: (snap: Snapshot, sessionId: string, opts?: { enemyOwner?: string }) => Array<{
     type: string; id?: number; owner?: string; x?: number; z?: number;
   }>;
-  ensureSession: (id: string) => { trainCooldown: number; placeCooldown: number; attackRetargetCooldown: number };
+  ensureSession: (id: string) => { trainCooldown: number; placeCooldown: number; attackRetargetCooldown: number; perHq?: Map<number, unknown> };
+  decideActions: (state: BrainState, sessionId: string) => { actions: BrainAction[] };
 };
+
+// Minimal `decideActions` state shape (mirrors RemoteAIClient.snapshot).
+interface BrainHq { id: number; team: string; alive: boolean; x: number; z: number; ox?: number; oz?: number; cellsW?: number; cellsD?: number; }
+interface BrainBldg { id: number; kind: string; team: string; upgradeState: string; trainQueueLen?: number; anchorHqId?: number | null; x?: number; z?: number; }
+interface BrainWorker { id: number; team: string; focus: string; taskKind: string; }
+interface BrainState {
+  enemyHqs: BrainHq[];
+  enemyBuildings: BrainBldg[];
+  targetBuildings: Array<{ id: number; kind: string; team: string; x: number; z: number; alive: boolean }>;
+  playerBuildings: unknown[];
+  enemyUnits: unknown[];
+  workers: BrainWorker[];
+  enemyResources: { food: number; metals: number; wood: number };
+  teamResources: Record<string, { food: number; metals: number; wood: number; popCap: number }>;
+  teamPopUsed: Record<string, number>;
+  enemyUnitCount: number;
+}
+interface BrainAction { type: string; workerId?: number; focus?: string; kind?: string; buildingId?: number; unitKind?: string; }
 
 function emptySnapshot(): Snapshot {
   return {
@@ -172,6 +191,126 @@ describe('ai-server bridge', () => {
     expect(places[0]!.owner).toBe('enemy');
     expect(places[0]!.kind).toBe('barracks');
     expect(typeof places[0]!.clientTag).toBe('string');
+  });
+
+  it('redirects farmers to mining when food is abundant and metals are dry', () => {
+    // A fully-built base (no outstanding building bill) sitting on a huge
+    // food bank with empty metals is the iter53-59 failure: the brain used
+    // to leave seed farmers over-producing food while the army starved for
+    // metals. With the iter60 worker-economy fix, abundant food → 0 farmers
+    // and the whole pool funds the metal/wood the army needs.
+    const s = ai.ensureSession('focus-test');
+    if (s.perHq) s.perHq.clear();
+    const team = 'enemy';
+    const state: BrainState = {
+      enemyHqs: [{ id: 1, team, alive: true, x: 100, z: 100, ox: 100, oz: 100, cellsW: 6, cellsD: 5 }],
+      enemyBuildings: [
+        { id: 1, kind: 'hq', team, upgradeState: 'enabled', anchorHqId: 1 },
+        { id: 2, kind: 'barracks', team, upgradeState: 'enabled', anchorHqId: 1, trainQueueLen: 0 },
+        { id: 3, kind: 'barracks', team, upgradeState: 'enabled', anchorHqId: 1, trainQueueLen: 0 },
+        { id: 4, kind: 'barracks', team, upgradeState: 'enabled', anchorHqId: 1, trainQueueLen: 0 },
+        { id: 5, kind: 'farm', team, upgradeState: 'enabled', anchorHqId: 1 },
+        { id: 6, kind: 'farm', team, upgradeState: 'enabled', anchorHqId: 1 },
+        { id: 7, kind: 'neighborhood', team, upgradeState: 'enabled', anchorHqId: 1 },
+        { id: 8, kind: 'neighborhood', team, upgradeState: 'enabled', anchorHqId: 1 },
+        { id: 9, kind: 'vehicle_depot', team, upgradeState: 'enabled', anchorHqId: 1 },
+      ],
+      targetBuildings: [],
+      playerBuildings: [],
+      enemyUnits: [],
+      workers: [
+        { id: 101, team, focus: 'farm', taskKind: 'farm' },
+        { id: 102, team, focus: 'farm', taskKind: 'farm' },
+        { id: 103, team, focus: 'farm', taskKind: 'farm' },
+        { id: 104, team, focus: 'farm', taskKind: 'farm' },
+        { id: 105, team, focus: 'farm', taskKind: 'farm' },
+      ],
+      enemyResources: { food: 5000, metals: 0, wood: 0 },
+      teamResources: { enemy: { food: 5000, metals: 0, wood: 0, popCap: 30 } },
+      teamPopUsed: { enemy: 5 },
+      enemyUnitCount: 5,
+    };
+    const { actions } = ai.decideActions(state, 'focus-test');
+    const focusActions = actions.filter(a => a.type === 'set_worker_focus');
+    // The brain must redirect the over-farming pool.
+    expect(focusActions.length).toBeGreaterThan(0);
+    // None should re-assign anyone TO farm (food is abundant → 0 farmers).
+    expect(focusActions.every(a => a.focus !== 'farm')).toBe(true);
+    // At least one farmer goes to mining (metals are the dry resource the
+    // army needs).
+    expect(focusActions.some(a => a.focus === 'mine')).toBe(true);
+  });
+
+  it('reserves metals for a tank when a depot is live (no infantry starving the armor)', () => {
+    // Depot built, no tank queued, metals below the 80 a tank needs but above
+    // infantry costs. Before iter61 the brain spent those metals on infantry
+    // every tick so the pool never reached 80 and 0 tanks ever built (iter53-60).
+    // Now the tank's metals are reserved: no combat unit queues until either the
+    // pool climbs to 80 (tank) or the reserve lifts.
+    const mkState = (metals: number): BrainState => ({
+      enemyHqs: [{ id: 1, team: 'enemy', alive: true, x: 100, z: 100, ox: 100, oz: 100, cellsW: 6, cellsD: 5 }],
+      enemyBuildings: [
+        { id: 1, kind: 'hq', team: 'enemy', upgradeState: 'enabled', anchorHqId: 1 },
+        { id: 2, kind: 'barracks', team: 'enemy', upgradeState: 'enabled', anchorHqId: 1, trainQueueLen: 0 },
+        { id: 9, kind: 'vehicle_depot', team: 'enemy', upgradeState: 'enabled', anchorHqId: 1, trainQueueLen: 0 },
+      ],
+      targetBuildings: [], playerBuildings: [], enemyUnits: [],
+      // Workers at the cap so the worker pump doesn't queue anything.
+      workers: Array.from({ length: 12 }, (_, i) => ({ id: 200 + i, team: 'enemy', focus: 'mine', taskKind: 'mine' })),
+      enemyResources: { food: 500, metals, wood: 500 },
+      teamResources: { enemy: { food: 500, metals, wood: 500, popCap: 40 } },
+      teamPopUsed: { enemy: 12 },
+      enemyUnitCount: 12,
+    });
+    // Below tank cost: reserve blocks infantry AND tank can't afford → no combat queue.
+    {
+      const s = ai.ensureSession('reserve-a'); if (s.perHq) s.perHq.clear();
+      const { actions } = ai.decideActions(mkState(50), 'reserve-a');
+      const trains = actions.filter(a => a.type === 'queue_train' && a.unitKind !== 'worker');
+      expect(trains.length).toBe(0);
+    }
+    // At tank cost: the tank queues (armor finally gets built).
+    {
+      const s = ai.ensureSession('reserve-b'); if (s.perHq) s.perHq.clear();
+      const { actions } = ai.decideActions(mkState(80), 'reserve-b');
+      const tankTrains = actions.filter(a => a.type === 'queue_train' && a.unitKind === 'tank');
+      expect(tankTrains.length).toBe(1);
+    }
+  });
+
+  it('fields advanced vehicle-depot units (tank, rocket_truck, aa_vehicle) once teched up', () => {
+    // A teched-up base (depot + barracks live) with metals to spare must
+    // rotate the depot through ALL three vehicle kinds, not tank-spam. Before
+    // iter64 the depot block hard-coded 'tank' and the AI never built anti-air
+    // or missile launchers despite owning the producer.
+    const s = ai.ensureSession('depot-rot'); if (s.perHq) s.perHq.clear();
+    const mkState = (): BrainState => ({
+      enemyHqs: [{ id: 1, team: 'enemy', alive: true, x: 100, z: 100, ox: 100, oz: 100, cellsW: 6, cellsD: 5 }],
+      enemyBuildings: [
+        { id: 1, kind: 'hq', team: 'enemy', upgradeState: 'enabled', anchorHqId: 1 },
+        { id: 2, kind: 'barracks', team: 'enemy', upgradeState: 'enabled', anchorHqId: 1, trainQueueLen: 0 },
+        { id: 9, kind: 'vehicle_depot', team: 'enemy', upgradeState: 'enabled', anchorHqId: 1, trainQueueLen: 0 },
+      ],
+      targetBuildings: [], playerBuildings: [], enemyUnits: [],
+      workers: Array.from({ length: 12 }, (_, i) => ({ id: 200 + i, team: 'enemy', focus: 'mine', taskKind: 'mine' })),
+      enemyResources: { food: 2000, metals: 3000, wood: 2000 },
+      teamResources: { enemy: { food: 2000, metals: 3000, wood: 2000, popCap: 60 } },
+      teamPopUsed: { enemy: 12 },
+      enemyUnitCount: 12,
+    });
+    // Drive several brain cycles; the depot fixture keeps trainQueueLen at 0
+    // (we don't simulate production) so each cycle queues one depot unit and
+    // the per-HQ rotation index advances. Collect the depot's unit kinds.
+    const depotKinds = new Set<string>();
+    for (let i = 0; i < 5; i++) {
+      const { actions } = ai.decideActions(mkState(), 'depot-rot');
+      for (const a of actions) {
+        if (a.type === 'queue_train' && a.buildingId === 9 && a.unitKind) depotKinds.add(a.unitKind);
+      }
+    }
+    expect(depotKinds.has('tank')).toBe(true);
+    expect(depotKinds.has('rocket_truck')).toBe(true);
+    expect(depotKinds.has('aa_vehicle')).toBe(true);
   });
 
   it('skips a unit that already has a path / firing target', () => {

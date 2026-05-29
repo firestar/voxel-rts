@@ -12,6 +12,9 @@ having to reverse-engineer from the source.
 | [world.md](world.md) | World dimensions, chunks, voxel size, coordinates |
 | [pathfinding.md](pathfinding.md) | Surface nav, volume nav, A*, smoother, headroom |
 | [rendering.md](rendering.md) | Renderer, mesher, instanced unit rendering, animation |
+| [ai-brain.md](ai-brain.md) | `ai-server.cjs` decision logic — build order, training, attack pass, stances, influence maps |
+| [ai-vs-ai-harness.md](ai-vs-ai-harness.md) | Running `auto-game.cjs`, the score table, exit codes, failure-mode triage |
+| [ai-strategies.md](ai-strategies.md) | Env knob reference and design space for build-order strategies |
 | [decisions.md](decisions.md) | Design decisions and the reasons behind them |
 | [glossary.md](glossary.md) | Short definitions of terms used throughout the code |
 

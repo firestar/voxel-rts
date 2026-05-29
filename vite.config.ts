@@ -21,16 +21,47 @@ const crossOriginIsolation = {
 export default defineConfig({
   plugins: [crossOriginIsolation],
   worker: { format: 'es' },
-  build: { target: 'es2022' },
+  // Two top-level pages: the normal game at /index.html and an
+  // AI-debug build at /debug.html (own boot script, wireframe-only
+  // rendering, lobby skipped). Both bundle on `vite build`.
+  build: {
+    target: 'es2022',
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        debug: 'debug.html',
+      },
+    },
+  },
   optimizeDeps: { include: ['three', 'three-mesh-bvh'] },
-  // Forward /ai → ai-server (3030) and /lobby → session-server (3040)
-  // so the dev experience matches the Docker build, where nginx does
-  // the same routing. Both client modules call same-origin paths; this
-  // proxy makes those paths land on the right local Node process.
+  // Forward /ai → ai-server (3030), /lobby → session-server (3040),
+  // /game → game-server (3050), and /world → game-server (3050) so the
+  // dev experience matches the Docker build, where nginx does the same
+  // routing. Both client modules call same-origin paths; this proxy
+  // makes those paths land on the right local Node process.
+  //
+  // /game/stream is a Server-Sent Events endpoint — disable proxy
+  // buffering on it (via the configure hook) so the connection stays
+  // open through quiet ticks instead of being closed by vite after the
+  // default response window.
   server: {
     proxy: {
       '/ai':    { target: 'http://localhost:3030', changeOrigin: false },
       '/lobby': { target: 'http://localhost:3040', changeOrigin: false },
+      '/game':  {
+        target: 'http://localhost:3050',
+        changeOrigin: false,
+        ws: false,
+        // Long timeout so /game/stream survives between snapshots.
+        configure: (proxy: { on: (ev: string, cb: (proxyReq: { setHeader: (k: string, v: string) => void }) => void) => void }) => {
+          proxy.on('proxyReq', (proxyReq) => {
+            proxyReq.setHeader('Connection', 'keep-alive');
+          });
+        },
+        timeout: 60 * 60 * 1000,
+        proxyTimeout: 60 * 60 * 1000,
+      },
+      '/world': { target: 'http://localhost:3050', changeOrigin: false },
     },
   },
 });

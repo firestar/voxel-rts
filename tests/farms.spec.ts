@@ -157,6 +157,43 @@ describe('Storage building', () => {
     for (let i = 0; i < 10; i++) mgr.tick(2.0, world, new UnitManager());
     expect(spawnCount).toBe(0);
   });
+
+  it('doorWorldPos rotates through all 4 face doors', () => {
+    // Regression: a worker pinned in a corner where the closest door
+    // sits in an unreachable 1-cell channel must be able to fall back
+    // to the next-closest face. Without rotation the worker re-targets
+    // the same dead goal forever and the team's storage stays empty.
+    const world = buildGrassPlane();
+    const nav = allocateNav(false);
+    buildSurfaceNav(world.buffers.voxels, nav);
+    const fp = checkFootprint(world.buffers.voxels, nav, STORAGE, 80, 80);
+    expect(fp.ok).toBe(true);
+    const mgr = new BuildingManager();
+    const b = mgr.place(world, STORAGE, fp.ox, fp.oz, fp.floorY);
+
+    // Caller standing west of the storage. Closest face is -X.
+    const callerX = (fp.ox * 8 - 40) * 0.125;
+    const callerZ = (fp.oz + STORAGE.cellsD * 0.5) * 8 * 0.125;
+    const r0 = doorWorldPos(b, callerX, callerZ, 0);
+    const r1 = doorWorldPos(b, callerX, callerZ, 1);
+    const r2 = doorWorldPos(b, callerX, callerZ, 2);
+    const r3 = doorWorldPos(b, callerX, callerZ, 3);
+
+    // rotation=0 must match the no-rotation default (closest face).
+    const def = doorWorldPos(b, callerX, callerZ);
+    expect(r0.x).toBe(def.x);
+    expect(r0.z).toBe(def.z);
+
+    // All 4 rotations land on distinct face anchors.
+    const all = [r0, r1, r2, r3].map(p => `${p.x.toFixed(3)},${p.z.toFixed(3)}`);
+    const uniq = new Set(all);
+    expect(uniq.size).toBe(4);
+
+    // Rotation wraps modulo 4: rotation=4 should equal rotation=0.
+    const r4 = doorWorldPos(b, callerX, callerZ, 4);
+    expect(r4.x).toBe(r0.x);
+    expect(r4.z).toBe(r0.z);
+  });
 });
 
 describe('Barracks unit production still works after BuildingManager refactor', () => {

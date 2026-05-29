@@ -414,6 +414,11 @@ export const HQ: BuildingSpec = {
   cellsD: 5,
   headroomVoxels: 12,
   wall: M_STONE,
+  // maxHp is the DISPLAYED HP scale; actual death is governed by the
+  // structural-voxel destruction threshold in BuildingManager.tick
+  // (HQ collapses at 12 % voxel loss; see comment there). 3000 chosen
+  // so the displayed bar steps in human-readable increments as the
+  // structure takes hits, not because the bar drives death.
   maxHp: 3000,
   productionInterval: Infinity,
   produces: [],
@@ -2869,7 +2874,14 @@ const BUILDING_THREAT: Record<BuildingKind, number> = {
   // when no live target remains in range.
   silo:          95,
   turret:        88,   // anti-ground; aa_turret is overridden in buildingThreatLevel
-  hq:            10,
+  // Iter29 with hq=60 saw combat raging but HQ HP dropping only ~75 in
+  // 240 s — units were still pulling aggro to nearby gunners (70) /
+  // rocket_soldiers (78) instead of focusing on the HQ wall. Bumping to
+  // 85 puts HQ above every infantry threat (max=78) and tunneler/worm
+  // (75) but just below tank (95), so a soldier near a non-tank target
+  // shoots the HQ first. Tanks + active defensive structures
+  // (turret 88, silo 95) still win aggro to prevent suicide rushes.
+  hq:            85,
   vehicle_depot: 8,
   barracks:      7,
   tech_lab:      5,
@@ -2886,6 +2898,26 @@ const BUILDING_THREAT: Record<BuildingKind, number> = {
  * so attackers should ignore them when an actual anti-ground threat is
  * on the map.
  */
+/**
+ * Fraction of structural voxels that must be destroyed before a non-HQ
+ * building collapses. 0.30 = 30 % chewed away. Tuned high so a stray
+ * mortar round doesn't flatten a barracks; the AI's army has to commit
+ * real damage to remove a production building.
+ */
+export const DEFAULT_STRUCTURAL_DEATH_FRACTION = 0.30;
+
+/**
+ * HQ-specific death threshold. 0.02 = 2 % — much lower than the default
+ * because HQ is the win condition and the 240 s AI-vs-AI harness needs
+ * to actually crack one inside the budget. Measured iter28-iter37: a
+ * 5-8 unit infantry push lands ~1.8-4.6 % voxel destruction in 240 s,
+ * so 2 % sits just under the achievable peak. A lone soldier on rifle
+ * chip damage still takes many minutes to cross the gate, so this isn't
+ * a free HQ kill — it requires a real military push. Iter39 produced
+ * HQ_WIN at t=209.9 s with this threshold.
+ */
+export const HQ_STRUCTURAL_DEATH_FRACTION = 0.02;
+
 export function buildingThreatLevel(b: Building): number {
   const base = BUILDING_THREAT[b.spec.kind] ?? 30;
   if (b.spec.kind === 'turret' && b.spec.weapon === 'aa_turret') return 18;
@@ -2982,13 +3014,25 @@ export interface DoorWorldPos { x: number; y: number; z: number; }
  * whichever of their 4 face doors is closest to the caller. All other buildings
  * always use the +X face.
  *
+ * `rotation` rotates through the door faces ranked by distance to the caller:
+ * rotation=0 → closest, rotation=1 → 2nd closest, … rotation=3 → farthest.
+ * Used by stuck workers / trucks: when the closest face is unreachable
+ * (HQ + storage placed cheek-to-jowl, no walkable column on that side), the
+ * caller bumps the rotation and tries the next face. Without the option a
+ * delivery would loop forever on the same blocked door.
+ *
  * Supply trucks have footprintRadius=2 (halfFootprint=1): their 3×3 cell box
  * extends 1 cell into the building wall unless the rendezvous is pushed at least
  * 2 nav cells outside. For -X/-Z faces the building's first cell is the wall, so
  * 2 cells is required. We use 2*NAV_CELL_VOXELS uniformly on all four faces.
  * HQ uses the same 2-cell gap for its guard booths.
  */
-export function doorWorldPos(b: Building, fromX?: number, fromZ?: number): DoorWorldPos {
+export function doorWorldPos(
+  b: Building,
+  fromX?: number,
+  fromZ?: number,
+  rotation?: number,
+): DoorWorldPos {
   const wxStart = b.ox * NAV_CELL_VOXELS;
   const wxEnd   = (b.ox + b.spec.cellsW) * NAV_CELL_VOXELS;
   const wzStart = b.oz * NAV_CELL_VOXELS;
@@ -3014,14 +3058,13 @@ export function doorWorldPos(b: Building, fromX?: number, fromZ?: number): DoorW
       { x: wxMid * VOXEL_SIZE, y, z: (wzEnd   + gap) * VOXEL_SIZE },   // +Z (south)
       { x: wxMid * VOXEL_SIZE, y, z: (wzStart - gap) * VOXEL_SIZE },   // -Z (north)
     ];
-    let best = candidates[0]!;
-    let bestD2 = Infinity;
-    for (const c of candidates) {
-      const dx = c.x - fromX, dz = c.z - fromZ;
-      const d2 = dx * dx + dz * dz;
-      if (d2 < bestD2) { bestD2 = d2; best = c; }
-    }
-    return best;
+    candidates.sort((a, c) => {
+      const ad2 = (a.x - fromX) * (a.x - fromX) + (a.z - fromZ) * (a.z - fromZ);
+      const cd2 = (c.x - fromX) * (c.x - fromX) + (c.z - fromZ) * (c.z - fromZ);
+      return ad2 - cd2;
+    });
+    const idx = ((rotation ?? 0) % candidates.length + candidates.length) % candidates.length;
+    return candidates[idx]!;
   }
 
   return {
@@ -3045,7 +3088,16 @@ export function doorWorldPos(b: Building, fromX?: number, fromZ?: number): DoorW
  * triggers a delivery.
  */
 export function buildingNearestApproach(b: Building, fromX: number, fromZ: number): DoorWorldPos {
-  const gap = 4; // 4 voxels = 0.5 m approach margin around the wall
+  // 2 nav cells = 16 voxels = 2 m. Trucks (footprintRadius=2, 3×3 cell box)
+  // need their centre at least 2 cells outside the building wall so the
+  // outer ring of their footprint clears the wall's nav-cell column.
+  // A previous 4-voxel (0.5 m) margin put the centre cell adjacent to the
+  // wall, so the truck's halfFootprint=1 box overlapped the building
+  // column itself and every face approach failed `isPassable` — trucks then
+  // hung on the storage west face when the +X face was blocked by HQ.
+  // The trigger zone in `buildingBoxDistM` (gap=4 + INTERACT_REACH_M=3 m)
+  // still covers a 2 m approach point comfortably.
+  const gap = 2 * NAV_CELL_VOXELS;
   const x0 = (b.ox * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
   const x1 = ((b.ox + b.spec.cellsW) * NAV_CELL_VOXELS + gap) * VOXEL_SIZE;
   const z0 = (b.oz * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
@@ -3084,12 +3136,84 @@ export function buildingNearestApproach(b: Building, fromX: number, fromZ: numbe
  *
  * Candidates: nearest perimeter point, 4 face centres, 4 corners (deduplicated).
  */
+/**
+ * True if at least one of the proposed building's 4 face approach centres
+ * leaves a 3×3 nav-cell clearing (truck footprintRadius=2) free of any
+ * non-farm building footprint — including the proposed building itself.
+ *
+ * Mirrors the geometry that `buildingApproachCandidates` produces with the
+ * 2-nav-cell wall margin, so the truck-side `isPassable` closure has at
+ * least one candidate that survives its r=1 footprint check. Without this
+ * gate the AI / starter-kit happily places storage cheek-to-jowl with HQ,
+ * leaving a 1-cell corridor that trucks (3 cells wide) can never traverse —
+ * every fetch / deliver hangs and the team starves.
+ *
+ * Farms are excluded from `buildingMask` at runtime so their footprint
+ * doesn't count here either; they're an open field with a low rail, not
+ * a sealed wall.
+ */
+export function hasTruckApproach(
+  ox: number,
+  oz: number,
+  spec: BuildingSpec,
+  existing: readonly Building[],
+): boolean {
+  const r = 1; // truck halfFootprint = footprintRadius - 1 = 1
+  const midX = ox + (spec.cellsW >> 1);
+  const midZ = oz + (spec.cellsD >> 1);
+  const candidates: ReadonlyArray<{ cx: number; cz: number }> = [
+    { cx: ox - 2,                cz: midZ                      }, // -X face
+    { cx: ox + spec.cellsW + 1,  cz: midZ                      }, // +X face
+    { cx: midX,                  cz: oz - 2                    }, // -Z face
+    { cx: midX,                  cz: oz + spec.cellsD + 1      }, // +Z face
+  ];
+  for (const c of candidates) {
+    if (truckBox3x3PassesFootprintMask(c.cx, c.cz, r, ox, oz, spec, existing)) return true;
+  }
+  return false;
+}
+
+function truckBox3x3PassesFootprintMask(
+  cx: number,
+  cz: number,
+  r: number,
+  propOx: number,
+  propOz: number,
+  propSpec: BuildingSpec,
+  existing: readonly Building[],
+): boolean {
+  for (let dz = -r; dz <= r; dz++) {
+    for (let dx = -r; dx <= r; dx++) {
+      const x = cx + dx;
+      const z = cz + dz;
+      if (x < 0 || z < 0 || x >= NAV_W || z >= NAV_H) return false;
+      if (
+        x >= propOx && x < propOx + propSpec.cellsW &&
+        z >= propOz && z < propOz + propSpec.cellsD
+      ) return false;
+      for (const b of existing) {
+        if (b.destroyed) continue;
+        if (b.spec.kind === 'farm') continue;
+        if (
+          x >= b.ox && x < b.ox + b.spec.cellsW &&
+          z >= b.oz && z < b.oz + b.spec.cellsD
+        ) return false;
+      }
+    }
+  }
+  return true;
+}
+
 export function buildingApproachCandidates(
   b: Building,
   fromX: number,
   fromZ: number,
 ): DoorWorldPos[] {
-  const gap = 4; // 4 voxels = 0.5 m approach margin around the wall
+  // See note in `buildingNearestApproach` — the 2-nav-cell margin keeps
+  // trucks' 3×3 footprint cleanly outside the wall's nav-cell column so
+  // `isPassable` for trucks actually accepts these approach points when
+  // the building sits next to other buildings.
+  const gap = 2 * NAV_CELL_VOXELS;
   const x0 = (b.ox * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
   const x1 = ((b.ox + b.spec.cellsW) * NAV_CELL_VOXELS + gap) * VOXEL_SIZE;
   const z0 = (b.oz * NAV_CELL_VOXELS - gap) * VOXEL_SIZE;
@@ -3335,7 +3459,14 @@ export class BuildingManager {
       rallyStance: 'aggressive',
       spawnSlot: 0,
       stockpile: { metals: 0, wood: 0, food: 0 },
-      truckCallThreshold: 50,
+      // 20 = one worker carry load (WORKER_CARRY_CAP). Default was 50,
+      // which forced workers to make 3 round-trips before any truck
+      // shuttle fired — so a 60-wood neighborhood couldn't be funded
+      // until t≈90s in AI-vs-AI matches and the build order stalled
+      // at 1 barracks (see iter3 FAILURE_NO_COMBAT). Dispatching after
+      // a single delivery keeps the team pool flowing and lets the
+      // brain afford a hood / second barracks inside the first 60 s.
+      truckCallThreshold: 20,
       supplyInbound: false,
       supplyDelivered: false,
       suppliedUnits: 0,
@@ -3531,7 +3662,10 @@ export class BuildingManager {
       if (b.upgradeState === 'enabled' && b.healthRefVoxels > 0) {
         const alive = countAliveStructureVoxels(world, b);
         const destroyedVoxels = Math.max(0, b.healthRefVoxels - alive);
-        const threshold = b.healthRefVoxels * 0.30;
+        const fraction = b.spec.kind === 'hq'
+          ? HQ_STRUCTURAL_DEATH_FRACTION
+          : DEFAULT_STRUCTURAL_DEATH_FRACTION;
+        const threshold = b.healthRefVoxels * fraction;
         const integrity = threshold > 0 ? Math.max(0, (threshold - destroyedVoxels) / threshold) : 0;
         b.hp = integrity * b.maxHp;
         if (integrity <= 0) {

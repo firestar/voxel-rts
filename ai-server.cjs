@@ -45,10 +45,26 @@ const UNIT_COSTS = {
   mortar_soldier: { food: 60, metals: 35, wood: 5  },
   rocket_soldier: { food: 60, metals: 40, wood: 0  },
   tank:           { food: 20, metals: 80, wood: 0  },
+  // Advanced vehicle-depot units. Costs mirror the canonical UNIT_TRAIN_COST
+  // in src/sim/Buildings.ts. Before iter64 the brain had no cost rows for
+  // these, so `canAffordUnitB('aa_vehicle')` returned false and the depot
+  // only ever queued tanks — the AI never fielded anti-air or missile
+  // launchers despite the depot being able to build them.
+  rocket_truck:   { food: 20, metals: 80, wood: 0  },
+  aa_vehicle:     { food: 20, metals: 90, wood: 0  },
   worker:         { food: 30, metals: 0,  wood: 10 },
 };
 
 const BARRACKS_PRODUCES = ['soldier', 'gunner', 'rocket_soldier', 'mortar_soldier'];
+// Vehicle-depot rotation. The depot can build all of these (Buildings.ts
+// VEHICLE_DEPOT.produces); the brain rotates through them so a teched-up AI
+// fields a mix of tanks (HQ demolition), rocket trucks (siege/missile) and
+// anti-air vehicles instead of tank-spamming. Order weights ground punch
+// first (tank, rocket_truck) with AA folded in for air/projectile defence.
+const DEPOT_PRODUCES = ['tank', 'rocket_truck', 'aa_vehicle'];
+// Max metal cost across the depot rotation — used as the metal reserve so
+// infantry training doesn't drain the pool below what a vehicle needs.
+const MAX_DEPOT_METAL = Math.max(...DEPOT_PRODUCES.map(k => UNIT_COSTS[k].metals));
 
 // Tournament-tunable parameters. Each parallel game gets a slightly
 // different env-var seed so we can compare AI variants head-to-head
@@ -60,11 +76,16 @@ const envNum = (name, fallback) => {
   const n = Number.parseFloat(v);
   return Number.isFinite(n) ? n : fallback;
 };
-const TRAIN_INTERVAL_S = envNum('AI_TRAIN_INTERVAL_S', 0.50);
+const TRAIN_INTERVAL_S = envNum('AI_TRAIN_INTERVAL_S', 0.30);
 const MAX_FIELDED_ENEMIES = envNum('AI_MAX_FIELDED', 200);
 const ATTACK_STOP_FRACTION = envNum('AI_ATTACK_STOP_FRACTION', 0.30);
 const ATTACK_RETARGET_S = envNum('AI_ATTACK_RETARGET_S', 1.75);
-const WORKER_TARGET = envNum('AI_WORKER_TARGET', 12);
+// Global worker ceiling. Acts as an upper clamp on every strategy's own worker
+// target (strategyWorkerCap = min(WORKER_TARGET, t.workers)). Raised 12→16 so
+// econ_boom (which wants 16 gatherers) isn't silently clamped to 12 — at 12 it
+// failed to out-economy the others, defeating its identity (iter85: 7 workers).
+// Other strategies are unaffected (their t.workers are ≤ 12).
+const WORKER_TARGET = envNum('AI_WORKER_TARGET', 16);
 /** How many combat units each base wants to keep within
  *  DEFENDER_RADIUS_M of its own HQ before routing the rest out to
  *  attack. Bigger value = more defensive. Tournament-tunable. */
@@ -91,20 +112,96 @@ function effectiveStance(team, ctx) {
   const seed = stanceForTeam(team);
   if (!ADAPTIVE_STANCE) return seed;
   if (ctx.heavyAttackByTeam && ctx.heavyAttackByTeam[team]) return 'defensive';
-  if (ctx.buildoutByTeam && ctx.buildoutByTeam[team] === false) return 'economic';
+  // Note: the original `!buildoutByTeam → economic` flip was removed.
+  // Buildout requires 2 farms + 1 neighborhood, but neighborhoods cost
+  // wood, and wood only arrives via supply trucks. When the truck loop
+  // can't close (storage placement geometry plus AI placement order
+  // produce layouts the truck planner can't navigate) the buildout
+  // never completes, every team's stance flips to `economic`, and the
+  // attack pass skips every combat unit for the full match. iter26
+  // dump: 5 combat units, all skipped via `defender=2 economic=3`,
+  // HQ HP 3000/3000. With the flip removed, seed stance (aggressive
+  // by default) keeps the AI attacking even while wood collection is
+  // slower than ideal — the seed strategy still cares about the home
+  // garrison via the defender quota, so this isn't a free-for-all.
   return seed;
 }
 /** Wave-timing: don't dribble attackers to the enemy one at a time.
  *  Hold idle armed units back until at least WAVE_SIZE are ready,
  *  then release the whole pack in one cycle. The defending side
  *  faces a concentrated push instead of single-file traffic that
- *  dies on the way in. Tunable per round. */
+ *  dies on the way in. Tunable per round.
+ *
+ *  Default 5 (rally-then-commit, iter48): WAVE_SIZE is the number of
+ *  attackers a team masses at its forward rally point before the whole
+ *  army commits to a single enemy HQ. Earlier flat per-unit waves of 2
+ *  (iter42) dribbled attackers across the 380 m map where 3-way midfield
+ *  attrition ground them down (iter43: 71 unit kills, 0 HQ damage). With
+ *  the rally/commit state machine below, a 5-unit massed push survives
+ *  the crossing and arrives with enough force to demolish an HQ. The
+ *  economy now fields 12+ combat units so the 5-unit gate is reachable;
+ *  a gather-time cap (GATHER_MAX_S) force-commits with ≥2 ready so the
+ *  never-release failure mode of the old WAVE=5 can't recur. */
 const WAVE_SIZE = envNum('AI_WAVE_SIZE', 5);
 /** Auto-rebuild: when a barracks / farm / hood is destroyed, the AI
  *  re-queues a place_building action so the economy stays online.
  *  Defaults on; set AI_AUTO_REBUILD=0 to disable for ablation tests. */
 const AUTO_REBUILD = envNum('AI_AUTO_REBUILD', 1);
-process.stderr.write(`[ai-server] params train=${TRAIN_INTERVAL_S} attack=${ATTACK_STOP_FRACTION} retarget=${ATTACK_RETARGET_S} workers=${WORKER_TARGET} defenders=${DEFENDER_QUOTA} stance=${STANCE_DEFAULT}\n`);
+
+/** Build-order STRATEGY (goal D). Orthogonal to stance: a strategy picks the
+ *  shape of the build plan (how many barracks/farms/hoods, whether & when to
+ *  tech to a vehicle depot, the worker target), while stance picks aggression.
+ *  Per-team override via AI_STRATEGY_player / _enemy / _enemy2; default via
+ *  AI_STRATEGY_DEFAULT. The harness seed-randomises a strategy per team so
+ *  AI-vs-AI matches show real opening variety. */
+const STRATEGY_DEFAULT = env.AI_STRATEGY_DEFAULT || '';
+/** Resolve a team's strategy. Priority: explicit AI_STRATEGY_<team> env →
+ *  AI_STRATEGY_DEFAULT env → per-session seed-random pick. The random fallback
+ *  means a persistent sidecar still gives each MATCH (session) a fresh mix of
+ *  openings per team, so AI-vs-AI runs vary without restarting the server. */
+function strategyForTeam(team, session) {
+  const explicit = env[`AI_STRATEGY_${team}`] || STRATEGY_DEFAULT;
+  if (explicit) return explicit;
+  if (session) {
+    if (!session.strategies) session.strategies = {};
+    if (!session.strategies[team]) {
+      const keys = Object.keys(BUILD_TARGETS);
+      session.strategies[team] = keys[Math.floor(Math.random() * keys.length)];
+      process.stderr.write(`[ai-server] strategy ${team}=${session.strategies[team]} (seed-random)\n`);
+    }
+    return session.strategies[team];
+  }
+  return 'balanced';
+}
+/**
+ * Per-strategy build plan.
+ *  - barracks/farms/hoods: max of each the HQ builds.
+ *  - depot: 1 = tech to a vehicle depot (tanks / rocket trucks / anti-air),
+ *    0 = never tech (pure infantry).
+ *  - depotFarmReq: farms required before the depot is placed. `tech_air`
+ *    rushes it at 1 so the depot's 75 s construction timer finishes inside a
+ *    normal ~180 s match and the team actually FIELDS advanced units; the
+ *    others wait for a fuller economy (2-3) and usually win/lose on infantry
+ *    before teching, which is what makes the openings visibly different.
+ *  - workers: worker target (caps the gatherer count for this strategy).
+ *  - depotMix: per-strategy vehicle-build rotation (defaults to DEPOT_PRODUCES,
+ *    tank-first). `tech_air` is the dedicated AIR strategy, so it leads with the
+ *    aa_vehicle — that both fits its identity AND guarantees an aa_vehicle
+ *    actually fields in a normal match (only ~2-3 vehicles build before the
+ *    clock, so AA buried 3rd in the default order rarely appeared). Tank still
+ *    fields as the 2nd vehicle, so this doesn't break tank/rocket_truck output.
+ */
+const BUILD_TARGETS = {
+  balanced:      { barracks: 3, farms: 2, hoods: 2, depot: 1, depotFarmReq: 2, workers: 12 },
+  econ_boom:     { barracks: 2, farms: 3, hoods: 3, depot: 1, depotFarmReq: 3, workers: 16 },
+  military_rush: { barracks: 3, farms: 1, hoods: 1, depot: 0, depotFarmReq: 2, workers: 8  },
+  tech_air:      { barracks: 1, farms: 1, hoods: 3, depot: 1, depotFarmReq: 1, workers: 6, depotMix: ['aa_vehicle', 'tank', 'rocket_truck'] },
+};
+function buildTargetsFor(team, session) {
+  return BUILD_TARGETS[strategyForTeam(team, session)] || BUILD_TARGETS.balanced;
+}
+
+process.stderr.write(`[ai-server] params train=${TRAIN_INTERVAL_S} attack=${ATTACK_STOP_FRACTION} retarget=${ATTACK_RETARGET_S} workers=${WORKER_TARGET} defenders=${DEFENDER_QUOTA} stance=${STANCE_DEFAULT} strategy=${STRATEGY_DEFAULT || 'seed-random'}\n`);
 
 function ensureSession(id) {
   let s = sessions.get(id);
@@ -126,6 +223,7 @@ function ensurePerHq(s, hqId) {
       placeCooldown: 0.50,
       trainCooldown: TRAIN_INTERVAL_S,
       pickIndex: 0,
+      depotPickIndex: 0,
     };
     s.perHq.set(hqId, h);
   }
@@ -405,39 +503,90 @@ function decideActions(state, sessionId) {
     const teamPopCap = (teamRes[hq.team] && teamRes[hq.team].popCap) || 10;
     const popPressure = teamPop >= teamPopCap - 2;
 
-    const wantMoreBarracks = (anyBarracks.length === 0 && anyFarms.length === 0)
-                          || (anyBarracks.length < 3 && anyFarms.length >= 2 && anyHoods.length >= 1);
-    if (popPressure && h.placeCooldown === 0 && anyHoods.length < 2 && canAffordBldg('neighborhood')) {
-      // Drop a second hood as soon as we're near cap, regardless of
-      // where we are in the build order.
+    // Once a depot is up but no vehicle is queued, hold a vehicle's worth of
+    // metals back from EXPANSION buildings (extra barracks, 2nd hood) so the
+    // depot can actually fund a tank / rocket_truck / aa_vehicle. iter65 showed
+    // depots built but 0 vehicles produced — the team spent every metal on its
+    // 6 barracks + 4 hoods and never had the 80-90 spare a vehicle needs. The
+    // essential early buildings (first barracks, farms, first hood, the depot
+    // itself) ignore the hold so the opening never stalls.
+    const vehicleQueuedNow = liveDepots.some(b => (b.trainQueueLen ?? 0) > 0);
+    const vehicleHold = (liveDepots.length > 0 && !vehicleQueuedNow) ? MAX_DEPOT_METAL : 0;
+    const canAffordExpansion = (kind) => {
+      const c = BUILDING_COSTS[kind];
+      if (!c) return false;
+      return (budget.metals - vehicleHold) >= c.metals && budget.wood >= c.wood;
+    };
+    // Build order driven by the team's STRATEGY (goal D). `t` carries the
+    // per-strategy caps + depot timing. Construction is gated by BOTH a
+    // per-building timer (depot 75 s) AND full material delivery, and matches
+    // end ~180 s (Buildings.ts:3756) — so a depot placed late can never enable.
+    // iter68 over-placed and the glut starved the depot's material delivery;
+    // iter69's serial throttle fixed the glut but DELAYED the depot. iter70 fix:
+    // keep essentials placing early, gate EXPANSION behind the depot being
+    // ENABLED so no expansion glut competes for construction trucks. iter72:
+    // `tech_air` rushes the depot at depotFarmReq=1 so its timer finishes in a
+    // normal match and the team actually fields tanks / AA / rocket trucks.
+    const t = buildTargetsFor(hq.team, s);
+    const depotUp = liveDepots.length > 0;
+    // Expansion gate. The hold-expansion-until-the-depot-is-enabled rule exists
+    // only to protect a RUSHED depot (tech_air, depotFarmReq 1) from being
+    // drowned by an expansion glut while its 75 s timer runs. Strategies that
+    // DEFER the depot (balanced/econ_boom, depotFarmReq ≥ 2) place it well after
+    // the economy is up, so gating their expansion on that late depot just
+    // cripples them — iter85 econ_boom stalled at 7 workers / cap 25 because its
+    // 2nd-3rd hoods never built until its depot finished at ~218 s. Those teams
+    // expand freely (construction-first dispatch still protects the depot). And
+    // no-depot strategies (military_rush) always expand freely.
+    const rushesDepot = t.depot > 0 && (t.depotFarmReq ?? 2) <= 1;
+    const expansionOk = !rushesDepot || depotUp;
+    if (popPressure && h.placeCooldown === 0 && anyHoods.length < t.hoods && canAffordBldg('neighborhood')) {
+      // Emergency: drop another hood the moment we're near cap.
       actions.push({ type: 'place_building', kind: 'neighborhood', anchorHqId: hq.id });
       debit(BUILDING_COSTS.neighborhood);
       h.placeCooldown = 3.0;
-    } else if (h.placeCooldown === 0 && wantMoreBarracks && canAffordBldg('barracks')) {
+    } else if (h.placeCooldown === 0 && anyBarracks.length === 0 && canAffordBldg('barracks')) {
+      // First barracks — the opening.
       actions.push({ type: 'place_building', kind: 'barracks', anchorHqId: hq.id });
       debit(BUILDING_COSTS.barracks);
       h.placeCooldown = 3.0;
-    } else if (h.placeCooldown === 0 && anyFarms.length < 2 && anyBarracks.length > 0 && canAffordBldg('farm')) {
+    } else if (h.placeCooldown === 0 && anyFarms.length === 0 && anyBarracks.length > 0 && canAffordBldg('farm')) {
+      // First farm — food economy.
       actions.push({ type: 'place_building', kind: 'farm', anchorHqId: hq.id });
       debit(BUILDING_COSTS.farm);
       h.placeCooldown = 3.0;
-    } else if (h.placeCooldown === 0 && anyHoods.length < 2 && anyFarms.length >= 2 && canAffordBldg('neighborhood')) {
-      // Neighborhoods are the ONLY pop-cap source. Place up to two
-      // so the AI can field a real army (each tier-3 hood = +15 cap).
+    } else if (h.placeCooldown === 0 && anyHoods.length === 0 && anyFarms.length >= 1 && canAffordBldg('neighborhood')) {
+      // First neighborhood — unlocks pop cap for the army.
       actions.push({ type: 'place_building', kind: 'neighborhood', anchorHqId: hq.id });
       debit(BUILDING_COSTS.neighborhood);
       h.placeCooldown = 3.0;
-    } else if (h.placeCooldown === 0 && anyDepots.length === 0 && anyHoods.length >= 1 && canAffordBldg('vehicle_depot')) {
-      // Vehicle depot once the food economy is steady and we have
-      // pop-cap room from the first neighborhood. Tanks do dramatically
-      // more damage to enemy HQs than infantry, so adding even one
-      // depot accelerates HQ destruction sharply.
+    } else if (t.depot > 0 && h.placeCooldown === 0 && anyDepots.length === 0 && anyHoods.length >= 1 && anyFarms.length >= t.depotFarmReq && canAffordBldg('vehicle_depot')) {
+      // Vehicle depot — placed at the strategy's depotFarmReq so its 75 s
+      // construction timer has time to finish. Tech to advanced units (goal A).
       actions.push({ type: 'place_building', kind: 'vehicle_depot', anchorHqId: hq.id });
       debit(BUILDING_COSTS.vehicle_depot);
       h.placeCooldown = 3.0;
+    } else if (h.placeCooldown === 0 && anyFarms.length < t.farms && canAffordExpansion('farm')) {
+      // Remaining farms (held behind the depot via canAffordExpansion's metal
+      // reserve so they don't starve a vehicle, but not behind depotUp — food
+      // matters for pop).
+      actions.push({ type: 'place_building', kind: 'farm', anchorHqId: hq.id });
+      debit(BUILDING_COSTS.farm);
+      h.placeCooldown = 3.0;
+    } else if (expansionOk && h.placeCooldown === 0 && anyBarracks.length < t.barracks && anyFarms.length >= 1 && anyHoods.length >= 1 && canAffordExpansion('barracks')) {
+      // Expansion barracks — gated behind the depot being ENABLED (for teching
+      // strategies) so it can't glut the construction queue and starve the
+      // depot's own material delivery.
+      actions.push({ type: 'place_building', kind: 'barracks', anchorHqId: hq.id });
+      debit(BUILDING_COSTS.barracks);
+      h.placeCooldown = 3.0;
+    } else if (expansionOk && h.placeCooldown === 0 && anyHoods.length < t.hoods && anyFarms.length >= 1 && canAffordExpansion('neighborhood')) {
+      // Additional neighborhoods — also held behind the depot completing.
+      actions.push({ type: 'place_building', kind: 'neighborhood', anchorHqId: hq.id });
+      debit(BUILDING_COSTS.neighborhood);
+      h.placeCooldown = 3.0;
     }
     void liveFarms;
-    void liveDepots;
 
     // Dynamic worker-focus assignment. The seed gives each base 2
     // auto + 2 farm + 2 chop. That's enough food/wood for a barracks
@@ -470,10 +619,23 @@ function decideActions(state, sessionId) {
       // farm worker and put the freed worker on the metal/wood
       // shortfall. Without this the AI ends up sitting on 5000+ food
       // while metals/wood are dry — and combat-unit production stalls.
-      const FARM_FOOD_BUFFER = 800;
-      const wantFarm = budget.food > FARM_FOOD_BUFFER ? 1 : 2;
+      // Farmer count scales DOWN as the food bank grows. Food is rarely the
+      // binding constraint — farms tick passive income and the pop cap limits
+      // how fast units can spend it — so a fat food bank means farmers are
+      // wasted labor. iter53-59 showed every AI hoarding 3000-6000 food while
+      // metals/wood ran dry and tanks never trained. Drop to 0 farmers when
+      // food is abundant and put the WHOLE pool on the metal/wood the build
+      // and the army actually need.
+      const FARM_FOOD_BUFFER = 600;
+      const FARM_FOOD_ABUNDANT = 1500;
+      const wantFarm = budget.food > FARM_FOOD_ABUNDANT ? 0
+        : budget.food > FARM_FOOD_BUFFER ? 1 : 2;
+      // Manage the ENTIRE worker pool, not a hardcoded 6 (the old constant
+      // left half a 12-worker team unmanaged on their seed focus — usually
+      // farming — which is the other half of the food-overflow bug).
+      const totalWorkers = myWorkers.length;
+      const otherWorkers = Math.max(0, totalWorkers - wantFarm);
       let wantChop = 0, wantMine = 0;
-      const otherWorkers = 6 - wantFarm;
       if (needWood > 0 && needMetals > 0) {
         wantChop = needWood >= needMetals
           ? Math.ceil(otherWorkers * 0.6)
@@ -483,6 +645,14 @@ function decideActions(state, sessionId) {
         wantChop = otherWorkers;
       } else if (needMetals > 0) {
         wantMine = otherWorkers;
+      } else {
+        // No outstanding BUILDING bill — fund ongoing UNIT production. Combat
+        // infantry + tanks are metal-heavy, so weight the pool toward mining
+        // with a chop minority for the wood that resupply / repairs consume.
+        // Without this branch the focus logic stopped redirecting once the
+        // buildings were placed and the seed farmers kept over-producing food.
+        wantMine = Math.ceil(otherWorkers * 0.6);
+        wantChop = otherWorkers - wantMine;
       }
       const haveFocus = (f) => myWorkers.filter(w => w.focus === f).length;
       const reassign = (toFocus, deficit) => {
@@ -513,28 +683,119 @@ function decideActions(state, sessionId) {
     // and burns resources reserved by the supply truck (= less metals
     // for the neighborhood we need to break out of the cap). Pause
     // training until the hood lands and pop opens up.
-    const trainBlocked = popPressure && teamPop >= teamPopCap;
+    // Vehicle pop reserve (iter73). A teching strategy WILL want to field a
+    // ~5-pop vehicle (tank) once its depot is up, but infantry + workers fill
+    // pop to the cap long before the depot enables (~111 s), and live units
+    // can't be evicted — so the queued vehicle is permanently pop-blocked
+    // (iter72: depot enabled, q=2, but supplied=0 at 24/25 pop). Hold 5 pop
+    // open from the START for depot strategies so there's room the moment the
+    // depot finishes. Non-teching strategies reserve nothing.
+    // Hold one vehicle's worth of pop open for the depot's output. (A larger
+    // reserve to field two vehicles, e.g. AA + tank, was trialled in iter87 but
+    // reliably spawned the 2nd vehicle into a boxed pad in the compact base and
+    // tripped FAILURE_STUCK — that needs a depot-placement clearance fix first.)
+    const vehiclePopReserve = t.depot > 0 ? 5 : 0;
+    const effTeamPopCap = teamPopCap - vehiclePopReserve;
+    // Count in-flight QUEUED units toward pop. Queued units don't occupy pop
+    // until they spawn, so without this both HQs (and successive ticks) keep
+    // queuing infantry while teamPop still reads below cap — by the time the
+    // convoy lands the team is OVER cap (iter73: 34 pop / 30 cap) and the
+    // 5-pop vehicle reserve is blown, so a queued tank/AA can never be supplied
+    // (popHasRoom fails forever). Charge a conservative 1.5 pop per queued unit
+    // so the brain stops short and the reserve actually holds.
+    const teamQueuedPop = buildings.reduce(
+      (a, b) => (b.team === hq.team && !b.destroyed ? a + (b.trainQueueLen || 0) * 1.5 : a), 0);
+    const trainBlocked = (teamPop + teamQueuedPop) >= effTeamPopCap;
     // Tank production first: an HQ kill takes a long time with rifles
     // (~5 DPS each vs. 3000 HP), but a tank shell crushes wall voxels
     // and the +90 score on a tank kill is the biggest single
     // contributor we can earn. Spend metals on tanks before infantry
     // when a depot is online.
-    if (!trainBlocked && liveDepots.length > 0 && canAffordUnitB('tank')) {
-      const depot = liveDepots.find(b => (b.trainQueueLen ?? 0) < 2) || liveDepots[0];
-      if ((depot.trainQueueLen ?? 0) < 2) {
-        actions.push({ type: 'queue_train', buildingId: depot.id, unitKind: 'tank' });
-        debit(UNIT_COSTS.tank);
+    // Vehicle-depot production: rotate through the DEPOT_PRODUCES mix (tank,
+    // rocket_truck, aa_vehicle) so the AI fields anti-air + missile launchers,
+    // not just tanks. Pick the next affordable kind in the rotation starting
+    // at the per-HQ depotPickIndex so the choice cycles instead of always
+    // re-queuing the cheapest. iter64: before this the block hard-coded 'tank'
+    // and the AI never built aa_vehicle / rocket_truck despite owning a depot.
+    if (!trainBlocked && liveDepots.length > 0) {
+      const depot = liveDepots.find(b => (b.trainQueueLen ?? 0) < 2);
+      if (depot) {
+        const mix = t.depotMix || DEPOT_PRODUCES;
+        for (let i = 0; i < mix.length; i++) {
+          const idx = (h.depotPickIndex + i) % mix.length;
+          const kind = mix[idx];
+          if (!canAffordUnitB(kind)) continue;
+          actions.push({ type: 'queue_train', buildingId: depot.id, unitKind: kind });
+          debit(UNIT_COSTS[kind]);
+          h.depotPickIndex = idx + 1;
+          break;
+        }
       }
     }
+    // Vehicle metal reserve. Depot units cost 80-90 metals; infantry (10-40)
+    // drain the pool below that every tick, so before iter61 the depot was
+    // built but NO vehicle ever trained (iter53-60: 0 tanks across every
+    // dump). When a depot is live and no vehicle is already queued, hold back
+    // a vehicle's metals from infantry training so the pool can climb to the
+    // vehicle cost — the depot block above then fires and the reserve lifts (a
+    // queued vehicle means vehicleQueued=true), letting infantry resume. Net:
+    // the team folds vehicles in among its infantry instead of never building
+    // armor / AA / rocket trucks.
+    let metalReserve = 0;
+    if (liveDepots.length > 0) {
+      const vehicleQueued = liveDepots.some(b => (b.trainQueueLen ?? 0) > 0);
+      if (!vehicleQueued) metalReserve = MAX_DEPOT_METAL;
+    }
+    // Reserve-aware affordability for INFANTRY only (workers cost 0 metals).
+    const canAffordInfantry = (kind) => {
+      const c = UNIT_COSTS[kind];
+      if (!c) return false;
+      return budget.food >= c.food
+        && (budget.metals - metalReserve) >= c.metals
+        && budget.wood >= c.wood;
+    };
     // Worker pump: more workers = faster gather rate = bigger army.
     // Each base seeds 6 workers; train extras from the barracks until
     // we hit WORKER_TARGET per team. Don't share `h.trainCooldown`
     // with the combat queue — workers are tracked on a SEPARATE
     // cadence so the barracks combat rotation isn't blocked.
     // WORKER_TARGET is env-tunable for the tournament.
+    //
+    // Pop-aware cap: reserve at least 4 pop slots for combat. In the
+    // debug.html boot path civilians never spawn (Game.debugMode skips
+    // tickCivilians) so popCap stays at the 10-slot base — without
+    // this floor the worker queue saturates the cap at 12 workers and
+    // every `queue_train` for soldiers/gunners hits trainBlocked, so
+    // teams field 0 combat units across a full match (iter14 dump:
+    // enemy=12 workers + 0 combat). The 4-slot buffer leaves room for
+    // 2 soldiers + 1 gunner (or similar) without starving the
+    // gathering economy. WORKER_TARGET remains the hard ceiling for
+    // resource-rich runs where popCap is far above 10.
+    // Pop-aware cap: reserve at least 4 pop slots for combat (one
+    // soldier + one gunner + buffer). In `debug.html` boot the civilian
+    // spawner is gated off (`Game.debugMode`) so popCap stays at the
+    // 10-slot base — without the floor the worker queue saturates the
+    // cap before any combat unit gets a slot, and the brain emits 0
+    // combat training all match.
+    // Worker ceiling is the smaller of the strategy's worker target and the
+    // global env cap, then pop-limited. econ_boom pushes more gatherers;
+    // military_rush keeps the count lean so pop goes to infantry.
+    const strategyWorkerCap = Math.min(WORKER_TARGET, buildTargetsFor(hq.team, s).workers);
+    const effectiveWorkerTarget = Math.min(strategyWorkerCap, Math.max(2, effTeamPopCap - 4));
+    // Anticipated team workers must count units in barracks training
+    // queues, otherwise both HQs of a multi-HQ team and successive
+    // brain ticks both see `myWorkers.length < cap` while the same
+    // workers are still pending production — the queues drain and the
+    // team ends up with 2× the intended pool (iter21 enemy team: 12
+    // workers alive vs. 6-cell intent). Treat every queued slot as a
+    // worker; over-counting combat ramps up worker discipline but is
+    // fine for the early/economy phase where worker training is the
+    // dominant action anyway.
+    const teamBarracks = buildings.filter(b => b.team === hq.team && !b.destroyed && b.kind === 'barracks');
+    const teamQueueLen = teamBarracks.reduce((acc, b) => acc + (b.trainQueueLen || 0), 0);
     h.workerCooldown = Math.max(0, (h.workerCooldown ?? 0) - dt);
     if (!trainBlocked && h.workerCooldown === 0 && liveBarracks.length > 0
-        && myWorkers.length < WORKER_TARGET
+        && (myWorkers.length + teamQueueLen) < effectiveWorkerTarget
         && canAffordUnitB('worker')) {
       // Pick the barracks with the FEWEST queued items so workers
       // distribute and don't starve any single barracks of combat
@@ -556,16 +817,30 @@ function decideActions(state, sessionId) {
       }
     }
     if (!trainBlocked && h.trainCooldown === 0 && state.enemyUnitCount < MAX_FIELDED_ENEMIES && liveBarracks.length > 0) {
-      const target = liveBarracks.find(b => (b.trainQueueLen ?? 0) < 4) || liveBarracks[0];
-      for (let i = 0; i < BARRACKS_PRODUCES.length; i++) {
-        const idx = (h.pickIndex + i) % BARRACKS_PRODUCES.length;
-        const kind = BARRACKS_PRODUCES[idx];
-        if (!canAffordUnitB(kind)) continue;
-        actions.push({ type: 'queue_train', buildingId: target.id, unitKind: kind });
-        debit(UNIT_COSTS[kind]);
-        h.pickIndex = idx + 1;
-        h.trainCooldown = TRAIN_INTERVAL_S;
-        break;
+      // Pick the barracks with the SHORTEST queue and only emit if it
+      // still has room. Previously this used `|| liveBarracks[0]` as a
+      // fallback, which meant once every barracks hit the cap we kept
+      // piling trains onto barracks #0 — driving queue depths into the
+      // dozens, none of which ever cleared because production was pop-
+      // capped. Hard skip when no barracks has room.
+      let target = null;
+      let bestLen = Infinity;
+      for (const b of liveBarracks) {
+        const len = b.trainQueueLen ?? 0;
+        if (len >= 4) continue;
+        if (len < bestLen) { bestLen = len; target = b; }
+      }
+      if (target) {
+        for (let i = 0; i < BARRACKS_PRODUCES.length; i++) {
+          const idx = (h.pickIndex + i) % BARRACKS_PRODUCES.length;
+          const kind = BARRACKS_PRODUCES[idx];
+          if (!canAffordInfantry(kind)) continue;
+          actions.push({ type: 'queue_train', buildingId: target.id, unitKind: kind });
+          debit(UNIT_COSTS[kind]);
+          h.pickIndex = idx + 1;
+          h.trainCooldown = TRAIN_INTERVAL_S;
+          break;
+        }
       }
     }
   }
@@ -647,6 +922,55 @@ function decideActions(state, sessionId) {
       }
       const adaptiveCtx = { buildoutByTeam, heavyAttackByTeam };
 
+      // ---- Force concentration via a single sticky target HQ per team.
+      // iter41-47 showed piecemeal trickle across the map is what 3-way
+      // midfield attrition feeds on, and iter45's per-home-HQ target
+      // scattered multi-HQ teams. iter48-52 added a rally-staging hop, but
+      // that proved boom-or-bust: units got pulled into field fights en
+      // route to the rally and never assembled, so waves often never
+      // committed (iter52: 0 HQ damage). The robust concentration lever is
+      // simpler — every released attacker on a team drives at the SAME
+      // sticky enemy HQ (nearest live enemy HQ to the team's HQ centroid,
+      // re-picked only when it dies). Shared target = damage piles on one
+      // structure even when units arrive staggered, without the fragile
+      // assembly gamble. The proven wave-release hysteresis (iter39/40
+      // HQ_WIN) gates how many leave home at once.
+      if (!s.armyTargetByTeam) s.armyTargetByTeam = {};
+      if (!s.waveByTeam) s.waveByTeam = {};
+      // Sticky single target per team: the whole army drives at ONE enemy
+      // HQ (nearest live enemy HQ to the team's HQ centroid), re-picked only
+      // when it dies. Shared target = damage piles on one structure; the
+      // stickiness avoids the cross-map thrash of per-unit nearest targeting
+      // (iter45). A weakest-HQ "snowball" variant was trialled (iter56/57)
+      // but did not out-win sticky-nearest (iter53 produced a clean HQ_WIN
+      // at 1/3 seeds; snowball 0/2) and needed extra hp plumbing, so the
+      // simpler sticky-nearest is kept.
+      const teamTarget = {};          // team -> sticky target HQ obj
+      for (const team of Object.keys(homeHqByTeam)) {
+        let sx = 0, sz = 0, n = 0;
+        for (const h of hqs) { if (h.team === team) { sx += h.x; sz += h.z; n++; } }
+        if (n === 0) continue;
+        const cx = sx / n, cz = sz / n;
+        let tgt = null;
+        const prevId = s.armyTargetByTeam[team];
+        if (prevId != null) {
+          tgt = targets.find(b => b && b.alive && b.kind === 'hq' && b.id === prevId && b.team !== team) || null;
+        }
+        if (!tgt) {
+          let best = null, bestD2 = Infinity;
+          for (const b of targets) {
+            if (!b || !b.alive || b.kind !== 'hq') continue;
+            if (b.team && b.team === team) continue;
+            const dx = b.x - cx, dz = b.z - cz;
+            const d2 = dx * dx + dz * dz;
+            if (d2 < bestD2) { bestD2 = d2; best = b; }
+          }
+          tgt = best;
+          s.armyTargetByTeam[team] = tgt ? tgt.id : null;
+        }
+        if (tgt) teamTarget[team] = tgt;
+      }
+
       let skipFiring = 0, skipPath = 0, skipUnarmed = 0, skipNoBldg = 0, skipInRange = 0, skipDefender = 0, skipEconomic = 0;
       for (const u of enemyUnits) {
         if (!u || u.hp <= 0) continue;
@@ -699,23 +1023,35 @@ function decideActions(state, sessionId) {
         if (stance === 'economic' && !buildoutByTeam[u.team]) {
           skipEconomic++; continue;
         }
-        // Wave-timing gate. Hold attackers back until enough are
-        // ready (armed + idle + no path) to send out as a pack.
-        // Tracked per team via state machine: once a wave releases,
-        // we keep releasing for that cycle until the count drops
-        // below WAVE_SIZE/2, then we wait for accumulation again.
-        if (!s.waveByTeam) s.waveByTeam = {};
+        // Wave-release hysteresis (proven iter39/40): hold attackers until
+        // WAVE_SIZE are ready, then keep releasing until the ready pool
+        // drains below WAVE_SIZE/2, so the team pushes in packs rather than
+        // single file.
         const wave = s.waveByTeam[u.team] || { releasing: false };
         s.waveByTeam[u.team] = wave;
         const ready = readyAttackersByTeam[u.team] || 0;
-        if (!wave.releasing && ready < WAVE_SIZE) {
-          continue; // hold — not enough attackers ready yet
-        }
+        if (!wave.releasing && ready < WAVE_SIZE) continue; // hold — massing
         wave.releasing = true;
         if (ready <= Math.floor(WAVE_SIZE / 2)) wave.releasing = false;
-        // Escort-siege gate: tanks + rocket trucks don't roll out
-        // alone. They need ≥2 friendly infantry within 30 m so the
-        // soft tank cargo doesn't get melted before it cracks a wall.
+
+        // Single sticky target HQ for the whole team (force concentration).
+        // Fall back to nearest enemy building only when no enemy HQ is live.
+        let bestB = teamTarget[u.team] || null;
+        if (!bestB) {
+          let fbD2 = Infinity;
+          for (const b of targets) {
+            if (!b || !b.alive) continue;
+            if (b.team && b.team === u.team) continue;
+            const dx = b.x - u.x, dz = b.z - u.z;
+            const d2 = dx * dx + dz * dz;
+            if (d2 < fbD2) { fbD2 = d2; bestB = b; }
+          }
+        }
+        if (!bestB) { skipNoBldg++; continue; }
+
+        // Escort gate: tanks + rocket trucks need ≥2 friendly infantry
+        // within 30 m so the soft chassis isn't melted before it cracks a
+        // wall.
         if (u.kind === 'tank' || u.kind === 'rocket_truck') {
           let escort = 0;
           const ER2 = 30 * 30;
@@ -729,60 +1065,6 @@ function decideActions(state, sessionId) {
           }
           if (escort < 2) continue; // hold the tank — infantry not ready
         }
-        // ============================================================
-        // Influence-map-aware target selection. HQ is ALWAYS the
-        // primary target (only HQ destruction wins the game), so we
-        // pick across enemy HQs using the influence map: weakest
-        // defended → easiest to crack. The influence layer only
-        // breaks the tie between multiple HQs and discourages a
-        // suicide rush at a heavily-fortified one. Other buildings
-        // are a pure fallback when no enemy HQ is alive (or reachable
-        // from this snapshot frame).
-        // ============================================================
-        const threatLayer = influence[u.team] ? influence[u.team].threat : null;
-        let imBest = null;
-        let imBestScore = -Infinity;
-        for (const b of targets) {
-          if (!b || !b.alive) continue;
-          if (b.team && b.team === u.team) continue;
-          if (b.kind !== 'hq') continue;
-          const localThreat = threatLayer ? imSampleAtWorld(threatLayer, b.x, b.z) : 0;
-          const dx = b.x - u.x, dz = b.z - u.z;
-          const distM = Math.sqrt(dx * dx + dz * dz);
-          // Score = inv-threat × inv-dist. The HQ value is constant
-          // (only HQs are scored here), so the formula resolves to
-          // "pick the closest weakly-defended HQ".
-          const score = 1
-            / (1 + localThreat * 0.02)
-            / (1 + distM * 0.003);
-          if (score > imBestScore) { imBestScore = score; imBest = b; }
-        }
-        // Use the influence-map pick if available, otherwise fall back
-        // to "nearest HQ / nearest anything" so a snapshot with no
-        // value-scored targets still routes attackers somewhere.
-        let bestB = imBest;
-        if (!bestB) {
-          let bestD2 = Infinity;
-          for (const b of targets) {
-            if (!b || !b.alive) continue;
-            if (b.team && b.team === u.team) continue;
-            if (b.kind !== 'hq') continue;
-            const dx = b.x - u.x, dz = b.z - u.z;
-            const d2 = dx * dx + dz * dz;
-            if (d2 < bestD2) { bestD2 = d2; bestB = b; }
-          }
-        }
-        if (!bestB) {
-          let bestD2 = Infinity;
-          for (const b of targets) {
-            if (!b || !b.alive) continue;
-            if (b.team && b.team === u.team) continue;
-            const dx = b.x - u.x, dz = b.z - u.z;
-            const d2 = dx * dx + dz * dz;
-            if (d2 < bestD2) { bestD2 = d2; bestB = b; }
-          }
-        }
-        if (!bestB) { skipNoBldg++; continue; }
         const range = APPROX_WEAPON_RANGE_M[u.kind] || 18;
         const stopRange = Math.max(1, range * ATTACK_STOP_FRACTION);
         const bdx = bestB.x - u.x, bdz = bestB.z - u.z;
@@ -790,24 +1072,18 @@ function decideActions(state, sessionId) {
         const distToTarget = Math.sqrt(bestD2);
         if (distToTarget <= stopRange) { skipInRange++; continue; }
         const scale = (distToTarget - stopRange) / distToTarget;
-        // Add a per-unit jitter offset to the firing-line goal so
-        // multiple attackers don't stack on the same XZ — without
-        // this, several units routing to the same enemy HQ all chose
-        // the same goalX/Z and the post-move separation pass couldn't
-        // disentangle them within the harness STUCK budget.
+        // Per-unit jitter so attackers don't stack on one XZ (the
+        // post-move separation pass can't disentangle a perfect stack
+        // within the harness STUCK budget).
         const jitterRad = 1.5; // ~12 voxels of spread
         const jx = ((u.id * 2654435761) >>> 0) / 0x100000000 * 2 - 1;
         const jz = ((u.id * 40503) >>> 0) / 0x100000000 * 2 - 1;
         const goalX = u.x + (bestB.x - u.x) * scale + jx * jitterRad;
         const goalZ = u.z + (bestB.z - u.z) * scale + jz * jitterRad;
         actions.push({ type: 'route_unit', unitId: u.id, x: goalX, z: goalZ });
-        // Squad fire-concentration: pick the highest-threat enemy
-        // unit within 25 m and broadcast it as the focus target.
-        // Multiple attackers walking together will see the same
-        // candidates and tend to pick the same one, so when they
-        // arrive in range their volley converges on one target
-        // instead of dribbling damage across the whole defending
-        // formation.
+        // Squad fire-concentration: pick the highest-threat enemy unit
+        // within 25 m as the shared focus target so the massed volley
+        // converges instead of dribbling across the defending formation.
         let focusUnit = null;
         let focusBest = -Infinity;
         const FOCUS_R2 = 25 * 25;
@@ -818,8 +1094,6 @@ function decideActions(state, sessionId) {
           const dx = e.x - u.x, dz = e.z - u.z;
           const d2 = dx * dx + dz * dz;
           if (d2 > FOCUS_R2) continue;
-          // Prefer highest DPS, tie-break on lower HP (finish low-
-          // health units first so they leave the fight faster).
           const score = dps - (e.hp ?? 0) * 0.01;
           if (score > focusBest) { focusBest = score; focusUnit = e; }
         }
@@ -828,8 +1102,12 @@ function decideActions(state, sessionId) {
         }
         routedThisCycle++;
       }
-      if (routedThisCycle > 0 || skipPath > 0 || skipFiring > 0) {
-        console.log(`[ai-attack] skips firing=${skipFiring} path=${skipPath} unarmed=${skipUnarmed} noBldg=${skipNoBldg} inRange=${skipInRange}`);
+      // Always log the per-cycle skip breakdown when there are
+      // armed-idle units but no routes — that's the signal that
+      // something silently dropped them and we need to know which gate.
+      if (routedThisCycle > 0 || skipPath > 0 || skipFiring > 0
+          || (armedIdle > 0 && routedThisCycle === 0)) {
+        console.log(`[ai-attack] skips firing=${skipFiring} path=${skipPath} unarmed=${skipUnarmed} noBldg=${skipNoBldg} inRange=${skipInRange} defender=${skipDefender} economic=${skipEconomic}`);
       }
     }
     if (routedThisCycle > 0) console.log(`[ai-attack] routed=${routedThisCycle}`);

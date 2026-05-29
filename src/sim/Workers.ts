@@ -253,6 +253,15 @@ export function tickWorkers(dt: number, deps: WorkerDeps): void {
       } else {
         u.taskStallTimer += dt;
         if (u.taskStallTimer >= TASK_STALL_SECONDS) {
+          // A stalled delivery means the closest storage door is unreachable
+          // (HQ + storage placed cheek-to-jowl can produce a 1-cell channel
+          // that A* never finds — see PATH FAIL warnings on enemy workers).
+          // Bump the per-unit failure count; on the next deliver attempt the
+          // worker rotates to the next-closest face so it stops looping on
+          // the same dead goal forever.
+          if (u.task.kind === 'deliver') {
+            u.repathFailures = (u.repathFailures ?? 0) + 1;
+          }
           // Blacklist the current cluster for this worker so the next
           // auto-task scan picks a different one.
           if (u.task.kind === 'mine' && u.claimedClusterId >= 0) {
@@ -561,27 +570,78 @@ function tickHarvester(u: Unit, dt: number, deps: WorkerDeps, scanFiredThisTick:
         u.task = { kind: 'idle' };
         return false;
       }
+      // Storage is the primary drop-off — its stockpile is what the
+      // supply trucks shuttle back to HQ. But if the AI placed its
+      // first storage in a closed pocket (HQ + barracks + farms wrap
+      // every cardinal face — see iter1 PATH FAIL warnings) every
+      // delivery stalls forever and the team starves on wood/metals
+      // because trucks never have anything to fetch.
+      //
+      // After even one stalled delivery (`repathFailures >= 1`) we
+      // fall back to the team's HQ door: the HQ footprint is large
+      // with several open faces near the initial worker spawn, so
+      // it's almost always reachable. On HQ arrival we credit the
+      // team resource pool directly (mirroring truck_deliver_hq
+      // accounting). It's a minor optimisation — the truck shuttle
+      // is normally what closes the loop — but it keeps the AI
+      // viable when its placement layout traps the closest storage.
+      // The `repathFailures` counter is reset on every successful
+      // drop, so a worker prefers the proper storage drop-off again
+      // on the next round trip.
+      const failures = u.repathFailures ?? 0;
       const storage = deps.buildings.nearestStorage(u.x, u.z, u.team);
-      if (!storage) return false;
-      const dpos = doorWorldPos(storage, u.x, u.z);
+      let target: Building | null = storage;
+      let hqFallback = false;
+      if (!target || failures >= 1) {
+        const hq = deps.buildings.buildings.find(b =>
+          !b.destroyed && b.spec.kind === 'hq' && b.team === u.team
+        );
+        if (hq) { target = hq; hqFallback = true; }
+      }
+      if (!target) return false;
+      // Rotate through the target's 4 face doors when prior attempts
+      // stalled. Without this a worker pinned in a base where the
+      // closest face sits in an unreachable corridor would re-route to
+      // the same dead goal every 0.4 s for the rest of the match.
+      //
+      // Storage-direction rotation only — the HQ fallback already
+      // implies the storage's nearest face was unreachable, so we
+      // start fresh at the HQ's closest face (rotation 0). Otherwise
+      // we'd be carrying over the storage's failure count to the HQ
+      // and skipping its own closest door.
+      const rotation = hqFallback ? 0 : (u.repathFailures ?? 0);
+      const dpos = doorWorldPos(target, u.x, u.z, rotation);
       const dx = dpos.x - u.x, dz = dpos.z - u.z;
       if (dx * dx + dz * dz <= INTERACT_REACH_M * INTERACT_REACH_M) {
-        storage.stockpile.wood += u.carrying.wood;
-        storage.stockpile.metals += u.carrying.metals;
+        const teamRes = deps.resourcesForTeam
+          ? deps.resourcesForTeam(u.team as 'player' | 'enemy' | 'enemy2')
+          : (u.team !== 'player' && deps.enemyResources ? deps.enemyResources : deps.resources);
+        if (hqFallback) {
+          teamRes.wood   += u.carrying.wood;
+          teamRes.metals += u.carrying.metals;
+        } else {
+          target.stockpile.wood   += u.carrying.wood;
+          target.stockpile.metals += u.carrying.metals;
+        }
         // Food is perishable: skip the truck run and credit the
         // worker's team resource pool directly. All non-player
         // teams have their own pools (per-team lookup) so one AI
         // faction can't drain the other's economy. Falls back to the
         // legacy enemyResources or to `resources` when the host has
         // not provided the team-aware accessor (test bench).
-        const teamRes = deps.resourcesForTeam
-          ? deps.resourcesForTeam(u.team as 'player' | 'enemy' | 'enemy2')
-          : (u.team !== 'player' && deps.enemyResources ? deps.enemyResources : deps.resources);
         teamRes.food += u.carrying.food;
         u.carrying.wood = 0;
         u.carrying.metals = 0;
         u.carrying.food = 0;
         u.task = { kind: 'idle' };
+        // Reset the rotation counter ONLY when the storage path itself
+        // worked. If we fell through to the HQ fallback the storage is
+        // still presumed unreachable, so keep `repathFailures >= 1` so the
+        // next deliver round skips straight to HQ instead of paying the
+        // 1 s task-stall + PATH FAIL log every cycle. Once the underlying
+        // layout changes (HQ destroyed, storage rebuilt elsewhere) the
+        // worker will go idle from no carry and pick up a fresh task.
+        if (!hqFallback) u.repathFailures = 0;
         return false;
       }
       if (u.path.length === 0) routeIfDue(u, deps, dpos.x, dpos.y, dpos.z);
@@ -646,50 +706,65 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
   // entire cluster depletes and every worker goes idle simultaneously, they
   // don't all scan in the same JS frame (which would freeze the main thread
   // for several seconds).
-  if (u.workerScanCooldown > 0 || scanFiredThisTick) return false;
+  if (u.workerScanCooldown > 0 || scanFiredThisTick) {
+    // Scan is throttled this tick (own cooldown, or another worker already
+    // scanned — only one voxel scan fires per tickWorkers call). A stranded
+    // idle worker would otherwise return here every tick and never relocate,
+    // sitting idle past the harness's 10 s rule when a whole cluster depletes
+    // and every worker goes idle at once (iter81 FAILURE_STUCK). Regrouping is
+    // cheap (no scan), so do it even while throttled.
+    regroupTowardBase(u, deps);
+    return false;
+  }
   u.workerScanCooldown = SCAN_COOLDOWN_SECS;
 
-  if (focus !== 'chop') {
+  // Resource gathering. A worker prefers its focus resource but falls
+  // back to the OTHER resource when the preferred one is exhausted
+  // within scan range. Without the fallback a chop-focus worker that
+  // fells every nearby tree (or a mine-focus worker whose clusters
+  // deplete) sits idle and trips the harness's 10 s worker-stuck rule
+  // (iter41 FAILURE_STUCK: chop worker #11 idle, no wood nearby).
+  // Gathering the alternate resource is standard RTS economy behaviour
+  // — it keeps the worker productive, keeps the AI-vs-AI run alive, and
+  // spreads workers across both resource types as one runs dry. It is
+  // NOT a stuck-recovery teleport: the worker still walks a real path
+  // to the alternate resource.
+  //
+  // Each scan returns one of: 'cheap' (assigned via the cluster planner;
+  // don't suppress other workers' scans this tick), 'expensive' (a full
+  // voxel scan fired; suppress further scans), 'defer' (transient
+  // cluster-slot race — retry next tick, don't try the other resource),
+  // or 'none' (nothing found; fall through to the other resource).
+  const tryMine = (): 'cheap' | 'expensive' | 'defer' | 'none' => {
     if (deps.findBestMineTarget) {
       const blacklist = getClusterBlacklist(u.id, performance.now() / 1000);
       const target = deps.findBestMineTarget(u.x, u.z, blacklist);
-      if (target) {
-        // Reserve a slot on the cluster up-front so the
-        // per-cluster max enforcement is honored from the moment
-        // of assignment, not just when the worker arrives. We
-        // look up the cluster via findMetalCluster on the picked
-        // voxel and call tryClaimClusterSlot. If reservation
-        // fails, the cluster is genuinely full — pick another.
-        const tvx = Math.floor(target.wx / VOXEL_SIZE);
-        const tvy = Math.floor(target.wy / VOXEL_SIZE);
-        const tvz = Math.floor(target.wz / VOXEL_SIZE);
-        const cluster = deps.findMetalCluster?.(tvx, tvy, tvz) ?? null;
-        const slot = cluster ? (deps.tryClaimClusterSlot?.(cluster, u.id) ?? null) : null;
-        if (cluster && slot === null) {
-          // Slot race-lost. Skip this assignment; the worker
-          // re-scans next tick and picks a different cluster.
-          return false;
-        }
-        u.task = { kind: 'mine', wx: target.wx, wy: target.wy, wz: target.wz };
-        u.claimedClusterId = target.clusterId;
-        if (slot !== null) u.claimedSlotIndex = slot;
-        u.workerRouteCooldown = 0;
-        deps.routeWorker(u, target.wx, target.wy, target.wz);
-        return false; // cheap — don't block other workers from assigning this tick
-      }
-    } else {
-      // Fallback: expensive full-world voxel scan when cluster metadata is absent.
-      const ore = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_METAL);
-      if (ore) {
-        u.task = { kind: 'mine', wx: (ore.vx + 0.5) * VOXEL_SIZE, wy: (ore.vy + 0.5) * VOXEL_SIZE, wz: (ore.vz + 0.5) * VOXEL_SIZE };
-        u.workerRouteCooldown = 0;
-        deps.routeWorker(u, u.task.wx, u.task.wy, u.task.wz);
-        return true; // expensive scan fired — suppress further scans this tick
-      }
+      if (!target) return 'none';
+      // Reserve a slot on the cluster up-front so the per-cluster max
+      // enforcement is honored from the moment of assignment.
+      const tvx = Math.floor(target.wx / VOXEL_SIZE);
+      const tvy = Math.floor(target.wy / VOXEL_SIZE);
+      const tvz = Math.floor(target.wz / VOXEL_SIZE);
+      const cluster = deps.findMetalCluster?.(tvx, tvy, tvz) ?? null;
+      const slot = cluster ? (deps.tryClaimClusterSlot?.(cluster, u.id) ?? null) : null;
+      if (cluster && slot === null) return 'defer'; // slot race-lost; re-scan next tick
+      u.task = { kind: 'mine', wx: target.wx, wy: target.wy, wz: target.wz };
+      u.claimedClusterId = target.clusterId;
+      if (slot !== null) u.claimedSlotIndex = slot;
+      u.workerRouteCooldown = 0;
+      deps.routeWorker(u, target.wx, target.wy, target.wz);
+      return 'cheap';
     }
-  }
+    // Fallback: expensive full-world voxel scan when cluster metadata is absent.
+    const ore = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_METAL);
+    if (!ore) return 'none';
+    u.task = { kind: 'mine', wx: (ore.vx + 0.5) * VOXEL_SIZE, wy: (ore.vy + 0.5) * VOXEL_SIZE, wz: (ore.vz + 0.5) * VOXEL_SIZE };
+    u.workerRouteCooldown = 0;
+    deps.routeWorker(u, u.task.wx, u.task.wy, u.task.wz);
+    return 'expensive';
+  };
 
-  if (focus !== 'mine') {
+  const tryWood = (): 'expensive' | 'none' => {
     const wood = findNearestExposed(deps.world.buffers.voxels, u.x, u.y, u.z, M_WOOD,
       (vx, vy, vz) => {
         if (voxelInsideAnyBuilding(deps.buildings, vx, vz)) return false;
@@ -712,28 +787,74 @@ function assignNextHarvestTask(u: Unit, deps: WorkerDeps, scanFiredThisTick: boo
         }
         return true;
       });
-    if (wood) {
-      claimWood(u.id, worldIndex(wood.vx, wood.vy, wood.vz));
-      u.task = { kind: 'chop', wx: (wood.vx + 0.5) * VOXEL_SIZE, wy: (wood.vy + 0.5) * VOXEL_SIZE, wz: (wood.vz + 0.5) * VOXEL_SIZE };
-      // Route to a passable nav cell adjacent to the trunk. The host's
-      // `findChopApproach` walks the 8 neighbour cells of the trunk's nav
-      // cell, picks the closest passable one to the worker, and returns its
-      // centre at ground Y. When the host doesn't supply that callback (e.g.
-      // tests with a minimal harness) we fall back to the older 1.25 m
-      // approach offset.
-      const cap = deps.findChopApproach?.(u.x, u.z, u.task.wx, u.task.wz) ?? null;
-      u.workerRouteCooldown = 0;
-      if (cap) {
-        deps.routeWorker(u, cap.x, cap.y, cap.z);
-      } else {
-        const ap = approachPos(u.x, u.z, u.task.wx, u.task.wz, 10);
-        const apY = deps.surfaceY ? deps.surfaceY(ap.x, ap.z) : u.y;
-        deps.routeWorker(u, ap.x, apY, ap.z);
-      }
-      return true;
+    if (!wood) return 'none';
+    claimWood(u.id, worldIndex(wood.vx, wood.vy, wood.vz));
+    u.task = { kind: 'chop', wx: (wood.vx + 0.5) * VOXEL_SIZE, wy: (wood.vy + 0.5) * VOXEL_SIZE, wz: (wood.vz + 0.5) * VOXEL_SIZE };
+    // Route to a passable nav cell adjacent to the trunk. The host's
+    // `findChopApproach` walks the 8 neighbour cells of the trunk's nav
+    // cell, picks the closest passable one to the worker, and returns its
+    // centre at ground Y. When the host doesn't supply that callback (e.g.
+    // tests with a minimal harness) we fall back to the older 1.25 m
+    // approach offset.
+    const cap = deps.findChopApproach?.(u.x, u.z, u.task.wx, u.task.wz) ?? null;
+    u.workerRouteCooldown = 0;
+    if (cap) {
+      deps.routeWorker(u, cap.x, cap.y, cap.z);
+    } else {
+      const ap = approachPos(u.x, u.z, u.task.wx, u.task.wz, 10);
+      const apY = deps.surfaceY ? deps.surfaceY(ap.x, ap.z) : u.y;
+      deps.routeWorker(u, ap.x, apY, ap.z);
     }
+    return 'expensive';
+  };
+
+  // Focus sets the PREFERENCE order; both resources are attempted so a
+  // worker never idles while either is reachable. 'mine'/'auto'/'farm'
+  // try ore first (the metals economy funds combat); 'chop' tries wood
+  // first. The complementary scan only runs when the preferred one
+  // came up empty.
+  const scanOrder = focus === 'chop' ? [tryWood, tryMine] : [tryMine, tryWood];
+  for (const scan of scanOrder) {
+    const r = scan();
+    if (r === 'cheap') return false;     // assigned via cluster planner (cheap)
+    if (r === 'expensive') return true;  // assigned; an expensive scan fired
+    if (r === 'defer') return false;     // transient slot race; retry next tick
+    // 'none' → preferred resource exhausted; fall through to the other
   }
-  return true; // scan ran, found nothing — still counts as fired so we don't pile on
+
+  // No resource reachable from here — the worker has wandered out of scan
+  // range of BOTH wood and ore. Walk it back toward base (see regroupTowardBase).
+  regroupTowardBase(u, deps);
+  return true; // scans ran, found nothing — count as fired so we don't pile on
+}
+
+/**
+ * Walk a stranded idle worker back toward its team's storage/HQ. Used when a
+ * worker can find no resource (both wood + ore out of scan range) AND when its
+ * voxel scan is throttled this tick — the base area is resource-dense, so the
+ * next scan from there finds work, and meanwhile the worker is MOVING on a real
+ * path rather than the 10 s stationary-idle the harness flags (iter66/iter81
+ * FAILURE_STUCK: enemy2 worker idle mid-map). No teleport/recovery hack — it's
+ * an ordinary route request home, cooldown-gated and only when meaningfully far
+ * (>12 m) so near-base idlers don't take a redundant walk.
+ *
+ * Crucially this is CHEAP (no voxel scan), so it runs even when the global
+ * per-tick scan throttle (`scanFiredThisTick`) suppresses this worker's scan —
+ * the bug that let stranded workers sit idle for 10 s when a whole cluster
+ * depleted and every worker went idle in the same frame.
+ */
+function regroupTowardBase(u: Unit, deps: WorkerDeps): void {
+  if (u.path.length > 0) return; // already moving somewhere
+  const regroup = deps.buildings.nearestStorage(u.x, u.z, u.team)
+    || deps.buildings.buildings.find(b => !b.destroyed && b.spec.kind === 'hq' && b.team === u.team)
+    || null;
+  if (!regroup || !deps.surfaceY) return;
+  const gx = (regroup.ox + regroup.spec.cellsW * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+  const gz = (regroup.oz + regroup.spec.cellsD * 0.5) * NAV_CELL_VOXELS * VOXEL_SIZE;
+  const dx = gx - u.x, dz = gz - u.z;
+  if (dx * dx + dz * dz > 12 * 12) {
+    routeIfDue(u, deps, gx, deps.surfaceY(gx, gz), gz);
+  }
 }
 
 function isHarvesterOrderForFocus(o: WorkOrder, focus: WorkerFocus): boolean {

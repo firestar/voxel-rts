@@ -18,10 +18,21 @@ verification is needed — e.g. checking rendering, UI, or live
 pathfinding behaviour. Start it, do the verification, then stop it.
 Don't leave it running unnecessarily.
 
-## Don't use sub agents
+## Sub agents
 
-Don't delegate work to sub agents via the `Agent` tool (Explore,
-general-purpose, Plan, etc.). Do the searching, reading, and editing
-directly in the main session. Sub agents fragment context, hide what
-actually got run, and make it harder to verify the work — which matters
-more here than the parallelism they buy.
+Sub agents (via the `Agent` / `Task` tool: Explore, general-purpose,
+Plan, etc.) are allowed when the user explicitly asks for them or when
+the work is genuinely parallelisable across independent surfaces
+(e.g. running several AI-vs-AI matches with different strategies and
+collecting logs).
+
+Default behaviour is still to do searching, reading, and editing in the
+main session — sub agents fragment context, hide what actually got run,
+and make it harder to verify the work. When you do use them:
+
+- Give each sub agent a narrow, well-defined task and ask it to report
+  back concrete artifacts (file paths, log excerpts, test names).
+- Always re-verify their claims in the main session by reading the
+  files / running the same commands before reporting "done".
+- Still gate everything on the three checks in "Verifying changes"
+  below, run from the main session.

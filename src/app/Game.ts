@@ -16,6 +16,7 @@ import { sharedBuffersAvailable } from '../util/Shared';
 import {
   SurfaceNavBuffers, allocateNav, buildSurfaceNav, refreshSurfaceNavBox,
   NAV_W, NAV_H, navIndex, navCenter, NAV_CELL_METERS, NAV_CELL_VOXELS,
+  MAX_FLATNESS_RADIUS,
 } from '../path/SurfaceNav';
 import {
   VolumeNavBuffers, allocateVolumeNav, buildVolumeNav, rebuildVolumeCell,
@@ -32,7 +33,7 @@ import {
   M_GRASS, M_STONE, M_PATH, M_MUD,
 } from '../voxel/Materials';
 import type { MaterialId } from '../voxel/types';
-import { BuildingManager, BARRACKS, STORAGE, HQ, ALL_BUILDINGS, BuildingSpec, Building, checkFootprint, buildingThreatLevel, doorWorldPos } from '../sim/Buildings';
+import { BuildingManager, BARRACKS, STORAGE, HQ, ALL_BUILDINGS, BuildingSpec, Building, checkFootprint, buildingThreatLevel, doorWorldPos, hasTruckApproach } from '../sim/Buildings';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { ConstructionOverlay } from '../render/ConstructionOverlay';
 import { BuildingRenderer } from '../render/BuildingRenderer';
@@ -48,7 +49,8 @@ import { LeafDecay } from '../sim/LeafDecay';
 import { CivilianSystem } from '../sim/Civilians';
 import { RemoteAIClient } from '../sim/RemoteAIClient';
 import { tickWorkers, approachPos, WORKER_CHOP_REACH_M } from '../sim/Workers';
-import { tickSupplyTrucks } from '../sim/SupplyTrucks';
+import { tickSupplyTrucks, resetSupplyTruckState } from '../sim/SupplyTrucks';
+import { assignAAInterceptors } from '../sim/AATargeting';
 import { PathTracer } from '../sim/PathTracer';
 import { WorkerTaskBoard, describeOrder } from '../sim/WorkerTasks';
 import { ProjectileManager, PROJECTILES, PROJECTILE_GRAVITY, muzzleOrigin, ProjectileImpact } from '../sim/Projectiles';
@@ -160,6 +162,18 @@ export class Game {
   /** How many AI opponents to seed at game start. Set by main.ts from
    *  the lobby's `aiCount` setting before `generate()` runs. */
   numAi = 1;
+  /** Debug mode: AI-vs-AI sandbox with wireframe-only rendering. Set
+   *  via the constructor `opts.debugMode` flag. When true the tick
+   *  loop skips work that isn't relevant to AI behaviour (fog-of-war
+   *  packing, tank-track painting, civilians, leaf decay, saplings),
+   *  and the renderer + chunk meshes are configured with debug
+   *  materials by the constructor. */
+  readonly debugMode: boolean;
+  /** Multiplier applied to `dt` for sim systems (units, buildings,
+   *  projectiles, workers, supply trucks, AI). Camera + input stay on
+   *  raw dt so the user can still navigate fluidly at 8× sim speed.
+   *  Default 1.0; the debug page exposes a hotkey/select to step it. */
+  simSpeedMultiplier = 1;
   /** Phase 2 of the zero-trust migration: when true, every spawned
    *  unit is mirrored into the authoritative `game-server` and its
    *  position is reconciled against the server's snapshot every
@@ -274,6 +288,12 @@ export class Game {
    *  reveals its full footprint plus a generous ring around it. */
   fowEnabled = true;
   fowUnitRadiusMeters = 50 * VOXEL_SIZE;
+  /** AA targeting telemetry (goal B measurement). Counts engagement
+   *  assignments: an `aa_vehicle` locked onto an incoming enemy projectile
+   *  (air) vs onto a ground target via the aggressive-stance fallback. The
+   *  harness reads these to report the live AA shots-on-air ratio. */
+  aaAirTargets = 0;
+  aaGroundTargets = 0;
   /** Per-kind sight bonus (cells = metres at NAV_CELL_METERS = 1)
    *  added on top of each building's footprint half-diagonal. Tuned
    *  to match `SIGHT_RADIUS_BY_BUILDING_KIND` on the server so the
@@ -416,7 +436,12 @@ export class Game {
     }
   }
 
-  constructor(canvas: HTMLCanvasElement, statsEl: HTMLElement | null) {
+  constructor(
+    canvas: HTMLCanvasElement,
+    statsEl: HTMLElement | null,
+    opts: { debugMode?: boolean } = {},
+  ) {
+    this.debugMode = !!opts.debugMode;
     // Relay console.log / console.warn / console.error to the local log
     // server so terminal monitoring works.
     const relay = (prefix: string, args: unknown[]): void => {
@@ -430,7 +455,7 @@ export class Game {
     console.warn = (...args) => { _warn(...args); relay('WARN ', args); };
     console.error = (...args) => { _err(...args); relay('ERROR ', args); };
 
-    this.renderer = new Renderer(canvas);
+    this.renderer = new Renderer(canvas, { debugMode: this.debugMode });
     this.camera = new RTSCamera();
     this.input = new Input();
     this.input.attach(window);
@@ -461,7 +486,16 @@ export class Game {
 
     const sharedAvailable = sharedBuffersAvailable();
     this.world = VoxelWorld.create(sharedAvailable);
-    this.meshes = new ChunkMeshRegistry(this.renderer.scene, this.world);
+    // Wireframe chunk material in debug mode: MeshBasicMaterial skips
+    // lighting entirely and `wireframe: true` shows the greedy mesh's
+    // edges directly. Bypasses the onBeforeCompile FoW/cutoff/AO patch
+    // the regular material uses.
+    const debugChunkMaterial = this.debugMode
+      ? new THREE.MeshBasicMaterial({ vertexColors: true, wireframe: true })
+      : undefined;
+    this.meshes = new ChunkMeshRegistry(this.renderer.scene, this.world, {
+      debugMaterial: debugChunkMaterial,
+    });
     // Wire the world into the projectile manager so newly spawned rounds
     // pre-compute their full visible arc (used by the dashed-line renderer
     // so the arc stays visible from spawn through impact).
@@ -501,6 +535,15 @@ export class Game {
     const worldExtentX = NAV_W * NAV_CELL_METERS;
     const worldExtentZ = NAV_H * NAV_CELL_METERS;
     this.meshes.setExplored(true, this.exploredTex, worldExtentX, worldExtentZ);
+
+    // In debug mode we want every faction's units / buildings to
+    // render unconditionally — there's no "player" to hide enemies
+    // from, and the FoW packing is dead weight. Turning the master
+    // switch off here also makes `isInsideCurrentFoW` irrelevant for
+    // the tick-time enemy-hidden predicate (see `tick()`).
+    if (this.debugMode) {
+      this.fowEnabled = false;
+    }
 
     this.buildings.spawner = (kind, x, y, z, b): Unit | null => this.spawnUnit(kind, x, y, z, b.team);
     this.buildings.popHasRoom = (kind, b): boolean => {
@@ -588,6 +631,34 @@ export class Game {
 
     this.onResize();
     window.addEventListener('resize', this.onResize);
+
+    if (this.debugMode) this.applyDebugWireframe();
+  }
+
+  /**
+   * Walk every Mesh / InstancedMesh / Line already attached to the
+   * scene and flip `wireframe = true` on its material. Unit /
+   * building / projectile renderers create their materials once in
+   * their constructors and reuse them across instances, so a single
+   * post-construction sweep covers every faction and every spawn
+   * that happens later. The chunk material has already been swapped
+   * to a wireframe `MeshBasicMaterial` via ChunkMeshRegistry's
+   * `debugMaterial` opt, so it's a no-op here (idempotent).
+   */
+  private applyDebugWireframe(): void {
+    const seen = new Set<THREE.Material>();
+    this.renderer.scene.traverse((obj) => {
+      const mat = (obj as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+      if (!mat) return;
+      const arr = Array.isArray(mat) ? mat : [mat];
+      for (const m of arr) {
+        if (seen.has(m)) continue;
+        seen.add(m);
+        if ('wireframe' in m) {
+          (m as THREE.MeshBasicMaterial).wireframe = true;
+        }
+      }
+    });
   }
 
   async generate(
@@ -647,6 +718,10 @@ export class Game {
     );
     await this.pathWorker.ready();
     this.minimap.buildTerrain(this.world.buffers.voxels);
+    // Clear any supply-truck registry state left over from a previous game in
+    // a reused process (multi-match harness). Stale truck ids would otherwise
+    // corrupt team attribution / refunds for fresh trucks.
+    resetSupplyTruckState();
     this.spawnInitialUnits();
   }
 
@@ -658,8 +733,23 @@ export class Game {
    */
   private findFlatSpawnCell(cx: number, cz: number, radius: number): { cx: number; cz: number } {
     const nav = this.surfaceNav!;
+    // Flatness alone isn't enough on a debug-mode flat plane: trees + ore
+    // piles cluster in the central grid, so the corner cells are FLATTER
+    // (further from any blocker) than the requested NW-corner spawn at
+    // (cx, cz). With a pure max-flatness search the player HQ gets dropped
+    // at (0, 0), worker spawn offsets push some workers off-map, and the
+    // harness's idle-worker watchdog trips at t=10 s.
+    //
+    // Two-criterion search: flatness FLOOR of MAX_FLATNESS_RADIUS / 2 is
+    // "plenty flat enough" for any building footprint, and within that
+    // band we tie-break by squared Manhattan distance to the requested
+    // centre. The result is the closest unblocked-and-flat cell to where
+    // the caller actually wants the base, which matches the lobby's
+    // generated-world behaviour without losing the flatness gate.
+    const FLAT_FLOOR = Math.max(1, Math.floor(MAX_FLATNESS_RADIUS / 2));
     let best = { cx, cz };
     let bestFlat = -1;
+    let bestD2 = Infinity;
     for (let dz = -radius; dz <= radius; dz++) {
       for (let dx = -radius; dx <= radius; dx++) {
         const x = cx + dx, z = cz + dz;
@@ -667,7 +757,21 @@ export class Game {
         const i = navIndex(x, z);
         if (nav.blocked[i]) continue;
         const f = nav.flatness[i]!;
-        if (f > bestFlat) { bestFlat = f; best = { cx: x, cz: z }; }
+        const d2 = dx * dx + dz * dz;
+        if (f >= FLAT_FLOOR) {
+          // Inside the "flat enough" band: closest to centre wins.
+          if (bestFlat < FLAT_FLOOR || d2 < bestD2) {
+            bestFlat = f;
+            bestD2 = d2;
+            best = { cx: x, cz: z };
+          }
+        } else if (bestFlat < FLAT_FLOOR && f > bestFlat) {
+          // Fallback: nothing has reached the flat floor yet; fall back
+          // to the previous "highest flatness wins" behaviour.
+          bestFlat = f;
+          bestD2 = d2;
+          best = { cx: x, cz: z };
+        }
       }
     }
     return best;
@@ -679,9 +783,18 @@ export class Game {
     // Pick the player's spawn cell from the NW corner of the map. The
     // enemy HQ ends up in the opposite (SE) corner via `placeEnemyHQ`,
     // so the two factions start at the long-diagonal extremes.
+    // Debug mode (AI-vs-AI testbed) packs the bases closer together: the
+    // real game spawns the player in the NW corner (0.10) so the campaign
+    // map feels large, but in `debug.html` the 380 m corner-to-corner
+    // crossing meant no massed wave could reach a far enemy HQ inside the
+    // 240 s harness budget — armies attrited mid-map (iter41-48). A 0.30
+    // player ratio + the compact AI ratios below halve the crossing
+    // (~305 m → ~150 m) so a concentrated push can actually demolish an
+    // HQ. Debug-only: the campaign layout is unchanged.
+    const playerRatio = this.debugMode ? 0.30 : 0.10;
     const found = this.findFlatSpawnCell(
-      Math.floor(NAV_W * 0.10),
-      Math.floor(NAV_H * 0.10),
+      Math.floor(NAV_W * playerRatio),
+      Math.floor(NAV_H * playerRatio),
       Math.floor(NAV_W * 0.20),
     );
     const c = navCenter(nav, found.cx, found.cz);
@@ -707,23 +820,30 @@ export class Game {
     // generated world) we just skip — the player can build one manually.
     const startCx = found.cx;
     const startCz = found.cz;
-    const offsets: [number, number][] = [[5, 0], [-5, 0], [0, 5], [0, -5], [4, 4], [-4, -4]];
+    // Bumped ±5 → ±7 so the gap between HQ and starter storage is 3
+    // nav cells = supply-truck footprint width. See seedEnemyEconomy
+    // comment for the truck-loop failure the smaller offset caused.
+    const offsets: [number, number][] = [[7, 0], [-7, 0], [0, 7], [0, -7], [6, 6], [-6, -6]];
     for (const [dx, dz] of offsets) {
       const ox = Math.max(0, Math.min(NAV_W - STORAGE.cellsW, startCx + dx - (STORAGE.cellsW >> 1)));
       const oz = Math.max(0, Math.min(NAV_H - STORAGE.cellsD, startCz + dz - (STORAGE.cellsD >> 1)));
       const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, STORAGE, ox, oz, this.buildings.buildings);
-      if (fp.ok) {
-        this.buildings.place(this.world, STORAGE, ox, oz, fp.floorY);
-        const pad = NAV_CELL_METERS;
-        const bx0 = ox * NAV_CELL_METERS;
-        const bz0 = oz * NAV_CELL_METERS;
-        const bx1 = (ox + STORAGE.cellsW) * NAV_CELL_METERS;
-        const bz1 = (oz + STORAGE.cellsD) * NAV_CELL_METERS;
-        const by0 = fp.floorY * VOXEL_SIZE;
-        const by1 = (fp.floorY + STORAGE.headroomVoxels + 4) * VOXEL_SIZE;
-        this.requestNavRebuildAround(bx0 - pad, by0 - pad, bz0 - pad, bx1 + pad, by1 + pad, bz1 + pad, false);
-        break;
-      }
+      if (!fp.ok) continue;
+      // Skip offsets that would seal the storage between adjacent buildings.
+      // See `hasTruckApproach` — trucks need a 3-cell-wide approach to fetch
+      // / deliver. Without this gate the starter HQ + storage place flush and
+      // every supply truck despawns "lost in action" 50 s later.
+      if (!hasTruckApproach(ox, oz, STORAGE, this.buildings.buildings)) continue;
+      this.buildings.place(this.world, STORAGE, ox, oz, fp.floorY);
+      const pad = NAV_CELL_METERS;
+      const bx0 = ox * NAV_CELL_METERS;
+      const bz0 = oz * NAV_CELL_METERS;
+      const bx1 = (ox + STORAGE.cellsW) * NAV_CELL_METERS;
+      const bz1 = (oz + STORAGE.cellsD) * NAV_CELL_METERS;
+      const by0 = fp.floorY * VOXEL_SIZE;
+      const by1 = (fp.floorY + STORAGE.headroomVoxels + 4) * VOXEL_SIZE;
+      this.requestNavRebuildAround(bx0 - pad, by0 - pad, bz0 - pad, bx1 + pad, by1 + pad, bz1 + pad, false);
+      break;
     }
     // Place the HQ. Try a ring of offsets further out so it doesn't overlap units.
     const hqOffsets: [number, number][] = [[-8, 0], [8, 0], [0, -8], [0, 8], [-8, -8], [8, 8]];
@@ -785,11 +905,30 @@ export class Game {
     [0.65, 0.65],
   ];
 
+  /** Compact AI anchors for the debug.html AI-vs-AI testbed. The campaign
+   *  ratios above scatter bases to the map corners (~305 m crossings); in
+   *  the 240 s harness no massed wave survives that crossing, so HQ_WIN was
+   *  unreachable (iter41-48: armies ground each other down mid-map). These
+   *  anchors cluster the enemies ~150 m from the player's 0.30 spawn so a
+   *  concentrated push (rally-then-commit, ai-server.cjs) can demolish an HQ
+   *  in time. Debug-only — `placeEnemyBases` picks this list when
+   *  `debugMode` is set; the campaign layout is unchanged. */
+  private static AI_BASE_RATIOS_DEBUG: ReadonlyArray<readonly [number, number]> = [
+    [0.70, 0.30],
+    [0.30, 0.70],
+    [0.70, 0.70],
+    [0.50, 0.72],
+    [0.72, 0.50],
+    [0.58, 0.30],
+    [0.30, 0.58],
+  ];
+
   private placeEnemyBases(count: number): void {
     if (!this.surfaceNav || count <= 0) return;
+    const ratios = this.debugMode ? Game.AI_BASE_RATIOS_DEBUG : Game.AI_BASE_RATIOS;
     const search = Math.max(8, Math.floor(NAV_W * 0.10));
-    for (let i = 0; i < Math.min(count, Game.AI_BASE_RATIOS.length); i++) {
-      const [rx, rz] = Game.AI_BASE_RATIOS[i]!;
+    for (let i = 0; i < Math.min(count, ratios.length); i++) {
+      const [rx, rz] = ratios[i]!;
       const targetCx = Math.floor(NAV_W * rx);
       const targetCz = Math.floor(NAV_H * rz);
       const best = this.findFlatSpawnCell(targetCx, targetCz, search);
@@ -844,12 +983,28 @@ export class Game {
     if (!this.surfaceNav) return;
     const startCx = hqOx + (HQ.cellsW >> 1);
     const startCz = hqOz + (HQ.cellsD >> 1);
-    const offsets: [number, number][] = [[5, 0], [-5, 0], [0, 5], [0, -5], [4, 4], [-4, -4]];
+    // Storage offsets bumped from ±5 → ±7. With HQ.cellsW=6 and
+    // STORAGE.cellsW=3 the old ±5 left a 1-cell gap between HQ and
+    // storage edges — passable for a 1×1 worker but a 3×3 supply
+    // truck couldn't squeeze through. Trucks then hung on truck_fetch
+    // / truck_deliver_hq, the watchdog despawned them at 50 s, and
+    // wood + metals piled up in the storage stockpile without ever
+    // reaching the team resource pool (iter26 dump: storage#8 metals=360,
+    // team budget metals=0). At ±7 the gap is 3 cells exactly = the
+    // truck's footprint width, so the HQ-side face approach is
+    // physically usable. Same change applied to the starter-kit
+    // player offsets above.
+    const offsets: [number, number][] = [[7, 0], [-7, 0], [0, 7], [0, -7], [6, 6], [-6, -6]];
     for (const [dx, dz] of offsets) {
       const ox = Math.max(0, Math.min(NAV_W - STORAGE.cellsW, startCx + dx - (STORAGE.cellsW >> 1)));
       const oz = Math.max(0, Math.min(NAV_H - STORAGE.cellsD, startCz + dz - (STORAGE.cellsD >> 1)));
       const fp = checkFootprint(this.world.buffers.voxels, this.surfaceNav!, STORAGE, ox, oz, this.buildings.buildings);
       if (!fp.ok) continue;
+      // Skip offsets that would seal the storage between adjacent buildings.
+      // Mirrors the same gate used by the player starter kit and the runtime
+      // AI placement — without it the enemy storage lands flush against HQ
+      // and every supply truck despawns "lost in action" inside the match.
+      if (!hasTruckApproach(ox, oz, STORAGE, this.buildings.buildings)) continue;
       this.buildings.place(this.world, STORAGE, ox, oz, fp.floorY, { team: baseTeam });
       const pad = NAV_CELL_METERS;
       const bx0 = ox * NAV_CELL_METERS;
@@ -876,17 +1031,33 @@ export class Game {
     //   - 2 farm (per game rule, only farm-focus workers can tend
     //     plots; without dedicated farmers the food economy stalls
     //     at the 20% milestone forever)
+    // Always offset workers toward the world interior. With base
+    // anchors at corners (AI_BASE_RATIOS up to 0.9, 0.9) the previous
+    // unconditional +X offset put 4 of 6 enemy workers PAST the world's
+    // east edge, where surfaceWorldY samples out-of-bounds voxels,
+    // returns ~0, and the workers fall to y=-34000 into the void. By
+    // picking +1 or -1 for each axis based on which side of the centre
+    // the HQ is on, seeds always land inside the playable area.
+    const worldXm = WORLD_X * VOXEL_SIZE;
+    const worldZm = WORLD_Z * VOXEL_SIZE;
+    const sx = cxw < worldXm * 0.5 ? +1 : -1;
+    const sz = czw < worldZm * 0.5 ? +1 : -1;
     const seed: Array<{ wx: number; wz: number; focus: 'auto' | 'farm' | 'chop' | 'mine' }> = [
-      { wx: cxw + halfW + 2, wz: czw - 2, focus: 'auto' },
-      { wx: cxw + halfW + 2, wz: czw + 2, focus: 'auto' },
-      { wx: cxw + halfW + 4, wz: czw - 1, focus: 'farm' },
-      { wx: cxw + halfW + 4, wz: czw + 1, focus: 'farm' },
-      { wx: cxw + halfW + 3, wz: czw - 3, focus: 'chop' },
-      { wx: cxw + halfW + 3, wz: czw + 3, focus: 'chop' },
+      { wx: cxw + sx * (halfW + 2), wz: czw + sz * -2, focus: 'auto' },
+      { wx: cxw + sx * (halfW + 2), wz: czw + sz * +2, focus: 'auto' },
+      { wx: cxw + sx * (halfW + 4), wz: czw + sz * -1, focus: 'farm' },
+      { wx: cxw + sx * (halfW + 4), wz: czw + sz * +1, focus: 'farm' },
+      { wx: cxw + sx * (halfW + 3), wz: czw + sz * -3, focus: 'chop' },
+      { wx: cxw + sx * (halfW + 3), wz: czw + sz * +3, focus: 'chop' },
     ];
+    // Defensive clamp: even with the interior-side flip, a base placed
+    // very close to the centre line can still overshoot if cellsW grows.
+    const SPAWN_MARGIN_M = 1;
     for (const { wx, wz, focus } of seed) {
-      const wy = this.surfaceWorldY(wx, wz);
-      const safe = this.safeSpawnXZ(wx, wz);
+      const cwx = Math.max(SPAWN_MARGIN_M, Math.min(worldXm - SPAWN_MARGIN_M, wx));
+      const cwz = Math.max(SPAWN_MARGIN_M, Math.min(worldZm - SPAWN_MARGIN_M, wz));
+      const wy = this.surfaceWorldY(cwx, cwz);
+      const safe = this.safeSpawnXZ(cwx, cwz);
       const w = this.units.spawn('worker', safe.x, wy, safe.z, { team: baseTeam, stance: 'defensive' });
       if (w) w.workerFocus = focus;
     }
@@ -982,11 +1153,22 @@ export class Game {
     return used;
   }
 
-  /** Recompute popCap for every team. The only contribution beyond the
-   *  10-unit bootstrap is +1 per alive civilian — civilians spawn from
-   *  neighborhood houses (tier × 5 per neighborhood), so neighborhoods
-   *  are the only building type that raises the cap. Barracks etc. do
-   *  NOT add population — they only train units. */
+  /** Recompute popCap for every team. Contributions:
+   *   - 10 base slots per live HQ (a single HQ seeds 6 workers, leaving 4
+   *     for combat; multi-HQ teams scale up).
+   *   - The housing capacity of each live neighborhood (`tier × 5`).
+   *
+   *  Neighborhood housing is granted DIRECTLY from the building rather than
+   *  counting spawned civilian units. The real game spawns `tier × 5`
+   *  civilians per hood and counted those for the cap, but the authoritative
+   *  server only spawns civilians for the host player's hoods — AI-team
+   *  neighborhoods produced ZERO civilians, so every AI was hard-capped at
+   *  10 × HQ no matter how many hoods it built (iter53-58: enemy2 stuck at
+   *  popCap 10 with 2 hoods, army frozen, 4000+ unspent food). Reading the
+   *  cap off the building makes a hood pay off immediately and identically
+   *  for every team, in both the debug testbed and the campaign. We take the
+   *  max of housing vs. live civilians so the campaign (where civilians do
+   *  spawn for the player) never double-counts a hood. */
   private recomputePopulationCaps(): void {
     const teams: ReadonlyArray<import('../sim/Buildings').BuildingTeam> =
       ['player', 'enemy', 'enemy2'];
@@ -996,9 +1178,24 @@ export class Game {
       if (u.kind !== 'civilian') continue;
       civiliansBy.set(u.team, (civiliansBy.get(u.team) ?? 0) + 1);
     }
+    const hqsBy = new Map<string, number>();
+    const housingBy = new Map<string, number>();
+    for (const b of this.buildings.buildings) {
+      if (b.destroyed) continue;
+      if (b.spec.kind === 'hq') {
+        hqsBy.set(b.team, (hqsBy.get(b.team) ?? 0) + 1);
+      } else if (b.spec.kind === 'neighborhood' && b.upgradeState === 'enabled') {
+        // Housing capacity mirrors the civilian quota the hood would target:
+        // tier × 5, tier = 1 + expand-upgrade level.
+        const tier = 1 + (b.upgradeTracks.expand ?? 0);
+        housingBy.set(b.team, (housingBy.get(b.team) ?? 0) + tier * 5);
+      }
+    }
     for (const team of teams) {
       const r = this.resourcesForTeam(team);
-      r.popCap = 10 + (civiliansBy.get(team) ?? 0);
+      const hqCount = hqsBy.get(team) ?? 1;
+      const housing = Math.max(housingBy.get(team) ?? 0, civiliansBy.get(team) ?? 0);
+      r.popCap = 10 * hqCount + housing;
     }
   }
 
@@ -1171,18 +1368,25 @@ export class Game {
     }
 
     if (this.pathfinder && !this.paused) {
-      this.units.tick(dt, this.surfaceNav!, this.vnav!, this.world.buffers.voxels, (req) => this.handleWorldEdit(req));
-      this.pathTracer.tick(dt, this.units.units);
+      // `simDt` lets the debug page run the sim faster than real time
+      // (1× / 2× / 4× / 8×) without speeding up the camera/input. Stays
+      // at `dt` when `simSpeedMultiplier === 1` (the default), so the
+      // normal game path is unchanged.
+      const simDt = dt * this.simSpeedMultiplier;
+      this.units.tick(simDt, this.surfaceNav!, this.vnav!, this.world.buffers.voxels, (req) => this.handleWorldEdit(req));
+      this.pathTracer.tick(simDt, this.units.units);
       // Any unit that latched needsRepath this frame (because it has been
       // collision-stuck long enough) gets a fresh route around the offending peer.
       this.servicePendingRepaths();
-      this.buildings.tick(dt, this.world, this.units);
-      this.paintTankTracks();
+      this.buildings.tick(simDt, this.world, this.units);
+      // Tank tracks are pure visual ornament and trigger a nav-rebuild
+      // per painted footprint — both are noise in AI debug mode.
+      if (!this.debugMode) this.paintTankTracks();
       // Aggressive-stance auto-engage: armed units in 'aggressive' mode pick
       // their own target and reposition when the trajectory is blocked.
       // Runs before tickWeapons so any new firingTarget assignments slew the
       // turret this same frame.
-      this.tickAggressiveStance(dt);
+      this.tickAggressiveStance(simDt);
       // Enemy hunt-and-attack lives on the AI server now — see
       // `aiClient.tick` below. The server emits route_unit actions
       // for idle enemies and the client just executes them.
@@ -1195,11 +1399,11 @@ export class Game {
       // it side-steps perpendicular to the projectile direction. Runs after
       // aggressive stance so the new target lock survives the dodge — we
       // don't re-route units that already have a firingTarget.
-      this.tickEvade(dt);
+      this.tickEvade(simDt);
       // Weapon firing pipeline. Slews turret/hull toward each unit's
       // firingTarget, fires when aligned, drops projectiles into the
       // ProjectileManager, and emits muzzle flashes for the renderer.
-      tickWeapons(dt, this.units, this.projectiles, {
+      tickWeapons(simDt, this.units, this.projectiles, {
         onMuzzleFlash: (x, y, z, radius, life, color) => {
           this.muzzleFlashes.spawn(x, y, z, radius, life, color.r, color.g, color.b);
         },
@@ -1210,7 +1414,7 @@ export class Game {
       // The unit-hit callback lets the projectile manager intercept rounds
       // that strike a unit's body sphere, so bullets fired at a soldier in
       // the open actually deal damage instead of expiring uselessly past them.
-      this.projectiles.tick(dt, this.world, (fx, fy, fz, dx, dy, dz, maxDist, ownerId) => {
+      this.projectiles.tick(simDt, this.world, (fx, fy, fz, dx, dy, dz, maxDist, ownerId) => {
         return this.unitRayHit(fx, fy, fz, dx, dy, dz, maxDist, ownerId);
       });
       for (const imp of this.projectiles.pendingImpacts) {
@@ -1231,7 +1435,7 @@ export class Game {
       // Worker automation: drive harvesters / transporters. Routing is
       // delegated back to routePath via the routeWorker callback so the
       // existing path client is reused unchanged.
-      tickWorkers(dt, {
+      tickWorkers(simDt, {
         units: this.units,
         world: this.world,
         buildings: this.buildings,
@@ -1273,7 +1477,7 @@ export class Game {
         findBestMineTarget: (fx, fz, exclude) => this.findBestMineTarget(fx, fz, exclude),
         findChopApproach: (wx, wz, tx, tz) => this.findChopApproach(wx, wz, tx, tz),
       });
-      tickSupplyTrucks(dt, {
+      tickSupplyTrucks(simDt, {
         units: this.units,
         buildings: this.buildings,
         resources: this.resources,
@@ -1313,8 +1517,10 @@ export class Game {
       // chunks the same way. Skip the local mature step so we don't
       // double-stamp the canopy.
       let matured = 0;
-      if (!this.zeroTrustEnabled) {
-        const grow = this.saplings.tick(dt, this.world);
+      // Saplings have no role in AI debugging — skip the per-frame
+      // maturation tick along with civilians + leaf decay.
+      if (!this.zeroTrustEnabled && !this.debugMode) {
+        const grow = this.saplings.tick(simDt, this.world);
         matured = grow.matured;
       }
       if (matured > 0) this.requestNavRebuild(false);
@@ -1327,15 +1533,15 @@ export class Game {
       // no-op (and would otherwise spawn duplicate timers from any
       // pre-attach trees the local sim still tracked).
       const decayBefore = this.leafDecay.size();
-      if (!this.zeroTrustEnabled) {
-        this.leafDecay.tick(this.world, dt);
+      if (!this.zeroTrustEnabled && !this.debugMode) {
+        this.leafDecay.tick(this.world, simDt);
       }
       // City life — civilian spawning + wandering. Phase 5 of the
       // zero-trust migration moved this to the authoritative server,
       // so we skip the local tick when zero-trust is on; civilians
       // arrive via snapshot reconciliation.
-      if (!this.zeroTrustEnabled) {
-        this.civilians.tick(dt, {
+      if (!this.zeroTrustEnabled && !this.debugMode) {
+        this.civilians.tick(simDt, {
           units: this.units,
           buildings: this.buildings,
           spawnCivilian: (x, y, z): import('../sim/Units').Unit | null => this.units.spawn('civilian', x, y, z),
@@ -1355,7 +1561,7 @@ export class Game {
       // lands, gating this off entirely meant the AI never produced
       // anything in zero-trust mode.
       if (this.surfaceNav) {
-        this.aiClient.tick(dt, {
+        this.aiClient.tick(simDt, {
           units: this.units,
           buildings: this.buildings,
           world: this.world,
@@ -1381,17 +1587,26 @@ export class Game {
     }
     // Pack FoW sources / explored-map BEFORE the renderer updates so
     // the unit + building cull predicates can use this frame's
-    // visibility data instead of last frame's stale snapshot.
-    this.packFoWAndExplored();
-    const enemyHidden = (u: Unit): boolean =>
-      u.team !== 'player' && !this.isInsideCurrentFoW(u.x, u.y, u.z);
-    const enemyBuildingHidden = (b: import('../sim/Buildings').Building): boolean => {
-      if (b.team !== 'enemy') return false;
-      const cx = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_METERS;
-      const cz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_METERS;
-      const cy = (b.floorY + 4) * VOXEL_SIZE;
-      return !this.isInsideCurrentFoW(cx, cy, cz);
-    };
+    // visibility data instead of last frame's stale snapshot. Debug
+    // mode wants every faction visible, so skip the packing and
+    // short-circuit both hide predicates.
+    let enemyHidden: (u: Unit) => boolean;
+    let enemyBuildingHidden: (b: import('../sim/Buildings').Building) => boolean;
+    if (this.debugMode) {
+      enemyHidden = () => false;
+      enemyBuildingHidden = () => false;
+    } else {
+      this.packFoWAndExplored();
+      enemyHidden = (u: Unit): boolean =>
+        u.team !== 'player' && !this.isInsideCurrentFoW(u.x, u.y, u.z);
+      enemyBuildingHidden = (b: import('../sim/Buildings').Building): boolean => {
+        if (b.team !== 'enemy') return false;
+        const cx = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_METERS;
+        const cz = (b.oz + b.spec.cellsD * 0.5) * NAV_CELL_METERS;
+        const cy = (b.floorY + 4) * VOXEL_SIZE;
+        return !this.isInsideCurrentFoW(cx, cy, cz);
+      };
+    }
     this.unitRenderer.update(this.units, enemyHidden);
     this.healthBars.update(this.units.units, this.buildings.buildings, this.metalClusters);
     this.constructionOverlay.update(this.buildings.buildings);
@@ -2572,16 +2787,58 @@ export class Game {
     });
 
     if (res.waypoints.length === 0 || !res.reached) {
-      if (unit.kind === 'supply_truck' || unit.kind === 'worker') {
-        const startOk = this.isUnitCellPassable(unit.kind, start);
-        const goalOk  = this.isUnitCellPassable(unit.kind, goal);
+      // Best-effort partial path. A* returns the chain to the CLOSEST reachable
+      // cell when the exact goal can't be reached (AStar.ts: endI = bestPartial)
+      // precisely so the caller can move toward it. For large-footprint vehicles
+      // (tanks, supply trucks) an attack point or a 4×4 depot's approach often
+      // resolves to a cell that's passable-as-a-point but sits in a pocket the
+      // 3×3 chassis can't squeeze into — genuinely unreachable for that
+      // footprint, not a bug. Rather than discard the route (idle the unit) and
+      // log a PATH FAIL, walk the partial path: the vehicle closes on the goal
+      // and re-evaluates on arrival (a truck's 45 s delivery watchdog
+      // abandons+refunds; a combat unit re-acquires a target). Workers are
+      // excluded — their delivery logic relies on the PATH FAIL → HQ-fallback
+      // signal below. Require >1 waypoint so a no-progress stub still surfaces.
+      if (res.reached === false && res.waypoints.length > 1 && unit.kind !== 'worker') {
+        this.units.setPath(unit, res.waypoints);
+        return;
+      }
+      const startOk = this.isUnitCellPassable(unit.kind, start);
+      const goalOk  = this.isUnitCellPassable(unit.kind, goal);
+      // Non-worker (combat / vehicle) with no useful partial path. This is
+      // almost always TRANSIENT crowding — a freshly-produced tank boxed in by
+      // friendly units in a compact base (iter87: tank#168 expanded=10, every
+      // reachable cell pointing away from the goal), which clears within a
+      // frame or two as neighbours move. FAILURE_STUCK (10 s of no movement) is
+      // the authoritative stuck signal for these units; a per-tick [PATH FAIL]
+      // here is noise that self-resolves. Log it as a non-counted [PATH HOLD]
+      // (keeps diagnostics visible) and hold — the brain re-routes next tick.
+      if (unit.kind !== 'worker') {
         console.warn(
-          `[PATH FAIL] ${unit.kind}#${unit.id} ` +
-          `pos=(${unit.x.toFixed(1)},${unit.y.toFixed(1)},${unit.z.toFixed(1)}) ` +
+          `[PATH HOLD] ${unit.kind}#${unit.id} no route this tick ` +
           `start=(${start.cx},${start.cy},${start.cz}){pass=${startOk}} ` +
           `goal=(${goal.cx},${goal.cy},${goal.cz}){pass=${goalOk}} ` +
-          `reached=${res.reached} expanded=${res.expanded}`,
+          `reached=${res.reached} expanded=${res.expanded} (transient; FAILURE_STUCK is authoritative)`,
         );
+        return;
+      }
+      // Workers keep the real PATH FAIL signal — it drives the HQ-delivery
+      // fallback below and the AI-vs-AI loop's worker-routing diagnostics.
+      console.warn(
+        `[PATH FAIL] ${unit.kind}#${unit.id} ` +
+        `pos=(${unit.x.toFixed(1)},${unit.y.toFixed(1)},${unit.z.toFixed(1)}) ` +
+        `start=(${start.cx},${start.cy},${start.cz}){pass=${startOk}} ` +
+        `goal=(${goal.cx},${goal.cy},${goal.cz}){pass=${goalOk}} ` +
+        `reached=${res.reached} expanded=${res.expanded}`,
+      );
+      // A worker that can't be routed to its current delivery target should
+      // flip to the HQ fallback immediately rather than wait for the 1 s
+      // task-stall watchdog. Bumping `repathFailures` is the same signal the
+      // stall handler raises; the deliver branch in `tickHarvester` picks
+      // the HQ door on the next attempt instead of looping on the dead
+      // storage corridor.
+      if (unit.kind === 'worker' && unit.task.kind === 'deliver') {
+        unit.repathFailures = (unit.repathFailures ?? 0) + 1;
       }
       return;
     }
@@ -4592,53 +4849,50 @@ export class Game {
     const projectiles = this.projectiles.projectiles;
     if (projectiles.length === 0) return;
     type AAEntry = { u: Unit; r2: number; flak: number };
-    const aaUnits: AAEntry[] = [];
+    const aaUnits: (AAEntry & { team: string })[] = [];
     for (const u of this.units.units) {
       if (u.kind !== 'aa_vehicle' || u.hp <= 0) continue;
-      if (u.team !== 'player') continue;
+      // iter80: AA interception now runs for EVERY team, not just the player
+      // (was gated to `team === 'player'`, so AI anti-air never fired).
       if (u.weapon === null) continue;
-      if (u.firingTarget) continue;
+      // NOTE: deliberately NOT skipping when u.firingTarget is set. This pass
+      // runs AFTER tickAggressiveStance, whose ground-target pick is only a
+      // FALLBACK for AA. Air defence is higher priority, so we OVERRIDE any
+      // ground target with an incoming enemy projectile when one is in range
+      // (the call-site's intent: "a fresh AA lock overrides any stale ground
+      // target"). The old `if (u.firingTarget) continue` defeated that — AA
+      // stayed locked on ground and never intercepted. When no projectile is
+      // assigned the ground fallback remains, so AA still defends itself in a
+      // melee (and never trips FAILURE_IDLE_COMBAT).
       if (u.fireCooldown > 0) continue;
       const w = WEAPONS[u.weapon];
       const flak = Math.min(
         PROJECTILES[w.projectile].muzzleVelocity * w.velocityScale,
         u.launcherMaxStrength,
       );
-      aaUnits.push({ u, r2: w.rangeMeters * w.rangeMeters, flak });
+      aaUnits.push({ u, r2: w.rangeMeters * w.rangeMeters, flak, team: u.team });
     }
     if (aaUnits.length === 0) return;
 
-    // Per-vehicle "best assigned projectile" pass. Each projectile attaches
-    // to the nearest in-range AA vehicle so two vehicles never waste shots
-    // on the same threat.
-    const assignedToVehicle = new Map<number, { p: typeof projectiles[number]; d2: number }>();
-    for (const p of projectiles) {
-      if (p.dead) continue;
-      if (p.kind === 'aa_missile') continue;
-      // Friendly-fire gate: only engage rounds owned by enemies.
+    // Pure assignment (see AATargeting.ts): nearest in-range ENEMY projectile
+    // per vehicle, own-team rounds excluded, one projectile per vehicle.
+    const projById = new Map<number, typeof projectiles[number]>();
+    const projInputs = projectiles.map(p => {
+      projById.set(p.id, p);
+      let ownerTeam: string | null = null;
       if (p.ownerId >= 0) {
         const owner = this.units.units.find(o => o.id === p.ownerId);
-        if (owner && owner.team === 'player') continue;
-      } else if (p.ownerId !== -1) {
-        continue; // negative non-(-1) = friendly building
+        ownerTeam = owner ? owner.team : null;
       }
+      return { id: p.id, ownerTeam, dead: p.dead, kind: p.kind, x: p.x, y: p.y, z: p.z };
+    });
+    const vehInputs = aaUnits.map(e => ({
+      id: e.u.id, team: e.team, x: e.u.x, y: e.u.y, z: e.u.z, rangeMeters: WEAPONS[e.u.weapon!].rangeMeters,
+    }));
+    const assignment = assignAAInterceptors(vehInputs, projInputs);
 
-      let bestIdx = -1;
-      let bestD2 = Infinity;
-      for (let i = 0; i < aaUnits.length; i++) {
-        const { u, r2 } = aaUnits[i]!;
-        const dx = p.x - u.x, dy = p.y - (u.y + 1.6), dz = p.z - u.z;
-        const d2 = dx * dx + dy * dy + dz * dz;
-        if (d2 > r2) continue;
-        if (d2 < bestD2) { bestD2 = d2; bestIdx = i; }
-      }
-      if (bestIdx < 0) continue;
-      const u = aaUnits[bestIdx]!.u;
-      const prev = assignedToVehicle.get(u.id);
-      if (!prev || bestD2 < prev.d2) assignedToVehicle.set(u.id, { p, d2: bestD2 });
-    }
-
-    for (const [unitId, { p }] of assignedToVehicle) {
+    for (const [unitId, projId] of assignment) {
+      const p = projById.get(projId)!;
       const u = aaUnits.find(e => e.u.id === unitId)!.u;
       const flak = aaUnits.find(e => e.u.id === unitId)!.flak;
       const muzzleY = u.y + 1.6;
@@ -4652,6 +4906,7 @@ export class Game {
       const leadY = Math.max(0.5, p.y + p.vy * tof - 0.5 * targetGrav * tof * tof - 1.0);
       const leadZ = p.z + p.vz * tof;
       u.firingTarget = { x: leadX, y: leadY, z: leadZ };
+      this.aaAirTargets++;
     }
   }
 
@@ -4733,14 +4988,21 @@ export class Game {
       // treat enemy buildings as high-priority targets — they're the
       // demolition tools, and the user wants them tearing structures
       // down even with screening units in the way. Infantry without
-      // explosive weapons keeps the normal building threat (so they
-      // shoot enemy soldiers first per the units-first rule).
+      // explosive weapons keeps the normal building threat for non-HQ
+      // structures (so they shoot enemy soldiers first per the
+      // units-first rule), but plain soldiers + gunners ALSO get the
+      // siege bonus specifically when targeting an HQ — the AI-vs-AI
+      // loop needs every weapon in the field to chew through the win-
+      // condition wall, not just the four siege kinds. Without this,
+      // iter29's 11 combat units chipped just 0.275 HP/s off enemy
+      // HQs because most fire was absorbed by screening peers.
       const isSiege = (
         u.kind === 'tank' ||
         u.kind === 'rocket_truck' ||
         u.kind === 'rocket_soldier' ||
         u.kind === 'mortar_soldier'
       );
+      const isInfantryAntiHq = (u.kind === 'soldier' || u.kind === 'gunner');
       for (const b of liveBuildings) {
         if (b.team === u.team) continue;
         const cxw = (b.ox + b.spec.cellsW * 0.5) * NAV_CELL_METERS;
@@ -4749,7 +5011,9 @@ export class Game {
         const d2 = dx * dx + dz * dz;
         if (d2 > range2) continue;
         const proximity = PROXIMITY_BONUS_MAX * Math.max(0, 1 - Math.sqrt(d2) / range);
-        const buildingScore = isSiege
+        const targetIsHq = b.spec.kind === 'hq';
+        const siegeBonusApplies = isSiege || (isInfantryAntiHq && targetIsHq);
+        const buildingScore = siegeBonusApplies
           ? buildingThreatLevel(b) + 100
           : buildingThreatLevel(b);
         const score = buildingScore + proximity;
@@ -4833,6 +5097,7 @@ export class Game {
       if (reaches) {
         u.firingTarget = { x: tx, y: ty, z: tz };
         u.autoEngageCooldown = 0.25;
+        if (u.kind === 'aa_vehicle') this.aaGroundTargets++;
         continue;
       }
       // Arc fell short. Two cases:

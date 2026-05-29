@@ -87,6 +87,42 @@ describe('newPathBasics', () => {
     }
   });
 
+  it('returns a best-effort PARTIAL chain toward an unreachable goal (reached=false, len>1)', () => {
+    // Regression for the large-vehicle partial-path fix (Game.ts routePath,
+    // iter77). When a tank can't reach its exact goal — modelled here by
+    // capping expansions so the search bails before arriving — A* must still
+    // return the chain to the CLOSEST expanded cell so the caller can walk the
+    // vehicle TOWARD the goal instead of idling + logging a PATH FAIL.
+    const world = VoxelWorld.create(false);
+    buildLayeredWorld(world);
+
+    const pf = new Pathfinder(false);
+    pf.attach(world);
+    pf.registerProfile(TANK);
+
+    const start = pf.groundCellAt('tank', 40.5, 40.5);
+    const goal = pf.groundCellAt('tank', 200.5, 200.5); // far away
+    expect(start).not.toBeNull();
+    expect(goal).not.toBeNull();
+
+    // Tiny expansion budget → the search cannot reach the far goal.
+    const result = pf.findPath('tank', { start: start!, goal: goal!, maxExpansions: 40 });
+    expect(result.reached).toBe(false);
+    // Best-effort partial chain: more than just the start cell.
+    expect(result.cells.length).toBeGreaterThan(1);
+    expect(result.cells[0]!.cx).toBe(start!.cx);
+    expect(result.cells[0]!.cz).toBe(start!.cz);
+    // The chain makes real progress toward the goal (closer than the start).
+    const last = result.cells[result.cells.length - 1]!;
+    const dStart = chebyshev(start!, goal!);
+    const dLast = chebyshev(last, goal!);
+    expect(dLast).toBeLessThan(dStart);
+    // Still a connected 26-neighbour walk.
+    for (let i = 1; i < result.cells.length; i++) {
+      expect(isCellAdjacent(result.cells[i - 1]!, result.cells[i]!)).toBe(true);
+    }
+  });
+
   it('soldier passable bitmap has more set bits than tank passable bitmap', () => {
     const world = VoxelWorld.create(false);
     buildLayeredWorld(world);

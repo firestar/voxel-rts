@@ -5,7 +5,9 @@ import { M_DIRT, M_GRASS } from '../src/voxel/Materials';
 import { allocateNav, buildSurfaceNav, NAV_CELL_VOXELS } from '../src/path/SurfaceNav';
 import {
   ALL_BUILDINGS, BARRACKS, POWER_PLANT, REFINERY, TECH_LAB, TURRET, SILO,
-  BuildingManager, checkFootprint,
+  HQ, STORAGE,
+  BuildingManager, checkFootprint, buildingApproachCandidates,
+  HQ_STRUCTURAL_DEATH_FRACTION, DEFAULT_STRUCTURAL_DEATH_FRACTION,
 } from '../src/sim/Buildings';
 import { UnitManager } from '../src/sim/Units';
 import { ProjectileManager } from '../src/sim/Projectiles';
@@ -272,6 +274,113 @@ describe('Launcher strength cap (per-unit)', () => {
     // (within one tick of drag).
     expect(speed).toBeLessThanOrEqual(80 + 0.01);
     expect(speed).toBeGreaterThan(70);
+  });
+});
+
+describe('HQ_WIN reachability — siege class + HQ damage threshold', () => {
+  // Building death is voxel-based: triggers when destroyedVoxels >=
+  // healthRefVoxels × DESTRUCTION_FRACTION. iter39 (AI-vs-AI harness)
+  // produced HQ_WIN at t=209.9 s only after the HQ-specific fraction
+  // dropped from 0.30 → 0.02 in iter38. With the smaller threshold a
+  // 5-8 unit infantry push (soldier+gunner siege-bonused vs. HQ in
+  // `Game.tickAggressiveStance`) lands the kill inside the 240 s
+  // harness budget. Pin both numbers so a regression that bumps either
+  // back up lights this test red instead of silently re-pushing
+  // HQ_WIN out of reach.
+  it('HQ structural-death fraction sits in the achievable range', () => {
+    // Measured: a typical 5-8 unit attack landed 1.8 %-4.6 % voxel
+    // destruction on an HQ in 240 s. Threshold must sit below that
+    // ceiling so HQ_WIN is reachable, but not so low that a lone
+    // soldier can rifle-chip an HQ in <60 s (rifle terrainDamageScale
+    // ≈ 0.033 keeps that floor well above 0.005).
+    expect(HQ_STRUCTURAL_DEATH_FRACTION).toBeGreaterThanOrEqual(0.005);
+    expect(HQ_STRUCTURAL_DEATH_FRACTION).toBeLessThanOrEqual(0.05);
+  });
+  it('Non-HQ buildings keep the 30 % structural-death rule', () => {
+    // Tanking a barracks / storage / depot through stray fire is part
+    // of the game's pacing — if this drops the AI's first stray mortar
+    // round flattens the entire base. Keep the existing rule as a
+    // hard floor.
+    expect(DEFAULT_STRUCTURAL_DEATH_FRACTION).toBeGreaterThanOrEqual(0.25);
+  });
+  it('HQ maxHp stays at 3000 (display scale, not death gate)', () => {
+    // maxHp is what the in-game HP bar renders. Death is governed by
+    // the structural fraction above. Pinned so a future change that
+    // tries to make HQ harder by bumping maxHp learns the actual
+    // death gate is elsewhere.
+    expect(HQ.maxHp).toBe(3000);
+  });
+});
+
+describe('buildingApproachCandidates — truck approach in cramped layouts', () => {
+  // Recreates the AI-vs-AI iter6 layout: HQ at (318..323, 324..328), storage
+  // tucked at (325..327, 325..327), barracks at (324..327, 321..324). The
+  // 1-cell corridor between HQ and storage west face is too narrow for the
+  // truck's 3×3 footprint. With the previous 0.5 m approach gap every
+  // candidate face center landed inside the wall's neighbour column, so
+  // `pickApproach` couldn't find any passable point and trucks hung until
+  // they despawned as "lost in action".
+  it('returns a face approach point clear of adjacent buildings for a 3-cell truck box', () => {
+    const world = buildFlatWorld();
+    const nav = allocateNav(false);
+    buildSurfaceNav(world.buffers.voxels, nav);
+    const bm = new BuildingManager();
+    const hqOx = 50, hqOz = 50;
+    const fpHq = checkFootprint(world.buffers.voxels, nav, HQ, hqOx, hqOz);
+    expect(fpHq.ok, fpHq.reason).toBe(true);
+    bm.place(world, HQ, hqOx, hqOz, fpHq.floorY);
+    // Place storage 2 nav cells east of HQ — same layout the AI builds at
+    // the +2 offset its default `applyPlaceBuilding` uses.
+    const storOx = hqOx + HQ.cellsW + 1; // 1-cell corridor between HQ and storage
+    const storOz = hqOz + 1;
+    // Rebuild the surface nav after HQ placement so headroom checks pass
+    // for the storage stamp.
+    buildSurfaceNav(world.buffers.voxels, nav);
+    const fpSt = checkFootprint(world.buffers.voxels, nav, STORAGE, storOx, storOz, bm.buildings);
+    expect(fpSt.ok, fpSt.reason).toBe(true);
+    const storage = bm.place(world, STORAGE, storOx, storOz, fpSt.floorY);
+
+    // Compute approach candidates from the HQ side (typical truck origin).
+    const fromX = (hqOx + HQ.cellsW * 0.5) * NAV_CELL_VOXELS * 0.125;
+    const fromZ = (hqOz + HQ.cellsD * 0.5) * NAV_CELL_VOXELS * 0.125;
+    const candidates = buildingApproachCandidates(storage, fromX, fromZ);
+    expect(candidates.length).toBeGreaterThan(0);
+
+    // Build the building-mask box (cells inside any live building footprint
+    // are off-limits for the truck's 3×3 nav-cell footprint). Mirror the
+    // truck `isPassable` closure in `Game.ts`: r=1 around the candidate
+    // cell must contain no building-mask cells.
+    const NAV_W = WORLD_X / NAV_CELL_VOXELS;
+    const NAV_H = WORLD_Z / NAV_CELL_VOXELS;
+    const mask = new Uint8Array(NAV_W * NAV_H);
+    for (const b of bm.buildings) {
+      for (let cz = b.oz; cz < b.oz + b.spec.cellsD; cz++) {
+        for (let cx = b.ox; cx < b.ox + b.spec.cellsW; cx++) {
+          mask[cz * NAV_W + cx] = 1;
+        }
+      }
+    }
+    const truckPassable = (x: number, z: number): boolean => {
+      const cx = Math.floor(x);
+      const cz = Math.floor(z);
+      for (let dz = -1; dz <= 1; dz++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = cx + dx, nz = cz + dz;
+          if (nx < 0 || nz < 0 || nx >= NAV_W || nz >= NAV_H) return false;
+          if (mask[nz * NAV_W + nx]) return false;
+        }
+      }
+      return true;
+    };
+
+    // At least one of the 9 candidates must be passable for a 3×3 truck
+    // box — otherwise trucks loop forever on this storage.
+    const passing = candidates.filter(c => truckPassable(c.x, c.z));
+    expect(
+      passing.length,
+      `none of ${candidates.length} candidates were truck-passable:\n` +
+      candidates.map(c => `  (${c.x.toFixed(1)},${c.z.toFixed(1)})`).join('\n'),
+    ).toBeGreaterThan(0);
   });
 });
 

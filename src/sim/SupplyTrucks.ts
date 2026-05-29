@@ -127,9 +127,41 @@ function teamResources(deps: SupplyTruckDeps, team: BuildingTeam): Resources {
  *  truck (truck spawned outside the dispatch flow). */
 function truckTeam(truckId: number, deps: SupplyTruckDeps): BuildingTeam {
   const hqId = activeTruckToHQ.get(truckId);
-  if (hqId === undefined) return 'player';
+  if (hqId === undefined) {
+    // Registry miss — the truck has no recorded owning HQ. This should never
+    // happen for a dispatched truck; if it does (e.g. a stale module-level map
+    // carried across matches in a reused harness process), the 'player'
+    // fallback would route an enemy truck to the PLAYER HQ. Log it loudly so
+    // the genuine cross-team routing is visible rather than silent.
+    console.warn(`[TRUCK #${truckId}] team registry MISS — falling back to 'player' (possible stale state across matches; call resetSupplyTruckState() at session start)`);
+    return 'player';
+  }
   const hq = deps.buildings.buildings.find(b => b.id === hqId);
-  return hq?.team ?? 'player';
+  if (!hq) {
+    console.warn(`[TRUCK #${truckId}] owning HQ#${hqId} not found — falling back to 'player'`);
+    return 'player';
+  }
+  return hq.team;
+}
+
+/**
+ * Clear ALL module-level supply-truck state. The dispatch registries
+ * (`activeTruckToHQ`, in-flight payloads, rebuild queues, cooldowns, progress
+ * trackers) live at module scope and survive across games in a reused process
+ * (e.g. a multi-match harness). Without a reset, a truck id from a previous
+ * match can collide with a fresh truck and corrupt team attribution / refunds.
+ * Call from `Game` at game-session start.
+ */
+export function resetSupplyTruckState(): void {
+  activeTruckToHQ.clear();
+  activeResupply.clear();
+  activeFetch.clear();
+  truckRebuildQueues.clear();
+  truckRepathTimer.clear();
+  hqLaunchCooldown.clear();
+  truckProgressTrack.clear();
+  dispatchTimer = 0;
+  logTimer = 0;
 }
 
 let dispatchTimer = 0;
@@ -163,8 +195,19 @@ export function tickSupplyTrucks(dt: number, deps: SupplyTruckDeps): void {
   dispatchTimer = DISPATCH_INTERVAL;
 
   dispatchStorageTrucks(deps);
-  dispatchResupplyTrucks(deps);
+  // Construction (upgrade) BEFORE unit-production resupply. Both compete for
+  // the same per-HQ truck cap (5) AND the same team metal pool, and resupply
+  // runs on a tight backlog (TRAIN_INTERVAL 0.3 s), so when it dispatched
+  // first it drained every truck slot + every metal before a pending building
+  // could be funded. That left costly late buildings — the vehicle_depot
+  // especially (70m/50w) — stuck at hp=0 / 'pending' forever, so the AI never
+  // fielded tanks / anti-air / rocket trucks despite queuing them correctly
+  // (iter64-67: depots placed, 0 vehicles produced). Finishing a half-built
+  // structure is strictly more valuable than pumping one more soldier, and
+  // each pending building self-limits its trucks via `outstanding`, so this
+  // doesn't starve unit production — it just lets construction complete first.
   dispatchUpgradeTrucks(deps);
+  dispatchResupplyTrucks(deps);
   dispatchUpgradeRecoveryTrucks(deps);
 }
 
@@ -424,13 +467,22 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
       }
     }
 
+    // Resolve the truck's owning team up front so BOTH the diagnostic log and
+    // the task handlers below use the same team-scoped HQ lookups. Previously
+    // this was declared after the log block, so the `truck_deliver_hq` /
+    // `truck_return` log called `nearestHQ(x, z)` with NO team arg and printed
+    // the distance to whichever HQ was geometrically nearest — on the compact
+    // debug map that's frequently the ENEMY HQ, making it look like trucks were
+    // routing to enemy bases when dispatch + routing are in fact team-filtered.
+    const teamOfTruck = truckTeam(u.id, deps);
+
     if (doLog) {
       let distInfo = '';
       if (task.kind === 'truck_fetch') {
         const s = deps.buildings.buildings.find(b => b.id === task.storageId);
         if (s) distInfo = ` dist_to_storage=${buildingBoxDistM(u.x, u.z, s).toFixed(1)}m`;
       } else if (task.kind === 'truck_deliver_hq' || task.kind === 'truck_return') {
-        const hq = deps.buildings.nearestHQ(u.x, u.z);
+        const hq = deps.buildings.nearestHQ(u.x, u.z, teamOfTruck);
         if (hq) { const d = doorWorldPos(hq); distInfo = ` dist_to_hq=${Math.sqrt((u.x-d.x)**2+(u.z-d.z)**2).toFixed(1)}m`; }
       } else if (task.kind === 'truck_resupply') {
         const b = deps.buildings.buildings.find(b => b.id === task.buildingId);
@@ -438,8 +490,6 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
       }
       console.log(`[TRUCK #${u.id}] task=${task.kind} pos=(${u.x.toFixed(1)},${u.z.toFixed(1)}) path=${u.path.length} waypoints${distInfo}`);
     }
-
-    const teamOfTruck = truckTeam(u.id, deps);
 
     if (task.kind === 'truck_fetch') {
       const storage = deps.buildings.buildings.find(b => b.id === task.storageId);

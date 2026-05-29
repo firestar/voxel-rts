@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Voxel RTS — AI Debug</title>
+    <style>
+      html, body {
+        margin: 0; padding: 0; height: 100%;
+        overflow: hidden; background: #000;
+        color: #d6d2c0;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 12px;
+      }
+
+      #app {
+        position: fixed; top: 0; left: 0; bottom: 0;
+        right: 420px;
+      }
+
+      /* Tiny status header. Game.ts looks up `#stats` and writes its
+         FPS / unit-count line into it once a second. */
+      #debug-header {
+        position: fixed; top: 0; left: 0; right: 420px;
+        height: 28px;
+        display: flex; align-items: center; gap: 16px;
+        padding: 0 12px;
+        background: rgba(12, 16, 22, 0.92);
+        border-bottom: 1px solid #1f2a36;
+        font-size: 12px;
+        z-index: 50;
+      }
+      #debug-header b { color: #f4cf6c; }
+      #debug-header label { opacity: 0.7; margin-right: 4px; }
+      #debug-header select, #debug-header input {
+        background: #0c1218; color: #d6d2c0;
+        border: 1px solid #2a3a48; border-radius: 3px;
+        padding: 2px 4px; font-family: inherit; font-size: 12px;
+      }
+      #stats { opacity: 0.85; }
+
+      /* Right-side live log panel. */
+      #debug-panel {
+        position: fixed;
+        top: 0; bottom: 0; right: 0;
+        width: 420px;
+        display: flex; flex-direction: column;
+        background: rgba(8, 12, 18, 0.96);
+        border-left: 1px solid #1f2a36;
+        font-size: 11px;
+        line-height: 1.35;
+        z-index: 60;
+      }
+      #debug-panel .dp-section {
+        display: flex; flex-direction: column;
+        flex: 1 1 0;
+        min-height: 0;
+        border-bottom: 1px solid #1f2a36;
+      }
+      #debug-panel .dp-section:last-child { border-bottom: none; }
+      #debug-panel .dp-head {
+        flex: 0 0 auto;
+        padding: 6px 10px;
+        background: #11202c;
+        color: #f4cf6c;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        font-size: 11px;
+        display: flex; align-items: center; gap: 8px;
+      }
+      #debug-panel .dp-head .dp-count {
+        color: #8aa;
+        font-weight: 400;
+        margin-left: auto;
+      }
+      #debug-panel .dp-body {
+        flex: 1 1 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding: 4px 8px;
+        white-space: pre;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      }
+      #debug-panel .dp-body .row { padding: 1px 0; }
+      #debug-panel .dp-body .row.team-player { color: #8ec8ff; }
+      #debug-panel .dp-body .row.team-enemy { color: #ff9a8a; }
+      #debug-panel .dp-body .row.team-enemy2 { color: #c9a4ff; }
+      #debug-panel .dp-body .row.firing { background: rgba(255, 80, 60, 0.10); }
+      #debug-panel .dp-body .row.muted { opacity: 0.5; }
+      #debug-panel .dp-body.empty { color: #556; font-style: italic; }
+      #debug-panel #dp-filter {
+        flex: 1; min-width: 0;
+        background: #0c1218; color: #d6d2c0;
+        border: 1px solid #2a3a48; border-radius: 3px;
+        padding: 2px 4px; font-family: inherit; font-size: 11px;
+      }
+      #debug-panel .dp-stats {
+        flex: 0 0 auto;
+        padding: 6px 10px;
+        background: #0a141c;
+        color: #aab8c4;
+        border-top: 1px solid #1f2a36;
+        white-space: pre;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 11px;
+      }
+
+      /* Loading splash (Game.ts reads `#progress` during world generation). */
+      #progress {
+        position: fixed; inset: 0;
+        display: flex; align-items: center; justify-content: center;
+        background: #000; color: #d6d2c0;
+        font-size: 14px;
+        z-index: 999;
+      }
+      #progress.hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+
+    <div id="debug-header">
+      <b>AI DEBUG</b>
+      <span id="stats">—</span>
+      <label for="dh-speed">speed</label>
+      <select id="dh-speed">
+        <option value="1">1×</option>
+        <option value="2">2×</option>
+        <option value="4">4×</option>
+        <option value="8">8×</option>
+      </select>
+      <label for="dh-pause">
+        <input type="checkbox" id="dh-pause" /> pause
+      </label>
+    </div>
+
+    <div id="debug-panel">
+      <div class="dp-section">
+        <div class="dp-head">
+          Units <span class="dp-count" id="dp-units-count">0</span>
+          <input id="dp-filter" type="text" placeholder="filter (kind/team/id)" />
+        </div>
+        <div class="dp-body" id="dp-units"></div>
+      </div>
+      <div class="dp-section">
+        <div class="dp-head">
+          Projectiles <span class="dp-count" id="dp-projectiles-count">0</span>
+        </div>
+        <div class="dp-body" id="dp-projectiles"></div>
+      </div>
+      <div class="dp-stats" id="dp-aistats">AI actions: —</div>
+    </div>
+
+    <!-- DOM hooks the main Game looks up but the debug UI doesn't surface.
+         Kept hidden so getElementById() returns a node and Game.ts doesn't
+         have to special-case missing UI in debug mode. -->
+    <div style="display: none">
+      <div id="mode"></div>
+      <div id="actions"></div>
+      <div id="tasks"></div>
+      <div id="pathinfo"></div>
+      <div id="res-food"></div>
+      <div id="res-metals"></div>
+      <div id="res-wood"></div>
+      <div id="res-pop"></div>
+      <div id="age-medallion"></div>
+      <div id="age-name"></div>
+      <div id="age-time"></div>
+      <div id="selection-panel">
+        <div id="sel-portrait"></div>
+        <div id="sel-name"></div>
+        <div id="sel-sub"></div>
+        <div id="sel-stats"></div>
+      </div>
+      <div id="bottombar-mini"></div>
+      <div id="selbox"></div>
+    </div>
+
+    <div id="progress">Booting AI debug…</div>
+
+    <script type="module" src="/src/debug-main.ts"></script>
+  </body>
+</html>

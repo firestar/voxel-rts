@@ -76,9 +76,15 @@ export class ChunkMeshRegistry {
   constructor(
     public readonly scene: THREE.Scene,
     public readonly world: VoxelWorld,
+    opts: { debugMaterial?: THREE.Material } = {},
   ) {
     this.worldVersion = world.buffers.version;
-    this.material = makeChunkMaterial(this.hideAboveYUniform, this.fowUniforms);
+    // When a debug override is provided we skip the onBeforeCompile
+    // patch entirely — the FoW + Y-cutoff + AO shader work is dead
+    // weight in wireframe mode. setHideAboveY / setFow / setExplored
+    // remain callable (they just twiddle uniforms nothing reads).
+    this.material = opts.debugMaterial
+      ?? makeChunkMaterial(this.hideAboveYUniform, this.fowUniforms);
     const cores = Math.max(2, Math.min((navigator.hardwareConcurrency ?? 4) - 1, 8));
     for (let i = 0; i < cores; i++) {
       const w = new MesherWorker();

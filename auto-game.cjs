@@ -24,6 +24,24 @@ const puppeteer = require('puppeteer');
 
 const BASE = process.env.PROBE_URL || 'http://localhost:8080';
 const NUM_AI = Number(process.env.AUTO_AI || 2);
+// Debug-mode bypass: when PROBE_URL points at /debug.html the page boots
+// straight into `Game(debugMode=true)` via `src/debug-main.ts` — no lobby
+// selectors, no Watcher seat, no clickthrough needed. The harness still
+// works the same way once `window.__game` exists; only the boot steps
+// differ. Triggered by either `debug.html` in the URL or an explicit
+// AUTO_DEBUG=1 override so callers can opt in without churning PROBE_URL.
+const DEBUG_MODE = /debug\.html/i.test(BASE) || process.env.AUTO_DEBUG === '1';
+// Server-state reset hits the game-server through the vite proxy. PROBE_URL
+// in debug mode carries a query string (`?ai=3`) that breaks naive string
+// concat; use the URL parser to get the origin.
+const RESET_URL = (() => {
+  try {
+    const u = new URL(BASE);
+    return `${u.origin}/game/input`;
+  } catch {
+    return `${BASE.replace(/[/?#].*$/, '')}/game/input`;
+  }
+})();
 // Game runs until an HQ is destroyed (HQ_WIN) or it bails on a
 // failure state (FAILURE_*). The wall-clock ceiling is 8 min so a
 // stalemate doesn't pin the orchestrator; the orchestrator counts
@@ -108,6 +126,7 @@ async function main() {
   log(`launching chromium (${NUM_AI} AI, ${RUN_SECONDS}s budget)`);
   const browser = await puppeteer.launch({
     headless: false,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: [
       '--enable-webgl',
       '--ignore-gpu-blocklist',
@@ -134,7 +153,7 @@ async function main() {
   // buildings from prior sessions otherwise persist and trip the
   // civilian-overflow audit at t = 1 s of the new game.
   try {
-    const resp = await fetch(`${BASE}/game/input`, {
+    const resp = await fetch(RESET_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'reset_state' }),
@@ -144,33 +163,48 @@ async function main() {
   } catch (e) { log(`reset_state error: ${e.message}`); }
 
   log(`navigating to ${BASE}`);
-  await page.goto(BASE, { waitUntil: 'networkidle2', timeout: 60000 });
+  // debug.html opens an SSE stream to /game/stream that never goes idle, so
+  // `networkidle2` would always time out. Wait for DOM ready instead — the
+  // `waitForFunction(__game)` step below covers the boot completion.
+  const waitUntil = DEBUG_MODE ? 'domcontentloaded' : 'networkidle2';
+  await page.goto(BASE, { waitUntil, timeout: 60000 });
 
-  await page.waitForSelector('#lobby-create', { timeout: 30000 });
-  await page.evaluate(() => {
-    const i = document.querySelector('#lobby-name');
-    if (i) i.value = 'Watcher';
-  });
-  await page.click('#lobby-create');
-  await page.waitForSelector('#ai-count', { timeout: 30000 });
+  if (DEBUG_MODE) {
+    // debug.html skips the lobby entirely — `src/debug-main.ts` constructs
+    // the Game with the URL-param `ai=N` already applied, then calls
+    // `attachAuthoritativeServer(gameClient)` which flips zeroTrustEnabled.
+    // Just wait for the same window globals the lobby path produces.
+    log(`debug mode: skipping lobby, waiting for __game (PROBE_URL has ai=${NUM_AI} expected)`);
+    await page.waitForFunction(() => !!window.__game, { timeout: 60000, polling: 250 });
+    await page.waitForFunction(() => window.__game?.zeroTrustEnabled === true, { timeout: 60000, polling: 250 });
+    log('game booted');
+  } else {
+    await page.waitForSelector('#lobby-create', { timeout: 30000 });
+    await page.evaluate(() => {
+      const i = document.querySelector('#lobby-name');
+      if (i) i.value = 'Watcher';
+    });
+    await page.click('#lobby-create');
+    await page.waitForSelector('#ai-count', { timeout: 30000 });
 
-  for (let i = 0; i < 8; i++) {
-    const cur = Number(await page.$eval('#ai-count', el => el.textContent.trim()));
-    if (cur === NUM_AI) break;
-    const sel = cur < NUM_AI ? '.ai-step[data-delta="1"]' : '.ai-step[data-delta="-1"]';
-    await page.click(sel);
-    await new Promise(r => setTimeout(r, 220));
+    for (let i = 0; i < 8; i++) {
+      const cur = Number(await page.$eval('#ai-count', el => el.textContent.trim()));
+      if (cur === NUM_AI) break;
+      const sel = cur < NUM_AI ? '.ai-step[data-delta="1"]' : '.ai-step[data-delta="-1"]';
+      await page.click(sel);
+      await new Promise(r => setTimeout(r, 220));
+    }
+    log(`aiCount = ${await page.$eval('#ai-count', el => el.textContent.trim())}`);
+
+    await page.click('#ready-btn');
+    await page.waitForSelector('#start-btn:not([disabled])', { timeout: 30000 });
+    await page.click('#start-btn');
+    log('clicked Start');
+
+    await page.waitForFunction(() => !!window.__game, { timeout: 60000, polling: 250 });
+    await page.waitForFunction(() => window.__game?.zeroTrustEnabled === true, { timeout: 60000, polling: 250 });
+    log('game booted');
   }
-  log(`aiCount = ${await page.$eval('#ai-count', el => el.textContent.trim())}`);
-
-  await page.click('#ready-btn');
-  await page.waitForSelector('#start-btn:not([disabled])', { timeout: 30000 });
-  await page.click('#start-btn');
-  log('clicked Start');
-
-  await page.waitForFunction(() => !!window.__game, { timeout: 60000, polling: 250 });
-  await page.waitForFunction(() => window.__game?.zeroTrustEnabled === true, { timeout: 60000, polling: 250 });
-  log('game booted');
 
   // The host browser is a Watcher — it has a player team but no AI
   // driving it, so its workers + HQ + storage form a tiny vision
@@ -192,6 +226,15 @@ async function main() {
       seen: new Map(),               // id → { team, kind, lastHp, dead, scoredCreate }
       seenBldg: new Map(),           // id → { team, kind, dead }
       kills: [],                     // { tick, victimTeam, victimKind, victimId }
+      // ---- AI performance metrics (goal C) ----
+      // buildOrder: per-team [{kind, t}] first-sight of each building (build trace).
+      // series: periodic per-team economy/military snapshots (every 10 s).
+      metrics: {
+        seenBldgIds: new Set(),
+        buildOrder: {},
+        series: [],
+        lastSeriesAt: 0,
+      },
       stuckSince: new Map(),         // id → wall-clock seconds when last meaningful XZ movement was observed
       lastPos: new Map(),            // id → [x, z]
       truckTaskAt: new Map(),        // truckId → { task, startedAt }
@@ -248,6 +291,42 @@ async function main() {
       const bldgs = g?.buildings?.buildings || [];
       const localLive = new Set();
       const SCORE = window.__autoSCORE;
+
+      // ---- AI performance metrics (goal C) ----
+      // Build-order trace: record the first time each building id is seen,
+      // tagged with its kind + seconds-since-start, so the scorecard can show
+      // the opening sequence per team and prove strategy variation.
+      const M = state.metrics;
+      for (const b of bldgs) {
+        if (b.destroyed) continue;
+        if (!M.seenBldgIds.has(b.id)) {
+          M.seenBldgIds.add(b.id);
+          (M.buildOrder[b.team] = M.buildOrder[b.team] || [])
+            .push({ kind: b.spec.kind, t: +(now - state.runStartedAt).toFixed(1) });
+        }
+      }
+      // Periodic per-team economy + military time-series (every 10 s) so the
+      // scorecard can show the worker ramp, army growth, and resource
+      // banked-vs-spent curve.
+      if (now - M.lastSeriesAt >= 10) {
+        M.lastSeriesAt = now;
+        const per = {};
+        const ensure = (team) => (per[team] = per[team] || { workers: 0, combat: 0 });
+        for (const u of us) {
+          if (u.hp <= 0) continue;
+          const T = ensure(u.team);
+          if (u.kind === 'worker') T.workers++;
+          else if (opts.COMBAT_KINDS.includes(u.kind)) T.combat++;
+        }
+        const res = { player: g?.resources, enemy: g?.enemyResources, enemy2: g?.enemy2Resources };
+        for (const team of Object.keys(res)) {
+          const r = res[team]; if (!r) continue;
+          const T = ensure(team);
+          T.food = Math.round(r.food); T.metals = Math.round(r.metals);
+          T.wood = Math.round(r.wood); T.popCap = r.popCap;
+        }
+        M.series.push({ t: +(now - state.runStartedAt).toFixed(0), per });
+      }
       for (const u of us) {
         if (u.hp <= 0) continue;
         localLive.add(u.id);
@@ -878,6 +957,10 @@ async function main() {
         trainQueueLen: b.trainQueue?.length ?? 0,
         cropProgress: b.cropProgress, cropReady: b.cropReady, harvestMilestone: b.harvestMilestone,
         suppliedUnits: b.suppliedUnits, inboundResupplyTrucks: b.inboundResupplyTrucks,
+        upgradeState: b.upgradeState,
+        upgradeStockpile: b.upgradeStockpile ? { ...b.upgradeStockpile } : undefined,
+        inboundUpgradeTrucks: b.inboundUpgradeTrucks,
+        constructionTimer: b.constructionTimer, constructionTotal: b.constructionTotal,
       }));
       const clusters = (g?.metalClusters || []).filter(c => !c.destroyed).map(c => ({
         id: c.id, x: c.worldX, z: c.worldZ, rxz: c.rxz,
@@ -896,13 +979,140 @@ async function main() {
         storageStockpiles: (g?.buildings?.buildings || []).filter(b => !b.destroyed && b.spec.kind === 'storage').map(b => ({
           id: b.id, team: b.team, metals: b.stockpile.metals, wood: b.stockpile.wood,
         })),
+        aaAirTargets: g?.aaAirTargets ?? 0,
+        aaGroundTargets: g?.aaGroundTargets ?? 0,
       };
     });
     const fs = require('fs');
-    const dumpPath = `/tmp/auto-dump-${(process.env.AUTO_ITER || '?')}.json`;
+    const dumpPath = process.env.AUTO_DUMP_PATH || `tmp/auto-dump-${(process.env.AUTO_ITER || '?')}.json`;
     fs.writeFileSync(dumpPath, JSON.stringify(dump));
     log(`diagnostic dump saved: ${dumpPath}`);
   } catch (e) { log('diagnostic dump failed: ' + e.message); }
+
+  // ---- AI performance scorecard (goal C) ----
+  // Compute a compact per-team scorecard from the in-page metrics + scoreEvents
+  // + kills + final state, print it, and persist tmp/auto-metrics-iterN.json so
+  // every iteration can be judged on economy ramp, military composition, tech
+  // progression, combat, and build-order variation.
+  try {
+    const metrics = await page.evaluate((cfg) => {
+      const g = window.__game;
+      const st = window.__autoState;
+      const M = st.metrics;
+      const us = g?.units?.units || [];
+      const bldgs = (g?.buildings?.buildings || []).filter(b => !b.destroyed);
+      const teams = ['player', 'enemy', 'enemy2'];
+      const ADVANCED = new Set(['tank', 'rocket_truck', 'aa_vehicle']);
+      // Units produced by kind, per team, from the create score-events
+      // (combat kinds emit a create event tagged {at, team, kind}).
+      const producedByKind = {};
+      const firstAt = {}; // "team:kind" -> earliest create time
+      for (const e of st.scoreEvents) {
+        if (e.ev !== 'create' || !e.team || !e.kind) continue;
+        const tk = e.team + ':' + e.kind;
+        producedByKind[tk] = (producedByKind[tk] || 0) + 1;
+        if (firstAt[tk] === undefined || e.at < firstAt[tk]) firstAt[tk] = +e.at.toFixed(1);
+      }
+      // Losses per team (kills record victimTeam).
+      const lossesByTeam = {};
+      for (const k of st.kills) {
+        if (!cfg.COMBAT_KINDS.includes(k.victimKind)) continue;
+        lossesByTeam[k.victimTeam] = (lossesByTeam[k.victimTeam] || 0) + 1;
+      }
+      // Final alive composition + worker count per team.
+      const aliveByKind = {}; const workersNow = {}; const combatNow = {};
+      for (const u of us) {
+        if (u.hp <= 0) continue;
+        const tk = u.team + ':' + u.kind;
+        aliveByKind[tk] = (aliveByKind[tk] || 0) + 1;
+        if (u.kind === 'worker') workersNow[u.team] = (workersNow[u.team] || 0) + 1;
+        else if (cfg.COMBAT_KINDS.includes(u.kind)) combatNow[u.team] = (combatNow[u.team] || 0) + 1;
+      }
+      // HQ structural damage dealt TO each team (3000 maxHp baseline).
+      const hqDamageTaken = {};
+      for (const b of bldgs) {
+        if (b.spec.kind !== 'hq') continue;
+        hqDamageTaken[b.team] = (hqDamageTaken[b.team] || 0) + Math.max(0, (b.maxHp || 3000) - b.hp);
+      }
+      const res = { player: g?.resources, enemy: g?.enemyResources, enemy2: g?.enemy2Resources };
+      const scorecard = {};
+      for (const team of teams) {
+        const prod = {}; let combatProduced = 0; const advanced = {};
+        for (const tk of Object.keys(producedByKind)) {
+          if (!tk.startsWith(team + ':')) continue;
+          const kind = tk.slice(team.length + 1);
+          prod[kind] = producedByKind[tk];
+          combatProduced += producedByKind[tk];
+          if (ADVANCED.has(kind)) advanced[kind] = producedByKind[tk];
+        }
+        const buildOrder = M.buildOrder[team] || [];
+        const buildKinds = [...new Set(buildOrder.map(b => b.kind))];
+        // Worker ramp: peak workers across the time series.
+        let peakWorkers = 0;
+        for (const s of M.series) { const p = s.per[team]; if (p && p.workers > peakWorkers) peakWorkers = p.workers; }
+        const r = res[team] || {};
+        scorecard[team] = {
+          economy: {
+            workersNow: workersNow[team] || 0,
+            peakWorkers,
+            banked: { food: Math.round(r.food || 0), metals: Math.round(r.metals || 0), wood: Math.round(r.wood || 0) },
+            popCap: r.popCap || 0,
+          },
+          military: {
+            combatProduced,
+            producedByKind: prod,
+            unitKindVariety: Object.keys(prod).length,
+            advanced,                       // tank / rocket_truck / aa_vehicle counts produced
+            aliveCombat: combatNow[team] || 0,
+          },
+          tech: {
+            buildingsBuilt: buildKinds,
+            hasDepot: buildKinds.includes('vehicle_depot'),
+            tier2Plus: buildKinds.filter(k => ['vehicle_depot', 'tech_lab', 'silo', 'turret', 'refinery', 'power_plant'].includes(k)),
+            timeToDepot: (buildOrder.find(b => b.kind === 'vehicle_depot') || {}).t ?? null,
+          },
+          combat: {
+            losses: lossesByTeam[team] || 0,
+            hqDamageDealtToEnemies: teams.filter(t => t !== team).reduce((a, t) => a + (hqDamageTaken[t] || 0), 0),
+            hqDamageTaken: hqDamageTaken[team] || 0,
+          },
+          buildOrderTrace: buildOrder,
+          firstAdvancedAt: {
+            tank: firstAt[team + ':tank'] ?? null,
+            rocket_truck: firstAt[team + ':rocket_truck'] ?? null,
+            aa_vehicle: firstAt[team + ':aa_vehicle'] ?? null,
+          },
+        };
+      }
+      const aaAir = g?.aaAirTargets ?? 0;
+      const aaGround = g?.aaGroundTargets ?? 0;
+      return {
+        scorecard, series: M.series, totalKills: st.kills.length,
+        aa: { air: aaAir, ground: aaGround, airRatio: (aaAir + aaGround) > 0 ? +(aaAir / (aaAir + aaGround)).toFixed(2) : null },
+      };
+    }, { COMBAT_KINDS });
+
+    const fs = require('fs');
+    const metricsPath = process.env.AUTO_METRICS_PATH || `tmp/auto-metrics-${(process.env.AUTO_ITER || '?')}.json`;
+    fs.writeFileSync(metricsPath, JSON.stringify(metrics, null, 2));
+    log(`metrics saved: ${metricsPath}`);
+    // Compact per-team scorecard to the log.
+    log('=== AI SCORECARD ===');
+    for (const team of ['player', 'enemy', 'enemy2']) {
+      const sc = metrics.scorecard[team];
+      if (!sc) continue;
+      const e = sc.economy, m = sc.military, t = sc.tech, c = sc.combat;
+      const prodStr = Object.entries(m.producedByKind).map(([k, v]) => `${k}=${v}`).join(',') || 'none';
+      const advStr = Object.entries(m.advanced).map(([k, v]) => `${k}=${v}`).join(',') || 'none';
+      const traceStr = sc.buildOrderTrace.map(b => `${b.kind}@${b.t}s`).join(' → ') || 'none';
+      log(`[${team}] econ: workers=${e.workersNow}(peak ${e.peakWorkers}) banked f${e.banked.food}/m${e.banked.metals}/w${e.banked.wood} cap${e.popCap}`);
+      log(`[${team}] mil: produced ${m.combatProduced} (${prodStr}) variety=${m.unitKindVariety} advanced=[${advStr}] aliveCombat=${m.aliveCombat}`);
+      log(`[${team}] tech: depot=${t.hasDepot} tier2+=[${t.tier2Plus.join(',')}] timeToDepot=${t.timeToDepot}s`);
+      log(`[${team}] combat: losses=${c.losses} hqDmgDealt=${Math.round(c.hqDamageDealtToEnemies)} hqDmgTaken=${Math.round(c.hqDamageTaken)}`);
+      log(`[${team}] build: ${traceStr}`);
+    }
+    log(`[AA] air-engagements=${metrics.aa.air} ground-engagements=${metrics.aa.ground} airRatio=${metrics.aa.airRatio}`);
+  } catch (e) { log('metrics scorecard failed: ' + e.message); }
 
   await browser.close();
   if (outcome === 'HQ_WIN') process.exit(0);
