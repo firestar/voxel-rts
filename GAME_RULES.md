@@ -107,6 +107,17 @@ constraint the user has stated across the loop.
   the cap.
 - The cap starts at **10** per team so a fresh base can field its
   starter units.
+- **Used population may exceed the cap.** Losing housing (a destroyed
+  neighborhood) drops the cap, but the soldiers / workers / vehicles that
+  were occupying those slots stay alive and keep counting toward used pop —
+  only the hood's resident **citizens** die with it. So the cap can fall
+  **below** the used count and the available pop (cap − used) can go
+  negative. The game does not retroactively kill units to fit a shrunken
+  cap; production is simply blocked until used drops back under the cap.
+- **HUD readout:** the population pill shows `used / cap`. When `used > cap`
+  (available pop is negative) the number renders in **bright red** so the
+  overdraw is unmistakable; it returns to the default colour once a slot is
+  regained.
 
 ### Citizens (neighborhood residents)
 
@@ -138,6 +149,10 @@ constraint the user has stated across the loop.
   neighborhood-destroyed case for citizens above. Units that die linger
   inert at `hp <= 0` (every system skips them); they are not garbage-trimmed
   out from under the player.
+- **Destroying a neighborhood kills only its resident citizens** — never any
+  other unit. Soldiers, workers, and vehicles standing on or near the lot are
+  untouched; they survive the loss of housing and continue to count toward
+  used population (which is what can push used over the cap, see Population).
 - **The one documented exception is the supply truck**, which is auto-spawned
   infrastructure: it despawns on **successful task completion** (after a
   delivery) or on HP → 0 — never from the watchdog for being slow (a truck

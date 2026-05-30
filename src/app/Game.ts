@@ -1680,6 +1680,13 @@ export class Game {
         const friendly = this.populationUsedFor('player');
         const cap = this.resources.popCap ?? 0;
         this.resPopEl.textContent = `${friendly} / ${cap}`;
+        // Used population can exceed the cap: destroying neighborhoods removes
+        // housing (and kills only their resident citizens), but the soldiers /
+        // workers / vehicles that were filling those slots stay alive and keep
+        // counting. When used > cap (available pop is negative) the number goes
+        // bright red so the overdraw is unmistakable. Cleared back to the
+        // default colour once a slot is regained.
+        this.resPopEl.style.color = friendly > cap ? '#ff2222' : '';
       }
       // Top-right age cluster: HQ tier as Roman numeral + a flavour name +
       // elapsed game time (HH:MM:SS).
