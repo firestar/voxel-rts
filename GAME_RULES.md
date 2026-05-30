@@ -124,6 +124,27 @@ constraint the user has stated across the loop.
 - Citizens are **attackable and have low HP** (20) — an enemy shooting a
   citizen kills it quickly, and each death costs the owner a pop slot
   (which the lot then re-grows on the 10 s cadence).
+- **Citizens are never silently deleted.** A citizen may leave the world for
+  exactly two reasons: it is **killed** (HP → 0 from enemy fire), or its
+  **home neighborhood is destroyed** (its residents are marked dead with it).
+  No other path — an `expand` upgrade, a pop-cap/overflow trim, a wander
+  glitch, or any watchdog — may remove a living citizen.
+
+### Unit lifecycle — no silent deletion
+
+- **No living unit is ever deleted except by death.** `UnitManager.despawn`
+  is the only thing that removes a unit from the world, and for combat units,
+  workers, and civilians it is only ever reached via death (HP → 0), plus the
+  neighborhood-destroyed case for citizens above. Units that die linger
+  inert at `hp <= 0` (every system skips them); they are not garbage-trimmed
+  out from under the player.
+- **The one documented exception is the supply truck**, which is auto-spawned
+  infrastructure: it despawns on **successful task completion** (after a
+  delivery) or on HP → 0 — never from the watchdog for being slow (a truck
+  must never "randomly disappear" mid-haul; see Supply trucks).
+- Under the authoritative zero-trust server the server owns unit lifecycles;
+  the client mirror removes a local unit only when the server's snapshot
+  stops reporting it (i.e. the server already applied a death / destruction).
 - `popHasRoom` gates production for **every** team, including the
   player slot in the AI-vs-AI loop. An AI faction without
   neighborhoods stalls at 10 population — it can't barracks-spam its

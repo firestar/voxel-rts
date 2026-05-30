@@ -124,6 +124,27 @@ describe('neighborhood citizens', () => {
     for (let i = 0; i < 5; i++) sys.tick(2, deps);
     expect(liveCivilians(units)).toBe(5); // residents stayed through the upgrade
   });
+
+  it('removes residents only when their neighborhood is destroyed', () => {
+    const sys = new CivilianSystem();
+    const b = makeNeighborhood();
+    const { deps, units } = makeDeps(b);
+    sys.tick(0.016, deps);
+    for (let i = 0; i < 4; i++) sys.tick(10, deps);
+    expect(liveCivilians(units)).toBe(5);
+
+    // Residents must NOT vanish for any benign reason — a quiet tick with the
+    // hood fully housed leaves every one of them alive.
+    for (let i = 0; i < 10; i++) sys.tick(1, deps);
+    expect(liveCivilians(units)).toBe(5);
+
+    // Destroy the neighborhood: its residents go away with it (killed, hp=0),
+    // which is one of the only two sanctioned removal triggers.
+    b.destroyed = true;
+    sys.tick(0.016, deps);
+    expect(liveCivilians(units)).toBe(0);
+    expect(units.every(u => u.hp <= 0)).toBe(true);
+  });
 });
 
 describe('neighborhoodHousing', () => {

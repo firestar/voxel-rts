@@ -96,6 +96,23 @@ export class CivilianSystem {
       if (u.kind === 'civilian' && u.hp > 0) alive.add(u.id);
     }
     for (const [bid, res] of this.residents) {
+      const home = deps.buildings.buildings.find(b => b.id === bid);
+      if (!home || home.destroyed) {
+        // Neighborhood destroyed: its residents go away WITH it. Killing a
+        // civilian (enemy fire) and destroying its home are the ONLY two ways
+        // a civilian may leave the world — never a silent despawn, an upgrade,
+        // an overflow trim, or a wander glitch. We mark the still-living
+        // residents dead (hp = 0) so they flow through the normal death path
+        // (every system skips hp<=0; the team's pop max drops by one per lost
+        // resident) instead of orphan-wandering forever under a dead lot's id.
+        for (const id of res.ids) {
+          const u = deps.units.units.find(uu => uu.id === id);
+          if (u && u.hp > 0) u.hp = 0;
+          this.civilians.delete(id);
+        }
+        this.residents.delete(bid);
+        continue;
+      }
       const before = res.ids.length;
       res.ids = res.ids.filter(id => alive.has(id));
       // A death drops the owner's pop max by 1 (the dead resident no longer
@@ -104,9 +121,6 @@ export class CivilianSystem {
       if (res.ids.length < before) {
         res.spawnCooldown = Math.min(res.spawnCooldown, REPLACEMENT_COOLDOWN_S);
         res.spawnTotal = REPLACEMENT_COOLDOWN_S;
-      }
-      if (res.ids.length === 0 && !deps.buildings.buildings.some(b => b.id === bid && !b.destroyed)) {
-        this.residents.delete(bid);
       }
     }
     for (const id of this.civilians.keys()) {
