@@ -1191,11 +1191,22 @@ export class Game {
         housingBy.set(b.team, (housingBy.get(b.team) ?? 0) + tier * 5);
       }
     }
+    // When the local civilian system is running (campaign: `civilians.tick`
+    // spawns residents for every team's hoods), the pop max is driven by the
+    // live citizen count — each created citizen adds +1, each killed citizen
+    // removes 1, capping at the hood's `tier × 5` housing. When civilians are
+    // NOT simulated locally (the AI-vs-AI debug testbed / authoritative
+    // zero-trust server, where the host only spawns its own civilians), fall
+    // back to reading housing straight off the buildings so AI teams aren't
+    // hard-capped at 10 — see the iter53-58 note above.
+    const civSystemActive = !this.zeroTrustEnabled && !this.debugMode;
     for (const team of teams) {
       const r = this.resourcesForTeam(team);
       const hqCount = hqsBy.get(team) ?? 1;
-      const housing = Math.max(housingBy.get(team) ?? 0, civiliansBy.get(team) ?? 0);
-      r.popCap = 10 * hqCount + housing;
+      const housing = housingBy.get(team) ?? 0;
+      const civilians = civiliansBy.get(team) ?? 0;
+      const contribution = civSystemActive ? Math.min(civilians, housing) : housing;
+      r.popCap = 10 * hqCount + contribution;
     }
   }
 

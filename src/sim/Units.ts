@@ -569,8 +569,9 @@ export function unitConfig(kind: UnitKind): UnitConfig {
     case 'civilian':
       // Non-combatant resident. Walks between neighborhood city buildings,
       // contributes nothing combat-wise. Slim footprint, soldier-class
-      // mobility on gentle terrain, no weapon, low HP — they're meant to
-      // wander the streets and dress up the base.
+      // mobility on gentle terrain, no weapon, very low HP — they're meant
+      // to wander the streets and dress up the base, and to fall quickly
+      // when an enemy shoots them (each death costs the owner a pop slot).
       return {
         footprintRadius: 1, widthMeters: 0.65,
         maxStepVoxels: 6, slopePenalty: 0.20,
@@ -580,7 +581,7 @@ export function unitConfig(kind: UnitKind): UnitConfig {
         heightVoxels: 14,
         canDig: false, requiresGround: true,
         speed: 2.6, speedDigging: 0,
-        hp: 35,
+        hp: 20,
         massKg: 70,
         terminalFallSpeed: 28,
         cutterRadius: 0, cutterForward: 0, cutterHeight: 0,

@@ -865,6 +865,14 @@ export interface Building {
   /** Total seconds the active construction was budgeted for (denominator
    *  for the time-progress fraction). */
   constructionTotal: number;
+  /**
+   * Neighborhood-only: 0..1 progress of the next citizen currently being
+   * grown (one new resident every `SPAWN_COOLDOWN_S` seconds while the lot
+   * is below its `tier × 5` housing quota). The HealthBar renderer reads
+   * this to draw a "growing citizen" progress bar over the lot. -1 when no
+   * citizen is in progress (lot at quota, or not a neighborhood).
+   */
+  citizenSpawnProgress: number;
 }
 
 /**
@@ -3489,6 +3497,7 @@ export class BuildingManager {
       tempPileVoxels: null,
       constructionTimer: 0,
       constructionTotal: 0,
+      citizenSpawnProgress: -1,
     };
     if (!spec.enabledOnPlace) {
       // Initial-build timer comes from the spec — barracks 60 s, depot

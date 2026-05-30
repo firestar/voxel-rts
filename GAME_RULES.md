@@ -101,12 +101,29 @@ constraint the user has stated across the loop.
 ### Population
 
 - Every team has its own population cap. The cap **only** comes from
-  neighborhoods: each alive civilian (spawned from a neighborhood
-  house) adds +1, so a tier-3 neighborhood (3 houses) tops up at +15.
-  No other building type contributes — barracks, vehicle depots,
-  HQs, etc. do NOT raise the cap.
+  neighborhoods: each house in a neighborhood provides **5 population**,
+  so a tier-3 neighborhood (3 houses) tops up at +15. No other building
+  type contributes — barracks, vehicle depots, HQs, etc. do NOT raise
+  the cap.
 - The cap starts at **10** per team so a fresh base can field its
   starter units.
+
+### Citizens (neighborhood residents)
+
+- A neighborhood **creates one new citizen every 10 seconds** while it is
+  below its housing quota (`tier × 5` = 5 per house). The lot shows a
+  **progress bar** of the next citizen's creation, and the new citizen
+  **animates growing in** (sprout → full size over ~1.5 s) as it is born.
+- **Each citizen created adds +1 to the owner's max population; each
+  citizen killed removes 1 from the max.** Net pop max therefore equals
+  the live citizen count, capped at the lot's `tier × 5` housing. When
+  the local civilian system isn't simulated (the AI-vs-AI debug testbed /
+  authoritative zero-trust server, which don't spawn civilians for every
+  team) the cap is read straight off the hood's housing capacity instead,
+  so AI teams aren't hard-capped at 10.
+- Citizens are **attackable and have low HP** (20) — an enemy shooting a
+  citizen kills it quickly, and each death costs the owner a pop slot
+  (which the lot then re-grows on the 10 s cadence).
 - `popHasRoom` gates production for **every** team, including the
   player slot in the AI-vs-AI loop. An AI faction without
   neighborhoods stalls at 10 population — it can't barracks-spam its
@@ -123,7 +140,8 @@ constraint the user has stated across the loop.
   newly placed hood, +1 per `expand_neighborhood` upgrade, capped at
   3 → 15 civilians per fully-upgraded hood). Going over fires
   `FAILURE_CIVILIAN_OVERFLOW` (exit code 10) — the server's civilian
-  spawner has bypassed its quota.
+  spawner has bypassed its quota. The 10 s creation cadence never lets a
+  lot exceed its quota; it only paces how fast the cap ramps up.
 
 ### Supply trucks
 

@@ -86,6 +86,11 @@ export class HealthBarRenderer {
         const reloadPct = b.weaponReloadTimer > 0 && reloadSecs > 0
           ? Math.round((1 - b.weaponReloadTimer / reloadSecs) * 100) : -1;
         const cropPct = b.spec.kind === 'farm' ? Math.round(b.cropProgress * 100) : -1;
+        // Neighborhood citizen-creation bar: a new resident is grown every
+        // 10 s while the lot is below its housing quota. -1 (hidden) when the
+        // lot is full or not a neighborhood.
+        const citizenPct = b.spec.kind === 'neighborhood' && b.citizenSpawnProgress >= 0
+          ? Math.round(b.citizenSpawnProgress * 100) : -1;
         // Upgrade progress: combined time × resource progress so the bar
         // tracks whichever gate is slowest. Reads `constructionTotal` from
         // the instance so the bar follows whichever upgrade is currently
@@ -110,7 +115,7 @@ export class HealthBarRenderer {
             : `⚒ build ${upgradePct}%`;
         }
 
-        const hasStatus = prodPct >= 0 || reloadPct >= 0 || cropPct >= 0 || upgradePct >= 0;
+        const hasStatus = prodPct >= 0 || reloadPct >= 0 || cropPct >= 0 || upgradePct >= 0 || citizenPct >= 0;
         const showBar = b.hp < b.maxHp || b.selected || hasStatus || b.spec.kind === 'hq';
         if (!showBar) continue;
 
@@ -129,9 +134,9 @@ export class HealthBarRenderer {
         const hpInt = Math.max(0, Math.ceil(b.hp));
         const truckLine = b.spec.kind === 'hq'
           ? `${b.activeTrucks}/${effectiveMaxTrucks(b)} trucks` : '';
-        const statusKey = `${hpInt}:${prodPct}:${prodLabel}:${reloadPct}:${cropPct}:${truckLine}:${upgradePct}:${upgradeLabel}`;
+        const statusKey = `${hpInt}:${prodPct}:${prodLabel}:${reloadPct}:${cropPct}:${truckLine}:${upgradePct}:${upgradeLabel}:${citizenPct}`;
         if (statusKey !== entry.lastStatusKey) {
-          drawBuildingBar(entry.canvas, hpInt, b.maxHp, prodPct, prodLabel, reloadPct, cropPct, truckLine, upgradePct, upgradeLabel);
+          drawBuildingBar(entry.canvas, hpInt, b.maxHp, prodPct, prodLabel, reloadPct, cropPct, truckLine, upgradePct, upgradeLabel, citizenPct);
           entry.texture.needsUpdate = true;
           entry.lastHp = hpInt;
           entry.lastMax = b.maxHp;
@@ -302,6 +307,7 @@ function drawBuildingBar(
   truckLine = '',
   upgradePct = -1,
   upgradeLabel = '',
+  citizenPct = -1,
 ): void {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
@@ -354,6 +360,12 @@ function drawBuildingBar(
   }
   if (reloadPct >= 0) {
     miniBar(ctx, BX, nextY, BW, 10, reloadPct / 100, '#ff8833', `reload ${reloadPct}%`);
+    nextY += 14;
+  }
+  if (citizenPct >= 0) {
+    // Pink to match the civilian theme; "citizen NN%" reads the new resident
+    // growing in the lot.
+    miniBar(ctx, BX, nextY, BW, 10, citizenPct / 100, '#ff77cc', `citizen ${citizenPct}%`);
   }
 }
 

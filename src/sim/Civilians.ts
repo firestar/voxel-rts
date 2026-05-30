@@ -23,8 +23,8 @@ import { VOXEL_SIZE } from '../voxel/types';
  * neighborhood (preferring ones other than their home), and route there.
  */
 
-const SPAWN_COOLDOWN_S = 6.0;          // seconds between civilian spawns per neighborhood
-const REPLACEMENT_COOLDOWN_S = 2.0;    // shorter cooldown when a death drops the count below quota
+const SPAWN_COOLDOWN_S = 10.0;         // a new citizen is created every 10 s per neighborhood (below quota)
+const REPLACEMENT_COOLDOWN_S = 10.0;   // a killed resident is replaced on the same 10 s cadence
 const IDLE_BETWEEN_TRIPS_S = [3.0, 9.0]; // random pause range between routes
 const WANDER_RADIUS_M = 4.0;            // jitter applied to the destination so civilians don't all stop on the same dot
 
@@ -33,6 +33,9 @@ interface NeighborhoodResidents {
   ids: number[];
   /** seconds remaining before the next spawn attempt. */
   spawnCooldown: number;
+  /** total seconds the current spawn countdown started from — denominator
+   *  for the `citizenSpawnProgress` bar so it fills smoothly 0→1. */
+  spawnTotal: number;
 }
 
 /** Per-civilian wandering state — separate from the unit so the unit type
@@ -95,11 +98,12 @@ export class CivilianSystem {
     for (const [bid, res] of this.residents) {
       const before = res.ids.length;
       res.ids = res.ids.filter(id => alive.has(id));
-      // A death below quota queues a replacement on a short cooldown, so
-      // the popCap that tracks live civilians visibly drops by 1 and then
-      // climbs back up over a couple of seconds.
+      // A death drops the owner's pop max by 1 (the dead resident no longer
+      // counts toward the cap). The lot queues a replacement on the standard
+      // 10 s cadence, so the cap climbs back up as the next citizen is grown.
       if (res.ids.length < before) {
         res.spawnCooldown = Math.min(res.spawnCooldown, REPLACEMENT_COOLDOWN_S);
+        res.spawnTotal = REPLACEMENT_COOLDOWN_S;
       }
       if (res.ids.length === 0 && !deps.buildings.buildings.some(b => b.id === bid && !b.destroyed)) {
         this.residents.delete(bid);
@@ -115,15 +119,26 @@ export class CivilianSystem {
       if (b.destroyed) continue;
       if (b.spec.kind !== 'neighborhood') continue;
       if (b.healthRefVoxels <= 0) continue;        // initial build hasn't finished
+      // 5 population per house in the lot: tier = number of houses
+      // (1 + expand upgrades), each house holds 5 residents.
       const tier = 1 + (b.upgradeTracks.expand ?? 0);
       const target = tier * 5;
       let res = this.residents.get(b.id);
       if (!res) {
-        res = { ids: [], spawnCooldown: 0 };
+        res = { ids: [], spawnCooldown: 0, spawnTotal: SPAWN_COOLDOWN_S };
         this.residents.set(b.id, res);
       }
       res.spawnCooldown = Math.max(0, res.spawnCooldown - dt);
-      if (res.ids.length >= target) continue;
+      if (res.ids.length >= target) {
+        // Lot fully housed — no citizen being grown, hide the progress bar.
+        b.citizenSpawnProgress = -1;
+        continue;
+      }
+      // Below quota: a citizen is being grown. Surface the 0→1 progress so
+      // the renderer can draw the creation bar over the lot.
+      b.citizenSpawnProgress = res.spawnTotal > 0
+        ? Math.max(0, Math.min(1, 1 - res.spawnCooldown / res.spawnTotal))
+        : 0;
       if (res.spawnCooldown > 0) continue;
       // Spawn at the lot centre's surface — we use surfaceY so the unit lands
       // on top of whatever floor the neighborhood stamped.
@@ -134,6 +149,10 @@ export class CivilianSystem {
       if (!u) continue;
       res.ids.push(u.id);
       res.spawnCooldown = SPAWN_COOLDOWN_S;
+      res.spawnTotal = SPAWN_COOLDOWN_S;
+      // The freshly created citizen kicks off the next 10 s creation cycle
+      // (or hides the bar if this spawn filled the lot's quota).
+      b.citizenSpawnProgress = res.ids.length >= target ? -1 : 0;
       this.civilians.set(u.id, {
         idleSeconds: IDLE_BETWEEN_TRIPS_S[0]! + Math.random() * (IDLE_BETWEEN_TRIPS_S[1]! - IDLE_BETWEEN_TRIPS_S[0]!),
         homeBuildingId: b.id,

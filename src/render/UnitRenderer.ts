@@ -26,6 +26,12 @@ import {
 const WORKER_VARIANTS: WorkerVariant[] = ['auto', 'mine', 'chop', 'farm'];
 const WORKER_VARIANT_IDX: Record<string, number> = { auto: 0, mine: 1, chop: 2, farm: 3 };
 
+/** A freshly created civilian grows from a sprout to full size over this
+ *  many seconds, so the "new resident being born" reads visually. */
+const CIVILIAN_GROW_SECONDS = 1.5;
+/** Scale a citizen starts at the moment it's created (then lerps to 1.0). */
+const CIVILIAN_GROW_START_SCALE = 0.2;
+
 /**
  * Per-kind, per-part InstancedMesh renderer.
  *
@@ -78,6 +84,9 @@ export class UnitRenderer {
    *  `distanceWalked` increment) still plays its walk cycle. */
   private lastDistanceWalked = new Map<number, number>();
   private lastRenderXZ = new Map<number, [number, number]>();
+  /** Wall-clock time (s) a civilian id was first rendered, so we can play a
+   *  short grow-in animation when a new resident is created. */
+  private civilianBornAt = new Map<number, number>();
 
   private capacity: number;
   private bodyM = new THREE.Matrix4();
@@ -88,6 +97,9 @@ export class UnitRenderer {
   private quat = new THREE.Quaternion();
   private tmpEuler = new THREE.Euler();
   private tmpV = new THREE.Vector3();
+  /** Reusable scale vector for `bodyM.compose` — lets civilians grow in
+   *  without allocating a Vector3 every frame. */
+  private tmpScale = new THREE.Vector3(1, 1, 1);
   /**
    * Per-instance team tint. We store one Color object per team and reuse it via
    * `setColorAt`, so each instance is multiplied by either white (no tint, for
@@ -299,7 +311,18 @@ export class UnitRenderer {
         : u.kind === 'worker' ? 0.05
         : 0.0;
       this.tmpV.set(u.x, u.y + feetOffset + bodyBob, u.z);
-      this.bodyM.compose(this.tmpV, this.quat, new THREE.Vector3(1, 1, 1));
+      // Newly created citizens grow from a sprout to full size so the
+      // "resident being born" reads visually. Every other kind renders at
+      // unit scale.
+      let bodyScale = 1;
+      if (u.kind === 'civilian') {
+        let bornAt = this.civilianBornAt.get(u.id);
+        if (bornAt === undefined) { bornAt = now; this.civilianBornAt.set(u.id, now); }
+        const growT = Math.min(1, (now - bornAt) / CIVILIAN_GROW_SECONDS);
+        bodyScale = CIVILIAN_GROW_START_SCALE + (1 - CIVILIAN_GROW_START_SCALE) * growT;
+      }
+      this.tmpScale.set(bodyScale, bodyScale, bodyScale);
+      this.bodyM.compose(this.tmpV, this.quat, this.tmpScale);
       const tint = u.team === 'enemy' ? this.enemyTint
         : u.team === 'enemy2' ? this.enemy2Tint
         : this.playerTint;
@@ -624,6 +647,16 @@ export class UnitRenderer {
       // active instances. Guard the upload so we don't throw on a bare
       // mesh.
       if (m.instanceColor) m.instanceColor.needsUpdate = true;
+    }
+
+    // Forget grow-in timers for civilians that no longer exist so a recycled
+    // id starts its own birth animation rather than snapping to full size.
+    if (this.civilianBornAt.size > 0) {
+      const liveCiv = new Set<number>();
+      for (const u of units.units) if (u.kind === 'civilian') liveCiv.add(u.id);
+      for (const id of this.civilianBornAt.keys()) {
+        if (!liveCiv.has(id)) this.civilianBornAt.delete(id);
+      }
     }
 
     // Hide any leftover rings from frames where more units were selected.
