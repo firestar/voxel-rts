@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { CivilianSystem, CivilianDeps } from '../src/sim/Civilians';
 import type { Unit } from '../src/sim/Units';
+import { neighborhoodHousing } from '../src/sim/Buildings';
 import type { Building } from '../src/sim/Buildings';
 
 /**
@@ -103,5 +104,54 @@ describe('neighborhood citizens', () => {
     // After the 10 s replacement window the lot is back to full strength.
     sys.tick(10, deps);
     expect(liveCivilians(units)).toBe(5);
+  });
+
+  it('keeps existing residents while the hood is mid-expand', () => {
+    const sys = new CivilianSystem();
+    // A tier-1 hood that has finished its initial build, fully housed.
+    const b = makeNeighborhood();
+    const { deps, units } = makeDeps(b);
+    sys.tick(0.016, deps);
+    for (let i = 0; i < 4; i++) sys.tick(10, deps);
+    expect(liveCivilians(units)).toBe(5);
+
+    // Player orders an expand: the lot flips to `pending` while the new
+    // house is constructed, but the existing houses are still standing
+    // (healthRefVoxels stays > 0) and the expand track only bumps on
+    // completion. The CivilianSystem must NOT despawn the residents.
+    b.upgradeState = 'pending';
+    b.activeUpgradeId = 'expand';
+    for (let i = 0; i < 5; i++) sys.tick(2, deps);
+    expect(liveCivilians(units)).toBe(5); // residents stayed through the upgrade
+  });
+});
+
+describe('neighborhoodHousing', () => {
+  it('counts 5 population per standing house and survives a mid-expand', () => {
+    // Non-neighborhood → no housing.
+    expect(neighborhoodHousing(makeNeighborhood({
+      spec: { kind: 'barracks', cellsW: 4, cellsD: 4 },
+    } as Partial<Building>) )).toBe(0);
+
+    // Initial build not finished → no houses standing yet.
+    expect(neighborhoodHousing(makeNeighborhood({ healthRefVoxels: 0 }))).toBe(0);
+
+    // Destroyed lot → nothing.
+    expect(neighborhoodHousing(makeNeighborhood({ destroyed: true }))).toBe(0);
+
+    // Built tier-1 hood → one house → 5 population.
+    expect(neighborhoodHousing(makeNeighborhood())).toBe(5);
+
+    // Mid-EXPAND (pending) tier-1 hood → existing house still counts (5),
+    // because the expand track only increments on completion. This is the
+    // key guarantee: the pop cap doesn't collapse during construction.
+    expect(neighborhoodHousing(makeNeighborhood({
+      upgradeState: 'pending', activeUpgradeId: 'expand',
+    }))).toBe(5);
+
+    // Completed expand → two houses → 10 population.
+    expect(neighborhoodHousing(makeNeighborhood({
+      upgradeTracks: { expand: 1 },
+    }))).toBe(10);
   });
 });

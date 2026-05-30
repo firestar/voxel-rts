@@ -572,6 +572,28 @@ export function upgradeOptionsFor(b: Building): UpgradeOption[] {
   return UPGRADE_OPTIONS.filter(o => o.applicable(b));
 }
 
+/**
+ * Population housing a neighborhood contributes to its team's cap: 5 per
+ * house, where the number of houses is `tier = 1 + completed expand
+ * upgrades`. Returns 0 for non-neighborhoods, destroyed lots, and a hood
+ * whose INITIAL build hasn't finished (`healthRefVoxels <= 0` → no houses
+ * standing yet).
+ *
+ * Crucially this gates on `healthRefVoxels` (initial build done), NOT on
+ * `upgradeState === 'enabled'`. A hood mid-EXPAND flips to `pending` while
+ * its new house is constructed, but its existing houses are still standing
+ * (the build queue only carves/regrows the new house) and its residents are
+ * still alive — so it must keep providing its current houses' housing. The
+ * `expand` track only increments on completion, so `tier` here reflects the
+ * houses that actually exist right now, not the one under construction.
+ */
+export function neighborhoodHousing(b: Building): number {
+  if (b.spec.kind !== 'neighborhood' || b.destroyed) return 0;
+  if (b.healthRefVoxels <= 0) return 0; // initial build not finished — no houses yet
+  const tier = 1 + (b.upgradeTracks.expand ?? 0);
+  return tier * 5;
+}
+
 /** Resource cost to train each unit kind. Deducted when HQ dispatches a supply truck. */
 export const UNIT_TRAIN_COST: Record<UnitKind, { food: number; metals: number; wood: number }> = {
   soldier:        { food: 40,  metals: 10,  wood: 10  },
