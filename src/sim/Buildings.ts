@@ -594,6 +594,53 @@ export function neighborhoodHousing(b: Building): number {
   return tier * 5;
 }
 
+/** Base population every live HQ grants before any housing. A single HQ
+ *  seeds 6 workers, leaving 4 for combat; multi-HQ teams scale up. */
+export const POP_PER_HQ = 10;
+
+/**
+ * Compute each team's population cap from the live world. Pure so the cap
+ * rule is unit-testable without standing up the THREE-backed `Game`.
+ *
+ * Cap = `POP_PER_HQ × live HQs` + housing contribution. Housing comes ONLY
+ * from neighborhoods, via `neighborhoodHousing` (which keeps counting a hood
+ * mid-EXPAND because it gates on the initial build, not `upgradeState`).
+ *
+ * `civSystemActive` distinguishes the two worlds the cap lives in:
+ *   - true  (campaign): `CivilianSystem` spawns residents for every team, so
+ *     the cap tracks the live citizen count, clamped to the hood's housing —
+ *     `min(civilians, housing)`. Each citizen born is +1, each killed is −1.
+ *   - false (AI-vs-AI debug testbed / authoritative server): only the host's
+ *     hoods spawn civilians, so reading housing straight off the buildings is
+ *     the only way AI teams climb past the base cap instead of freezing at 10.
+ */
+export function populationCapsFor(
+  buildings: ReadonlyArray<Building>,
+  civiliansByTeam: ReadonlyMap<string, number>,
+  civSystemActive: boolean,
+  teams: ReadonlyArray<BuildingTeam>,
+): Map<BuildingTeam, number> {
+  const hqsBy = new Map<string, number>();
+  const housingBy = new Map<string, number>();
+  for (const b of buildings) {
+    if (b.destroyed) continue;
+    if (b.spec.kind === 'hq') {
+      hqsBy.set(b.team, (hqsBy.get(b.team) ?? 0) + 1);
+    } else if (b.spec.kind === 'neighborhood') {
+      housingBy.set(b.team, (housingBy.get(b.team) ?? 0) + neighborhoodHousing(b));
+    }
+  }
+  const out = new Map<BuildingTeam, number>();
+  for (const team of teams) {
+    const hqCount = hqsBy.get(team) ?? 1;
+    const housing = housingBy.get(team) ?? 0;
+    const civilians = civiliansByTeam.get(team) ?? 0;
+    const contribution = civSystemActive ? Math.min(civilians, housing) : housing;
+    out.set(team, POP_PER_HQ * hqCount + contribution);
+  }
+  return out;
+}
+
 /** Resource cost to train each unit kind. Deducted when HQ dispatches a supply truck. */
 export const UNIT_TRAIN_COST: Record<UnitKind, { food: number; metals: number; wood: number }> = {
   soldier:        { food: 40,  metals: 10,  wood: 10  },

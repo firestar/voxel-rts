@@ -110,6 +110,75 @@ describe('AI build-order strategies (goal D)', () => {
     expect(depotTrains[0]).toBe('aa_vehicle');
   });
 
+  // ── Pop-cap relief via expand_neighborhood ──────────────────────────────
+  // Build a state where the team is within 2 slots of its cap (popPressure) and
+  // owns one enabled hood at a given expand tier. The brain should grow pop the
+  // cheap, safe way — by EXPANDING that hood — rather than always dropping a new
+  // lot. `hoodExpandTier` drives whether the hood can still grow.
+  function pressuredState(strategy: string, hoodExpandTier: number, hoodCount = 1, barracksCount = 1): any {
+    process.env.AI_STRATEGY_enemy = strategy;
+    const enemyBuildings: any[] = [
+      { id: 1, kind: 'hq', team: 'enemy', upgradeState: 'enabled', anchorHqId: 1 },
+      { id: 3, kind: 'farm', team: 'enemy', upgradeState: 'enabled', anchorHqId: 1, trainQueueLen: 0 },
+    ];
+    for (let i = 0; i < barracksCount; i++) {
+      enemyBuildings.push({ id: 100 + i, kind: 'barracks', team: 'enemy',
+        upgradeState: 'enabled', anchorHqId: 1, trainQueueLen: 0 });
+    }
+    for (let i = 0; i < hoodCount; i++) {
+      enemyBuildings.push({ id: 10 + i, kind: 'neighborhood', team: 'enemy',
+        upgradeState: 'enabled', anchorHqId: 1, expandTier: hoodExpandTier });
+    }
+    return {
+      enemyHqs: [{ id: 1, team: 'enemy', alive: true, x: 100, z: 100, ox: 100, oz: 100, cellsW: 6, cellsD: 5 }],
+      enemyBuildings,
+      targetBuildings: [], playerBuildings: [], enemyUnits: [],
+      workers: Array.from({ length: 6 }, (_, i) => ({ id: 400 + i, team: 'enemy', focus: 'mine', taskKind: 'mine' })),
+      enemyResources: { food: 1000, metals: 1000, wood: 1000 },
+      // popCap 15, used 14 → within 2 of the cap → popPressure on.
+      teamResources: { enemy: { food: 1000, metals: 1000, wood: 1000, popCap: 15 } },
+      teamPopUsed: { enemy: 14 }, enemyUnitCount: 14,
+    };
+  }
+
+  function runBrain(state: any): any[] {
+    const sid = `exp-${sidCounter++}`;
+    const s = ai.ensureSession(sid);
+    if (s.perHq) s.perHq.clear();
+    if (s.strategies) delete s.strategies;
+    s.lastTickAt = Date.now() - 5000;
+    return ai.decideActions(state, sid).actions;
+  }
+
+  it('relieves pop pressure by expanding an existing enabled hood (tier 0 → 1)', () => {
+    const actions = runBrain(pressuredState('balanced', 0));
+    const expands = actions.filter((a: any) => a.type === 'upgrade_building' && a.upgradeId === 'expand');
+    expect(expands.length).toBe(1);
+    expect(expands[0].buildingId).toBe(10);
+    // Prefers the upgrade over dropping a brand-new lot.
+    expect(actions.some((a: any) => a.type === 'place_building' && a.kind === 'neighborhood')).toBe(false);
+  });
+
+  it('does NOT expand a hood already at tier 3 (expandTier 2) — respects the housing cap', () => {
+    // military_rush caps at 1 hood, so with that hood maxed there is no pop
+    // relief building to emit at all (no new lot, no further expand).
+    const actions = runBrain(pressuredState('military_rush', 2, 1));
+    expect(actions.some((a: any) => a.type === 'upgrade_building' && a.upgradeId === 'expand')).toBe(false);
+  });
+
+  it('proactively expands once the strategy hood COUNT is maxed', () => {
+    // military_rush wants 3 barracks + 1 hood; give it both maxed (hood enabled,
+    // tier 0) and NOT pop-pressured. Barracks/farms/lots are all satisfied, so
+    // the only expansion left to raise the ceiling is to expand the hood. Drop
+    // pressure by widening the cap so the emergency branch doesn't fire; the
+    // proactive branch should.
+    const state = pressuredState('military_rush', 0, 1, 3);
+    state.teamResources.enemy.popCap = 60; // no pressure
+    state.teamPopUsed.enemy = 6;
+    const actions = runBrain(state);
+    expect(actions.some((a: any) => a.type === 'upgrade_building' && a.upgradeId === 'expand')).toBe(true);
+  });
+
   it('seed-random fallback assigns a valid strategy per team when no env override', () => {
     const sid = `rand-${sidCounter++}`;
     delete process.env.AI_STRATEGY_enemy;

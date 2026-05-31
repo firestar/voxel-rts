@@ -36,6 +36,14 @@ const BUILDING_COSTS = {
   neighborhood:  { metals: 30, wood: 60 },
 };
 
+// `expand_neighborhood` upgrade cost — mirrors the `expand` upgrade option's
+// baseCost in src/sim/Buildings.ts. Expanding an existing enabled hood adds
+// another house (+5 pop cap) for less than a fresh hood (30m/60w) and reuses
+// the lot's already-built, base-proximate footprint, so its upgrade-delivery
+// truck has a short, defended haul instead of a long exposed one. It's how a
+// team grows pop past `hoods × 5` toward the tier-3 `hoods × 15` ceiling.
+const EXPAND_COST = { metals: 25, wood: 50 };
+
 // Unit training costs. Same caveat: client owns the canonical numbers
 // (`UNIT_TRAIN_COST` in Buildings.ts); we use these to gate when an
 // action is worth emitting.
@@ -540,8 +548,32 @@ function decideActions(state, sessionId) {
     // no-depot strategies (military_rush) always expand freely.
     const rushesDepot = t.depot > 0 && (t.depotFarmReq ?? 2) <= 1;
     const expansionOk = !rushesDepot || depotUp;
-    if (popPressure && h.placeCooldown === 0 && anyHoods.length < t.hoods && canAffordBldg('neighborhood')) {
-      // Emergency: drop another hood the moment we're near cap.
+    // Hoods that can still grow another house: ENABLED (the sim only accepts an
+    // upgrade on an enabled building) and below tier 3 (expand caps at 2 levels
+    // = 3 houses). Expanding one adds +5 pop cap. Picking the lowest-tier one
+    // tops hoods up evenly; preferring expansion over a brand-new lot keeps the
+    // upgrade-delivery truck on a short, defended haul to an existing house
+    // rather than a long exposed run to a fresh forward lot (the dump showed
+    // forward hoods stalling at hp=0 because their construction trucks were
+    // killed mid-haul). With the pop-cap fix in Game.ts the hood keeps counting
+    // its current houses while the expand is `pending`, so the cap no longer
+    // dips during the upgrade.
+    const expandableHoods = anyHoods.filter(b => b.upgradeState === 'enabled' && (b.expandTier ?? 0) < 2);
+    const lowestTierExpandable = () => expandableHoods.reduce(
+      (lo, b) => ((b.expandTier ?? 0) < (lo.expandTier ?? 0) ? b : lo), expandableHoods[0]);
+    const canAffordExpandNow = () => budget.metals >= EXPAND_COST.metals && budget.wood >= EXPAND_COST.wood;
+    const canAffordExpandHeld = () => (budget.metals - vehicleHold) >= EXPAND_COST.metals && budget.wood >= EXPAND_COST.wood;
+    if (popPressure && h.placeCooldown === 0 && expandableHoods.length > 0 && canAffordExpandNow()) {
+      // Pop relief, preferred: expand an existing enabled hood (+5 cap). Cheaper
+      // than a fresh lot (25m/50w vs 30m/60w) and safer to deliver. Emergency,
+      // so it ignores the vehicle metal hold exactly like the first hood does.
+      const tgt = lowestTierExpandable();
+      actions.push({ type: 'upgrade_building', buildingId: tgt.id, upgradeId: 'expand' });
+      debit(EXPAND_COST);
+      h.placeCooldown = 3.0;
+    } else if (popPressure && h.placeCooldown === 0 && anyHoods.length < t.hoods && canAffordBldg('neighborhood')) {
+      // Emergency: drop another hood when no enabled hood can expand yet
+      // (e.g. the only hood is still mid initial-build).
       actions.push({ type: 'place_building', kind: 'neighborhood', anchorHqId: hq.id });
       debit(BUILDING_COSTS.neighborhood);
       h.placeCooldown = 3.0;
@@ -584,6 +616,15 @@ function decideActions(state, sessionId) {
       // Additional neighborhoods — also held behind the depot completing.
       actions.push({ type: 'place_building', kind: 'neighborhood', anchorHqId: hq.id });
       debit(BUILDING_COSTS.neighborhood);
+      h.placeCooldown = 3.0;
+    } else if (expansionOk && h.placeCooldown === 0 && anyHoods.length >= t.hoods && expandableHoods.length > 0 && anyFarms.length >= 1 && canAffordExpandHeld()) {
+      // Proactive expansion: the strategy's hood COUNT is maxed, so the only way
+      // to keep raising the pop ceiling is to add houses to existing hoods
+      // (toward tier 3). Held behind the same vehicle-metal reserve as other
+      // expansion so it never starves a queued tank.
+      const tgt = lowestTierExpandable();
+      actions.push({ type: 'upgrade_building', buildingId: tgt.id, upgradeId: 'expand' });
+      debit(EXPAND_COST);
       h.placeCooldown = 3.0;
     }
     void liveFarms;
@@ -1184,6 +1225,11 @@ function snapshotToEnemyState(snapshot, opts) {
       kind: b.kind,
       upgradeState: b.upgradeState,
       trainQueueLen: b.trainQueueLen ?? 0,
+      // Carry the completed expand level so the brain knows when a hood has
+      // hit tier 3 and can't expand further (matches the browser path's
+      // RemoteAIClient mapping). Without it the engine-bridge brain would keep
+      // emitting expand actions the sim rejects on a maxed hood.
+      expandTier: (b.upgradeTracks && b.upgradeTracks.expand) || b.expandTier || 0,
       x: (b.ox + (b.cellsW || 1) * 0.5) * NAV_CELL_METERS,
       z: (b.oz + (b.cellsD || 1) * 0.5) * NAV_CELL_METERS,
     }));

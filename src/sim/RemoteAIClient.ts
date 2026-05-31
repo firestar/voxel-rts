@@ -3,7 +3,7 @@ import {
   BuildingManager, Building, BuildingKind, BuildingSpec,
   BARRACKS, FARM, VEHICLE_DEPOT, NEIGHBORHOOD,
   checkFootprint, snapshotBuildingStructure, hasTruckApproach,
-  UNIT_TRAIN_COST,
+  UNIT_TRAIN_COST, upgradeOptionById,
 } from './Buildings';
 import { Resources } from './Resources';
 import { VoxelWorld } from '../voxel/VoxelWorld';
@@ -318,6 +318,14 @@ export class RemoteAIClient {
     const b = deps.buildings.buildings.find(x => x.id === a.buildingId);
     if (!b || b.destroyed) return;
     if (b.upgradeState !== 'enabled') return; // already pending / disabled
+    // Honour the upgrade's own applicability guard before committing. The
+    // player UI gates on `option.applicable(b)`, but an AI action arrives
+    // unvalidated — without this an `expand` on an already tier-3 hood would
+    // push it to a 4th house (housing 20 > the rules' 15 cap) since the expand
+    // `apply()` just increments with no clamp. Reject any upgrade the option
+    // says isn't applicable to this building's current state.
+    const opt = upgradeOptionById(a.upgradeId);
+    if (!opt || !opt.applicable(b)) return;
     b.activeUpgradeId = a.upgradeId;
     b.upgradeState = 'pending';
     b.upgradeStockpile.metals = 0;

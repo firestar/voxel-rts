@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { CivilianSystem, CivilianDeps } from '../src/sim/Civilians';
 import type { Unit } from '../src/sim/Units';
-import { neighborhoodHousing } from '../src/sim/Buildings';
-import type { Building } from '../src/sim/Buildings';
+import { neighborhoodHousing, populationCapsFor, POP_PER_HQ } from '../src/sim/Buildings';
+import type { Building, BuildingTeam } from '../src/sim/Buildings';
 
 /**
  * Headless coverage for the neighborhood citizen lifecycle:
@@ -174,5 +174,70 @@ describe('neighborhoodHousing', () => {
     expect(neighborhoodHousing(makeNeighborhood({
       upgradeTracks: { expand: 1 },
     }))).toBe(10);
+  });
+});
+
+describe('populationCapsFor', () => {
+  const TEAMS: BuildingTeam[] = ['player', 'enemy', 'enemy2'];
+
+  function hq(team: BuildingTeam, overrides: Partial<Building> = {}): Building {
+    return { id: 1, team, spec: { kind: 'hq', cellsW: 6, cellsD: 6 }, ox: 0, oz: 0,
+      destroyed: false, healthRefVoxels: 100, upgradeState: 'enabled',
+      upgradeTracks: {}, ...overrides } as unknown as Building;
+  }
+  function hood(team: BuildingTeam, overrides: Partial<Building> = {}): Building {
+    return makeNeighborhood({ team, ...overrides } as Partial<Building>);
+  }
+
+  it('starts every team at the base cap with only an HQ', () => {
+    const caps = populationCapsFor([hq('player')], new Map(), false, TEAMS);
+    expect(caps.get('player')).toBe(POP_PER_HQ);   // 10
+    expect(caps.get('enemy')).toBe(POP_PER_HQ);     // no buildings → assumed 1 HQ
+    expect(caps.get('enemy2')).toBe(POP_PER_HQ);
+  });
+
+  it('adds tier × 5 housing per neighborhood off the buildings when civilians are not simulated', () => {
+    // AI-vs-AI / server world: civSystemActive=false → housing read directly.
+    const buildings = [
+      hq('enemy'),
+      hood('enemy'),                                   // tier 1 → +5
+      hood('enemy', { id: 43, upgradeTracks: { expand: 2 } }), // tier 3 → +15
+    ];
+    const caps = populationCapsFor(buildings, new Map(), false, TEAMS);
+    expect(caps.get('enemy')).toBe(POP_PER_HQ + 5 + 15); // 30
+  });
+
+  it('does NOT collapse the cap while a hood is mid-EXPAND', () => {
+    // The exact bug: a pending expand used to drop the hood's housing to 0,
+    // crashing the cap to the base 10. neighborhoodHousing still counts the
+    // standing houses, so the cap holds at base + current housing.
+    const enabled = populationCapsFor(
+      [hq('player'), hood('player')], new Map(), false, TEAMS);
+    const midExpand = populationCapsFor(
+      [hq('player'), hood('player', { upgradeState: 'pending', activeUpgradeId: 'expand' } as Partial<Building>)],
+      new Map(), false, TEAMS);
+    expect(enabled.get('player')).toBe(POP_PER_HQ + 5);   // 15
+    expect(midExpand.get('player')).toBe(POP_PER_HQ + 5); // still 15, not 10
+  });
+
+  it('tracks live citizens clamped to housing when the civilian system is active', () => {
+    // Campaign world: civSystemActive=true → min(civilians, housing).
+    const buildings = [hq('player'), hood('player', { upgradeTracks: { expand: 1 } })]; // housing 10
+    // Only 3 citizens grown so far → cap = 10 base + 3.
+    expect(populationCapsFor(buildings, new Map([['player', 3]]), true, TEAMS).get('player'))
+      .toBe(POP_PER_HQ + 3);
+    // Fully housed (10 citizens) → cap = 10 base + 10, never more than housing.
+    expect(populationCapsFor(buildings, new Map([['player', 20]]), true, TEAMS).get('player'))
+      .toBe(POP_PER_HQ + 10);
+  });
+
+  it('scales the base cap with multiple HQs and ignores destroyed buildings', () => {
+    const buildings = [
+      hq('enemy2'), hq('enemy2', { id: 2 }),                 // 2 HQs → 20 base
+      hood('enemy2'),                                         // +5
+      hood('enemy2', { id: 44, destroyed: true }),            // destroyed → 0
+    ];
+    expect(populationCapsFor(buildings, new Map(), false, TEAMS).get('enemy2'))
+      .toBe(POP_PER_HQ * 2 + 5); // 25
   });
 });

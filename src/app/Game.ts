@@ -70,7 +70,7 @@ import {
   buildingActionsFor, unitActionsFor,
 } from './Actions';
 import { makeUnitPortraitButton, makeUnitPortraitTile, makeBuildingPortraitTile, makeUpgradePortraitButton } from './Portraits';
-import { upgradeOptionById } from '../sim/Buildings';
+import { upgradeOptionById, populationCapsFor } from '../sim/Buildings';
 
 /**
  * Player UI mode. `build*` modes preview a building footprint; `plant` mode
@@ -1178,35 +1178,19 @@ export class Game {
       if (u.kind !== 'civilian') continue;
       civiliansBy.set(u.team, (civiliansBy.get(u.team) ?? 0) + 1);
     }
-    const hqsBy = new Map<string, number>();
-    const housingBy = new Map<string, number>();
-    for (const b of this.buildings.buildings) {
-      if (b.destroyed) continue;
-      if (b.spec.kind === 'hq') {
-        hqsBy.set(b.team, (hqsBy.get(b.team) ?? 0) + 1);
-      } else if (b.spec.kind === 'neighborhood' && b.upgradeState === 'enabled') {
-        // Housing capacity mirrors the civilian quota the hood would target:
-        // tier × 5, tier = 1 + expand-upgrade level.
-        const tier = 1 + (b.upgradeTracks.expand ?? 0);
-        housingBy.set(b.team, (housingBy.get(b.team) ?? 0) + tier * 5);
-      }
-    }
     // When the local civilian system is running (campaign: `civilians.tick`
     // spawns residents for every team's hoods), the pop max is driven by the
-    // live citizen count — each created citizen adds +1, each killed citizen
-    // removes 1, capping at the hood's `tier × 5` housing. When civilians are
-    // NOT simulated locally (the AI-vs-AI debug testbed / authoritative
-    // zero-trust server, where the host only spawns its own civilians), fall
-    // back to reading housing straight off the buildings so AI teams aren't
-    // hard-capped at 10 — see the iter53-58 note above.
+    // live citizen count. When civilians are NOT simulated locally (the
+    // AI-vs-AI debug testbed / authoritative zero-trust server, where the host
+    // only spawns its own civilians), housing is read straight off the
+    // buildings so AI teams aren't hard-capped at 10. `populationCapsFor`
+    // encodes both — and counts a hood mid-EXPAND, so the cap no longer
+    // collapses to 10 during the upgrade (the bug commit 200c9b1 fixed in
+    // Buildings.ts but never propagated to this caller).
     const civSystemActive = !this.zeroTrustEnabled && !this.debugMode;
+    const caps = populationCapsFor(this.buildings.buildings, civiliansBy, civSystemActive, teams);
     for (const team of teams) {
-      const r = this.resourcesForTeam(team);
-      const hqCount = hqsBy.get(team) ?? 1;
-      const housing = housingBy.get(team) ?? 0;
-      const civilians = civiliansBy.get(team) ?? 0;
-      const contribution = civSystemActive ? Math.min(civilians, housing) : housing;
-      r.popCap = 10 * hqCount + contribution;
+      this.resourcesForTeam(team).popCap = caps.get(team) ?? 10;
     }
   }
 
