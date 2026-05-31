@@ -42,6 +42,16 @@ const activeResupply = new Map<number, { targetId: number; payload: { food: numb
  *  storage's `supplyInbound` flag and let the dispatcher try again. */
 const activeFetch = new Map<number, number>();
 
+/** In-flight UPGRADE-DELIVERY trucks: target building + cargo so a combat
+ *  kill can decrement `target.inboundUpgradeTrucks` (otherwise the building
+ *  believes a truck is forever inbound and the dispatcher — gated on
+ *  `inboundUpgradeTrucks > 0` — never sends a replacement, so the upgrade /
+ *  initial build stalls at hp 0 for the rest of the match) and refund the
+ *  reserved cargo to the team pool. Mirrors `activeResupply`. Only the
+ *  `truck_deliver_upgrade` task is tracked here; `truck_recover_upgrade`
+ *  (cancelled-upgrade reclaim) keeps its existing handling untouched. */
+const activeUpgrade = new Map<number, { targetId: number; payload: { metals: number; wood: number } }>();
+
 // Per-HQ rebuild countdowns (seconds remaining). When one reaches 0
 // the slot is freed so the dispatch system can send a replacement.
 const truckRebuildQueues = new Map<number, number[]>();
@@ -156,6 +166,7 @@ export function resetSupplyTruckState(): void {
   activeTruckToHQ.clear();
   activeResupply.clear();
   activeFetch.clear();
+  activeUpgrade.clear();
   truckRebuildQueues.clear();
   truckRepathTimer.clear();
   hqLaunchCooldown.clear();
@@ -270,6 +281,26 @@ function reconcileCombatKills(deps: SupplyTruckDeps): void {
       activeFetch.delete(truckId);
       const storage = deps.buildings.buildings.find(b => b.id === fetchStorage);
       if (storage) storage.supplyInbound = false;
+    }
+    // If the truck was delivering an upgrade payload, decrement the target's
+    // inbound count so the dispatcher re-sends (otherwise the building stalls
+    // at hp 0 forever behind a phantom inbound truck) and refund the cargo to
+    // the team pool — the reserved metals/wood were debited at dispatch.
+    const upgrade = activeUpgrade.get(truckId);
+    if (upgrade) {
+      activeUpgrade.delete(truckId);
+      const target = deps.buildings.buildings.find(b => b.id === upgrade.targetId);
+      if (target && !target.destroyed) {
+        target.inboundUpgradeTrucks = Math.max(0, target.inboundUpgradeTrucks - 1);
+      }
+      // Refund to the OWNING team's pool. Derive the team from the in-scope
+      // `hqId` (the loop key) rather than `truckTeam(truckId)` — the registry
+      // entry was already deleted above, so a `truckTeam` lookup here would
+      // miss and mis-route an enemy truck's refund to the player pool.
+      const ownerHq = deps.buildings.buildings.find(b => b.id === hqId);
+      const r = teamResources(deps, ownerHq ? ownerHq.team : 'player');
+      r.metals += upgrade.payload.metals;
+      r.wood   += upgrade.payload.wood;
     }
 
     const hq = deps.buildings.buildings.find(b => b.id === hqId);
@@ -408,6 +439,7 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
           }
           const target = deps.buildings.buildings.find(b => b.id === task.buildingId);
           if (target) target.inboundUpgradeTrucks = Math.max(0, target.inboundUpgradeTrucks - 1);
+          activeUpgrade.delete(u.id);
         } else if (task.kind === 'truck_resupply') {
           r.food   += task.payload.food   ?? 0;
           r.metals += task.payload.metals ?? 0;
@@ -596,6 +628,7 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         r.metals += task.payload.metals;
         r.wood   += task.payload.wood;
         target && target.inboundUpgradeTrucks > 0 && target.inboundUpgradeTrucks--;
+        activeUpgrade.delete(u.id);
         u.task = { kind: 'truck_return' };
         u.path = [];
         continue;
@@ -608,6 +641,7 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         r.metals += task.payload.metals;
         r.wood   += task.payload.wood;
         target.inboundUpgradeTrucks = Math.max(0, target.inboundUpgradeTrucks - 1);
+        activeUpgrade.delete(u.id);
         u.task = { kind: 'truck_return' };
         u.path = [];
         continue;
@@ -616,6 +650,7 @@ function tickActiveTrucks(deps: SupplyTruckDeps, dt: number): void {
         target.upgradeStockpile.metals += task.payload.metals;
         target.upgradeStockpile.wood   += task.payload.wood;
         target.inboundUpgradeTrucks = Math.max(0, target.inboundUpgradeTrucks - 1);
+        activeUpgrade.delete(u.id);
         console.log(`[TRUCK #${u.id}] DELIVER upgrade to ${target.spec.kind}#${target.id}: m=${task.payload.metals} w=${task.payload.wood}`);
         u.task = { kind: 'truck_return' };
         u.path = [];
@@ -897,6 +932,7 @@ function dispatchUpgradeTrucks(deps: SupplyTruckDeps): void {
         payload: { metals: cargoM, wood: cargoW },
       };
       activeTruckToHQ.set(truck.id, hq.id);
+      activeUpgrade.set(truck.id, { targetId: b.id, payload: { metals: cargoM, wood: cargoW } });
       console.log(`[DISPATCH] UPGRADE truck #${truck.id} → ${b.spec.kind}#${b.id} (m=${cargoM} w=${cargoW})`);
       const bPos = pickApproach(b, hqPos.x, hqPos.z, deps);
       deps.routeTruck(truck, bPos.x, bPos.y, bPos.z);
@@ -968,6 +1004,17 @@ function despawn(u: Unit, deps: SupplyTruckDeps): void {
     activeFetch.delete(u.id);
     const storage = deps.buildings.buildings.find(b => b.id === fetchStorage);
     if (storage) storage.supplyInbound = false;
+  }
+  const upgrade = activeUpgrade.get(u.id);
+  if (upgrade) {
+    activeUpgrade.delete(u.id);
+    const target = deps.buildings.buildings.find(b => b.id === upgrade.targetId);
+    if (target && !target.destroyed) {
+      target.inboundUpgradeTrucks = Math.max(0, target.inboundUpgradeTrucks - 1);
+    }
+    const r = teamResources(deps, team);
+    r.metals += upgrade.payload.metals;
+    r.wood   += upgrade.payload.wood;
   }
   activeTruckToHQ.delete(u.id); // normal despawn — no rebuild
   truckRepathTimer.delete(u.id);

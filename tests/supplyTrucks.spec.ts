@@ -172,3 +172,127 @@ describe('supply trucks — team attribution + cross-match state reset (iter79)'
     expect(warned).toBe(true);
   });
 });
+
+describe('supply trucks — a combat-killed upgrade truck frees the building to be re-supplied', () => {
+  /**
+   * Regression: an upgrade-delivery truck killed mid-haul left the target
+   * building's `inboundUpgradeTrucks` stuck at 1 forever (only `activeResupply`
+   * and `activeFetch` were unwound on a combat kill — never the upgrade
+   * delivery). The dispatcher gates on `inboundUpgradeTrucks > 0`, so the
+   * building never got a replacement truck and its upgrade / initial build
+   * stalled at hp 0 for the rest of the match — directly capping pop growth
+   * when the stalled building was a neighborhood.
+   */
+  function deps1() {
+    resetSupplyTruckState();
+    const hq = mkBuilding({ id: 1, ox: 10, oz: 10, spec: { kind: 'hq', cellsW: 6, cellsD: 5, produces: [], maxTrucks: 5 } });
+    // A pending neighborhood (the real-world stall victim): needs 30m/60w.
+    const hood = mkBuilding({
+      id: 2, ox: 40, oz: 10,
+      spec: { kind: 'neighborhood', cellsW: 6, cellsD: 6, produces: [] },
+      upgradeState: 'pending', upgradeStockpile: { metals: 0, wood: 0 },
+    });
+    const res: any = { food: 500, metals: 500, wood: 500, popCap: 200 };
+    const units: any = { units: [] as any[] };
+    let nextId = 7000;
+    const fakeBuildings: any = {
+      buildings: [hq, hood],
+      hqMaxTrucks: () => 5,
+      popHasRoom: () => true,
+      upgradeCostFor: (b: any) => (b.spec.kind === 'neighborhood' ? { metals: 30, wood: 60 } : null),
+    };
+    const deps = {
+      units, buildings: fakeBuildings, resources: res,
+      resourcesForTeam: () => res,
+      spawnTruck: (x: number, y: number, z: number, team: string) => {
+        const t = { id: nextId++, x, y, z, team, hp: 100, kind: 'supply_truck', task: null, path: [] as any[], heading: 0 };
+        units.units.push(t); return t;
+      },
+      routeTruck: (u: any, wx: number, wy: number, wz: number) => { u.path = [{ x: wx, y: wy, z: wz }]; },
+      isPassable: () => true,
+    } as unknown as SupplyTruckDeps;
+    return { deps, hood, res, units };
+  }
+
+  it('decrements inboundUpgradeTrucks, refunds cargo, and re-dispatches after a kill', () => {
+    const { deps, hood, res, units } = deps1();
+
+    // Tick 1: dispatch an upgrade truck toward the pending hood.
+    tickSupplyTrucks(0.6, deps);
+    expect(hood.inboundUpgradeTrucks).toBe(1);
+    const truck = units.units.find((u: any) => u.task?.kind === 'truck_deliver_upgrade');
+    expect(truck).toBeDefined();
+    const spent = (500 - res.metals) + (500 - res.wood);
+    expect(spent).toBeGreaterThan(0); // cargo was debited from the pool
+
+    // Combat kill: removeDeadUnits drops the truck from the array BEFORE the
+    // next tickSupplyTrucks, so reconcileCombatKills sees it gone.
+    units.units = units.units.filter((u: any) => u.id !== truck.id);
+
+    // Tick 2: the kill is reconciled — the phantom inbound is cleared and the
+    // reserved cargo refunded. (A same-tick re-dispatch is blocked only by the
+    // 1.5 s per-HQ launch gap left over from tick 1, not by any stuck counter.)
+    tickSupplyTrucks(0.6, deps);
+    expect(res.metals).toBe(500); // cargo fully refunded
+    expect(res.wood).toBe(500);
+    expect(hood.inboundUpgradeTrucks).toBe(0); // un-stuck — was leaked at 1 before the fix
+
+    // Within a few ticks (once the launch gap clears) a replacement upgrade
+    // truck is dispatched — proving the building is re-supplied, not stranded
+    // forever behind a phantom inbound count.
+    let replacement: any;
+    for (let i = 0; i < 6 && !replacement; i++) {
+      tickSupplyTrucks(0.6, deps);
+      replacement = units.units.find((u: any) => u.task?.kind === 'truck_deliver_upgrade');
+    }
+    expect(replacement).toBeDefined();
+    expect(hood.inboundUpgradeTrucks).toBe(1);
+  });
+
+  it('refunds a combat-killed ENEMY upgrade truck to the ENEMY pool, not the player', () => {
+    resetSupplyTruckState();
+    const enemyHq = mkBuilding({ id: 10, team: 'enemy', ox: 40, oz: 40, spec: { kind: 'hq', cellsW: 6, cellsD: 5, produces: [], maxTrucks: 5 } });
+    const enemyHood = mkBuilding({
+      id: 11, team: 'enemy', ox: 60, oz: 40,
+      spec: { kind: 'neighborhood', cellsW: 6, cellsD: 6, produces: [] },
+      upgradeState: 'pending', upgradeStockpile: { metals: 0, wood: 0 },
+    });
+    const enemyRes: any = { food: 500, metals: 500, wood: 500, popCap: 60 };
+    const playerRes: any = { food: 500, metals: 500, wood: 500, popCap: 60 };
+    const units: any = { units: [] as any[] };
+    let nextId = 8000;
+    const deps = {
+      units,
+      buildings: {
+        buildings: [enemyHq, enemyHood],
+        hqMaxTrucks: () => 5,
+        popHasRoom: () => true,
+        upgradeCostFor: (b: any) => (b.spec.kind === 'neighborhood' ? { metals: 30, wood: 60 } : null),
+      },
+      resources: playerRes,
+      resourcesForTeam: (team: string) => (team === 'enemy' ? enemyRes : playerRes),
+      spawnTruck: (x: number, y: number, z: number, team: string) => {
+        const t = { id: nextId++, x, y, z, team, hp: 100, kind: 'supply_truck', task: null, path: [] as any[], heading: 0 };
+        units.units.push(t); return t;
+      },
+      routeTruck: (u: any, wx: number, wy: number, wz: number) => { u.path = [{ x: wx, y: wy, z: wz }]; },
+      isPassable: () => true,
+    } as unknown as SupplyTruckDeps;
+
+    tickSupplyTrucks(0.6, deps);
+    const truck = units.units.find((u: any) => u.task?.kind === 'truck_deliver_upgrade');
+    expect(truck).toBeDefined();
+    expect(enemyRes.metals + enemyRes.wood).toBeLessThan(1000); // enemy pool debited
+    const playerBefore = playerRes.metals + playerRes.wood;
+
+    // Combat kill, then reconcile.
+    units.units = units.units.filter((u: any) => u.id !== truck.id);
+    tickSupplyTrucks(0.6, deps);
+
+    // Refund landed in the ENEMY pool (team attribution via the owning HQ),
+    // never the player's.
+    expect(enemyRes.metals).toBe(500);
+    expect(enemyRes.wood).toBe(500);
+    expect(playerRes.metals + playerRes.wood).toBe(playerBefore);
+  });
+});

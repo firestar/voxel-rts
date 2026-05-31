@@ -172,9 +172,15 @@ constraint the user has stated across the loop.
   to build (or `expand_neighborhood`-upgrade) a hood. Pop-cap relief
   outranks the barracks → farm → depot order while the squeeze is on.
 - Per team the live civilian count must NEVER exceed the sum of
-  `tier × 5` over its live `enabled` neighborhoods (tier = 1 for a
-  newly placed hood, +1 per `expand_neighborhood` upgrade, capped at
-  3 → 15 civilians per fully-upgraded hood). Going over fires
+  `tier × 5` over its live neighborhoods **whose initial build is
+  finished** (`healthRefVoxels > 0`) — the same gate as
+  `neighborhoodHousing`, NOT `upgradeState === 'enabled'`. A hood
+  mid-EXPAND flips to `pending` while its new house is carved, but its
+  existing houses stand and their residents persist (a citizen only
+  leaves on death or hood destruction), so it keeps contributing its
+  current quota. tier = 1 for a newly placed hood, +1 per **completed**
+  `expand_neighborhood` upgrade (the track increments on completion),
+  capped at 3 → 15 civilians per fully-upgraded hood. Going over fires
   `FAILURE_CIVILIAN_OVERFLOW` (exit code 10) — the server's civilian
   spawner has bypassed its quota. The 10 s creation cadence never lets a
   lot exceed its quota; it only paces how fast the cap ramps up.

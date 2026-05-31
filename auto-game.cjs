@@ -765,7 +765,17 @@ async function main() {
         for (const b of bldgs) {
           if (b.destroyed) continue;
           if (b.spec?.kind !== 'neighborhood') continue;
-          if (b.upgradeState && b.upgradeState !== 'enabled') continue;
+          // Count a hood's CURRENT houses once its INITIAL build is done — the
+          // same gate as the sim's neighborhoodHousing(). Do NOT gate on
+          // `upgradeState === 'enabled'`: a hood mid-EXPAND flips to `pending`
+          // while its new house is carved, but its existing houses stand and
+          // their residents persist (a citizen only leaves on death or hood
+          // destruction — see citizens.spec). Skipping a pending hood here
+          // dropped its quota to 0 and false-tripped FAILURE_CIVILIAN_OVERFLOW
+          // the moment the AI expanded a populated hood. The `expand` track
+          // only increments on completion, so tier reflects the houses that
+          // exist right now.
+          if (!(b.healthRefVoxels > 0)) continue; // initial build unfinished — no houses yet
           const tier = (b.upgradeTracks?.expand ?? 0) + 1;
           capByTeam.set(b.team, (capByTeam.get(b.team) || 0) + tier * 5);
           hoodsByTeam.set(b.team, (hoodsByTeam.get(b.team) || 0) + 1);
