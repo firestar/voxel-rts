@@ -136,8 +136,8 @@ export type GameCommand =
   | { type: 'stop_entity'; id?: number; clientTag?: string; owner?: string }
   | { type: 'despawn_entity'; id?: number; clientTag?: string; owner?: string }
   | { type: 'set_position'; id?: number; clientTag?: string; owner?: string; x: number; y: number; z: number }
-  | { type: 'place_building'; clientTag: string; owner?: string; kind?: string; ox?: number; oz?: number; floorY?: number; cellsW?: number; cellsD?: number; upgradeState?: string; hp?: number; maxHp?: number; trainQueue?: string[] }
-  | { type: 'update_building'; id?: number; clientTag?: string; owner?: string; hp?: number; maxHp?: number; upgradeState?: string; trainQueue?: string[]; destroyed?: boolean }
+  | { type: 'place_building'; clientTag: string; owner?: string; kind?: string; ox?: number; oz?: number; floorY?: number; cellsW?: number; cellsD?: number; upgradeState?: string; hp?: number; maxHp?: number; trainQueue?: string[]; civilianCap?: number }
+  | { type: 'update_building'; id?: number; clientTag?: string; owner?: string; hp?: number; maxHp?: number; upgradeState?: string; trainQueue?: string[]; destroyed?: boolean; civilianCap?: number }
   | { type: 'despawn_building'; id?: number; clientTag?: string; owner?: string }
   | { type: 'set_resources'; owner: string; food?: number; metals?: number; wood?: number; popCap?: number }
   | { type: 'damage_entity'; id?: number; clientTag?: string; amount: number }

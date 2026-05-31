@@ -126,9 +126,25 @@ const FARM_INCOME_FOOD_PER_SEC = 2.5;
  *  thousands of spawns and bloat the snapshot. */
 const MAX_PROJECTILES = 2048;
 // Civilian behaviour, mirroring `src/sim/Civilians.ts`.
-const CIVILIAN_QUOTA_PER_NEIGHBORHOOD = 5;
-const CIVILIAN_SPAWN_COOLDOWN_S = 6.0;
-const CIVILIAN_REPLACEMENT_COOLDOWN_S = 2.0;
+// A new citizen is created every 10 s per neighborhood while below its
+// `civilianCap` (tier × 5); a killed resident is re-grown on the same cadence.
+// Matches the client CivilianSystem (src/sim/Civilians.ts) and the documented
+// rule. Per-hood capacity is the client-synced `b.civilianCap`, NOT a fixed
+// tier-1 constant — a tier-3 hood grows up to 15.
+const CIVILIAN_SPAWN_COOLDOWN_S = 10.0;
+const CIVILIAN_REPLACEMENT_COOLDOWN_S = 10.0;
+// Every civilian eats 2 food per minute. When an owner's food can't cover its
+// civilians' upkeep, food drains to 0 and one civilian STARVES (dies) every
+// CIVILIAN_STARVE_INTERVAL_S until income covers the rest — pop falls and the
+// hood re-grows residents once food recovers. The server owns civilians, so it
+// is the authoritative starver for every owner; it drains the AI factions'
+// food here, while each human client drains its OWN food locally (the player
+// pool the client pushes is client-authoritative).
+const CIVILIAN_UPKEEP_FOOD_PER_MIN = 2;
+const CIVILIAN_STARVE_INTERVAL_S = 5.0;
+// AI factions whose food the SERVER owns (and therefore drains for upkeep).
+// Human-player pools (keyed by playerId) are drained client-side.
+const SERVER_FOOD_OWNERS = new Set(['enemy', 'enemy2']);
 const CIVILIAN_IDLE_MIN_S = 3.0;
 const CIVILIAN_IDLE_MAX_S = 9.0;
 const CIVILIAN_WANDER_RADIUS_M = 4.0;
@@ -318,6 +334,13 @@ function spawnBuilding(args) {
     upgradeState: typeof args.upgradeState === 'string' ? args.upgradeState.slice(0, 16) : 'pending',
     hp: clampNum(args.hp, 0, 1e7, 0),
     maxHp: clampNum(args.maxHp, 0, 1e7, 0),
+    // Civilian housing capacity, set by the client (owner of construction /
+    // upgrades) to `tier × 5` of the hood's CURRENT finished houses. The
+    // civilian spawner reads this directly so it never needs to know about
+    // tiers or the initial-build vs expand distinction: a hood mid-EXPAND
+    // keeps its current capacity (its residents are preserved), and the new
+    // house's 5 slots open only when the client bumps the cap on completion.
+    civilianCap: clampNum(args.civilianCap, 0, 1000, 0),
     trainQueue: Array.isArray(args.trainQueue)
       ? args.trainQueue.slice(0, 32).map(s => String(s).slice(0, 32))
       : [],
@@ -1004,6 +1027,67 @@ function tickFarmIncome(dt) {
   }
 }
 
+/** Civilian food upkeep + starvation. Every live civilian eats
+ *  CIVILIAN_UPKEEP_FOOD_PER_MIN food/min from its owner's pool. The server
+ *  drains the AI factions' food (SERVER_FOOD_OWNERS) — human pools are drained
+ *  client-side — but it is the authoritative civilian killer for EVERY owner:
+ *  when an owner's (server- or client-synced) food can't cover the bite, food
+ *  clamps at 0 and one civilian starves every CIVILIAN_STARVE_INTERVAL_S until
+ *  income catches up. Deaths flow through deleteEntity → the tickCivilians
+ *  roster reap drops the id and the lot re-grows a replacement once fed. */
+function tickCivilianUpkeep(dt) {
+  if (dt <= 0) return;
+  // Count live civilians per owner.
+  const counts = new Map();
+  for (const e of state.entities.values()) {
+    if (e.kind !== 'civilian' || e.hp <= 0) continue;
+    counts.set(e.owner, (counts.get(e.owner) || 0) + 1);
+  }
+  // Clear stale starve timers for owners with no civilians left.
+  for (const owner of [...civilianStarveTimer.keys()]) {
+    if (!counts.has(owner)) civilianStarveTimer.delete(owner);
+  }
+  const ratePerSec = CIVILIAN_UPKEEP_FOOD_PER_MIN / 60;
+  for (const [owner, n] of counts) {
+    const cost = n * ratePerSec * dt;
+    const r = getResources(owner);
+    const serverOwned = SERVER_FOOD_OWNERS.has(owner);
+    const available = r.food || 0;
+    if (available >= cost) {
+      // Fully fed. Only the server-owned (AI) pools are debited here; human
+      // pools are debited by their own client so the 500 ms push doesn't undo it.
+      if (serverOwned) r.food = available - cost;
+      civilianStarveTimer.set(owner, 0);
+      continue;
+    }
+    // Can't cover the bite — drain server-owned pools to 0 and accrue
+    // starvation pressure (for ALL owners, using whatever food the pool
+    // reports; a human pool reads the client-synced, already-drained value).
+    if (serverOwned) r.food = 0;
+    const t = (civilianStarveTimer.get(owner) || 0) + dt;
+    if (t >= CIVILIAN_STARVE_INTERVAL_S) {
+      civilianStarveTimer.set(owner, 0);
+      starveOneCivilian(owner);
+    } else {
+      civilianStarveTimer.set(owner, t);
+    }
+  }
+}
+
+/** Kill one live civilian belonging to `owner` (the most-recently-spawned, so
+ *  long-settled residents are the last to go). The roster reap in
+ *  tickCivilians drops the freed id and re-grows a replacement once fed. */
+function starveOneCivilian(owner) {
+  let victim = null;
+  for (const e of state.entities.values()) {
+    if (e.kind !== 'civilian' || e.hp <= 0 || e.owner !== owner) continue;
+    if (!victim || e.id > victim.id) victim = e;
+  }
+  if (!victim) return;
+  deleteEntity(victim);
+  civilianStates.delete(victim.id);
+}
+
 /** Reduce HP and despawn at zero. Used by the projectile tick path
  *  for both direct hits and explosive splash. Mirrors the
  *  `damage_entity` command's behaviour without going through
@@ -1364,6 +1448,8 @@ function getResources(owner) {
 const civilianResidents = new Map();
 /** entityId → { idleSeconds: number, homeBuildingId: number } */
 const civilianStates = new Map();
+/** owner → seconds of unpaid civilian upkeep accrued (drives starvation). */
+const civilianStarveTimer = new Map();
 
 function buildingCenter(b) {
   const cx = (b.ox + b.cellsW * 0.5) * NAV_CELL_METERS;
@@ -1578,14 +1664,16 @@ function tickCivilians(dt) {
   for (const id of [...civilianStates.keys()]) {
     if (!state.entities.has(id)) civilianStates.delete(id);
   }
-  // Drop civilianResidents entries whose hood is no longer alive +
-  // enabled. The civilians it tracked were "inside" that hood when
-  // it died, so they go with the building. Without this cleanup,
-  // orphaned civilians persist after the hood is gone and push the
-  // per-team total over the (neighborhoods × 5) audit cap.
+  // Drop civilianResidents entries whose hood can no longer house anyone —
+  // it was destroyed, stopped being a neighborhood, or its capacity fell to 0
+  // (initial build not finished). Those residents go with the building. A hood
+  // mid-EXPAND keeps a positive `civilianCap` (the client holds it at the
+  // current finished houses' tier × 5), so its residents are PRESERVED through
+  // the upgrade — destroying them was the reported bug. Civilians otherwise
+  // leave the world only by death (HP→0, reaped above) or hood destruction.
   for (const [hoodId, res] of [...civilianResidents]) {
     const b = state.buildings.get(hoodId);
-    if (b && !b.destroyed && b.kind === 'neighborhood' && b.upgradeState === 'enabled') continue;
+    if (b && !b.destroyed && b.kind === 'neighborhood' && (b.civilianCap || 0) > 0) continue;
     for (const civId of res.ids) {
       const civ = state.entities.get(civId);
       if (civ) deleteEntity(civ);
@@ -1594,34 +1682,38 @@ function tickCivilians(dt) {
     civilianResidents.delete(hoodId);
   }
 
-  // Snapshot the live neighborhood roster once per tick.
+  // Snapshot the live neighborhood roster once per tick. A hood houses
+  // civilians as soon as it can (capacity > 0), INCLUDING while a further
+  // house is mid-construction (upgradeState 'pending') — capacity is the
+  // client-authoritative tier × 5 of the finished houses, not gated on
+  // 'enabled'.
   const neighborhoods = [];
   for (const b of state.buildings.values()) {
     if (b.destroyed) continue;
     if (b.kind !== 'neighborhood') continue;
-    if (b.upgradeState !== 'enabled') continue;
+    if ((b.civilianCap || 0) <= 0) continue;
     neighborhoods.push(b);
   }
   if (neighborhoods.length === 0) return;
 
-  // Spawning.
+  // Spawning. Each hood grows toward its `civilianCap` (tier × 5: 5 per
+  // finished house, up to 15 for a fully-upgraded tier-3 lot) on the 10 s
+  // creation cadence; a death re-grows on the shorter replacement cadence.
   for (const b of neighborhoods) {
+    const quota = b.civilianCap || 0;
     let res = civilianResidents.get(b.id);
     if (!res) {
       res = { ids: [], spawnCooldown: 0 };
       civilianResidents.set(b.id, res);
     }
     res.spawnCooldown = Math.max(0, res.spawnCooldown - dt);
-    if (res.ids.length >= CIVILIAN_QUOTA_PER_NEIGHBORHOOD) continue;
+    if (res.ids.length >= quota) continue;
     if (res.spawnCooldown > 0) continue;
-    // Audit: per the user-authored game rule, a tier-N hood hosts
-    // at most N×5 civilians. CIVILIAN_QUOTA_PER_NEIGHBORHOOD is the
-    // tier-1 cap; logging a warn here surfaces any future-quota
-    // mismatch when the AI starts upgrading hoods.
-    if (res.ids.length + 1 > CIVILIAN_QUOTA_PER_NEIGHBORHOOD) {
-      console.warn(`[civ-overflow] hood ${b.id} owner=${b.owner} ids=${res.ids.length} quota=${CIVILIAN_QUOTA_PER_NEIGHBORHOOD}`);
-      continue;
-    }
+    // Don't grow a resident the owner can't feed. While the team is bankrupt
+    // (food at 0), spawning pauses — combined with upkeep starvation this lets
+    // the population fall to what food sustains instead of churning a
+    // spawn→starve→spawn loop, and it climbs back once food recovers.
+    if ((getResources(b.owner).food || 0) <= 0) continue;
     const c = buildingCenter(b);
     const tag = `civ-${state.nextId}`;
     const civ = spawnEntity({
@@ -1638,7 +1730,7 @@ function tickCivilians(dt) {
       idleSeconds: CIVILIAN_IDLE_MIN_S + Math.random() * (CIVILIAN_IDLE_MAX_S - CIVILIAN_IDLE_MIN_S),
       homeBuildingId: b.id,
     });
-    res.spawnCooldown = res.ids.length < CIVILIAN_QUOTA_PER_NEIGHBORHOOD
+    res.spawnCooldown = res.ids.length < quota
       ? CIVILIAN_REPLACEMENT_COOLDOWN_S
       : CIVILIAN_SPAWN_COOLDOWN_S;
   }
@@ -1911,6 +2003,7 @@ function applyCommand(cmd) {
       }
       if (typeof cmd.hp === 'number') b.hp = clampNum(cmd.hp, 0, 1e7, b.hp);
       if (typeof cmd.maxHp === 'number') b.maxHp = clampNum(cmd.maxHp, 0, 1e7, b.maxHp);
+      if (typeof cmd.civilianCap === 'number') b.civilianCap = clampNum(cmd.civilianCap, 0, 1000, b.civilianCap);
       if (Array.isArray(cmd.trainQueue)) {
         b.trainQueue = cmd.trainQueue.slice(0, 32).map(s => String(s).slice(0, 32));
       }
@@ -2065,6 +2158,7 @@ function applyCommand(cmd) {
       state.resources.clear();
       civilianResidents.clear();
       civilianStates.clear();
+      civilianStarveTimer.clear();
       return { ok: true };
     }
     default:
@@ -2103,6 +2197,9 @@ function tick(dt) {
   // brain doesn't starve while the proper farmer pipeline is still
   // browser-side.
   tickFarmIncome(dt);
+  // Civilian food upkeep (2 food/min each) + starvation. Runs after income so
+  // the farm stream offsets the bite before anyone goes hungry.
+  tickCivilianUpkeep(dt);
   for (const e of state.entities.values()) {
     let budget = e.speed * dt;
     while (budget > 0) {

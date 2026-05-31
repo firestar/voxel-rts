@@ -606,18 +606,21 @@ export const POP_PER_HQ = 10;
  * from neighborhoods, via `neighborhoodHousing` (which keeps counting a hood
  * mid-EXPAND because it gates on the initial build, not `upgradeState`).
  *
- * `civSystemActive` distinguishes the two worlds the cap lives in:
- *   - true  (campaign): `CivilianSystem` spawns residents for every team, so
- *     the cap tracks the live citizen count, clamped to the hood's housing —
- *     `min(civilians, housing)`. Each citizen born is +1, each killed is −1.
- *   - false (AI-vs-AI debug testbed / authoritative server): only the host's
- *     hoods spawn civilians, so reading housing straight off the buildings is
- *     the only way AI teams climb past the base cap instead of freezing at 10.
+ * `civilianDrivenTeams` chooses the contribution per team:
+ *   - a team in the set has its civilians SIMULATED (the host/player's hoods
+ *     spawn residents that mirror into the unit list), so its cap tracks the
+ *     live civilian count clamped to housing — `min(civilians, housing)`. Each
+ *     citizen born is +1, each killed −1, capped per-hood at `tier × 5`. The
+ *     cap therefore ramps up as residents grow in.
+ *   - a team NOT in the set (the AI factions, whose hoods are placed
+ *     server-side by the ai-server bridge and don't spawn civilians) reads
+ *     housing straight off its buildings, so it climbs past the base cap on
+ *     hood completion instead of freezing at 10 with zero civilians.
  */
 export function populationCapsFor(
   buildings: ReadonlyArray<Building>,
   civiliansByTeam: ReadonlyMap<string, number>,
-  civSystemActive: boolean,
+  civilianDrivenTeams: ReadonlySet<string>,
   teams: ReadonlyArray<BuildingTeam>,
 ): Map<BuildingTeam, number> {
   const hqsBy = new Map<string, number>();
@@ -635,7 +638,7 @@ export function populationCapsFor(
     const hqCount = hqsBy.get(team) ?? 1;
     const housing = housingBy.get(team) ?? 0;
     const civilians = civiliansByTeam.get(team) ?? 0;
-    const contribution = civSystemActive ? Math.min(civilians, housing) : housing;
+    const contribution = civilianDrivenTeams.has(team) ? Math.min(civilians, housing) : housing;
     out.set(team, POP_PER_HQ * hqCount + contribution);
   }
   return out;

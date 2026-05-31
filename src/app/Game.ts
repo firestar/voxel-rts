@@ -70,7 +70,7 @@ import {
   buildingActionsFor, unitActionsFor,
 } from './Actions';
 import { makeUnitPortraitButton, makeUnitPortraitTile, makeBuildingPortraitTile, makeUpgradePortraitButton } from './Portraits';
-import { upgradeOptionById, populationCapsFor } from '../sim/Buildings';
+import { upgradeOptionById, populationCapsFor, neighborhoodHousing } from '../sim/Buildings';
 
 /**
  * Player UI mode. `build*` modes preview a building footprint; `plant` mode
@@ -1178,20 +1178,42 @@ export class Game {
       if (u.kind !== 'civilian') continue;
       civiliansBy.set(u.team, (civiliansBy.get(u.team) ?? 0) + 1);
     }
-    // When the local civilian system is running (campaign: `civilians.tick`
-    // spawns residents for every team's hoods), the pop max is driven by the
-    // live citizen count. When civilians are NOT simulated locally (the
-    // AI-vs-AI debug testbed / authoritative zero-trust server, where the host
-    // only spawns its own civilians), housing is read straight off the
-    // buildings so AI teams aren't hard-capped at 10. `populationCapsFor`
-    // encodes both — and counts a hood mid-EXPAND, so the cap no longer
-    // collapses to 10 during the upgrade (the bug commit 200c9b1 fixed in
-    // Buildings.ts but never propagated to this caller).
-    const civSystemActive = !this.zeroTrustEnabled && !this.debugMode;
-    const caps = populationCapsFor(this.buildings.buildings, civiliansBy, civSystemActive, teams);
+    // The PLAYER/host's neighborhoods spawn civilians (server-side, keyed off
+    // the client-synced `civilianCap`) that mirror into `this.units`, so the
+    // player's pop max is driven by the live civilian count: each resident +1,
+    // capped per-hood at `tier × 5` (4 fully-upgraded tier-3 hoods → 60
+    // civilians → +60 pop), ramping up as residents grow in and dropping as
+    // they die / starve. The AI factions' hoods are placed server-side by the
+    // ai-server bridge and don't spawn civilians, so they fall back to reading
+    // housing off their buildings (otherwise a civilian-only rule would freeze
+    // every AI at the base cap). `populationCapsFor` holds a hood's
+    // contribution through a pending expand for both.
+    const civilianDrivenTeams = new Set<string>(['player']);
+    const caps = populationCapsFor(this.buildings.buildings, civiliansBy, civilianDrivenTeams, teams);
     for (const team of teams) {
       this.resourcesForTeam(team).popCap = caps.get(team) ?? 10;
     }
+  }
+
+  /** Each civilian eats {@link Game.CIVILIAN_UPKEEP_FOOD_PER_MIN} food/min.
+   *  The authoritative server owns civilians and enforces upkeep (incl.
+   *  starvation) for every owner, draining the AI factions' food itself — but
+   *  the PLAYER's food pool is client-authoritative (we push it to the server
+   *  every BRIDGE_PUSH_INTERVAL_S, clobbering server-side changes), so we drain
+   *  it here in lockstep. Otherwise the server's player-side starvation would
+   *  fire off a food value the client keeps resetting. Clamped at 0; the server
+   *  starves a civilian when food can't cover the bite (pop drops, the hood
+   *  re-grows a replacement once food recovers). */
+  private static readonly CIVILIAN_UPKEEP_FOOD_PER_MIN = 2;
+  private drainPlayerCivilianUpkeep(dt: number): void {
+    if (dt <= 0) return;
+    let playerCivs = 0;
+    for (const u of this.units.units) {
+      if (u.hp > 0 && u.kind === 'civilian' && u.team === 'player') playerCivs++;
+    }
+    if (playerCivs === 0) return;
+    const bite = playerCivs * (Game.CIVILIAN_UPKEEP_FOOD_PER_MIN / 60) * dt;
+    this.resources.food = Math.max(0, this.resources.food - bite);
   }
 
   private debugLogTimer = 0;
@@ -1505,6 +1527,7 @@ export class Game {
         },
       });
       this.recomputePopulationCaps();
+      this.drainPlayerCivilianUpkeep(simDt);
       this.debugLogResources(dt);
       // Phase 5b: server is canonical for sapling maturation under
       // zero-trust; the broadcast voxel_edit lands in our voxel
@@ -3627,6 +3650,11 @@ export class Game {
         upgradeState: b.upgradeState,
         hp: b.hp, maxHp: b.maxHp,
         trainQueue: b.trainQueue,
+        // Civilian housing capacity the server should spawn up to. Computed
+        // here (the client owns construction/upgrades) so the server doesn't
+        // need to re-derive tier / initial-build state. Counts a hood's
+        // CURRENT finished houses (tier × 5), holding through a pending expand.
+        civilianCap: neighborhoodHousing(b),
       });
     };
     const prevDestroyed = this.buildings.onBuildingDestroyed;
@@ -3656,6 +3684,7 @@ export class Game {
         upgradeState: b.upgradeState,
         hp: b.hp, maxHp: b.maxHp,
         trainQueue: b.trainQueue,
+        civilianCap: neighborhoodHousing(b),
       });
     }
   }
@@ -3680,6 +3709,9 @@ export class Game {
         hp: b.hp,
         upgradeState: b.upgradeState,
         trainQueue: b.trainQueue,
+        // Keep the server's civilian quota in sync as hoods finish building /
+        // complete an expand (tier × 5 of the current finished houses).
+        civilianCap: neighborhoodHousing(b),
       });
     }
     this.gameClient.send({

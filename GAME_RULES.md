@@ -100,13 +100,25 @@ constraint the user has stated across the loop.
 
 ### Population
 
-- Every team has its own population cap. The cap **only** comes from
-  neighborhoods: each house in a neighborhood provides **5 population**,
-  so a tier-3 neighborhood (3 houses) tops up at +15. No other building
-  type contributes — barracks, vehicle depots, HQs, etc. do NOT raise
-  the cap.
-- The cap starts at **10** per team so a fresh base can field its
+- Every team has its own population cap (**per player**). The cap above
+  the base comes **only** from neighborhoods: each finished house provides
+  **5 population**, so a tier-3 neighborhood (3 houses) tops up at +15, and
+  4 fully-upgraded hoods → 60. No other building type contributes — barracks,
+  vehicle depots, HQs, etc. do NOT raise the cap.
+- The cap starts at **10** per live HQ so a fresh base can field its
   starter units.
+- **A player's cap is driven by its live CITIZEN count** (see Citizens): each
+  spawned citizen is +1, each death/starvation −1, clamped per-hood at
+  `tier × 5`. So the cap **ramps up** as residents grow in (not instantly on
+  hood completion) and falls as they die. The **AI factions** — whose hoods
+  are placed server-side by the ai-server bridge and don't spawn citizens —
+  fall back to reading housing (`tier × 5`) straight off their buildings, so
+  they climb past the base cap on hood completion instead of freezing at 10.
+- **Civilian food upkeep:** each live citizen eats **2 food per minute** from
+  its owner's pool. A bankrupt team (food at 0) cannot grow new citizens and
+  its existing citizens **starve** — one dies every few seconds until food
+  income covers the rest (see Citizens). Net population therefore self-limits
+  to what the food economy can feed.
 - **Used population may exceed the cap.** Losing housing (a destroyed
   neighborhood) drops the cap, but the soldiers / workers / vehicles that
   were occupying those slots stay alive and keep counting toward used pop —
@@ -127,11 +139,19 @@ constraint the user has stated across the loop.
   **animates growing in** (sprout → full size over ~1.5 s) as it is born.
 - **Each citizen created adds +1 to the owner's max population; each
   citizen killed removes 1 from the max.** Net pop max therefore equals
-  the live citizen count, capped at the lot's `tier × 5` housing. When
-  the local civilian system isn't simulated (the AI-vs-AI debug testbed /
-  authoritative zero-trust server, which don't spawn civilians for every
-  team) the cap is read straight off the hood's housing capacity instead,
-  so AI teams aren't hard-capped at 10.
+  the live citizen count, capped at the lot's `tier × 5` housing. The
+  authoritative server spawns citizens per neighborhood up to its
+  client-synced `civilianCap` (= `tier × 5` of the hood's CURRENT finished
+  houses), so a **tier-3 hood grows up to 15** — not a fixed 5. The AI
+  factions' hoods (placed server-side, no client `civilianCap`) don't spawn
+  citizens, so their cap reads housing directly (see Population).
+- **A hood only grows a citizen the owner can feed.** While the team's food
+  is at 0, spawning pauses; combined with upkeep starvation the population
+  falls to what the food economy sustains and climbs back once food recovers.
+- **Starvation:** when food can't cover the 2-food/min-per-citizen upkeep,
+  the owner's food drains to 0 and citizens die one at a time (most-recent
+  first) on a fixed interval until income ≥ upkeep. Deaths drop the pop max;
+  the lot re-grows replacements once the team can afford them.
 - Citizens are **attackable and have low HP** (20) — an enemy shooting a
   citizen kills it quickly, and each death costs the owner a pop slot
   (which the lot then re-grows on the 10 s cadence).
