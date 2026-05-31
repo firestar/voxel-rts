@@ -393,7 +393,8 @@ export class UnitRenderer {
         this.applyWorkerLegMatrix(nW, wLegL, swing,  +WORKER_LEG_X);
         this.applyWorkerLegMatrix(nW, wLegR, -swing, -WORKER_LEG_X);
         const isDigging = !isMoving && (
-          u.task.kind === 'chop' || u.task.kind === 'mine'
+          u.task.kind === 'chop' || u.task.kind === 'mine' ||
+          u.task.kind === 'farm' || u.task.kind === 'harvestFarm'
         );
         const armAngle = isDigging
           ? Math.sin(now * 6.0 + u.id * 0.37) * 0.75 - 0.25
