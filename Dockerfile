@@ -22,6 +22,7 @@ RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 # Copy the rest and run the production build (vite build).
 COPY tsconfig.json ./
 COPY index.html ./
+COPY debug.html ./
 COPY vite.config.ts ./
 COPY src ./src
 RUN npx vite build
