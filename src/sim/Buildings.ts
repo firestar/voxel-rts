@@ -4274,33 +4274,28 @@ export class BuildingManager {
   }
 
   /**
-   * Per-frame farm tick. Crops grow on a 0..1 progress meter that PAUSES at
-   * every 20 % barrier (0.2, 0.4, 0.6, 0.8) until a farmer steps onto the
-   * field. Each farmer visit advances `harvestMilestone` by one and growth
-   * resumes toward the next barrier. After the fourth advance (milestone == 4)
-   * growth runs to 1.0 unimpeded; at 100 % `cropReady` flips and the crop
-   * waits for a harvester. The farmer's role is "milestone unlock", not
-   * yield boost — there's no tend-acceleration any more.
+   * Per-frame farm tick. The crop grows on a 0..1 meter ONLY while a
+   * farm-focus worker is physically standing on the plot ("tending" it); when
+   * no farmer is present the crop pauses where it is. There are no milestone
+   * pauses — a continuously-tended farm runs straight to 1.0 over
+   * `productionInterval` seconds, then `cropReady` flips and the crop waits for
+   * the farmer (already on the plot) to harvest it. This is the "farmer sticks
+   * to the farm; the farm only grows while tended" rule.
    *
-   * Liveness check is folded into this tick on a coarse interval so a farm
-   * whose fence has been levelled goes inert.
+   * Liveness check is folded into the per-building tick loop now.
    */
   private tickFarm(b: Building, dt: number, world: VoxelWorld, units: UnitManager): void {
     void world;
-    // Liveness is handled at the top of the per-building tick loop now;
-    // farms just advance their crop progress here.
     b.productionTimer -= dt;
     if (b.productionTimer <= 0) {
       b.productionTimer += b.spec.productionInterval;
     }
-    // Already ripe — wait for a harvester. collectFarm resets state.
+    // Already ripe — wait for the tending farmer to harvest. collectFarm resets.
     if (b.cropReady) return;
 
-    // Detect a FARM-FOCUSED worker physically present in the farm box.
-    // Miners / choppers / auto workers walking through don't count — only a
-    // worker dedicated to farming advances the milestone. The farmer-id
-    // channel is preserved for the renderer / UI so the visiting farmer
-    // shows as the farm's tender.
+    // Detect a FARM-FOCUSED worker physically present in the farm box. Only a
+    // dedicated farmer counts — miners / choppers / auto workers crossing the
+    // plot do NOT tend it. The farmer-id channel feeds the renderer / UI.
     const wxStart = b.ox * NAV_CELL_VOXELS * VOXEL_SIZE;
     const wzStart = b.oz * NAV_CELL_VOXELS * VOXEL_SIZE;
     const wxEnd = wxStart + b.spec.cellsW * NAV_CELL_VOXELS * VOXEL_SIZE;
@@ -4309,9 +4304,6 @@ export class BuildingManager {
     for (const u of units.units) {
       if (u.hp <= 0) continue;
       if (u.kind !== 'worker') continue;
-      // Per game rule: only farm-focused workers can advance crop
-      // milestones. Auto / mine / chop workers walking through the
-      // plot are NOT farmers.
       if (u.workerFocus !== 'farm') continue;
       if (u.x < wxStart || u.x >= wxEnd) continue;
       if (u.z < wzStart || u.z >= wzEnd) continue;
@@ -4319,36 +4311,24 @@ export class BuildingManager {
       b.farmerId = u.id;
       break;
     }
-    if (!farmerOnFarm && b.farmerId !== null) {
-      // Stale farmer reference: clear so the UI doesn't show a phantom owner.
-      const farmer = lookupUnit(units, b.farmerId);
-      if (!farmer || farmer.hp <= 0) b.farmerId = null;
-    }
-
-    // Up to 4 milestones (one per 20 %); after the 4th, growth runs to 1.0.
-    const maxMilestones = 4;
-    const nextMilestone = (b.harvestMilestone + 1) * 0.2;
-    const atMilestone = b.harvestMilestone < maxMilestones && b.cropProgress >= nextMilestone;
-
-    if (atMilestone) {
-      // Paused — only advance when a farmer's actually on the plot.
-      if (farmerOnFarm) {
-        b.harvestMilestone++;
+    if (!farmerOnFarm) {
+      // No farmer on the plot — growth pauses. Clear a stale farmer ref so the
+      // UI doesn't show a phantom tender.
+      if (b.farmerId !== null) {
+        const farmer = lookupUnit(units, b.farmerId);
+        if (!farmer || farmer.hp <= 0) b.farmerId = null;
       }
       return;
     }
 
-    // Between milestones (or past the last one) — grow at ambient rate. Clamp
-    // the per-tick advance to the upcoming milestone so a large dt doesn't
-    // skip over the pause band; the tick after this one will see
-    // cropProgress == nextMilestone, flag atMilestone, and stall until a
-    // farmer arrives.
+    // Tended: grow continuously toward ripe over `productionInterval` seconds.
     const ratePerSec = 1.0 / b.spec.productionInterval;
-    const cap = b.harvestMilestone < maxMilestones ? nextMilestone : 1.0;
-    let next = b.cropProgress + ratePerSec * dt;
-    if (next > cap) next = cap;
-    b.cropProgress = Math.min(1, next);
-    if (b.cropProgress >= 1 && b.harvestMilestone >= maxMilestones) {
+    b.cropProgress = Math.min(1, b.cropProgress + ratePerSec * dt);
+    // harvestMilestone is retained for save/snapshot compatibility but no
+    // longer gates growth; keep it pinned to the legacy "done" sentinel so any
+    // stale reader treats the crop as freely-growing rather than paused.
+    b.harvestMilestone = 4;
+    if (b.cropProgress >= 1) {
       b.cropReady = true;
     }
   }

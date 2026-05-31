@@ -44,53 +44,52 @@ describe('Farm building', () => {
     expect(v[worldIndex(fenceX, fp.floorY + 1, fenceZ)]).toBe(M_DIRT_ROAD);
   });
 
-  it('growth pauses at every 20% milestone until a farmer visits', () => {
+  it('grows ONLY while a farm-focus worker is tending the plot', () => {
     const world = buildGrassPlane();
     const nav = allocateNav(false);
     buildSurfaceNav(world.buffers.voxels, nav);
     const fp = checkFootprint(world.buffers.voxels, nav, FARM, 30, 30);
     const mgr = new BuildingManager();
-    let foodAdded = 0;
-    mgr.foodSink = (amount): void => { foodAdded += amount; };
     const farm = mgr.place(world, FARM, fp.ox, fp.oz, fp.floorY);
+    // Simulate a finished build: a fresh farm places as 'pending' and only
+    // grows once construction completes and it flips to 'enabled'. (The test
+    // harness has no supply-truck construction loop.)
+    farm.upgradeState = 'enabled';
     expect(farm.cropProgress).toBe(0);
     expect(farm.cropReady).toBe(false);
-    expect(farm.harvestMilestone).toBe(0);
 
-    // Step well past 20 % growth without any farmer present. Growth pauses
-    // at the 0.2 barrier — cropProgress holds, harvestMilestone stays 0.
+    // No farmer present → the crop does NOT grow, no matter how long we tick.
     const um = new UnitManager();
     for (let i = 0; i < 5; i++) mgr.tick(FARM.productionInterval, world, um);
-    expect(farm.harvestMilestone).toBe(0);
-    expect(farm.cropProgress).toBeGreaterThanOrEqual(0.2);
-    expect(farm.cropProgress).toBeLessThan(0.4);
+    expect(farm.cropProgress).toBe(0);
     expect(farm.cropReady).toBe(false);
 
-    // Drop a non-farmer worker (auto focus) on the field — should NOT
-    // advance the milestone, since only farm-focused workers tend.
     const cxw = (farm.ox + farm.spec.cellsW * 0.5) * 8 * 0.125;
     const czw = (farm.oz + farm.spec.cellsD * 0.5) * 8 * 0.125;
+
+    // A NON-farmer (auto focus) standing on the plot does NOT tend it.
     const drifter = um.spawn('worker', cxw, (fp.floorY + 1) * 0.125, czw);
     drifter.workerFocus = 'auto';
-    mgr.tick(0.05, world, um);
-    expect(farm.harvestMilestone).toBe(0);
+    for (let i = 0; i < 3; i++) mgr.tick(FARM.productionInterval, world, um);
+    expect(farm.cropProgress).toBe(0);
 
-    // Now switch the worker to farm focus — milestone advances on next tick.
+    // Switch it to farm focus → the crop grows continuously while it stands
+    // there (no milestone pauses). Half an interval of tending ≈ 50 % grown.
     drifter.workerFocus = 'farm';
-    mgr.tick(0.05, world, um);
-    expect(farm.harvestMilestone).toBe(1);
-
-    // Remove the farmer; growth resumes through to the next milestone (0.4)
-    // and pauses again.
-    um.units.length = 0;
-    for (let i = 0; i < 5; i++) mgr.tick(FARM.productionInterval, world, um);
-    expect(farm.harvestMilestone).toBe(1);
-    expect(farm.cropProgress).toBeGreaterThanOrEqual(0.4);
+    mgr.tick(FARM.productionInterval * 0.5, world, um);
+    expect(farm.cropProgress).toBeGreaterThan(0.4);
     expect(farm.cropProgress).toBeLessThan(0.6);
-    expect(farm.cropReady).toBe(false);
+    expect(farm.farmerId).toBe(drifter.id);
+
+    // Remove the farmer → growth PAUSES exactly where it was.
+    const held = farm.cropProgress;
+    um.units.length = 0;
+    for (let i = 0; i < 3; i++) mgr.tick(FARM.productionInterval, world, um);
+    expect(farm.cropProgress).toBe(held);
+    expect(farm.farmerId).toBe(null);
   });
 
-  it('once 100% is reached, a single harvest drops 25 food and resets', () => {
+  it('a continuously-tended farm ripens, then a harvest pays out and resets', () => {
     const world = buildGrassPlane();
     const nav = allocateNav(false);
     buildSurfaceNav(world.buffers.voxels, nav);
@@ -99,28 +98,24 @@ describe('Farm building', () => {
     let foodAdded = 0;
     mgr.foodSink = (amount): void => { foodAdded += amount; };
     const farm = mgr.place(world, FARM, fp.ox, fp.oz, fp.floorY);
+    farm.upgradeState = 'enabled'; // simulate finished construction (see above)
 
-    // Farm-focused worker stays on the field — clears every milestone as
-    // growth advances.
+    // A farmer that stays on the plot grows it straight to 1.0 — no pauses.
     const um = new UnitManager();
     const cxw = (farm.ox + farm.spec.cellsW * 0.5) * 8 * 0.125;
     const czw = (farm.oz + farm.spec.cellsD * 0.5) * 8 * 0.125;
     const farmer = um.spawn('worker', cxw, (fp.floorY + 1) * 0.125, czw);
     farmer.workerFocus = 'farm';
-    // Tick long enough to walk past all 4 milestones + finish to 1.0.
-    for (let i = 0; i < 30; i++) mgr.tick(FARM.productionInterval, world, um);
-    expect(farm.harvestMilestone).toBe(4);
+    for (let i = 0; i < 5 && !farm.cropReady; i++) mgr.tick(FARM.productionInterval, world, um);
     expect(farm.cropProgress).toBe(1);
     expect(farm.cropReady).toBe(true);
 
-    // Pre-100% collect was rejected on previous milestones — verify only the
-    // final 100% harvest pays out.
-    const res = mgr.collectFarm(farm, 999);
-    expect(res.foodGained).toBe(25);
-    expect(foodAdded).toBe(25);
+    // Harvest pays out the farm yield and resets to a fresh growth cycle.
+    const res = mgr.collectFarm(farm, farmer.id);
+    expect(res.foodGained).toBe(60);
+    expect(foodAdded).toBe(60);
     expect(farm.cropReady).toBe(false);
     expect(farm.cropProgress).toBe(0);
-    expect(farm.harvestMilestone).toBe(0);
   });
 });
 

@@ -129,36 +129,29 @@ export class WorkerTaskBoard {
         claimedBy: b.harvesterClaimId ?? 0, buildingId: b.id,
       });
     }
-    // Add a farmTend order for any farm that's paused at a 20 % milestone
-    // and needs a worker to walk through it. Removed automatically once
-    // cropProgress dips below the next milestone (i.e. the farmer's visit
-    // advanced harvestMilestone and growth resumed).
+    // Add a farmTend order for any non-ripe farm that currently has NO farmer
+    // standing on it (`farmerId` null). The crop only grows while a farmer
+    // tends it, so an untended farm needs one dispatched. The order is claimed
+    // by a farm-focus worker who routes to the plot and sticks there; it's
+    // dropped below once the farmer actually arrives (farmerId set) or the
+    // crop ripens.
     for (const b of buildings.buildings) {
       if (b.destroyed) continue;
       if (b.spec.kind !== 'farm') continue;
       if (b.cropReady) continue;
-      if (b.harvestMilestone >= 4) continue;
-      const nextMilestone = (b.harvestMilestone + 1) * 0.2;
-      if (b.cropProgress < nextMilestone) continue;
+      if (b.farmerId !== null) continue; // already tended
       if (this.orders.some(o => o.kind === 'farmTend' && o.buildingId === b.id)) continue;
       this.orders.push({
         id: this.nextId++, kind: 'farmTend', seq: this.nextSeq++,
         claimedBy: 0, buildingId: b.id,
       });
     }
-    // Drop farmTend orders whose farm has resumed growth (milestone advanced)
-    // — let the worker drop the task and pick up the next available job.
+    // Drop a farmTend order once its farm is tended (a farmer arrived) or ripe.
     for (let i = this.orders.length - 1; i >= 0; i--) {
       const o = this.orders[i]!;
       if (o.kind !== 'farmTend') continue;
       const b = buildings.byId(o.buildingId!);
-      if (!b || b.cropReady || b.harvestMilestone >= 4) {
-        this.orders.splice(i, 1);
-        continue;
-      }
-      const nextMilestone = (b.harvestMilestone + 1) * 0.2;
-      if (b.cropProgress < nextMilestone) {
-        // Growth has resumed (the visiting farmer cleared the milestone).
+      if (!b || b.cropReady || b.farmerId !== null) {
         this.orders.splice(i, 1);
       }
     }

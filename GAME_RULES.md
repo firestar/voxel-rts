@@ -62,8 +62,17 @@ constraint the user has stated across the loop.
   come from worker gathering.
 - **Only farm-focused workers can tend / harvest farms.** Auto /
   mine / chop workers walking through a farm plot do NOT count as
-  the farmer; the crop will not advance past the next milestone.
-  Each base must dedicate workers to `farm` focus.
+  the farmer. Each base must dedicate workers to `farm` focus.
+- **A farmer sticks to its farm; the crop grows ONLY while a farm-focus
+  worker is standing on the plot.** Clicking a worker then a farm pathfinds
+  it to the plot and pins it there (`workerFocus = 'farm'`, `task = farm`); it
+  stays until given another order. With no farmer present the crop **pauses**
+  where it is — there are no timed "milestone" advances. A continuously-tended
+  farm grows straight to ripe over `productionInterval`.
+- **Harvest → storage → return.** When the crop ripens the tending farmer
+  harvests it (collecting the farm's food yield), carries it to the nearest
+  storage, drops it, then **returns to the same farm and resumes tending**.
+  While it's away delivering, the crop pauses (no farmer on the plot).
 - Food deposit (worker carry → team pool) and the farm `foodSink`
   both route through `Game.resourcesForTeam(team)` so each AI
   faction has its own `food/metals/wood` pool. No one team can
