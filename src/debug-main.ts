@@ -1,6 +1,7 @@
 import { Game } from './app/Game';
 import { GameClient } from './net/GameClient';
 import { generateDebugWorld } from './voxel/DebugWorldGen';
+import { generateSandboxWorld } from './voxel/SandboxWorld';
 import { DebugPanel } from './app/DebugPanel';
 
 /**
@@ -43,14 +44,20 @@ async function boot(): Promise<void> {
   game.aiClient.tickIntervalSeconds = aiPulseMs / 1000;
   (window as unknown as Record<string, unknown>).__game = game;
 
-  progressEl.textContent = `Generating flat world (${seed})…`;
+  // `?scene=cave` boots the pathfinding sandbox (obstacles + cave with a
+  // staircase mouth, corridor, branch and deep chamber) instead of the flat
+  // AI plain, so the cave/obstacle pathfinding can be demoed in the real app.
+  const scene = params.get('scene');
+  const provider = scene === 'cave' ? generateSandboxWorld : generateDebugWorld;
+  const worldLabel = scene === 'cave' ? 'cave sandbox' : 'flat world';
+  progressEl.textContent = `Generating ${worldLabel} (${seed})…`;
   await game.generate(
     seed,
     (done, total) => {
       const pct = ((done / total) * 100).toFixed(0);
-      progressEl.textContent = `Generating flat world… ${pct}%`;
+      progressEl.textContent = `Generating ${worldLabel}… ${pct}%`;
     },
-    generateDebugWorld,
+    provider,
   );
 
   // Authoritative server — same wiring as the main page. If the

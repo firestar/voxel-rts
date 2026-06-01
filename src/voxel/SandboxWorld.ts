@@ -34,6 +34,7 @@
 import { WORLD_X, WORLD_Y, WORLD_Z, AIR } from './types';
 import { VoxelWorld, worldIndex } from './VoxelWorld';
 import { M_GRASS, M_DIRT, M_STONE, M_BEDROCK } from './Materials';
+import type { MetalCluster } from './Metals';
 
 const NAV = 8; // voxels per nav cell
 
@@ -100,6 +101,28 @@ export function buildSandboxWorld(world: VoxelWorld, opts: SandboxOptions = {}):
     branchEnd: point(56, 2, 74),
     tunnelerTarget: point(92, 2, 40),
   };
+}
+
+/**
+ * Worldgen provider matching {@link Game.generate}'s `provider` parameter, so
+ * the debug page can boot directly into the sandbox cave/obstacle scene (the
+ * same scene the pathfinding tests use) instead of the flat AI plain. Returns
+ * an empty metal-cluster list — the sandbox carries no ore. The landmarks are
+ * stashed on `window.__sandbox` so a demo driver can spawn units at the cave
+ * mouth and route them to the chamber without hard-coding coordinates.
+ */
+export async function generateSandboxWorld(
+  world: VoxelWorld,
+  _seed: number,
+  onProgress?: (p: { done: number; total: number }) => void,
+): Promise<MetalCluster[]> {
+  onProgress?.({ done: 0, total: 1 });
+  const landmarks = buildSandboxWorld(world, {});
+  if (typeof window !== 'undefined') {
+    (window as unknown as Record<string, unknown>).__sandbox = landmarks;
+  }
+  onProgress?.({ done: 1, total: 1 });
+  return [];
 }
 
 // ----------------------------------------------------------------------------
