@@ -19,6 +19,11 @@ export class RTSCamera {
   yaw = 0;          // radians, around Y
   pitch = -0.95;    // ~ -54° (look down)
   distance = 24;    // meters from target
+  /** When set, overrides the fixed look-at height (the world is normally
+   *  framed around a point ~18 m up). The cave follow-cam sets this to the
+   *  tracked unit's Y so underground units stay centred in the frame instead
+   *  of projecting far below the surface look-point. Null = default behaviour. */
+  targetY: number | null = null;
 
   readonly minDist = 4;
   readonly maxDist = 60;
@@ -71,7 +76,8 @@ export class RTSCamera {
     const offZ = Math.cos(this.yaw) * cosP * this.distance;
     const offY = -sinP * this.distance;
     // Aim at a point slightly above the world floor so the lookat tilts the world correctly.
-    const tgtY = Math.min(WORLD_Y * VOXEL_SIZE * 0.4, 18);
+    // A caller may override the look-at height (e.g. to follow an underground unit).
+    const tgtY = this.targetY != null ? this.targetY : Math.min(WORLD_Y * VOXEL_SIZE * 0.4, 18);
     this.cam.position.set(this.target.x + offX, tgtY + offY, this.target.z + offZ);
     this.cam.lookAt(this.target.x, tgtY, this.target.z);
   }

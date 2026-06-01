@@ -646,6 +646,21 @@ export class Game {
    * `debugMaterial` opt, so it's a no-op here (idempotent).
    */
   private applyDebugWireframe(): void {
+    this.setWireframe(true);
+  }
+
+  /** Current wireframe state (debug rendering). */
+  wireframeOn = false;
+
+  /**
+   * Flip `wireframe` on every scene material that supports it. Walks the live
+   * scene each call, so materials created after construction (units, buildings,
+   * projectiles spawned later) are covered too. With `on=false` in debug mode
+   * the chunk material renders as solid flat-shaded vertex colours instead of
+   * the greedy-mesh wireframe — useful for eyeballing the actual terrain.
+   * Returns the new state so callers can update UI.
+   */
+  setWireframe(on: boolean): boolean {
     const seen = new Set<THREE.Material>();
     this.renderer.scene.traverse((obj) => {
       const mat = (obj as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
@@ -654,11 +669,16 @@ export class Game {
       for (const m of arr) {
         if (seen.has(m)) continue;
         seen.add(m);
-        if ('wireframe' in m) {
-          (m as THREE.MeshBasicMaterial).wireframe = true;
-        }
+        if ('wireframe' in m) (m as THREE.MeshBasicMaterial).wireframe = on;
       }
     });
+    this.wireframeOn = on;
+    return on;
+  }
+
+  /** Toggle wireframe rendering; returns the new state. */
+  toggleWireframe(): boolean {
+    return this.setWireframe(!this.wireframeOn);
   }
 
   async generate(
