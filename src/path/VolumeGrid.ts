@@ -6,13 +6,28 @@
  * dirtied. Every per-unit-type grid is derived from this layer, so the
  * voxel scan only happens once across all unit kinds.
  */
-import { WORLD_Y, AIR } from '../voxel/types';
+import { WORLD_X, WORLD_Y, WORLD_Z, AIR } from '../voxel/types';
 import { worldIndex } from '../voxel/VoxelWorld';
 import { MATERIALS, M_BEDROCK } from '../voxel/Materials';
 import {
   NAV_CELL_VOXELS, GRID_X, GRID_Y, GRID_Z, GRID_COUNT,
   cellIndex, getBit, setBit, clearBit, allocateBitmap,
 } from './Nav';
+
+// Flat material→hp lookup, built once. Replaces the `MATERIALS[m]!.hp`
+// array-of-objects property access in the rebuildCell hot loop (called 512×
+// per nav cell). A monomorphic typed-array load is far friendlier to the JIT.
+const MAT_HP = (() => {
+  const t = new Uint16Array(MATERIALS.length);
+  for (let i = 0; i < MATERIALS.length; i++) t[i] = MATERIALS[i]!.hp;
+  return t;
+})();
+
+// worldIndex(x, y, z) = (y*WORLD_Z + z)*WORLD_X + x, so stepping +1 in x adds 1,
+// +1 in z adds WORLD_X, +1 in y adds WORLD_X*WORLD_Z. Precompute the y/z strides
+// so the inner loop walks the buffer with adds instead of a multiply per voxel.
+const VX_Y_STRIDE = WORLD_X * WORLD_Z;
+const VX_Z_STRIDE = WORLD_X;
 
 export interface VolumeGrid {
   /** 1 bit per cell — set when the cell contains *any* solid voxel. */
@@ -77,19 +92,26 @@ export function rebuildCell(voxels: Uint8Array, vg: VolumeGrid, cx: number, cy: 
   const wxStart = cx * NAV_CELL_VOXELS;
   const wyStart = cy * NAV_CELL_VOXELS;
   const wzStart = cz * NAV_CELL_VOXELS;
+  // Base linear voxel index of the cell's (wxStart, wyStart, wzStart) corner.
+  // We advance it by precomputed strides rather than re-multiplying per voxel.
+  const baseI = worldIndex(wxStart, wyStart, wzStart);
   for (let dy = 0; dy < NAV_CELL_VOXELS; dy++) {
     const wy = wyStart + dy;
+    const rowYI = baseI + dy * VX_Y_STRIDE;
+    let sawSolidThisLayer = false;
     for (let dz = 0; dz < NAV_CELL_VOXELS; dz++) {
-      const wz = wzStart + dz;
-      for (let dx = 0; dx < NAV_CELL_VOXELS; dx++) {
-        const m = voxels[worldIndex(wxStart + dx, wy, wz)]!;
+      let i = rowYI + dz * VX_Z_STRIDE;
+      for (let dx = 0; dx < NAV_CELL_VOXELS; dx++, i++) {
+        const m = voxels[i]!;
         if (m === AIR) continue;
         solidCount++;
         if (m === M_BEDROCK) hasBedrock = true;
-        hpSum += MATERIALS[m]!.hp;
-        if (wy > topVoxelY) topVoxelY = wy;
+        hpSum += MAT_HP[m]!;
+        sawSolidThisLayer = true;
       }
     }
+    // dy ascends, so the highest layer with any solid voxel wins topVoxelY.
+    if (sawSolidThisLayer) topVoxelY = wy;
   }
   if (solidCount > 0) {
     setBit(vg.solid, i);

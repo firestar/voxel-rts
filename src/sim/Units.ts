@@ -2177,13 +2177,27 @@ export class UnitManager {
         }
         // Snap surface units to terrain so a push toward a rise doesn't bury
         // their feet. Diggers handle their own vertical positioning in tickVolume.
+        //
+        // BUT only when the burial is SHALLOW — within the unit's own step
+        // height. The separation push is at most 1 voxel horizontally, and on
+        // path-validated terrain two adjacent surface cells differ by no more
+        // than maxStepVoxels, so a genuine "pushed into a rise" burial is always
+        // shallow. A unit standing in a covered cave is metres below the local
+        // `surfaceWorldY` (which reports the CORRIDOR ROOF, not the cave floor);
+        // without this bound the snap teleported queued cave units straight up
+        // through the roof to the surface (the cave-mouth "clump & freeze" — a
+        // queue of soldiers descending a tunnel got lifted out two at a time
+        // whenever separation resolved their overlap). Bounding the lift to the
+        // step height leaves underground units where they belong.
         if (aOk && !a.canDig) {
           const sy = surfaceWorldY(nav, a.x, a.z);
-          if (a.y < sy) { a.y = sy; a.vy = 0; }
+          const buried = sy - a.y;
+          if (buried > 0 && buried <= a.maxStepVoxels * VOXEL_SIZE) { a.y = sy; a.vy = 0; }
         }
         if (bOk && !b.canDig) {
           const sy = surfaceWorldY(nav, b.x, b.z);
-          if (b.y < sy) { b.y = sy; b.vy = 0; }
+          const buried = sy - b.y;
+          if (buried > 0 && buried <= b.maxStepVoxels * VOXEL_SIZE) { b.y = sy; b.vy = 0; }
         }
       }
     }
