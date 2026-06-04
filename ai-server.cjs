@@ -61,6 +61,13 @@ const UNIT_COSTS = {
   rocket_truck:   { food: 20, metals: 80, wood: 0  },
   aa_vehicle:     { food: 20, metals: 90, wood: 0  },
   worker:         { food: 30, metals: 0,  wood: 10 },
+  // Digging units. Costs mirror UNIT_TRAIN_COST in src/sim/Buildings.ts.
+  // Both come out of the vehicle depot. The brain fields a tunneler (or
+  // worm) so the army has a sapper that can carve a straight tunnel
+  // through terrain to the enemy base — see the tunneler siege pass in
+  // the attack section, and DIGGER_TARGET below for how many it wants.
+  tunneler:       { food: 20, metals: 120, wood: 0 },
+  worm:           { food: 20, metals: 100, wood: 0 },
 };
 
 const BARRACKS_PRODUCES = ['soldier', 'gunner', 'rocket_soldier', 'mortar_soldier'];
@@ -155,6 +162,15 @@ const WAVE_SIZE = envNum('AI_WAVE_SIZE', 5);
  *  re-queues a place_building action so the economy stays online.
  *  Defaults on; set AI_AUTO_REBUILD=0 to disable for ablation tests. */
 const AUTO_REBUILD = envNum('AI_AUTO_REBUILD', 1);
+
+/** How many digging units (tunneler) a depot-teching team wants to
+ *  field. Diggers carve a straight tunnel through terrain toward the
+ *  enemy HQ (see the depot-train rule and the tunneler siege pass), so
+ *  even one lets the AI breach a base instead of grinding the front
+ *  wall. Non-teching strategies (no vehicle depot) field none. The
+ *  digger is queued AFTER the depot's first combat vehicle so a team's
+ *  primary armour still leads its rotation. Tournament-tunable. */
+const DIGGER_TARGET = envNum('AI_DIGGER_TARGET', 1);
 
 /** Build-order STRATEGY (goal D). Orthogonal to stance: a strategy picks the
  *  shape of the build plan (how many barracks/farms/hoods, whether & when to
@@ -440,6 +456,7 @@ function decideActions(state, sessionId) {
     : (state.enemyHq && state.enemyHq.alive ? [state.enemyHq] : []);
   if (hqs.length === 0) return { actions };
   const buildings = Array.isArray(state.enemyBuildings) ? state.enemyBuildings : [];
+  const allEnemyUnits = Array.isArray(state.enemyUnits) ? state.enemyUnits : [];
   const teamRes = state.teamResources || {};
   const fallbackRes = state.enemyResources || { food: 0, metals: 0, wood: 0 };
 
@@ -458,6 +475,7 @@ function decideActions(state, sessionId) {
     const h = ensurePerHq(s, hq.id);
     h.placeCooldown = Math.max(0, h.placeCooldown - dt);
     h.trainCooldown = Math.max(0, h.trainCooldown - dt);
+    h.diggerCooldown = Math.max(0, (h.diggerCooldown ?? 0) - dt);
 
     // Filter buildings claimed by this HQ. With multi-team AIs we also
     // require the building to belong to the same team as the HQ — the
@@ -761,15 +779,35 @@ function decideActions(state, sessionId) {
     if (!trainBlocked && liveDepots.length > 0) {
       const depot = liveDepots.find(b => (b.trainQueueLen ?? 0) < 2);
       if (depot) {
-        const mix = t.depotMix || DEPOT_PRODUCES;
-        for (let i = 0; i < mix.length; i++) {
-          const idx = (h.depotPickIndex + i) % mix.length;
-          const kind = mix[idx];
-          if (!canAffordUnitB(kind)) continue;
-          actions.push({ type: 'queue_train', buildingId: depot.id, unitKind: kind });
-          debit(UNIT_COSTS[kind]);
-          h.depotPickIndex = idx + 1;
-          break;
+        // Sapper rule: field DIGGER_TARGET tunnelers so the army has a unit
+        // that can cut a tunnel straight to the enemy base. Gated AFTER the
+        // depot's first rotation vehicle (depotPickIndex > 0) so a team's
+        // primary armour/AA still leads, and behind a cooldown + a live-count
+        // cap so it builds exactly the target rather than spamming diggers.
+        const diggerTarget = t.depot > 0 ? (t.diggers ?? DIGGER_TARGET) : 0;
+        const myDiggers = allEnemyUnits.filter(
+          u => u && (u.hp ?? 1) > 0 && u.team === hq.team
+            && (u.kind === 'tunneler' || u.kind === 'worm')).length;
+        const wantDigger = diggerTarget > 0 && h.depotPickIndex > 0
+          && myDiggers < diggerTarget && h.diggerCooldown === 0
+          && canAffordUnitB('tunneler');
+        if (wantDigger) {
+          actions.push({ type: 'queue_train', buildingId: depot.id, unitKind: 'tunneler' });
+          debit(UNIT_COSTS.tunneler);
+          // Hold off re-queuing until this one has had time to build, so a
+          // not-yet-spawned tunneler (still 0 in myDiggers) isn't double-ordered.
+          h.diggerCooldown = 25.0;
+        } else {
+          const mix = t.depotMix || DEPOT_PRODUCES;
+          for (let i = 0; i < mix.length; i++) {
+            const idx = (h.depotPickIndex + i) % mix.length;
+            const kind = mix[idx];
+            if (!canAffordUnitB(kind)) continue;
+            actions.push({ type: 'queue_train', buildingId: depot.id, unitKind: kind });
+            debit(UNIT_COSTS[kind]);
+            h.depotPickIndex = idx + 1;
+            break;
+          }
         }
       }
     }
@@ -1143,6 +1181,30 @@ function decideActions(state, sessionId) {
         }
         routedThisCycle++;
       }
+
+      // ---- Tunneler / worm siege pass. Diggers carry no weapon, so the
+      // armed-attacker loop above skips them (skipUnarmed). They're the team's
+      // sappers: route each idle digger straight at the team's sticky target
+      // HQ. Game.routePath gives a canDig unit with ground underfoot a direct,
+      // terrain-cutting path (no A* detour around the hill), so a single
+      // route_unit at the enemy HQ IS a dig order — the tunneler carves a
+      // tunnel the rest of the army can follow underground to the base. Drive
+      // it all the way onto the HQ (no stop-short) so the breach reaches the
+      // structure. Re-issued only when idle (pathLen 0) so it isn't yanked
+      // mid-cut; on arrival it re-routes and keeps carving.
+      let dugThisCycle = 0;
+      for (const u of enemyUnits) {
+        if (!u || u.hp <= 0) continue;
+        if (u.kind !== 'tunneler' && u.kind !== 'worm') continue;
+        if (u.pathLen > 0) continue;
+        const tgt = teamTarget[u.team];
+        if (!tgt) continue;
+        actions.push({ type: 'route_unit', unitId: u.id, x: tgt.x, z: tgt.z });
+        routedThisCycle++;
+        dugThisCycle++;
+      }
+      if (dugThisCycle > 0) console.log(`[ai-attack] diggers routed=${dugThisCycle}`);
+
       // Always log the per-cycle skip breakdown when there are
       // armed-idle units but no routes — that's the signal that
       // something silently dropped them and we need to know which gate.
