@@ -69,14 +69,12 @@ describe('AI digging units (tunneler)', () => {
     const s = ai.ensureSession(sid);
     if (s.perHq) s.perHq.clear();
     if (s.strategies) delete s.strategies;
-    // Pretend the depot already trained its first vehicle so the sapper gate is open.
-    const h = ai.ensureSession(sid); void h;
     s.lastTickAt = Date.now() - 5000;
-    ai.decideActions(depotState(), sid); // advances depotPickIndex past 0
-    // A tunneler is already alive → target (1) met → no further tunneler orders.
+    ai.decideActions(depotState(), sid); // advances depotPickIndex past 0 (first vehicle)
+    // DIGGER_TARGET (2) tunnelers are already alive → target met → no more orders.
     s.lastTickAt = Date.now() - 5000;
-    const tunneler = { id: 50, kind: 'tunneler', team: 'enemy', x: 100, z: 100, hp: 100, pathLen: 0, armed: false, hasFiringTarget: false };
-    const { actions } = ai.decideActions(depotState([tunneler]), sid);
+    const dig = (id: number) => ({ id, kind: 'tunneler', team: 'enemy', x: 100, z: 100, hp: 100, pathLen: 0, armed: false, hasFiringTarget: false });
+    const { actions } = ai.decideActions(depotState([dig(50), dig(51)]), sid);
     const tunnelerTrains = actions.filter(
       (a: any) => a.type === 'queue_train' && a.unitKind === 'tunneler');
     expect(tunnelerTrains.length).toBe(0);

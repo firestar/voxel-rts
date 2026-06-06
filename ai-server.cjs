@@ -158,19 +158,33 @@ function effectiveStance(team, ctx) {
  *  a gather-time cap (GATHER_MAX_S) force-commits with ≥2 ready so the
  *  never-release failure mode of the old WAVE=5 can't recur. */
 const WAVE_SIZE = envNum('AI_WAVE_SIZE', 5);
-/** Auto-rebuild: when a barracks / farm / hood is destroyed, the AI
- *  re-queues a place_building action so the economy stays online.
- *  Defaults on; set AI_AUTO_REBUILD=0 to disable for ablation tests. */
+/** Gather-time force-commit. The WAVE_SIZE gate holds attackers home until a
+ *  full pack of WAVE_SIZE is idle-and-ready at once. A team that can't reach
+ *  that — pop-capped to a small army, or bleeding units to midfield attrition
+ *  as fast as it masses — would otherwise sit on its army for the WHOLE match
+ *  (iter comment promised this cap but it was never wired up). Once a team has
+ *  been massing this long with at least a minimal pack (2) ready, commit the
+ *  wave anyway so a stalled army still pressures the enemy. Tournament-tunable;
+ *  0 disables (pure WAVE_SIZE gate). */
+const GATHER_MAX_S = envNum('AI_GATHER_MAX_S', 30);
+/** Auto-rebuild: when a barracks / farm / hood is destroyed the count-based
+ *  build order re-places it automatically (the snapshot drops destroyed
+ *  buildings, so `anyBarracks.length < target` fires again). This flag is
+ *  retained as an ablation knob but the rebuild is implicit in the build order. */
 const AUTO_REBUILD = envNum('AI_AUTO_REBUILD', 1);
 
-/** How many digging units (tunneler) a depot-teching team wants to
- *  field. Diggers carve a straight tunnel through terrain toward the
- *  enemy HQ (see the depot-train rule and the tunneler siege pass), so
- *  even one lets the AI breach a base instead of grinding the front
- *  wall. Non-teching strategies (no vehicle depot) field none. The
- *  digger is queued AFTER the depot's first combat vehicle so a team's
- *  primary armour still leads its rotation. Tournament-tunable. */
-const DIGGER_TARGET = envNum('AI_DIGGER_TARGET', 1);
+/** How many digging units (tunnelers) a depot-teching team wants to field.
+ *  Diggers carve a straight tunnel through terrain toward the enemy HQ (see the
+ *  depot-train rule and the tunneler siege pass), bypassing the surface front to
+ *  attack the base directly. Default 2: a lone sapper surfaces at the HQ and the
+ *  home garrison kills it before it carves through, but a PAIR overwhelms the
+ *  defenders and breaks the base — in the headless batch sim (scripts/
+ *  aiBatchSim.cjs, with underground-transit modelled) decisive-game rate rose
+ *  monotonically 1→2→3 diggers (58→61→65%), so 2 buys most of the gain without
+ *  over-investing 120 metals/digger away from the army. Non-teching strategies
+ *  (no depot) field none; diggers queue AFTER the depot's first combat vehicle
+ *  so primary armour still leads. Tournament-tunable. */
+const DIGGER_TARGET = envNum('AI_DIGGER_TARGET', 2);
 
 /** Build-order STRATEGY (goal D). Orthogonal to stance: a strategy picks the
  *  shape of the build plan (how many barracks/farms/hoods, whether & when to
@@ -209,17 +223,19 @@ function strategyForTeam(team, session) {
  *    before teching, which is what makes the openings visibly different.
  *  - workers: worker target (caps the gatherer count for this strategy).
  *  - depotMix: per-strategy vehicle-build rotation (defaults to DEPOT_PRODUCES,
- *    tank-first). `tech_air` is the dedicated AIR strategy, so it leads with the
- *    aa_vehicle — that both fits its identity AND guarantees an aa_vehicle
- *    actually fields in a normal match (only ~2-3 vehicles build before the
- *    clock, so AA buried 3rd in the default order rarely appeared). Tank still
- *    fields as the 2nd vehicle, so this doesn't break tank/rocket_truck output.
+ *    tank-first). `tech_air` still techs early (depotFarmReq 1) and keeps the
+ *    aa_vehicle SECOND so it reliably fields its namesake within the ~2-3
+ *    vehicles a match produces — but it now LEADS with a tank. Leading with the
+ *    aa_vehicle (dps ~8 vs ground) crippled tech_air's offence: in the headless
+ *    batch sim (scripts/aiBatchSim.cjs) it won 0% of games until the first
+ *    vehicle became a tank (then ~24-34%). Paired with barracks 1→2 for more
+ *    infantry punch behind the armour.
  */
 const BUILD_TARGETS = {
   balanced:      { barracks: 3, farms: 2, hoods: 2, depot: 1, depotFarmReq: 2, workers: 12 },
   econ_boom:     { barracks: 2, farms: 3, hoods: 3, depot: 1, depotFarmReq: 3, workers: 16 },
   military_rush: { barracks: 3, farms: 1, hoods: 1, depot: 0, depotFarmReq: 2, workers: 8  },
-  tech_air:      { barracks: 1, farms: 1, hoods: 3, depot: 1, depotFarmReq: 1, workers: 6, depotMix: ['aa_vehicle', 'tank', 'rocket_truck'] },
+  tech_air:      { barracks: 2, farms: 1, hoods: 3, depot: 1, depotFarmReq: 1, workers: 6, depotMix: ['tank', 'aa_vehicle', 'rocket_truck'] },
 };
 function buildTargetsFor(team, session) {
   return BUILD_TARGETS[strategyForTeam(team, session)] || BUILD_TARGETS.balanced;
@@ -1048,6 +1064,35 @@ function decideActions(state, sessionId) {
           s.armyTargetByTeam[team] = tgt ? tgt.id : null;
         }
         if (tgt) teamTarget[team] = tgt;
+      }
+
+      // Gather-time force-commit (GATHER_MAX_S). Track how long each team has
+      // been massing — idle-ready attackers waiting at home but below the
+      // WAVE_SIZE release threshold. Once that exceeds GATHER_MAX_S with at
+      // least a minimal pack ready, flip the wave to releasing so a team that
+      // can never reach WAVE_SIZE still commits instead of holding its army for
+      // the entire match. Done once per team, before the per-unit routing loop.
+      // Accumulate massing time in SECONDS per attack-cycle (this block runs
+      // about once every ATTACK_RETARGET_S of game time). dt-style accumulation
+      // — rather than a wall-clock timestamp — keeps it correct under sim
+      // fast-forward and matches how the cooldowns above are driven.
+      if (!s.massingTimeByTeam) s.massingTimeByTeam = {};
+      if (GATHER_MAX_S > 0) {
+        for (const team of Object.keys(homeHqByTeam)) {
+          const wave = s.waveByTeam[team] || { releasing: false };
+          s.waveByTeam[team] = wave;
+          const ready = readyAttackersByTeam[team] || 0;
+          if (wave.releasing || ready === 0) {
+            s.massingTimeByTeam[team] = 0; // committing already, or nobody massing
+          } else {
+            s.massingTimeByTeam[team] = (s.massingTimeByTeam[team] || 0) + ATTACK_RETARGET_S;
+            if (ready >= 2 && s.massingTimeByTeam[team] >= GATHER_MAX_S) {
+              wave.releasing = true; // force the stalled pack out
+              s.massingTimeByTeam[team] = 0;
+              console.log(`[ai-attack] team=${team} force-commit after ~${GATHER_MAX_S}s massing (ready=${ready})`);
+            }
+          }
+        }
       }
 
       let skipFiring = 0, skipPath = 0, skipUnarmed = 0, skipNoBldg = 0, skipInRange = 0, skipDefender = 0, skipEconomic = 0;

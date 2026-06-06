@@ -83,7 +83,7 @@ describe('AI build-order strategies (goal D)', () => {
     expect(placed).toContain('barracks');
   });
 
-  it('tech_air leads its depot rotation with the aa_vehicle (its namesake fields reliably)', () => {
+  it('tech_air leads its depot rotation with a tank (offence first); AA still fields second', () => {
     process.env.AI_STRATEGY_enemy = 'tech_air';
     const state: any = {
       enemyHqs: [{ id: 1, team: 'enemy', alive: true, x: 100, z: 100, ox: 100, oz: 100, cellsW: 6, cellsD: 5 }],
@@ -102,12 +102,18 @@ describe('AI build-order strategies (goal D)', () => {
     const s = ai.ensureSession(sid);
     if (s.perHq) s.perHq.clear();
     if (s.strategies) delete s.strategies;
-    s.lastTickAt = Date.now() - 5000;
-    const { actions } = ai.decideActions(state, sid);
-    const depotTrains = actions
-      .filter((a: any) => a.type === 'queue_train' && a.buildingId === 9)
-      .map((a: any) => a.unitKind);
-    expect(depotTrains[0]).toBe('aa_vehicle');
+    // A few depot ticks: the rotation interleaves a tunneler (sapper rule), so
+    // look at the VEHICLE order specifically.
+    const depotTrains: string[] = [];
+    for (let t = 0; t < 4; t++) {
+      s.lastTickAt = Date.now() - 5000;
+      for (const a of ai.decideActions(state, sid).actions) {
+        if (a.type === 'queue_train' && a.buildingId === 9) depotTrains.push(a.unitKind);
+      }
+    }
+    const vehicles = depotTrains.filter(k => k !== 'tunneler' && k !== 'worm');
+    expect(vehicles[0]).toBe('tank');             // offence leads, NOT the dps-8 AA
+    expect(vehicles).toContain('aa_vehicle');     // namesake still fields (2nd vehicle)
   });
 
   // ── Pop-cap relief via expand_neighborhood ──────────────────────────────
