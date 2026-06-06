@@ -5,7 +5,7 @@ import { Input } from './Input';
 import { VoxelWorld, worldIndex } from '../voxel/VoxelWorld';
 import { ChunkMeshRegistry } from '../render/ChunkMeshRegistry';
 import { generateWorld } from '../voxel/WorldGen';
-import { raycastVoxel } from '../voxel/Raycast';
+import { raycastVoxel, pickColumnBelowCut, VoxelHit } from '../voxel/Raycast';
 import { VOXEL_SIZE, WORLD_Y, WORLD_X, WORLD_Z, AIR } from '../voxel/types';
 import { DebrisParticles } from '../render/DebrisParticles';
 import { Pathfinder, profileFromUnit } from '../path/Pathfinder';
@@ -34,6 +34,7 @@ import {
 } from '../voxel/Materials';
 import type { MaterialId } from '../voxel/types';
 import { BuildingManager, BARRACKS, STORAGE, HQ, ALL_BUILDINGS, BuildingSpec, Building, checkFootprint, buildingThreatLevel, doorWorldPos, hasTruckApproach } from '../sim/Buildings';
+import { WinConditionHandler, MatchResult, MatchState } from '../sim/WinConditions';
 import { BuildingGhost } from '../render/BuildingGhost';
 import { ConstructionOverlay } from '../render/ConstructionOverlay';
 import { BuildingRenderer } from '../render/BuildingRenderer';
@@ -280,6 +281,27 @@ export class Game {
    * (clamped); `\` resets it to the world top (= effectively no cut).
    */
   private hideAboveY = WORLD_Y * VOXEL_SIZE;
+
+  /** Win-condition evaluation. Runs every sim tick against a cheap snapshot of
+   *  which teams still hold an HQ; latches the first result. See WinConditions. */
+  readonly winConditions = new WinConditionHandler();
+  /** The match outcome once decided (null while in progress). Exposed so the
+   *  AI-vs-AI harness can read a single canonical winner off `window.__game`. */
+  matchResult: MatchResult | null = null;
+  /** True once the match has ended — freezes the sim (the tick loop's sim block
+   *  is gated on it) while leaving rendering / camera live. */
+  matchOver = false;
+  /** Sim seconds elapsed, for time-based win conditions + result reporting. */
+  private matchElapsed = 0;
+  /** Every team that has fielded an HQ this match. A team stays a participant
+   *  after losing its HQ so elimination is detectable. */
+  private participatingTeams = new Set<Team>();
+  /** Player seat used for victory/defeat framing. */
+  private readonly playerTeam: Team = 'player';
+  /** Optional callback fired once when the match ends (harness / UI hook). */
+  onMatchEnd: ((r: MatchResult) => void) | null = null;
+  private matchBannerEl: HTMLDivElement | null = null;
+
   /** Fog-of-war: chunk fragments outside every player unit / building
    *  sphere are discarded. Default unit radius is 100-voxel diameter
    *  → 50-voxel radius → 6.25 m at the world's 0.125 m/voxel.
@@ -1404,7 +1426,7 @@ export class Game {
       }
     }
 
-    if (this.pathfinder && !this.paused) {
+    if (this.pathfinder && !this.paused && !this.matchOver) {
       // `simDt` lets the debug page run the sim faster than real time
       // (1× / 2× / 4× / 8×) without speeding up the camera/input. Stays
       // at `dt` when `simSpeedMultiplier === 1` (the default), so the
@@ -1622,6 +1644,10 @@ export class Game {
       // refresh + one applyDamage to the worker, regardless of how many
       // impacts / tracks triggered requestNavRebuildAround this frame.
       this.flushNavRebuild();
+      // Win conditions: once the sim has advanced this frame, check whether the
+      // match just ended (player HQ gone, enemies wiped, last team standing).
+      this.matchElapsed += simDt;
+      this.checkWinConditions();
     }
     // Pack FoW sources / explored-map BEFORE the renderer updates so
     // the unit + building cull predicates can use this frame's
@@ -1879,13 +1905,24 @@ export class Game {
     baseY?: number,
     pitchCapRad?: number,
     pitchOriginXZ?: { x: number; z: number },
+    preferColumnUnderCut = false,
   ): {
     surface: THREE.Vector3;
     target: THREE.Vector3;
     voxelXYZ: { x: number; y: number; z: number; nx: number; ny: number; nz: number };
   } | null {
     const { origin, dir } = this.rayFromScreen(px, py, w, h);
-    const hit = raycastVoxel(this.world, origin, dir, 400, this.raycastMaxVoxelY());
+    const maxVoxelY = this.raycastMaxVoxelY();
+    // With the Y-cutoff active the player is looking at a specific underground
+    // slice; the move command wants the target directly under the cursor on
+    // that slice, not wherever the camera's angled ray exits the column. Pick
+    // the vertical column under the cursor first (see pickColumnUnderCut), and
+    // fall back to the normal angled-ray pick when it doesn't apply.
+    let hit: VoxelHit | null = null;
+    if (preferColumnUnderCut && this.yCutoffActive()) {
+      hit = this.pickColumnUnderCut(origin, dir, maxVoxelY);
+    }
+    if (!hit) hit = raycastVoxel(this.world, origin, dir, 400, maxVoxelY);
     if (!hit) return null;
     const wx = (hit.x + 0.5) * VOXEL_SIZE;
     // When the click resolves to the top face of a solid voxel (the common
@@ -1938,7 +1975,9 @@ export class Game {
     }
     const selected = this.units.units.find(u => u.selected);
     if (!selected) { this.target.hide(); return; }
-    const r = this.resolveTarget(hold.startX, hold.startY, w, h, 0);
+    // Preview marker must match the move pick (column-under-cursor when the
+    // Y-cutoff is active) so it lands where the unit will actually go.
+    const r = this.resolveTarget(hold.startX, hold.startY, w, h, 0, undefined, undefined, undefined, true);
     if (!r) { this.target.hide(); return; }
     this.target.show(r.surface, r.target);
   }
@@ -2209,7 +2248,10 @@ export class Game {
       return;
     }
     const lead = selected[0]!;
-    const r = this.resolveTarget(release.startX, release.startY, w, h, 0);
+    // Move command: when the Y-cutoff is active, target the column directly
+    // under the cursor on the viewed slice (nearest visible Y), not wherever
+    // the angled camera ray exits the terrain.
+    const r = this.resolveTarget(release.startX, release.startY, w, h, 0, undefined, undefined, undefined, true);
     if (!r) return;
 
     if (selected.length === 1) {
@@ -5224,6 +5266,97 @@ export class Game {
   private raycastMaxVoxelY(): number | undefined {
     if (!isFinite(this.hideAboveY)) return undefined;
     return Math.max(0, Math.floor(this.hideAboveY / VOXEL_SIZE));
+  }
+
+  /** True when the Y-cutoff overlay is actually hiding terrain (the player has
+   *  lowered it below the world top). At the default top it hides nothing, so
+   *  the column-under-cursor pick stays off and clicks use the normal ray. */
+  private yCutoffActive(): boolean {
+    return this.hideAboveY < WORLD_Y * VOXEL_SIZE - 1e-6;
+  }
+
+  /** Y-cutoff move pick — see {@link pickColumnBelowCut}. Targets the column
+   *  directly under the cursor on the viewed slice instead of where the angled
+   *  camera ray exits the terrain. */
+  private pickColumnUnderCut(
+    origin: THREE.Vector3, dir: THREE.Vector3, maxVoxelY: number | undefined,
+  ): VoxelHit | null {
+    return pickColumnBelowCut(this.world, origin, dir, this.hideAboveY, maxVoxelY);
+  }
+
+  /**
+   * Build the win-condition snapshot from current building state and evaluate
+   * the rules. Ends the match (once) the first time a rule fires. Called at the
+   * end of each advanced sim tick.
+   */
+  private checkWinConditions(): void {
+    if (this.matchOver) return;
+    const teamsWithLiveHq = new Set<Team>();
+    for (const b of this.buildings.buildings) {
+      if (b.spec.kind !== 'hq' || b.destroyed) continue;
+      // healthRefVoxels > 0 mirrors the HQ-alive checks used elsewhere (e.g. the
+      // AI snapshot) — it skips the brief window between place() and the first
+      // structural snapshot so a just-placed HQ doesn't read as already dead.
+      if (b.healthRefVoxels <= 0) continue;
+      teamsWithLiveHq.add(b.team);
+      this.participatingTeams.add(b.team);
+    }
+    // No participants yet (pre-spawn frames) — nothing to decide.
+    if (this.participatingTeams.size === 0) return;
+    const state: MatchState = {
+      playerTeam: this.playerTeam,
+      participants: [...this.participatingTeams],
+      teamsWithLiveHq,
+      elapsedSeconds: this.matchElapsed,
+    };
+    const result = this.winConditions.evaluate(state);
+    if (result) this.endMatch(result);
+  }
+
+  /** Latch the outcome, freeze the sim, surface a banner + fire the hook. */
+  private endMatch(result: MatchResult): void {
+    if (this.matchOver) return;
+    this.matchResult = result;
+    this.matchOver = true;
+    console.log(
+      `[match] ${result.kind.toUpperCase()} winner=${result.winner ?? 'none'} ` +
+      `reason=${result.reason} t=${this.matchElapsed.toFixed(1)}s`,
+    );
+    this.showMatchBanner(result);
+    if (this.onMatchEnd) this.onMatchEnd(result);
+  }
+
+  /** Reset for a fresh match (clears the latched result + participant set). */
+  resetMatchState(): void {
+    this.winConditions.reset();
+    this.matchResult = null;
+    this.matchOver = false;
+    this.matchElapsed = 0;
+    this.participatingTeams.clear();
+    if (this.matchBannerEl) this.matchBannerEl.style.display = 'none';
+  }
+
+  /** Centered VICTORY / DEFEAT / DRAW overlay. No-op without a DOM (tests). */
+  private showMatchBanner(result: MatchResult): void {
+    if (typeof document === 'undefined' || !document.body) return;
+    let el = this.matchBannerEl;
+    if (!el) {
+      el = document.createElement('div');
+      el.style.cssText = [
+        'position:fixed', 'left:50%', 'top:40%', 'transform:translate(-50%,-50%)',
+        'padding:18px 36px', 'border-radius:10px', 'font:700 42px/1.2 system-ui,sans-serif',
+        'letter-spacing:2px', 'text-align:center', 'pointer-events:none', 'z-index:1000',
+        'background:rgba(0,0,0,0.6)', 'box-shadow:0 4px 24px rgba(0,0,0,0.5)',
+      ].join(';');
+      document.body.appendChild(el);
+      this.matchBannerEl = el;
+    }
+    const label = result.kind === 'victory' ? 'VICTORY'
+      : result.kind === 'defeat' ? 'DEFEAT' : 'DRAW';
+    el.style.color = result.kind === 'victory' ? '#7CFC6B'
+      : result.kind === 'defeat' ? '#FF6B6B' : '#DDDDDD';
+    el.textContent = label;
+    el.style.display = 'block';
   }
 
   private updateProjectileArcs(): void {

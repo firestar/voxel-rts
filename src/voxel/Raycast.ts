@@ -101,3 +101,33 @@ export function raycastVoxel(
   }
   return null;
 }
+
+/**
+ * Y-cutoff "nearest visible Y" pick. With the cutoff overlay active the player
+ * is viewing a specific underground slice at `planeY` (meters). A normal angled
+ * camera ray drills diagonally and exits the column far from where the cursor
+ * points on that slice; instead, intersect the camera ray with the cut plane to
+ * get the XZ directly under the cursor, then cast straight DOWN that column to
+ * the first solid voxel — the nearest visible surface beneath the click.
+ *
+ * Returns null (so the caller can fall back to the angled-ray pick) when the ray
+ * isn't heading downward through the plane, the plane is behind the camera, or
+ * the column is empty all the way to the floor.
+ */
+export function pickColumnBelowCut(
+  world: VoxelWorld,
+  origin: { x: number; y: number; z: number },
+  dir: { x: number; y: number; z: number },
+  planeY: number,
+  maxVoxelY?: number,
+): VoxelHit | null {
+  if (dir.y >= -1e-6) return null;            // not looking down through the plane
+  const t = (planeY - origin.y) / dir.y;      // ray param where it crosses the plane
+  if (t <= 0) return null;                     // plane is behind the camera
+  const cx = origin.x + dir.x * t;
+  const cz = origin.z + dir.z * t;
+  // Start a half-voxel below the plane so the first sampled cell is the top
+  // visible layer, then cast straight down to the world floor.
+  const down = { x: cx, y: planeY - VOXEL_SIZE * 0.5, z: cz };
+  return raycastVoxel(world, down, { x: 0, y: -1, z: 0 }, planeY + 1, maxVoxelY);
+}
